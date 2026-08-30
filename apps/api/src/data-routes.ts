@@ -2201,12 +2201,15 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }
         const current = await client.query(
-          `SELECT id FROM users
+          `SELECT id, role FROM users
             WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE`,
           [request.authUser!.id],
         );
         if (!current.rowCount) {
           throw new ApiError(401, "INVALID_CREDENTIALS", "No se pudo verificar la cuenta.");
+        }
+        if (current.rows[0].role === "ADMIN") {
+          throw new ApiError(409, "ADMIN_ACCOUNT_DELETION_NOT_ALLOWED", "Otra persona autorizada debe retirar primero el acceso administrativo.");
         }
         await client.query(
           `INSERT INTO privacy_operations (

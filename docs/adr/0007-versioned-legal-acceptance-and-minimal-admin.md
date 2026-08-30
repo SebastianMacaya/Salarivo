@@ -3,6 +3,8 @@
 - Estado: Accepted
 - Fecha: 2026-08-29
 
+> La decisión de aceptación legal continúa vigente. La administración mínima fue supersedida el 2026-08-30 por el [ADR 0012](0012-granular-admin-console.md).
+
 ## Contexto
 
 Crear una cuenta requiere evidencia de qué Términos se aceptaron y qué Aviso de Privacidad se mostró. La operación local también necesita visibilidad básica sin abrir acceso transversal a recibos, salarios o PII.

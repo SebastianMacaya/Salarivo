@@ -4,7 +4,7 @@
 
 ## Alcance
 
-Web, API, Google OIDC, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, observabilidad, exports y operaciones de borrado.
+Web, consola administrativa, API, Google OIDC, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, observabilidad, exports y operaciones de borrado.
 
 ## Activos
 
@@ -16,6 +16,7 @@ Web, API, Google OIDC, PostgreSQL, cola, workers, object storage, scanner, OCR/I
 - claves de cifrado y credenciales de proveedores;
 - exports y autorizaciones firmadas;
 - correcciones humanas y audit trail;
+- roles/capacidades administrativas y evidencia de acciones privilegiadas;
 - disponibilidad y presupuesto de procesamiento.
 
 ## Atacantes
@@ -80,8 +81,11 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 | Mensajes duplicados/retries | idempotency keys, constraints y state transitions transaccionales | delivery duplicado produce un resultado |
 | Fuga por logs/APM | sanitizer central, allowlist de campos, redacción en errores/traces | test captura logs y busca PII sintética |
 | Secretos expuestos | secret manager, rotación, scanning y no incluirlos en imágenes/repositorio | secret scanning y revisión de config |
-| Insider | least privilege, acceso just-in-time, auditoría, separación de funciones | revisión periódica de accesos y eventos |
-| Escalamiento a admin | rol sólo en DB, nunca desde body/cookie; guard server-side en cada ruta; respuestas agregadas sin PII ni salarios | registro con `role` falla, USER recibe 403 y revocación aplica al siguiente request |
+| Insider o soporte con acceso excesivo | roles por función, capacidades allowlisted, DTO admin separados, contacto completo sólo con permiso + step-up + motivo/referencia, sin acceso a PDF/OCR/salario | roles inferiores reciben 403, la lista sólo contiene contacto enmascarado y toda lectura excepcional deja evento atómico |
+| Escalamiento a admin | rol sólo en DB, nunca desde registro/cookie; coherencia `role`/`admin_role`; MFA obligatorio; deny-by-default y guard por capacidad en cada ruta | rol/capacidad desconocidos no autorizan, USER recibe 403 y la revocación aplica al siguiente request |
+| IDOR administrativo o payload excesivo | endpoints/queries transversales explícitos, schemas mínimos, paginación, IDs validados y prohibición de reutilizar rutas owner-only con bypass | cambiar UUID no amplía capacidad y las respuestas no incluyen filename, key, hash, OCR, importes, CUIT/CUIL ni tokens |
+| Carrera o abuso en comandos admin | step-up, motivo tipado, locks y precondiciones dentro de la misma transacción; no self-change ni remoción del último SUPER_ADMIN; no cancelar RUNNING ni retry permanente | requests concurrentes producen una transición válida y un único resultado auditable |
+| Alteración de auditoría administrativa | tabla append-only sin FK destructiva, metadata allowlisted y escritura atómica con la mutación | UPDATE/DELETE fallan y una cascada de cuenta no elimina la evidencia |
 | Reidentificación en benchmark futuro | feature apagada; antes de habilitar: cohortes amplias predefinidas, k mínimo, redondeo, demora, anti-differencing, query budget, mitigación Sybil/poisoning y opt-in separado | ataques de membership inference y consultas diferenciales no recuperan aportes individuales |
 | Supply chain | lockfile, versiones evaluadas, SCA/SAST, imágenes/versiones reproducibles | scans bloqueantes y actualización controlada |
 | Borrado incompleto | orquestación idempotente sobre DB/storage/cache/cola/temporales/backups; marcador de ejecución hasta limpiar temporales | prueba de account deletion, job activo y reconciliación |
@@ -117,7 +121,7 @@ Las alertas sólo incluyen IDs internos y códigos.
 
 ## Riesgos abiertos
 
-- Proceso operativo de alta, recuperación y revocación para administradores.
+- Procedimiento operativo probado de alta inicial, recuperación y revisión periódica de administradores; la consola sólo implementa cambio/revocación bajo un `SUPER_ADMIN` activo.
 - Validación operativa de Google OIDC y rotación del client secret antes de producción; la versión legal inicial 1.0 ya fue aprobada para la instancia privada.
 - Store distribuido de rate limiting antes de escalar la API a múltiples réplicas; el proxy productivo normaliza la IP cliente antes de que la API la use como clave local.
 - Auditoría durable y alertas sanitizadas para intentos MFA denegados o bloqueados.

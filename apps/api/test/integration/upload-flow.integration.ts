@@ -848,7 +848,10 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.ok(legalAcknowledgements.rows.every((row) => row.accepted_at instanceof Date));
   const deniedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieB } });
   assert.equal(deniedAdmin.statusCode, 403, deniedAdmin.body);
-  await pool.query("UPDATE users SET role = 'ADMIN', updated_at = now() WHERE id = $1", [userIdA]);
+  await pool.query(
+    "UPDATE users SET role = 'ADMIN', admin_role = 'READ_ONLY', updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
   const blockedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
   assert.equal(blockedAdmin.statusCode, 403, blockedAdmin.body);
   assert.equal(blockedAdmin.json().error.code, "MFA_SETUP_REQUIRED");
@@ -896,6 +899,85 @@ test("upload privado crea un único documento y un único intent durable", async
   cookieA = rotatedCookie(confirmedMfa, cookieA);
   const revokedSecondarySession = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: secondaryCookieA } });
   assert.equal(revokedSecondarySession.statusCode, 401, revokedSecondarySession.body);
+  const readOnlyContext = await app.inject({ method: "GET", url: "/api/v1/admin/context", headers: { cookie: cookieA } });
+  assert.equal(readOnlyContext.statusCode, 200, readOnlyContext.body);
+  assert.equal(readOnlyContext.json().data.user.adminRole, "READ_ONLY");
+  const readOnlyUsers = await app.inject({
+    method: "GET",
+    url: "/api/v1/admin/users?page=1&pageSize=10&sort=createdAt&direction=desc",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(readOnlyUsers.statusCode, 200, readOnlyUsers.body);
+  assert.ok(readOnlyUsers.json().data.items.some((user: { id: string }) => user.id === userIdA));
+  assert.equal(readOnlyUsers.body.includes(emailA), false);
+  await pool.query("UPDATE sessions SET step_up_expires_at = NULL WHERE token_hash = $1", [
+    tokenHash(cookieA.split("=", 2)[1]!),
+  ]);
+  const readOnlyEmailOracle = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/users?search=${encodeURIComponent(emailB)}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(readOnlyEmailOracle.statusCode, 200, readOnlyEmailOracle.body);
+  assert.deepEqual(readOnlyEmailOracle.json().data.items, []);
+  assert.equal(readOnlyEmailOracle.json().data.total, 0);
+  const invalidAdminQuery = await app.inject({
+    method: "GET",
+    url: "/api/v1/admin/users?role=OWNER",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(invalidAdminQuery.statusCode, 400, invalidAdminQuery.body);
+
+  const disposableAdminTargetCookie = await seedGoogleAccount(`admin-target-${suffix}@example.test`);
+  const disposableAdminTarget = await app.inject({
+    method: "GET",
+    url: "/api/v1/auth/me",
+    headers: { cookie: disposableAdminTargetCookie },
+  });
+  assert.equal(disposableAdminTarget.statusCode, 200, disposableAdminTarget.body);
+  const disposableAdminTargetId = String(disposableAdminTarget.json().data.id);
+  const deniedReadOnlyMutation = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/users/${disposableAdminTargetId}/revoke-sessions`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "SECURITY_INCIDENT", reference: `INT-${suffix}` },
+  });
+  assert.equal(deniedReadOnlyMutation.statusCode, 403, deniedReadOnlyMutation.body);
+  assert.equal(deniedReadOnlyMutation.json().error.code, "ADMIN_PERMISSION_REQUIRED");
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT result, actor_admin_role, reason_code, reference
+         FROM admin_audit_events
+        WHERE actor_user_id = $1 AND subject_user_id = $2 AND action = 'USER_SESSIONS_REVOKED'`,
+      [userIdA, disposableAdminTargetId],
+    )).rows,
+    [{ result: "DENIED", actor_admin_role: "READ_ONLY", reason_code: "SECURITY_INCIDENT", reference: `INT-${suffix}` }],
+  );
+
+  await pool.query("UPDATE users SET admin_role = 'SUPER_ADMIN', updated_at = now() WHERE id = $1", [userIdA]);
+  await grantStepUp(cookieA);
+  const revokedDisposableSessions = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/users/${disposableAdminTargetId}/revoke-sessions`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "SECURITY_INCIDENT", reference: `INT-${suffix}` },
+  });
+  assert.equal(revokedDisposableSessions.statusCode, 200, revokedDisposableSessions.body);
+  assert.equal(revokedDisposableSessions.json().data.revokedSessions, 1);
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: disposableAdminTargetCookie } })).statusCode,
+    401,
+  );
+  assert.equal(
+    (await pool.query(
+      `SELECT count(*)::integer AS count FROM admin_audit_events
+        WHERE actor_user_id = $1 AND subject_user_id = $2 AND action = 'USER_SESSIONS_REVOKED' AND result = 'SUCCESS'`,
+      [userIdA, disposableAdminTargetId],
+    )).rows[0].count,
+    1,
+  );
+  await pool.query("DELETE FROM users WHERE id = $1", [disposableAdminTargetId]);
+
   const adminOverview = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
   assert.equal(adminOverview.statusCode, 200, adminOverview.body);
   assert.equal(adminOverview.headers["cache-control"], "no-store");
@@ -907,7 +989,22 @@ test("upload privado crea un único documento y un único intent durable", async
   for (const forbidden of ["password_hash", "original_filename", "gross_amount", "net_amount", "object_key"]) {
     assert.equal(adminOverview.body.includes(forbidden), false);
   }
-  await pool.query("UPDATE users SET role = 'USER', updated_at = now() WHERE id = $1", [userIdA]);
+  const deniedAdminAccountDeletion = await app.inject({
+    method: "DELETE",
+    url: "/api/v1/privacy/account",
+    headers: { origin, cookie: cookieA },
+    payload: { confirmation: "ELIMINAR", receiptToken: deletionReceiptToken() },
+  });
+  assert.equal(deniedAdminAccountDeletion.statusCode, 409, deniedAdminAccountDeletion.body);
+  assert.equal(deniedAdminAccountDeletion.json().error.code, "ADMIN_ACCOUNT_DELETION_NOT_ALLOWED");
+  assert.deepEqual(
+    (await pool.query("SELECT role, admin_role, status FROM users WHERE id = $1", [userIdA])).rows[0],
+    { role: "ADMIN", admin_role: "SUPER_ADMIN", status: "ACTIVE" },
+  );
+  await pool.query(
+    "UPDATE users SET role = 'USER', admin_role = NULL, updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
   const revokedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
   assert.equal(revokedAdmin.statusCode, 403, revokedAdmin.body);
   async function createEmployment(cookie: string, employerName: string) {
@@ -935,6 +1032,16 @@ test("upload privado crea un único documento y un único intent durable", async
   const employmentA = await createEmployment(cookieA, "Empresa Asociada A");
   const employmentB = await createEmployment(cookieB, "Empresa Ajena B");
   const googleEmployment = await createEmployment(googleCookie, "Empresa Google Sintética");
+  await pool.query("UPDATE users SET role = 'ADMIN', admin_role = 'SUPER_ADMIN', updated_at = now() WHERE id = $1", [userIdA]);
+  const wildcardEmployerSearch = await app.inject({
+    method: "GET",
+    url: "/api/v1/admin/employers?search=%25",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(wildcardEmployerSearch.statusCode, 200, wildcardEmployerSearch.body);
+  assert.deepEqual(wildcardEmployerSearch.json().data.items, []);
+  assert.equal(wildcardEmployerSearch.json().data.total, 0);
+  await pool.query("UPDATE users SET role = 'USER', admin_role = NULL, updated_at = now() WHERE id = $1", [userIdA]);
   const googleCannotEditOtherEmployment = await app.inject({
     method: "PATCH",
     url: `/api/v1/employments/${employmentA}`,
@@ -1485,6 +1592,45 @@ test("upload privado crea un único documento y un único intent durable", async
        ($4, $2, $3, 2, 'Deducción', NULL, 50.00, 'ARS', 'DEDUCTION', 0.9),
        ($5, $2, $3, 3, 'Deducción', NULL, 20.00, 'ARS', 'DEDUCTION', 0.8)`,
     [crypto.randomUUID(), userId, settlementId, crypto.randomUUID(), crypto.randomUUID()],
+  );
+
+  await pool.query(
+    "UPDATE users SET role = 'ADMIN', admin_role = 'SECURITY', updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
+  const securityUserDetail = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/users/${userIdA}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(securityUserDetail.statusCode, 200, securityUserDetail.body);
+  assert.deepEqual(securityUserDetail.json().data.employments, []);
+  const adminDocuments = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/documents?search=${documentId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(adminDocuments.statusCode, 200, adminDocuments.body);
+  assert.deepEqual(adminDocuments.json().data.items.map((document: { id: string }) => document.id), [documentId]);
+  const adminDocument = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/documents/${documentId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(adminDocument.statusCode, 200, adminDocument.body);
+  assert.deepEqual(adminDocument.json().data.recentJobs, []);
+  for (const forbidden of [
+    "originalFilename", "original_filename", "objectKey", "object_key", "sha256", "ocr",
+    "extracted", "grossAmount", "gross_amount", "netAmount", "net_amount", "rawValue",
+    "raw_value", "correctedValue", "corrected_value", canonicalObjectKey, incomingObjectKey,
+    "recibo-sintetico.pdf", "1000.00", "820.00", "180.00",
+  ]) {
+    assert.equal(adminDocuments.body.includes(forbidden), false, `admin document list exposed ${forbidden}`);
+    assert.equal(adminDocument.body.includes(forbidden), false, `admin document detail exposed ${forbidden}`);
+  }
+  await pool.query(
+    "UPDATE users SET role = 'USER', admin_role = NULL, updated_at = now() WHERE id = $1",
+    [userIdA],
   );
 
   await pool.query("UPDATE documents SET processing_status = 'NEEDS_REVIEW' WHERE id = $1", [documentId]);

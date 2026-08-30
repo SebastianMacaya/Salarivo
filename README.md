@@ -16,7 +16,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - borrado separado de original o documento completo;
 - MFA TOTP, recovery codes y step-up de acciones sensibles; MFA obligatorio para administración;
 - exportación JSON completa y eliminación durable de cuenta con constancia consultable;
-- páginas públicas de Términos/Privacidad y panel admin de métricas sanitizadas;
+- páginas públicas de Términos/Privacidad y consola admin granular con metadata operativa, comandos acotados y auditoría append-only;
 - reglas para agentes y mejora supervisada en [AGENTS.md](AGENTS.md).
 
 El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argentinos y produce como máximo una liquidación por PDF; ampliar tipos, países o múltiples liquidaciones exige fixtures y tests nuevos.
@@ -54,10 +54,10 @@ Abrí `http://localhost:3000`. La web local llama a `http://localhost:3001/api/v
 
 La configuración de Google usa `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` y `GOOGLE_OAUTH_REDIRECT_URI`.
 
-El rol `ADMIN` nunca se acepta desde registro ni desde la web. En una instalación local, un operador puede promover una cuenta existente directamente en PostgreSQL usando un email exacto; no expongas ese acceso de base de datos en producción:
+El rol `ADMIN` nunca se acepta desde registro ni desde la web. Antes de promover una cuenta local debe estar activa y tener MFA habilitado. El primer `SUPER_ADMIN` se provisiona fuera de la API mediante PostgreSQL; no expongas ese acceso de base de datos en producción:
 
 ~~~powershell
-docker compose exec postgres psql -U salarivo -d salarivo -c "UPDATE users SET role = 'ADMIN', updated_at = now() WHERE email = 'tu-email@example.com';"
+docker compose exec postgres psql -U salarivo -d salarivo -c "UPDATE users SET role = 'ADMIN', admin_role = 'SUPER_ADMIN', updated_at = now() WHERE email = 'tu-email@example.com' AND role = 'USER' AND status = 'ACTIVE' AND EXISTS (SELECT 1 FROM mfa_factors WHERE user_id = users.id AND status = 'ACTIVE');"
 ~~~
 
 La versión legal 1.0 está cerrada y aprobada por el titular para esta vista privada de uso individual y es la primera vigente para el alta exclusiva con Google. Ninguna aprobación equivale a una revisión profesional ni habilita acceso de terceros; esa ampliación requiere una versión nueva con identidad, domicilio, canal y operación legal acordes al servicio real.
@@ -93,6 +93,7 @@ npm run test:integration
 - [Arquitectura](docs/architecture/overview.md)
 - [Pipeline de ingestión](docs/architecture/ingestion-pipeline.md)
 - [Modelo de dominio](docs/architecture/domain-model.md)
+- [Consola administrativa](docs/architecture/admin-console.md)
 - [Threat model](docs/security/threat-model.md)
 - [Auditoría de privacidad y seguridad 2026-08-30](docs/security/privacy-security-audit-2026-08-30.md)
 - [Seguridad de upload](docs/security/file-upload.md)
@@ -100,4 +101,5 @@ npm run test:integration
 - [Retención](docs/privacy/data-retention.md)
 - [Políticas legales](docs/legal/policies.md)
 - [Google OIDC e identidades externas](docs/adr/0010-google-oidc-and-external-identities.md)
+- [Consola administrativa granular](docs/adr/0012-granular-admin-console.md)
 - [ADRs](docs/adr/README.md)

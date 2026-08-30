@@ -12,6 +12,16 @@ import Fastify, {
   type FastifyRequest,
 } from "fastify";
 import type { ApiConfig } from "./config.ts";
+import {
+  adminPermissions,
+  adminRoles,
+  hasAdminPermission,
+  isAdminRole,
+  permissionsForAdminRole,
+  type AdminPermission,
+  type AdminRole,
+} from "./admin-rbac.ts";
+import { registerAdminRoutes } from "./admin-routes.ts";
 import { registerDataRoutes } from "./data-routes.ts";
 import type { Storage } from "./storage.ts";
 import { registerGoogleAuthRoutes } from "./google-auth-routes.ts";
@@ -29,6 +39,8 @@ type AuthUser = {
   email: string;
   displayName: string | null;
   role: "USER" | "ADMIN";
+  adminRole: AdminRole | null;
+  permissions: readonly AdminPermission[];
   createdAt: string;
   authState: "AUTHENTICATED" | "MFA_REQUIRED" | "MFA_SETUP_REQUIRED";
   mfaEnabled: boolean;
@@ -114,7 +126,7 @@ const userSchema = {
   type: "object",
   additionalProperties: false,
   required: [
-    "id", "email", "displayName", "role", "createdAt", "authState", "mfaEnabled",
+    "id", "email", "displayName", "role", "adminRole", "permissions", "createdAt", "authState", "mfaEnabled",
     "onboardingCompleted", "authMethods",
   ],
   properties: {
@@ -122,6 +134,8 @@ const userSchema = {
     email: { type: "string" },
     displayName: nullableText(100),
     role: { type: "string", enum: ["USER", "ADMIN"] },
+    adminRole: { anyOf: [{ type: "string", enum: [...adminRoles] }, { type: "null" }] },
+    permissions: { type: "array", uniqueItems: true, items: { type: "string", enum: [...adminPermissions] } },
     createdAt: { type: "string" },
     authState: { type: "string", enum: ["AUTHENTICATED", "MFA_REQUIRED", "MFA_SETUP_REQUIRED"] },
     mfaEnabled: { type: "boolean" },
@@ -235,6 +249,7 @@ function timestamp(value: Date | string): string {
 
 function userFrom(row: Record<string, unknown>): AuthUser {
   const role = row.role === "ADMIN" ? "ADMIN" : "USER";
+  const adminRole = role === "ADMIN" && isAdminRole(row.admin_role) ? row.admin_role : null;
   const mfaEnabled = Boolean(row.mfa_enabled);
   const authState = role === "ADMIN" && !mfaEnabled
     ? "MFA_SETUP_REQUIRED"
@@ -247,6 +262,8 @@ function userFrom(row: Record<string, unknown>): AuthUser {
     email: String(row.email),
     displayName: row.display_name === null ? null : String(row.display_name),
     role,
+    adminRole,
+    permissions: permissionsForAdminRole(adminRole),
     createdAt: timestamp(row.created_at as Date | string),
     authState,
     mfaEnabled,
@@ -398,7 +415,7 @@ export async function buildApp(
   await app.register(cors, {
     origin: config.publicOrigin,
     credentials: true,
-    methods: ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"],
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   });
   await app.register(helmet);
   // ponytail: local in-memory limit; move counters to Redis when the API runs in more than one process.
@@ -509,7 +526,7 @@ export async function buildApp(
 
     const digest = tokenHash(rawToken);
     const result = await pool.query(
-      `SELECT u.id, u.email, u.display_name, u.role, u.created_at,
+      `SELECT u.id, u.email, u.display_name, u.role, u.admin_role, u.created_at,
               u.onboarding_completed_at,
               EXISTS (
                 SELECT 1 FROM auth_accounts account
@@ -559,10 +576,17 @@ export async function buildApp(
     }
   }
 
-  async function requireAdmin(request: FastifyRequest): Promise<void> {
+  async function requireAdminPermission(
+    request: FastifyRequest,
+    permission: AdminPermission,
+    stepUp = false,
+  ): Promise<void> {
     await requireAuth(request);
-    if (request.authUser!.role !== "ADMIN") {
-      throw new ApiError(403, "ADMIN_REQUIRED", "No tenés permisos para acceder al panel de administración.");
+    if (!hasAdminPermission(request.authUser!.adminRole, permission)) {
+      throw new ApiError(403, "ADMIN_PERMISSION_REQUIRED", "No tenés permisos para realizar esta operación.");
+    }
+    if (stepUp && !request.authStepUp) {
+      throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
     }
   }
 
@@ -757,96 +781,7 @@ export async function buildApp(
     userSchema,
   });
 
-  app.get(
-    "/api/v1/admin/overview",
-    {
-      preHandler: requireAdmin,
-      schema: {
-        response: responses(200, {
-          type: "object",
-          additionalProperties: false,
-          required: ["metrics", "legalDocuments"],
-          properties: {
-            metrics: {
-              type: "object",
-              additionalProperties: false,
-              required: ["totalUsers", "activeUsers", "totalDocuments", "pendingReview", "activeImports", "failedDocuments"],
-              properties: {
-                totalUsers: { type: "integer", minimum: 0 },
-                activeUsers: { type: "integer", minimum: 0 },
-                totalDocuments: { type: "integer", minimum: 0 },
-                pendingReview: { type: "integer", minimum: 0 },
-                activeImports: { type: "integer", minimum: 0 },
-                failedDocuments: { type: "integer", minimum: 0 },
-              },
-            },
-            legalDocuments: {
-              type: "array",
-              items: {
-                type: "object",
-                additionalProperties: false,
-                required: ["documentType", "version", "effectiveAt", "requiresAcceptance", "approvedForProduction", "acknowledgementCount"],
-                properties: {
-                  documentType: { type: "string", enum: ["TERMS", "PRIVACY_NOTICE"] },
-                  version: { type: "string" },
-                  effectiveAt: { type: "string" },
-                  requiresAcceptance: { type: "boolean" },
-                  approvedForProduction: { type: "boolean" },
-                  acknowledgementCount: { type: "integer", minimum: 0 },
-                },
-              },
-            },
-          },
-        }),
-      },
-    },
-    async (_request, reply) => {
-      const [metrics, legalDocuments] = await Promise.all([
-        pool.query(
-          `SELECT
-             (SELECT count(*)::integer FROM users) AS total_users,
-             (SELECT count(*)::integer FROM users WHERE status = 'ACTIVE' AND deleted_at IS NULL) AS active_users,
-             (SELECT count(*)::integer FROM documents WHERE deleted_at IS NULL) AS total_documents,
-             (SELECT count(*)::integer FROM documents WHERE deleted_at IS NULL
-               AND processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION')) AS pending_review,
-             (SELECT count(*)::integer FROM import_batches WHERE status IN ('ACTIVE', 'PAUSED')) AS active_imports,
-             (SELECT count(*)::integer FROM documents WHERE deleted_at IS NULL
-               AND processing_status IN ('FAILED_PERMANENT', 'QUARANTINED', 'REJECTED_UNSUPPORTED')) AS failed_documents`,
-        ),
-        pool.query(
-          `SELECT version.document_type, version.version, version.effective_at, version.requires_acceptance,
-                  version.approved_for_production,
-                  count(acknowledgement.user_id)::integer AS acknowledgement_count
-             FROM legal_document_versions version
-             LEFT JOIN legal_acknowledgements acknowledgement ON acknowledgement.document_version_id = version.id
-            GROUP BY version.id
-            ORDER BY version.document_type, version.effective_at DESC`,
-        ),
-      ]);
-      const row = metrics.rows[0];
-      reply.header("Cache-Control", "no-store");
-      return {
-        data: {
-          metrics: {
-            totalUsers: row.total_users,
-            activeUsers: row.active_users,
-            totalDocuments: row.total_documents,
-            pendingReview: row.pending_review,
-            activeImports: row.active_imports,
-            failedDocuments: row.failed_documents,
-          },
-          legalDocuments: legalDocuments.rows.map((document) => ({
-            documentType: String(document.document_type),
-            version: String(document.version),
-            effectiveAt: timestamp(document.effective_at),
-            requiresAcceptance: Boolean(document.requires_acceptance),
-            approvedForProduction: Boolean(document.approved_for_production),
-            acknowledgementCount: Number(document.acknowledgement_count),
-          })),
-        },
-      };
-    },
-  );
+  await registerAdminRoutes(app, { config, ApiError, requireAdminPermission });
 
   app.get(
     "/api/v1/employers",

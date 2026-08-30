@@ -1,6 +1,7 @@
 'use client';
 
 import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import { money, percentage } from './format';
 import { mfaQrDataUrl } from './mfa-qr';
 import { uploadFile, type AuthorizedUpload } from './storage-upload';
@@ -13,6 +14,8 @@ type User = {
   email: string;
   displayName: string | null;
   role: 'USER' | 'ADMIN';
+  adminRole: 'SUPER_ADMIN' | 'OPERATIONS' | 'SUPPORT' | 'SECURITY' | 'FINANCE' | 'READ_ONLY' | null;
+  permissions: string[];
   authState: 'AUTHENTICATED' | 'MFA_REQUIRED' | 'MFA_SETUP_REQUIRED';
   mfaEnabled: boolean;
   onboardingCompleted: boolean;
@@ -107,24 +110,6 @@ type ImportBatch = {
   progress: { total: number; resolved: number; percentage: number };
   totals: Record<string, number>;
   items: ImportBatchItem[];
-};
-type AdminOverview = {
-  metrics: {
-    totalUsers: number;
-    activeUsers: number;
-    totalDocuments: number;
-    pendingReview: number;
-    activeImports: number;
-    failedDocuments: number;
-  };
-  legalDocuments: Array<{
-    documentType: 'TERMS' | 'PRIVACY_NOTICE';
-    version: string;
-    effectiveAt: string;
-    requiresAcceptance: boolean;
-    approvedForProduction: boolean;
-    acknowledgementCount: number;
-  }>;
 };
 type LegalSummary = { version: string };
 
@@ -756,7 +741,7 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
   );
 }
 
-type Section = 'summary' | 'jobs' | 'import' | 'history' | 'privacy' | 'admin';
+type Section = 'summary' | 'jobs' | 'import' | 'history' | 'privacy';
 const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'summary', label: 'Resumen', icon: '⌂' },
   { id: 'jobs', label: 'Empleos', icon: '▣' },
@@ -778,9 +763,7 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
   const [pendingSensitiveAction, setPendingSensitiveAction] = useState<(() => Promise<void>) | null>(null);
   const [logoutError, setLogoutError] = useState('');
   const [logoutBusy, setLogoutBusy] = useState(false);
-  const visibleSections = user.role === 'ADMIN'
-    ? [...sections, { id: 'admin' as const, label: 'Administración', icon: '⚙' }]
-    : sections;
+  const visibleSections = sections;
 
   const runSensitive = useCallback<RunSensitive>(async (action) => {
     try { await action(); }
@@ -808,6 +791,7 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
         <div className="sidebar-head"><Brand /><button className="icon-button mobile-only" onClick={() => setMenuOpen(false)} aria-label="Cerrar menú">×</button></div>
         <nav aria-label="Navegación principal">
           {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
+          {user.role === 'ADMIN' && <Link className="nav-item" href="/admin"><span aria-hidden="true">⚙</span>Administración</Link>}
         </nav>
         {logoutError && <p className="message error" role="alert">{logoutError}</p>}
         <div className="sidebar-user">
@@ -825,7 +809,6 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
         {section === 'import' && <Importer onDone={() => setRefreshKey((n) => n + 1)} />}
         {section === 'history' && <History key={refreshKey} runSensitive={runSensitive} />}
         {section === 'privacy' && <Privacy user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
-        {section === 'admin' && user.role === 'ADMIN' && <Admin />}
       </main>
       {pendingSensitiveAction && <StepUpDialog mfaEnabled={Boolean(user.mfaEnabled)} action={pendingSensitiveAction} onClose={() => setPendingSensitiveAction(null)} />}
     </div>
@@ -1396,39 +1379,9 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
       <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un JSON con tu cuenta, empleos, importaciones, documentos, extracciones, liquidaciones, correcciones y constancias de privacidad. Los PDFs y secretos no se incluyen.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <button className="button primary" onClick={downloadExport}>Descargar</button> : exportJob ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
       <section className="settings-card"><div className="setting-icon">◇</div><div><h2>Originales y datos estructurados</h2><p>Desde Historial podés borrar un PDF y conservar la liquidación revisada. Cada lifecycle es independiente.</p></div></section>
       <section className="settings-card"><div className="setting-icon">§</div><div><h2>Documentos legales</h2><p>Consultá la versión vigente de los <a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> y el <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a>.</p></div></section>
-      <section className="settings-card danger-zone"><div className="setting-icon">!</div><div><h2>Eliminar mi cuenta</h2><p>Inicia el borrado irreversible de documentos, datos estructurados, sesiones y exportaciones.</p><label>Escribí <strong>ELIMINAR</strong> para confirmar<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label></div><div className="setting-actions"><button className="button danger-button" disabled={confirmation !== 'ELIMINAR'} onClick={deleteAccount}>Eliminar cuenta</button></div></section>
-    </div>
-  );
-}
-
-function Admin() {
-  const [overview, setOverview] = useState<AdminOverview | null>(null);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    api<AdminOverview>('/admin/overview').then(setOverview).catch((caught) => {
-      setError(caught instanceof Error ? caught.message : 'No pudimos abrir el panel.');
-    });
-  }, []);
-
-  const metrics = overview?.metrics;
-  return (
-    <div className="page">
-      <PageHeader eyebrow="Operación segura" title="Administración" />
-      <p className="page-intro">Sólo muestra conteos operativos y adopción legal. No expone salarios, PDFs, OCR, nombres de archivo ni datos personales.</p>
-      {error && <p className="message error" role="alert">{error}</p>}
-      {!overview ? !error && <div className="loader" role="status" aria-label="Cargando panel" /> : <>
-        <div className="metric-grid admin-metrics">
-          <article className="metric"><small>Usuarios activos</small><strong>{metrics?.activeUsers ?? 0}</strong><span>{metrics?.totalUsers ?? 0} cuentas totales</span></article>
-          <article className="metric"><small>Documentos</small><strong>{metrics?.totalDocuments ?? 0}</strong><span>sin mostrar contenido</span></article>
-          <article className="metric"><small>Revisión pendiente</small><strong>{metrics?.pendingReview ?? 0}</strong><span>documentos que requieren acción</span></article>
-          <article className="metric"><small>Importaciones activas</small><strong>{metrics?.activeImports ?? 0}</strong><span>{metrics?.failedDocuments ?? 0} documentos fallidos</span></article>
-        </div>
-        <section className="panel">
-          <div className="panel-heading"><div><p className="eyebrow">Versiones inmutables</p><h2>Documentos legales</h2></div></div>
-          <div className="table-wrap"><table><thead><tr><th>Documento</th><th>Versión</th><th>Vigente desde</th><th>Registro</th><th>Producción</th><th>Confirmaciones</th></tr></thead><tbody>{overview.legalDocuments.map((document) => <tr key={`${document.documentType}-${document.version}`}><td>{document.documentType === 'TERMS' ? 'Términos' : 'Aviso de privacidad'}</td><td>{document.version}</td><td>{new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium', timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date(document.effectiveAt))}</td><td>{document.requiresAcceptance ? 'Aceptación' : 'Lectura confirmada'}</td><td>{document.approvedForProduction ? 'Aprobado' : 'Borrador'}</td><td>{document.acknowledgementCount}</td></tr>)}</tbody></table></div>
-        </section>
-      </>}
+      {user.role === 'ADMIN'
+        ? <section className="settings-card"><div className="setting-icon">!</div><div><h2>Baja de una cuenta administrativa</h2><p>Para preservar el último acceso de gobierno, otra persona con permiso debe retirar primero tu rol administrativo. Después podés solicitar la eliminación como usuario.</p></div></section>
+        : <section className="settings-card danger-zone"><div className="setting-icon">!</div><div><h2>Eliminar mi cuenta</h2><p>Inicia el borrado irreversible de documentos, datos estructurados, sesiones y exportaciones.</p><label>Escribí <strong>ELIMINAR</strong> para confirmar<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label></div><div className="setting-actions"><button className="button danger-button" disabled={confirmation !== 'ELIMINAR'} onClick={deleteAccount}>Eliminar cuenta</button></div></section>}
     </div>
   );
 }

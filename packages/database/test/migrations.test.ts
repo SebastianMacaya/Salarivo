@@ -22,11 +22,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 14);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 14 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 15);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 15 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 14, name: "upload_session_marker_etag" },
+    { version: 15, name: "granular_admin_console" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -104,4 +104,20 @@ test("upload marker migration adds a bounded nullable ETag without rewriting his
   assert.match(migration.sql, /upload_marker_etag IS NULL/);
   assert.match(migration.sql, /length\(upload_marker_etag\) BETWEEN 1 AND 128/);
   assert.match(migration.sql, /upload_marker_etag !~ '\[\[:cntrl:\]\]'/);
+});
+
+test("granular admin migration keeps roles fixed and audit append-only", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 15);
+  assert.ok(migration);
+  assert.match(migration.sql, /ADD COLUMN admin_role text/);
+  assert.match(migration.sql, /SET admin_role = 'READ_ONLY'/);
+  assert.match(migration.sql, /\(role = 'ADMIN'\) = \(admin_role IS NOT NULL\)/);
+  for (const role of ["SUPER_ADMIN", "OPERATIONS", "SUPPORT", "SECURITY", "FINANCE", "READ_ONLY"]) {
+    assert.match(migration.sql, new RegExp(`'${role}'`));
+  }
+  assert.match(migration.sql, /CREATE TABLE admin_audit_events/);
+  assert.match(migration.sql, /metadata_no_sensitive jsonb/);
+  assert.match(migration.sql, /BEFORE UPDATE OR DELETE ON admin_audit_events/);
+  assert.match(migration.sql, /BEFORE TRUNCATE ON admin_audit_events/);
+  assert.doesNotMatch(migration.sql, /original_filename|object_key|gross_amount|net_amount|raw_value|corrected_value/);
 });

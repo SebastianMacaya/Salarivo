@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–013. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–015. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -195,7 +195,11 @@ Nunca contiene salario, OCR, documento, token o identificador fiscal completo.
 
 LegalDocumentVersion conserva una versión append-only de Términos o Aviso de Privacidad con locale, contenido, publicación, vigencia y aprobación explícita para producción. LegalAcknowledgement vincula un usuario con la versión exacta y un `acceptedAt` generado por servidor: para Términos representa aceptación; para el Aviso, lectura confirmada. El segundo paso del alta Google resuelve la versión vigente y compara las versiones mostradas; el navegador no selecciona IDs legales. Usuario, aceptación/confirmación, AuthAccount, Session y auditoría se crean atómicamente después del callback, nunca antes de la aceptación. No se exponen rutas de autenticación por email y contraseña.
 
-User tiene sólo `USER` o `ADMIN`. `ADMIN` habilita rutas explícitas de métricas sanitizadas y no altera ownership ni concede acceso a recursos de otra cuenta. El rol se relee desde DB en cada request privilegiado.
+User tiene `USER` o `ADMIN` como límite grueso. Un `ADMIN` debe tener además un `admin_role` entre `SUPER_ADMIN`, `OPERATIONS`, `SUPPORT`, `SECURITY`, `FINANCE` y `READ_ONLY`; la base impide combinaciones incoherentes. El servidor relee estado, rol y `admin_role` en cada request privilegiado y resuelve capacidades mediante una asignación cerrada en código. Ningún rol altera ownership ni concede por sí solo acceso al contenido de otra cuenta.
+
+### AdminAuditEvent
+
+Registro append-only separado del AuditEvent del titular. Conserva UUID del actor, `admin_role`, capacidad, acción, tipo/ID de recurso, sujeto opcional, resultado, motivo tipado, referencia operativa restringida y metadata sanitizada. No tiene FK hacia el usuario para que una cascada no destruya evidencia; tampoco guarda contacto, salario, OCR, documento, identificador fiscal, token ni texto libre. Las mutaciones críticas escriben el evento dentro de su misma transacción.
 
 ### MFAFactor, sesión y constancias de privacidad
 
@@ -241,6 +245,7 @@ Las migraciones vigentes materializan:
 - endDate no anterior a startDate;
 - confidence dentro de 0..1;
 - estados restringidos al vocabulario permitido; los servicios aplican las transiciones.
+- coherencia entre `role = ADMIN` y un `admin_role` válido; eventos administrativos append-only.
 
 Índices:
 
@@ -250,6 +255,7 @@ Las migraciones vigentes materializan:
 - ImportBatchItem por batchId + status;
 - ProcessingJob por state + availableAt y userId;
 - AuditEvent por userId + timestamp.
+- recorridos admin por estado/fecha de User, Document, ProcessingJob y PrivacyOperation; AdminAuditEvent por fecha, actor, sujeto y recurso.
 
 Las políticas de row-level security pueden ser defensa adicional, nunca reemplazo de autorización en servicios.
 

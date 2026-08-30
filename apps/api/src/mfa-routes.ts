@@ -452,6 +452,12 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
       const userId = request.authUser!.id;
       const outcome = await withTransaction(async (client) => {
         if (!await lockValidStepUpSession(client, request.authSessionHash!, userId)) return { status: "STEP_UP_REQUIRED" } as const;
+        const current = await client.query(
+          `SELECT role FROM users WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE`,
+          [userId],
+        );
+        if (current.rowCount !== 1) return { status: "AUTHENTICATION_REQUIRED" } as const;
+        if (current.rows[0].role === "ADMIN") return { status: "ADMIN_MFA_REQUIRED" } as const;
         const factor = await client.query(
           `DELETE FROM mfa_factors WHERE user_id = $1 AND status = 'ACTIVE' RETURNING id`,
           [userId],
@@ -467,6 +473,8 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
         return { status: "OK", session } as const;
       });
       if (outcome.status === "STEP_UP_REQUIRED") throw new ApiError(403, outcome.status, "Confirmá tu identidad para continuar.");
+      if (outcome.status === "AUTHENTICATION_REQUIRED") throw new ApiError(401, outcome.status, "Iniciá sesión para continuar.");
+      if (outcome.status === "ADMIN_MFA_REQUIRED") throw new ApiError(409, outcome.status, "Un administrador no puede desactivar su segundo factor.");
       if (outcome.status === "MFA_NOT_ENABLED") throw new ApiError(409, outcome.status, "No hay un segundo factor activo.");
       setSession(reply, outcome.session.token);
       return { data: null };

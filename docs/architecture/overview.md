@@ -42,8 +42,8 @@ El proveedor se selecciona explícitamente. La instancia productiva usa Cloudfla
 
 | Componente | Hace | No hace |
 | --- | --- | --- |
-| Web | preflight UX, upload directo, progreso y revisión | decidir seguridad o ownership |
-| API/BFF | auth local/Google, sesiones propias, ownership, sesiones de upload, batches, consultas y comandos | OCR síncrono, cargar PDFs completos o delegar autorización al IdP |
+| Web | preflight UX, upload directo, progreso, revisión y consola admin filtrada por capacidades | decidir seguridad, ownership o autorización administrativa |
+| API/BFF | auth local/Google, sesiones propias, ownership, RBAC admin, sesiones de upload, batches, consultas y comandos | OCR síncrono, cargar PDFs completos o delegar autorización al IdP |
 | PostgreSQL | metadata, dominio estructurado, estados, job/outbox durable, auditoría e idempotencia | almacenar binarios |
 | Redis/cola | scheduling, backpressure, retries y fairness | ser la única fuente de verdad del batch |
 | Object storage | originales, cuarentena y objetos temporales controlados | exposición pública |
@@ -62,6 +62,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 6. Aplicación a proveedor externo: salida mínima, redactada y autorizada.
 7. Aplicación a observabilidad: sólo IDs internos, códigos y métricas no sensibles.
 8. Navegador/API a Google OIDC: `state`, `nonce` y PKCE por intento; callback, issuer, audience y redirects validados server-side.
+9. Administrador a API: MFA y capacidad explícita por request; un rol administrativo nunca reemplaza ownership ni habilita payload Restricted.
 
 ## Módulos de dominio
 
@@ -73,6 +74,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 - analytics: proyecciones sobre datos estructurados;
 - privacy: preferencias, exportación y eliminación;
 - audit: eventos sensibles sin payload salarial.
+- admin: consultas transversales de metadata, capacidades fijas y comandos operativos auditados.
 
 Las dependencias apuntan hacia adentro:
 
@@ -131,6 +133,7 @@ Recursos iniciales:
 | analytics | evolución salarial estructurada |
 | exports | solicitar y consultar export privado |
 | privacy | eliminar cuenta; preferencias editables quedan pendientes |
+| admin | dashboard, metadata paginada, diagnóstico y comandos acotados por capacidad; sin acceso a contenido privado |
 
 Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se incorpore OpenAPI describirá auth, schemas, límites y respuestas; los detalles de proveedor quedarán fuera del contrato HTTP.
 
@@ -204,6 +207,7 @@ El benchmark futuro agregará, fuera del historial privado, sólo contribuciones
 - Unit: invariantes de dominio, estados, dinero y precedencia de correcciones.
 - Integration: PostgreSQL, cola, storage, idempotencia y cleanup.
 - Security: ownership/IDOR por cada método de login, colisiones de identidad OIDC, replay/callback/redirect, MIME falso, magic bytes, malware, PDF corrupto/cifrado, límites y URLs firmadas.
+- Admin: deny-by-default, capacidad por endpoint, MFA/step-up, DTO mínimos, IDOR transversal, concurrencia de comandos y auditoría atómica.
 - Load: un usuario con 500 documentos y varios usuarios simultáneos; la memoria API debe mantenerse acotada.
 - Fixtures: sólo PDFs sintéticos válidos, SAC, bono, factura, corrupto, renombrado, vacío, escaneado, sobredimensionado, cifrado y ambiguo.
 
@@ -217,4 +221,4 @@ El workflow `.github/workflows/ci.yml` ejecuta lint, typecheck, unit, build web,
 
 ## Decisiones abiertas
 
-El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, Google OIDC y MFA TOTP. Cloudflare R2 fue elegido para object storage productivo con cifrado administrado por el proveedor; siguen abiertos la evaluación operativa/jurídica de ubicación y subencargados, el aislamiento final del parser y los backups de producción. La integración con Google y R2 no levanta el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.
+El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, Google OIDC, MFA TOTP y una [consola administrativa](admin-console.md) privada por defecto. Cloudflare R2 fue elegido para object storage productivo con cifrado administrado por el proveedor; siguen abiertos la evaluación operativa/jurídica de ubicación y subencargados, el aislamiento final del parser y los backups de producción. La consola y las integraciones con Google/R2 no levantan el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.

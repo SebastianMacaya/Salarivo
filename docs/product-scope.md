@@ -33,8 +33,10 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - historial básico y evolución de bruto/neto;
 - eliminación de original, documento o cuenta;
 - exportación de datos;
-- auditoría de acciones sensibles.
-- administración mínima de sólo lectura con conteos sanitizados, sin acceso a salarios, PDFs, OCR ni PII.
+- auditoría de acciones sensibles;
+- consola administrativa interna con RBAC por capacidades, MFA obligatorio, metadata paginada de usuarios/documentos/empleos/jobs/storage y comandos operativos acotados con auditoría append-only.
+
+La administración no altera ownership ni concede acceso general al contenido privado. Las listas usan metadata mínima y contacto enmascarado; leer un email completo es una operación separada con permiso, step-up, motivo y auditoría. No se exponen PDFs, filenames, URLs firmadas, object keys, OCR, salarios, conceptos, identificadores fiscales completos, tokens ni secretos. Tampoco están habilitados break-glass, impersonación, reproceso completo, baja administrativa de cuenta, merge global de empleadores, tickets, flags o configuración dinámica. Ver [ADR 0012](adr/0012-granular-admin-console.md).
 
 La identidad del dominio sigue siendo el UUID interno. Google OIDC agrega una cuenta de autenticación identificada sólo por `(provider, sub)` y emite la misma sesión opaca propia: un email coincidente no identifica ni auto-vincula usuarios, y la aplicación no conserva access, refresh ni ID tokens del proveedor. Las cuentas `BLOCKED` o `SUSPENDED` fallan cerradas. El ownership de empleos, imports, documentos, liquidaciones, analytics, exports y operaciones de privacidad no cambia con el método de login.
 
