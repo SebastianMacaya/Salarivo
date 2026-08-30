@@ -1,6 +1,9 @@
 FROM node:24.15-bookworm-slim
 
 ENV NODE_ENV=production APP_ENV=production
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 COPY package.json package-lock.json ./
