@@ -54,7 +54,7 @@ AuthAccount relaciona un usuario interno con una identidad externa mediante la c
 
 El intento OIDC conserva por un TTL corto los hashes de `state` y del vínculo con el navegador, además de `nonce`, PKCE verifier y propósito para validar y canjear el callback. Es de un solo uso, no sustituye una Session y no acepta un redirect del cliente. Para una identidad nueva, el callback deja un registro verificado transitorio; el segundo paso crea User, LegalAcknowledgement, AuthAccount, Session y AuditEvent en una sola transacción, con onboarding todavía pendiente.
 
-Session sigue siendo propia y opaca: sólo su hash se persiste y su UUID interno determina revocación, expiración y garantía. Google crea esa sesión sin cambiar el owner interno. Revocar otras sesiones conserva únicamente la actual. El step-up sin MFA inicia OIDC con `max_age=0`, queda ligado a esa Session y rota su token al elevar la garantía.
+Session sigue siendo propia y opaca: sólo su hash se persiste y su UUID interno determina revocación, expiración y garantía. Google crea esa sesión sin cambiar el owner interno. Revocar otras sesiones conserva únicamente la actual. El step-up sin MFA inicia otra autorización OIDC con selección explícita de la misma cuenta, queda ligado a esa Session y rota su token al elevar la garantía.
 
 ### Employer y Employment
 
@@ -197,7 +197,7 @@ User tiene sólo `USER` o `ADMIN`. `ADMIN` habilita rutas explícitas de métric
 
 ### MFAFactor, sesión y constancias de privacidad
 
-MFAFactor conserva un secreto TOTP cifrado y versionado, estado pendiente/activo, contador anti-replay y lock temporal. Los recovery codes se guardan sólo como hashes. `mfaVerifiedAt` y `stepUpExpiresAt` pertenecen a la sesión exacta; elevar garantía rota su token. Si la cuenta no tiene un factor activo, el step-up usa otra autenticación Google con `max_age=0`, ligada al ID de la sesión original y con la misma rotación al completarse.
+MFAFactor conserva un secreto TOTP cifrado y versionado, estado pendiente/activo, contador anti-replay y lock temporal. Los recovery codes se guardan sólo como hashes. `mfaVerifiedAt` y `stepUpExpiresAt` pertenecen a la sesión exacta; elevar garantía rota su token. Si la cuenta no tiene un factor activo, el step-up usa otra autorización de la misma cuenta Google, ligada al ID de la sesión original y con la misma rotación al completarse.
 
 StorageDeletionTombstone sobrevive a cascades y conserva únicamente las dos keys opacas necesarias para reconciliar un borrado físico. AccountDeletionReceipt conserva el hash de una constancia opaca y el estado de la baja sin email, nombre, userId ni FK personal después de completarse.
 

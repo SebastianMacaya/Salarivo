@@ -140,7 +140,7 @@ Google usa OIDC Authorization Code con PKCE, `state` y `nonce`; el callback es `
 
 La respuesta válida se resuelve por `(provider, sub)` en `auth_accounts`. El email recibido es un atributo verificable del perfil, no una clave de login ni de vinculación: una colisión nunca auto-vincula una cuenta. No se persisten access, refresh ni ID tokens. Google termina en el UUID y la sesión opaca interna ya usados por los guards y por ownership.
 
-Para una identidad nueva, el callback deja un onboarding pendiente, pero no crea una cuenta activa. El segundo paso crea usuario, aceptación legal, `auth_account`, sesión y auditoría en una única transacción. `BLOCKED` y `SUSPENDED` fallan cerrados. En una cuenta Google-only, el step-up inicia otra autorización con `max_age=0`, ligada a la sesión actual, y rota esa sesión cuando termina; la persona también puede revocar el resto de sus sesiones. [ADR 0010](../adr/0010-google-oidc-and-external-identities.md) conserva sin cambios el modelo de ownership.
+Para una identidad nueva, el callback deja un onboarding pendiente, pero no crea una cuenta activa. El segundo paso crea usuario, aceptación legal, `auth_account`, sesión y auditoría en una única transacción. `BLOCKED` y `SUSPENDED` fallan cerrados. En una cuenta Google-only, el step-up inicia otra autorización con selección explícita de la misma cuenta, ligada a la sesión actual, y rota esa sesión cuando termina; la persona también puede revocar el resto de sus sesiones. [ADR 0010](../adr/0010-google-oidc-and-external-identities.md) conserva sin cambios el modelo de ownership.
 
 ## Ports principales
 

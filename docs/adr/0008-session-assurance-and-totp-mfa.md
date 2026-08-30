@@ -10,7 +10,7 @@ Una sesión robada no debe bastar para administrar Salarivo ni para exportar, de
 ## Decisión
 
 - La garantía pertenece a la sesión exacta y distingue autenticación primaria, MFA verificado y `STEP_UP` breve.
-- Los administradores deben tener MFA activo y verificarlo en cada sesión. Un usuario sin MFA confirma las acciones sensibles reautenticándose con Google; si habilitó MFA usa TOTP o un recovery code.
+- Los administradores deben tener MFA activo y verificarlo en cada sesión. Un usuario sin MFA confirma las acciones sensibles con una nueva autorización de la misma cuenta Google, ligada a su sesión; Google no ofrece reautenticación forzada. Si habilitó MFA usa TOTP o un recovery code.
 - TOTP usa 6 dígitos, período de 30 segundos, ventana de ±1 y contador de último uso bloqueado en PostgreSQL para impedir replay.
 - El enrolamiento es pendiente, vence y queda ligado a la sesión exacta que lo inició; el factor anterior no se reemplaza hasta validar el nuevo.
 - El secreto se cifra con AES-256-GCM, nonce aleatorio, AAD ligada a usuario/factor y keyring versionado. Producción falla al arrancar sin una clave válida.

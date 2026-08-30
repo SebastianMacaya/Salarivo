@@ -57,7 +57,7 @@ export function createGoogleOidc(config: ApiConfig["googleOAuth"]): GoogleOidcCl
         code_challenge: input.codeChallenge,
         code_challenge_method: "S256",
       };
-      if (input.stepUp) parameters.max_age = "0";
+      if (input.stepUp) parameters.prompt = "select_account";
       if (input.loginHint) parameters.login_hint = input.loginHint;
       return buildAuthorizationUrl(await configuration(), parameters).href;
     },
@@ -71,7 +71,6 @@ export function createGoogleOidc(config: ApiConfig["googleOAuth"]): GoogleOidcCl
           expectedNonce: input.nonce,
           pkceCodeVerifier: input.codeVerifier,
           idTokenExpected: true,
-          ...(input.stepUp ? { maxAge: 0 } : {}),
         },
       );
       const claims = tokens.claims();
