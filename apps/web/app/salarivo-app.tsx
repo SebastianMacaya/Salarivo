@@ -2,6 +2,7 @@
 
 import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { money, percentage } from './format';
+import { mfaQrDataUrl } from './mfa-qr';
 import { uploadFile, type AuthorizedUpload } from './storage-upload';
 
 const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
@@ -493,6 +494,7 @@ function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onC
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [secretCopied, setSecretCopied] = useState(false);
 
   const beginEnrollment = useCallback(async () => {
     setError(''); setBusy(true);
@@ -519,12 +521,26 @@ function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onC
     finally { setBusy(false); }
   }
 
+  async function copySecret() {
+    if (!enrollment) return;
+    setError('');
+    try {
+      await navigator.clipboard.writeText(enrollment.secret);
+      setSecretCopied(true);
+    } catch {
+      setError('No pudimos copiar la clave. Seleccionala y copiala manualmente.');
+    }
+  }
+
   if (recoveryCodes) return <RecoveryCodes codes={recoveryCodes} onDone={onComplete} />;
   if (enrollment) {
     return (
       <div className="stack-form">
-        <p>Agregá esta clave en tu aplicación autenticadora:</p>
-        <p><code>{enrollment.secret}</code></p>
+        <p>Escaneá este QR con tu aplicación autenticadora:</p>
+        {/* eslint-disable-next-line @next/next/no-img-element -- El QR ya es un SVG local embebido. */}
+        <img className="mfa-qr" src={mfaQrDataUrl(enrollment.otpauthUri)} alt="Código QR para agregar Salarivo a una aplicación autenticadora" width={220} height={220} />
+        <p>También podés ingresar la clave manualmente:</p>
+        <div className="mfa-secret"><code>{enrollment.secret}</code><button type="button" className="button compact" onClick={() => void copySecret()} aria-live="polite">{secretCopied ? 'Copiada' : 'Copiar clave'}</button></div>
         <p><small>La configuración vence el {new Intl.DateTimeFormat('es-AR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(enrollment.expiresAt))}.</small></p>
         <form className="stack-form" onSubmit={confirmEnrollment}>
           <label>Código de 6 dígitos<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required autoFocus /></label>

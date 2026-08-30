@@ -110,6 +110,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .access-card h2 { margin-bottom: 30px; font-family: Georgia, serif; font-size: 36px; font-weight: 500; letter-spacing: -.03em; }
 .stack-form { display: grid; gap: 18px; }
 .stack-form label, .danger-zone label { display: grid; gap: 8px; color: #39463f; font-size: 13px; font-weight: 700; }
+.mfa-qr { width: min(220px, 100%); height: auto; justify-self: center; padding: 10px; border: 1px solid var(--line); border-radius: 12px; background: white; }
+.mfa-secret { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.mfa-secret code { overflow-wrap: anywhere; }
 .legal-checks { display: grid; gap: 11px; }
 .legal-check { display: grid; grid-template-columns: 18px 1fr; align-items: start; gap: 9px; color: #39463f; font-size: 13px; line-height: 1.45; }
 .legal-check label { display: inline; font-weight: 550; cursor: pointer; }
