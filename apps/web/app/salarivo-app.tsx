@@ -1,6 +1,7 @@
 'use client';
 
-import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { MFA_ENROLLMENT_RESUME_KEY, shouldResumeMfaEnrollment } from './auth-flow';
 import { money, percentage } from './format';
 import { uploadFile, type AuthorizedUpload } from './storage-upload';
 
@@ -174,6 +175,24 @@ function clearAuthQuery() {
   window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
 }
 
+function setMfaEnrollmentResume(enabled: boolean) {
+  try {
+    if (enabled) window.sessionStorage.setItem(MFA_ENROLLMENT_RESUME_KEY, '1');
+    else window.sessionStorage.removeItem(MFA_ENROLLMENT_RESUME_KEY);
+  } catch {
+    return;
+  }
+}
+
+function hasMfaEnrollmentResume(authResult: string | null): boolean {
+  try {
+    return authResult === 'google-step-up'
+      && window.sessionStorage.getItem(MFA_ENROLLMENT_RESUME_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 async function downloadApiFile(path: string, filename: string) {
   const response = await fetch(apiUrl(path), { credentials: 'include' });
   if (!response.ok) {
@@ -318,18 +337,22 @@ export function SalarivoApp() {
   const [accessMode, setAccessMode] = useState<'login' | 'google-register'>('login');
   const [accessError, setAccessError] = useState('');
   const [authNotice, setAuthNotice] = useState('');
+  const [resumeMfaEnrollment, setResumeMfaEnrollment] = useState(false);
 
   useEffect(() => {
     let stopped = false;
     const auth = new URLSearchParams(window.location.search).get('auth');
+    const resumeEnrollment = hasMfaEnrollmentResume(auth);
 
     if (auth === 'google-registration') {
+      setMfaEnrollmentResume(false);
       void Promise.resolve().then(() => {
         if (!stopped) { setAccessMode('google-register'); setUser(null); }
       });
       return () => { stopped = true; };
     }
     if (auth && auth !== 'google-success' && auth !== 'google-step-up') {
+      setMfaEnrollmentResume(false);
       clearAuthQuery();
       void Promise.resolve().then(() => {
         if (!stopped) {
@@ -339,16 +362,18 @@ export function SalarivoApp() {
       });
       return () => { stopped = true; };
     }
-    if (auth === 'google-step-up') {
-      void Promise.resolve().then(() => {
-        if (!stopped) setAuthNotice('Identidad confirmada. Repetí la acción sensible para completarla.');
-      });
-    }
     if (auth) clearAuthQuery();
     api<User>('/auth/me').then(
-      (current) => { if (!stopped) setUser(current); },
+      (current) => {
+        if (stopped) return;
+        setMfaEnrollmentResume(false);
+        setUser(current);
+        if (shouldResumeMfaEnrollment(auth, current.authState, resumeEnrollment)) setResumeMfaEnrollment(true);
+        else if (auth === 'google-step-up') setAuthNotice('Identidad confirmada. Repetí la acción sensible para completarla.');
+      },
       (caught: unknown) => {
         if (stopped) return;
+        setMfaEnrollmentResume(false);
         setUser(null);
         if (auth || !(caught instanceof ApiError) || caught.status !== 401) {
           setAccessError(auth
@@ -379,7 +404,12 @@ export function SalarivoApp() {
     onReceiptToken={(token) => setDeletionReceiptEntry({ token, source: 'lookup' })}
   />;
   if (user.authState === 'MFA_REQUIRED' || user.authState === 'MFA_SETUP_REQUIRED') {
-    return <MfaAccessGate user={user} onAuthenticated={setUser} onLogout={() => setUser(null)} />;
+    return <MfaAccessGate
+      user={user}
+      resumeEnrollment={resumeMfaEnrollment}
+      onAuthenticated={(current) => { setResumeMfaEnrollment(false); setUser(current); }}
+      onLogout={() => { setResumeMfaEnrollment(false); setUser(null); }}
+    />;
   }
   if (!user.onboardingCompleted) {
     return <OnboardingScreen user={user} onComplete={setUser} onLogout={() => setUser(null)} />;
@@ -484,13 +514,14 @@ function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => Promi
   );
 }
 
-function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onComplete: () => Promise<void> | void }) {
+function MfaEnrollment({ pending = false, resume = false, onComplete }: { pending?: boolean; resume?: boolean; onComplete: () => Promise<void> | void }) {
   const [enrollment, setEnrollment] = useState<MfaEnrollmentResult | null>(null);
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const resumed = useRef(false);
 
-  async function beginEnrollment() {
+  const beginEnrollment = useCallback(async (redirectOnStepUp = true) => {
     setError(''); setBusy(true);
     try {
       setEnrollment(await api<MfaEnrollmentResult>('/auth/mfa/enrollment', {
@@ -498,14 +529,21 @@ function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onC
       }));
     } catch (caught) {
       let failure = caught;
-      if (caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
+      if (redirectOnStepUp && caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
+        setMfaEnrollmentResume(true);
         try { await redirectToGoogle('/auth/google/step-up/start'); return; }
-        catch (redirectError) { failure = redirectError; }
+        catch (redirectError) { setMfaEnrollmentResume(false); failure = redirectError; }
       }
       setError(failure instanceof Error ? failure.message : 'No pudimos iniciar la configuración.');
     }
     finally { setBusy(false); }
-  }
+  }, []);
+
+  useEffect(() => {
+    if (!resume || resumed.current) return;
+    resumed.current = true;
+    void beginEnrollment(false);
+  }, [beginEnrollment, resume]);
 
   async function confirmEnrollment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError(''); setBusy(true);
@@ -538,14 +576,14 @@ function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onC
   return (
     <div className="stack-form">
       {pending && <p className="message error">Hay una configuración incompleta. Iniciá una nueva para reemplazarla.</p>}
-      <p>Vamos a pedirte que confirmes tu cuenta de Google antes de configurar el segundo factor.</p>
+      <p>Google puede pedirte que confirmes tu cuenta otra vez por seguridad. Después continuamos acá automáticamente.</p>
       {error && <p className="message error" role="alert">{error}</p>}
       <button type="button" className="button primary" disabled={busy} onClick={() => void beginEnrollment()}>{busy ? 'Preparando…' : 'Configurar segundo factor'}</button>
     </div>
   );
 }
 
-function MfaAccessGate({ user, onAuthenticated, onLogout }: { user: User; onAuthenticated: (user: User) => void; onLogout: () => void }) {
+function MfaAccessGate({ user, resumeEnrollment, onAuthenticated, onLogout }: { user: User; resumeEnrollment: boolean; onAuthenticated: (user: User) => void; onLogout: () => void }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -576,7 +614,7 @@ function MfaAccessGate({ user, onAuthenticated, onLogout }: { user: User; onAuth
         <p className="eyebrow">{user.email}</p>
         <h2 id="mfa-access-title">{user.authState === 'MFA_SETUP_REQUIRED' ? 'Activá el segundo factor' : 'Ingresá tu segundo factor'}</h2>
         {user.authState === 'MFA_SETUP_REQUIRED'
-          ? <MfaEnrollment onComplete={async () => onAuthenticated(await api<User>('/auth/me'))} />
+          ? <MfaEnrollment resume={resumeEnrollment} onComplete={async () => onAuthenticated(await api<User>('/auth/me'))} />
           : <form className="stack-form" onSubmit={verify}>
               <label>Código de la app o de recuperación<input name="code" autoComplete="one-time-code" maxLength={39} required autoFocus /></label>
               {error && <p className="message error" role="alert">{error}</p>}

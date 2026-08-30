@@ -77,6 +77,7 @@ test("upload privado crea un único documento y un único intent durable", async
     nonce: string;
     codeChallenge: string;
     stepUp: boolean;
+    loginHint?: string;
   }>();
   let googleExchangeCalls = 0;
   const googleOidc: GoogleOidcClient = {
@@ -85,12 +86,14 @@ test("upload privado crea un único documento y un único intent durable", async
         nonce: input.nonce,
         codeChallenge: input.codeChallenge,
         stepUp: input.stepUp,
+        ...(input.loginHint ? { loginHint: input.loginHint } : {}),
       });
       const url = new URL("https://accounts.google.test/authorize");
       url.searchParams.set("state", input.state);
       url.searchParams.set("nonce", input.nonce);
       url.searchParams.set("code_challenge", input.codeChallenge);
       url.searchParams.set("step_up", String(input.stepUp));
+      if (input.loginHint) url.searchParams.set("login_hint", input.loginHint);
       return url.href;
     },
     async exchange(input) {
@@ -252,7 +255,7 @@ test("upload privado crea un único documento y un único intent durable", async
     const authorizationUrl = new URL(String(response.json().data.authorizationUrl));
     const state = authorizationUrl.searchParams.get("state");
     assert.ok(state);
-    return { oauthCookie: namedCookie(response, "salarivo_oauth"), state };
+    return { oauthCookie: namedCookie(response, "salarivo_oauth"), state, loginHint: authorizationUrl.searchParams.get("login_hint") };
   }
 
   function googleCallback(
@@ -750,6 +753,7 @@ test("upload privado crea un único documento y un único intent durable", async
   const googleStepUpCode = `step-up-${suffix}`;
   googleIdentities.set(googleStepUpCode, googleIdentities.get(googleCode)!);
   const googleStepUpAttempt = await startGoogle("/api/v1/auth/google/step-up/start", googleCookie);
+  assert.equal(googleStepUpAttempt.loginHint, googleIdentities.get(googleCode)!.subject);
   const previousGoogleCookie = googleCookie;
   const googleStepUpCallback = await googleCallback(googleStepUpAttempt, googleStepUpCode, googleCookie);
   assert.equal(googleStepUpCallback.statusCode, 302, googleStepUpCallback.body);
@@ -856,7 +860,24 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(blockedEnrollment.statusCode, 403, blockedEnrollment.body);
   assert.equal(blockedEnrollment.json().error.code, "STEP_UP_REQUIRED");
-  await grantStepUp(cookieA);
+  const adminStepUpCode = `admin-step-up-${suffix}`;
+  const adminSubject = createHash("sha256").update(emailA).digest("base64url");
+  googleIdentities.set(adminStepUpCode, {
+    subject: adminSubject,
+    email: emailA,
+    emailVerified: true,
+    displayName: "Admin Sintético",
+  });
+  const adminStepUpAttempt = await startGoogle("/api/v1/auth/google/step-up/start", cookieA);
+  assert.equal(adminStepUpAttempt.loginHint, adminSubject);
+  const previousAdminCookie = cookieA;
+  const adminStepUpCallback = await googleCallback(adminStepUpAttempt, adminStepUpCode, cookieA);
+  assert.equal(adminStepUpCallback.headers.location, `${origin}/?auth=google-step-up`);
+  cookieA = namedCookie(adminStepUpCallback, "salarivo_session");
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: previousAdminCookie } })).statusCode,
+    401,
+  );
   const enrollment = await app.inject({
     method: "POST",
     url: "/api/v1/auth/mfa/enrollment",

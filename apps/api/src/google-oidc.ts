@@ -19,6 +19,7 @@ export type GoogleOidcClient = Readonly<{
     nonce: string;
     codeChallenge: string;
     stepUp: boolean;
+    loginHint?: string;
   }): Promise<string>;
   exchange(input: {
     callbackUrl: URL;
@@ -57,6 +58,7 @@ export function createGoogleOidc(config: ApiConfig["googleOAuth"]): GoogleOidcCl
         code_challenge_method: "S256",
       };
       if (input.stepUp) parameters.max_age = "0";
+      if (input.loginHint) parameters.login_hint = input.loginHint;
       return buildAuthorizationUrl(await configuration(), parameters).href;
     },
 

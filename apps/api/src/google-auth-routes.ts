@@ -120,24 +120,24 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
     const codeChallenge = createHash("sha256").update(codeVerifier, "utf8").digest("base64url");
     let userId: string | null = null;
     let sessionId: string | null = null;
+    let loginHint: string | undefined;
 
     if (purpose === "STEP_UP") {
       userId = request.authUser!.id;
       const linked = await pool.query(
-        `SELECT session.id
+        `SELECT session.id, account.provider_account_id
            FROM sessions AS session
+          JOIN auth_accounts AS account
+             ON account.user_id = session.user_id AND account.provider = 'GOOGLE'
           WHERE session.user_id = $1 AND session.token_hash = $2
-            AND session.revoked_at IS NULL AND session.expires_at > now()
-            AND EXISTS (
-              SELECT 1 FROM auth_accounts account
-               WHERE account.user_id = $1 AND account.provider = 'GOOGLE'
-            )`,
+            AND session.revoked_at IS NULL AND session.expires_at > now()`,
         [userId, request.authSessionHash],
       );
       if (linked.rowCount !== 1) {
         throw new ApiError(409, "GOOGLE_ACCOUNT_REQUIRED", "La cuenta no tiene un acceso de Google vinculado.");
       }
       sessionId = String(linked.rows[0].id);
+      loginHint = String(linked.rows[0].provider_account_id);
     }
 
     let authorizationUrl: string;
@@ -147,6 +147,7 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
         nonce,
         codeChallenge,
         stepUp: purpose === "STEP_UP",
+        ...(loginHint ? { loginHint } : {}),
       });
     } catch {
       throw new ApiError(503, "GOOGLE_AUTH_UNAVAILABLE", "El acceso con Google no está disponible temporalmente.");

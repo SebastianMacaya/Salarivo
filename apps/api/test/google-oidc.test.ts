@@ -41,6 +41,7 @@ test("Google discovery retries after a transient failure without weakening the a
   assert.equal(authorizationUrl.searchParams.get("nonce"), input.nonce);
   assert.equal(authorizationUrl.searchParams.get("code_challenge"), input.codeChallenge);
   assert.equal(authorizationUrl.searchParams.get("code_challenge_method"), "S256");
-  const stepUpUrl = new URL(await client.authorizationUrl({ ...input, stepUp: true }));
+  const stepUpUrl = new URL(await client.authorizationUrl({ ...input, stepUp: true, loginHint: "synthetic-sub" }));
   assert.equal(stepUpUrl.searchParams.get("max_age"), "0");
+  assert.equal(stepUpUrl.searchParams.get("login_hint"), "synthetic-sub");
 });
