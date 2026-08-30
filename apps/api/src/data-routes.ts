@@ -3,7 +3,7 @@ import { Readable } from "node:stream";
 import { pool, withTransaction, type PoolClient } from "@salarivo/database";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
-import { sessionCookieName, tokenHash, verifyPassword } from "./security.ts";
+import { sessionCookieName, tokenHash } from "./security.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 import { lockR2UploadCapacity } from "./r2-capacity.ts";
 import { createStorage, waitForR2WriteWindow, type Storage } from "./storage.ts";
@@ -2155,7 +2155,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     },
   );
 
-  app.delete<{ Body: { confirmation: string; password?: string; receiptToken: string } }>(
+  app.delete<{ Body: { confirmation: string; receiptToken: string } }>(
     "/api/v1/privacy/account",
     {
       preHandler: requireStepUp,
@@ -2165,7 +2165,6 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           type: "object", additionalProperties: false, required: ["confirmation", "receiptToken"],
           properties: {
             confirmation: { type: "string", const: "ELIMINAR" },
-            password: { type: "string", minLength: 1, maxLength: 128 },
             receiptToken: { type: "string", pattern: TOKEN_PATTERN },
           },
         },
@@ -2174,29 +2173,16 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     async (request, reply) => {
       const operationId = randomUUID();
       const receiptToken = request.body.receiptToken;
-      const account = await pool.query(
-        `SELECT password_hash FROM users
-          WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
-        [request.authUser!.id],
-      );
-      if (!account.rowCount) {
-        throw new ApiError(401, "INVALID_CREDENTIALS", "No se pudo verificar la cuenta.");
-      }
-      const verifiedHash = account.rows[0].password_hash === null ? null : String(account.rows[0].password_hash);
-      if (verifiedHash !== null && (!request.body.password || !await verifyPassword(request.body.password, verifiedHash))) {
-        throw new ApiError(401, "INVALID_CREDENTIALS", "La contraseña actual no es correcta.");
-      }
       await withTransaction(async (client) => {
         if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }
         const current = await client.query(
-          `SELECT password_hash FROM users
+          `SELECT id FROM users
             WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE`,
           [request.authUser!.id],
         );
-        const currentHash = current.rows[0]?.password_hash === null ? null : String(current.rows[0]?.password_hash);
-        if (!current.rowCount || currentHash !== verifiedHash) {
+        if (!current.rowCount) {
           throw new ApiError(401, "INVALID_CREDENTIALS", "No se pudo verificar la cuenta.");
         }
         await client.query(

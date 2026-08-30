@@ -122,7 +122,7 @@ Recursos iniciales:
 
 | Recurso | Operaciones MVP |
 | --- | --- |
-| auth | alta e inicio/callback Google, login local sólo para cuentas existentes, onboarding, logout, revocación de otras sesiones, MFA y step-up |
+| auth | alta e inicio/callback Google, onboarding, logout, revocación de otras sesiones, MFA y step-up |
 | upload-sessions | crear y confirmar upload |
 | imports | crear, consultar, recuperar el lote activo y cancelar uploads pendientes; pausa/reanudación quedan pendientes |
 | documents | listar, consultar, asociar masivamente a un empleo, corregir, cerrar revisión, eliminar y confirmar tipo; reproceso queda pendiente |
@@ -138,7 +138,7 @@ Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se 
 
 Google usa OIDC Authorization Code con PKCE, `state` y `nonce`; el callback es `GET`. Cada intento es breve, de un solo uso y queda ligado al navegador por una cookie y estado server-side. El redirect posterior sólo puede apuntar a destinos internos allowlisted.
 
-La respuesta válida se resuelve por `(provider, sub)` en `auth_accounts`. El email recibido es un atributo verificable del perfil, no una clave de login ni de vinculación: una colisión nunca auto-vincula una cuenta. No se persisten access, refresh ni ID tokens. Tanto password como Google terminan en el UUID y la sesión opaca interna ya usados por los guards y por ownership.
+La respuesta válida se resuelve por `(provider, sub)` en `auth_accounts`. El email recibido es un atributo verificable del perfil, no una clave de login ni de vinculación: una colisión nunca auto-vincula una cuenta. No se persisten access, refresh ni ID tokens. Google termina en el UUID y la sesión opaca interna ya usados por los guards y por ownership.
 
 Para una identidad nueva, el callback deja un onboarding pendiente, pero no crea una cuenta activa. El segundo paso crea usuario, aceptación legal, `auth_account`, sesión y auditoría en una única transacción. `BLOCKED` y `SUSPENDED` fallan cerrados. En una cuenta Google-only, el step-up inicia otra autorización con `max_age=0`, ligada a la sesión actual, y rota esa sesión cuando termina; la persona también puede revocar el resto de sus sesiones. [ADR 0010](../adr/0010-google-oidc-and-external-identities.md) conserva sin cambios el modelo de ownership.
 
@@ -217,4 +217,4 @@ El workflow `.github/workflows/ci.yml` ejecuta lint, typecheck, unit, build web,
 
 ## Decisiones abiertas
 
-El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, login local/Google OIDC y MFA TOTP. Cloudflare R2 fue elegido para object storage productivo con cifrado administrado por el proveedor; siguen abiertos la evaluación operativa/jurídica de ubicación y subencargados, el aislamiento final del parser y los backups de producción. La integración con Google y R2 no levanta el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.
+El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, Google OIDC y MFA TOTP. Cloudflare R2 fue elegido para object storage productivo con cifrado administrado por el proveedor; siguen abiertos la evaluación operativa/jurídica de ubicación y subencargados, el aislamiento final del parser y los backups de producción. La integración con Google y R2 no levanta el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.

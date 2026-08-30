@@ -11,7 +11,7 @@ import {
   recoveryCodeHash,
   validateTotpCode,
 } from "./mfa.ts";
-import { tokenHash, verifyPassword } from "./security.ts";
+import { tokenHash } from "./security.ts";
 import { lockValidStepUpSession, rotateSession } from "./session-assurance.ts";
 
 type ErrorConstructor = new (statusCode: number, code: string, message: string) => Error;
@@ -24,9 +24,7 @@ type Options = {
   setSession: (reply: FastifyReply, token: string) => void;
   userSchema: object;
 };
-type EnrollmentBody = { password?: string };
 type CodeBody = { code: string };
-type StepUpBody = { password?: string; code?: string };
 
 const ENROLLMENT_TTL_MS = 10 * 60_000;
 const LOCK_TTL_MS = 15 * 60_000;
@@ -181,7 +179,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
     },
   );
 
-  app.post<{ Body: EnrollmentBody }>(
+  app.post(
     "/api/v1/auth/mfa/enrollment",
     {
       preHandler: requirePrimaryAuth,
@@ -190,7 +188,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
         body: {
           type: "object",
           additionalProperties: false,
-          properties: { password: { type: "string", minLength: 1, maxLength: 128 } },
+          properties: {},
         },
         response: {
           200: envelope({
@@ -215,8 +213,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
 
       const outcome = await withTransaction(async (client) => {
         const user = await client.query(
-          `SELECT u.password_hash, session.id AS session_id,
-                  EXISTS (SELECT 1 FROM mfa_factors WHERE user_id = u.id AND status = 'ACTIVE') AS enabled,
+          `SELECT session.id AS session_id,
                   session.step_up_expires_at > now() AS stepped_up
              FROM users u
              JOIN sessions AS session
@@ -226,14 +223,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
           [userId, request.authSessionHash],
         );
         if (user.rowCount !== 1) return "AUTHENTICATION_REQUIRED";
-        if (user.rows[0].enabled && !user.rows[0].stepped_up) return "STEP_UP_REQUIRED";
-        if (!user.rows[0].enabled) {
-          if (user.rows[0].password_hash === null) {
-            if (!user.rows[0].stepped_up) return "STEP_UP_REQUIRED";
-          } else if (!request.body.password || !await verifyPassword(request.body.password, String(user.rows[0].password_hash))) {
-            return "INVALID_CREDENTIALS";
-          }
-        }
+        if (!user.rows[0].stepped_up) return "STEP_UP_REQUIRED";
         await client.query(`DELETE FROM mfa_factors WHERE user_id = $1 AND status = 'PENDING'`, [userId]);
         await client.query(
           `INSERT INTO mfa_factors (
@@ -245,7 +235,6 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
       });
       if (outcome === "AUTHENTICATION_REQUIRED") throw new ApiError(401, outcome, "Iniciá sesión para continuar.");
       if (outcome === "STEP_UP_REQUIRED") throw new ApiError(403, outcome, "Confirmá tu identidad para continuar.");
-      if (outcome === "INVALID_CREDENTIALS") throw new ApiError(401, outcome, "La contraseña no es válida.");
       return { data: { secret, otpauthUri: buildTotpUri(secret, request.authUser!.email), expiresAt: expiresAt.toISOString() } };
     },
   );
@@ -365,20 +354,13 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
     },
   );
 
-  app.post<{ Body: StepUpBody }>(
+  app.post<{ Body: CodeBody }>(
     "/api/v1/auth/step-up",
     {
       preHandler: requireAuth,
       config: { rateLimit: { max: 10, timeWindow: "15 minutes" } },
       schema: {
-        body: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            password: { type: "string", minLength: 1, maxLength: 128 },
-            code: { type: "string", minLength: 6, maxLength: 39 },
-          },
-        },
+        body: codeBodySchema,
         response: {
           200: envelope({
             type: "object",
@@ -392,31 +374,13 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
     async (request, reply) => {
       const userId = request.authUser!.id;
       const outcome = await withTransaction(async (client) => {
-        const active = await client.query(
-          `SELECT EXISTS (SELECT 1 FROM mfa_factors WHERE user_id = $1 AND status = 'ACTIVE') AS enabled`,
-          [userId],
-        );
-        if (active.rows[0].enabled) {
-          if (!request.body.code) return { status: "INVALID" } as const;
-          const verification = await verifyFactor(client, userId, request.body.code);
-          if (!verification.ok) return { status: "FACTOR_FAILED", verification } as const;
-        } else {
-          const user = await client.query(`SELECT password_hash FROM users WHERE id = $1 FOR UPDATE`, [userId]);
-          if (
-            !request.body.password
-            || user.rowCount !== 1
-            || user.rows[0].password_hash === null
-            || !await verifyPassword(request.body.password, String(user.rows[0].password_hash))
-          ) {
-            return { status: "INVALID" } as const;
-          }
-        }
+        const verification = await verifyFactor(client, userId, request.body.code);
+        if (!verification.ok) return { status: "FACTOR_FAILED", verification } as const;
         const session = await rotateSession(client, request.authSessionHash!, { stepUp: true });
         await audit(client, userId, "AUTH_STEP_UP", null);
         return { status: "OK", session } as const;
       });
       if (outcome.status === "FACTOR_FAILED") throwVerification(outcome.verification);
-      if (outcome.status === "INVALID") throw new ApiError(401, "INVALID_CREDENTIALS", "La credencial no es válida.");
       setSession(reply, outcome.session.token);
       return { data: { stepUpExpiresAt: outcome.session.stepUpExpiresAt! } };
     },

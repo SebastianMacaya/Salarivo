@@ -45,14 +45,16 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
   assert.equal(googleUnavailable.statusCode, 503);
   assert.equal(googleUnavailable.json().error.code, "GOOGLE_AUTH_UNAVAILABLE");
 
-  const passwordRegistration = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/register",
-    headers: { origin: "http://localhost:3000" },
-    payload: {},
-  });
-  assert.equal(passwordRegistration.statusCode, 403);
-  assert.equal(passwordRegistration.json().error.code, "PASSWORD_REGISTRATION_DISABLED");
+  for (const path of ["register", "login", "forgot-password", "reset-password"]) {
+    const legacyPasswordRoute = await app.inject({
+      method: "POST",
+      url: `/api/v1/auth/${path}`,
+      headers: { origin: "http://localhost:3000" },
+      payload: {},
+    });
+    assert.equal(legacyPasswordRoute.statusCode, 404);
+    assert.equal(legacyPasswordRoute.json().error.code, "NOT_FOUND");
+  }
 
   assert.equal(
     derivedDocumentFilename("document.pdf", "2026-07", "Empresa: Sintética / Norte?"),

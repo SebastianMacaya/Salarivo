@@ -18,12 +18,9 @@ import { createGoogleOidc, type GoogleOidcClient } from "./google-oidc.ts";
 import { registerMfaRoutes } from "./mfa-routes.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 import {
-  hashPassword,
   hasTrustedMutationOrigin,
-  opaqueToken,
   sessionCookieName,
   tokenHash,
-  verifyPassword,
 } from "./security.ts";
 
 type AuthUser = {
@@ -35,7 +32,7 @@ type AuthUser = {
   authState: "AUTHENTICATED" | "MFA_REQUIRED" | "MFA_SETUP_REQUIRED";
   mfaEnabled: boolean;
   onboardingCompleted: boolean;
-  authMethods: ("PASSWORD" | "GOOGLE")[];
+  authMethods: "GOOGLE"[];
 };
 
 declare module "fastify" {
@@ -86,7 +83,6 @@ export function validateRegistrationLegalDocuments(
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const DATE_PATTERN = "^\\d{4}-\\d{2}-\\d{2}$";
-const EMAIL_PATTERN = "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$";
 const TOKEN_PATTERN = "^[A-Za-z0-9_-]{43}$";
 const nullableText = (maximum: number) => ({
   anyOf: [
@@ -132,7 +128,7 @@ const userSchema = {
     authMethods: {
       type: "array",
       uniqueItems: true,
-      items: { type: "string", enum: ["PASSWORD", "GOOGLE"] },
+      items: { type: "string", const: "GOOGLE" },
     },
   },
 };
@@ -244,9 +240,7 @@ function userFrom(row: Record<string, unknown>): AuthUser {
     : mfaEnabled && !row.mfa_verified_at
       ? "MFA_REQUIRED"
       : "AUTHENTICATED";
-  const authMethods: ("PASSWORD" | "GOOGLE")[] = [];
-  if (row.password_enabled === true) authMethods.push("PASSWORD");
-  if (row.google_enabled === true) authMethods.push("GOOGLE");
+  const authMethods: "GOOGLE"[] = row.google_enabled === true ? ["GOOGLE"] : [];
   return {
     id: String(row.id),
     email: String(row.email),
@@ -306,14 +300,6 @@ function employmentFrom(row: Record<string, unknown>) {
   };
 }
 
-function normalizeEmail(value: string): string {
-  const email = value.trim().toLowerCase();
-  if (email.length > 254 || !new RegExp(EMAIL_PATTERN).test(email)) {
-    throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
-  }
-  return email;
-}
-
 function text(value: string, maximum: number): string {
   const normalized = value.trim();
   if (normalized.length === 0 || normalized.length > maximum) {
@@ -358,9 +344,6 @@ function isDatabaseError(error: unknown): error is { code: string } {
   return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string";
 }
 
-type LoginBody = { email: string; password: string };
-type ForgotPasswordBody = { email: string };
-type ResetPasswordBody = { token: string; password: string };
 type EmployerBody = { name: string; countryCode: string };
 type EmployerPatch = { name?: string; countryCode?: string };
 type EmploymentBody = {
@@ -377,8 +360,6 @@ type EmploymentPatch = Partial<EmploymentBody>;
 type IdParams = { id: string };
 type LegalParams = { type: "terms" | "privacy" };
 type LegalQuery = { version?: string };
-
-const dummyPasswordHash = hashPassword("dummy password used only for timing");
 
 export async function buildApp(
   config: ApiConfig,
@@ -520,7 +501,6 @@ export async function buildApp(
     const result = await pool.query(
       `SELECT u.id, u.email, u.display_name, u.role, u.created_at,
               u.onboarding_completed_at,
-              u.password_hash IS NOT NULL AS password_enabled,
               EXISTS (
                 SELECT 1 FROM auth_accounts account
                  WHERE account.user_id = u.id AND account.provider = 'GOOGLE'
@@ -536,7 +516,11 @@ export async function buildApp(
           AND s.revoked_at IS NULL
           AND s.expires_at > now()
           AND u.status = 'ACTIVE'
-          AND u.deleted_at IS NULL`,
+          AND u.deleted_at IS NULL
+          AND EXISTS (
+                SELECT 1 FROM auth_accounts account
+                 WHERE account.user_id = u.id AND account.provider = 'GOOGLE'
+              )`,
       [digest],
     );
     if (result.rowCount !== 1) {
@@ -641,91 +625,6 @@ export async function buildApp(
       if (result.rowCount !== 1) throw new ApiError(404, "LEGAL_DOCUMENT_NOT_FOUND", "Documento legal no encontrado.");
       reply.header("Cache-Control", "public, max-age=300");
       return { data: legalDocumentFrom(result.rows[0]) };
-    },
-  );
-
-  app.post(
-    "/api/v1/auth/register",
-    {
-      config: { rateLimit: { max: 5, timeWindow: "15 minutes" } },
-    },
-    async () => {
-      throw new ApiError(403, "PASSWORD_REGISTRATION_DISABLED", "El alta está disponible únicamente con Google.");
-    },
-  );
-
-  app.post<{ Body: LoginBody }>(
-    "/api/v1/auth/login",
-    {
-      config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
-      schema: {
-        body: {
-          type: "object",
-          additionalProperties: false,
-          required: ["email", "password"],
-          properties: {
-            email: { type: "string", minLength: 3, maxLength: 254, pattern: EMAIL_PATTERN },
-            password: { type: "string", minLength: 1, maxLength: 128 },
-          },
-        },
-        response: responses(200, userSchema),
-      },
-    },
-    async (request, reply) => {
-      const email = normalizeEmail(request.body.email);
-      const result = await pool.query(
-        `SELECT id, email, password_hash, display_name, role, created_at,
-                onboarding_completed_at,
-                password_hash IS NOT NULL AS password_enabled,
-                EXISTS (
-                  SELECT 1 FROM auth_accounts account
-                   WHERE account.user_id = users.id AND account.provider = 'GOOGLE'
-                ) AS google_enabled,
-                EXISTS (
-                  SELECT 1 FROM mfa_factors factor
-                   WHERE factor.user_id = users.id AND factor.status = 'ACTIVE'
-                ) AS mfa_enabled
-           FROM users
-          WHERE email = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
-        [email],
-      );
-      const row = result.rows[0];
-      const valid = await verifyPassword(
-        request.body.password,
-        row?.password_hash === null || !row ? await dummyPasswordHash : String(row.password_hash),
-      );
-      if (!row || row.password_hash === null || !valid) {
-        throw new ApiError(401, "INVALID_CREDENTIALS", "Email o contraseña incorrectos.");
-      }
-
-      const token = opaqueToken();
-      const verifiedHash = String(row.password_hash);
-      const sessionCreated = await withTransaction(async (client) => {
-        const current = await client.query(
-          `SELECT password_hash FROM users
-            WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL
-            FOR UPDATE`,
-          [row.id],
-        );
-        if (!current.rowCount || String(current.rows[0].password_hash) !== verifiedHash) return false;
-        await client.query(
-          `INSERT INTO sessions (id, user_id, token_hash, expires_at)
-           VALUES ($1, $2, $3, $4)`,
-          [
-            randomUUID(),
-            row.id,
-            tokenHash(token),
-            new Date(Date.now() + config.sessionTtlSeconds * 1000),
-          ],
-        );
-        await client.query(`UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = $1`, [row.id]);
-        return true;
-      });
-      if (!sessionCreated) {
-        throw new ApiError(401, "INVALID_CREDENTIALS", "Email o contraseña incorrectos.");
-      }
-      setSession(reply, token);
-      return { data: userFrom(row) };
     },
   );
 
@@ -936,132 +835,6 @@ export async function buildApp(
           })),
         },
       };
-    },
-  );
-
-  app.post<{ Body: ForgotPasswordBody }>(
-    "/api/v1/auth/forgot-password",
-    {
-      config: { rateLimit: { max: 5, timeWindow: "15 minutes" } },
-      schema: {
-        body: {
-          type: "object",
-          additionalProperties: false,
-          required: ["email"],
-          properties: {
-            email: { type: "string", minLength: 3, maxLength: 254, pattern: EMAIL_PATTERN },
-          },
-        },
-        response: responses(202, {
-          type: "object",
-          additionalProperties: false,
-          required: ["accepted"],
-          properties: {
-            accepted: { type: "boolean", const: true },
-            resetToken: { type: "string", pattern: TOKEN_PATTERN },
-          },
-        }),
-      },
-    },
-    async (request, reply) => {
-      if (config.appEnv === "production") {
-        throw new ApiError(503, "RECOVERY_DELIVERY_UNAVAILABLE", "La recuperación no está disponible temporalmente.");
-      }
-
-      const email = normalizeEmail(request.body.email);
-      const token = opaqueToken();
-      const user = await pool.query(
-        `SELECT id FROM users
-          WHERE email = $1 AND status = 'ACTIVE' AND deleted_at IS NULL
-            AND password_hash IS NOT NULL`,
-        [email],
-      );
-      if (user.rowCount === 1) {
-        await withTransaction(async (client) => {
-          await client.query(
-            `UPDATE password_reset_tokens SET used_at = now()
-              WHERE user_id = $1 AND used_at IS NULL`,
-            [user.rows[0].id],
-          );
-          await client.query(
-            `INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
-             VALUES ($1, $2, $3, $4)`,
-            [
-              randomUUID(),
-              user.rows[0].id,
-              tokenHash(token),
-              new Date(Date.now() + config.passwordResetTtlSeconds * 1000),
-            ],
-          );
-        });
-      }
-
-      return reply.code(202).send({ data: { accepted: true, resetToken: token } });
-    },
-  );
-
-  app.post<{ Body: ResetPasswordBody }>(
-    "/api/v1/auth/reset-password",
-    {
-      config: { rateLimit: { max: 5, timeWindow: "15 minutes" } },
-      schema: {
-        body: {
-          type: "object",
-          additionalProperties: false,
-          required: ["token", "password"],
-          properties: {
-            token: { type: "string", pattern: TOKEN_PATTERN },
-            password: { type: "string", minLength: 12, maxLength: 128 },
-          },
-        },
-        response: responses(200, {
-          type: "object",
-          additionalProperties: false,
-          required: ["reset"],
-          properties: { reset: { type: "boolean", const: true } },
-        }),
-      },
-    },
-    async (request, reply) => {
-      const passwordHash = await hashPassword(request.body.password);
-      const reset = await withTransaction(async (client) => {
-        const found = await client.query(
-          `SELECT t.id, t.user_id
-             FROM password_reset_tokens t
-             JOIN users u ON u.id = t.user_id
-            WHERE t.token_hash = $1
-              AND t.used_at IS NULL
-              AND t.expires_at > now()
-              AND u.status = 'ACTIVE'
-              AND u.deleted_at IS NULL
-            FOR UPDATE OF t`,
-          [tokenHash(request.body.token)],
-        );
-        if (found.rowCount !== 1) return false;
-
-        const userId = found.rows[0].user_id;
-        await client.query(
-          `UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`,
-          [passwordHash, userId],
-        );
-        await client.query(
-          `UPDATE password_reset_tokens SET used_at = now()
-            WHERE user_id = $1 AND used_at IS NULL`,
-          [userId],
-        );
-        await client.query(
-          `UPDATE sessions SET revoked_at = now()
-            WHERE user_id = $1 AND revoked_at IS NULL`,
-          [userId],
-        );
-        return true;
-      });
-      if (!reset) {
-        throw new ApiError(400, "INVALID_RESET_TOKEN", "El enlace de recuperación no es válido o venció.");
-      }
-
-      clearSession(reply);
-      return { data: { reset: true } };
     },
   );
 

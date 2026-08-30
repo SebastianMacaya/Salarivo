@@ -21,7 +21,7 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 
 ### Incluye
 
-- alta exclusiva con Google, aceptación versionada de Términos y confirmación del Aviso de Privacidad; login Google o por contraseña para cuentas existentes, onboarding, logout, revocación de otras sesiones y recuperación local de contraseña;
+- alta e inicio de sesión exclusivamente con Google, aceptación versionada de Términos y confirmación del Aviso de Privacidad, onboarding, logout y revocación de otras sesiones;
 - alta, edición y cierre de múltiples empleadores y empleos simultáneos o sucesivos;
 - carga individual y masiva de PDFs;
 - ImportBatch persistente, recuperable al volver a la pantalla, con progreso agregado y por archivo;

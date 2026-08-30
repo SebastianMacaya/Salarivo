@@ -57,7 +57,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 
 | Amenaza | Controles requeridos | Verificación |
 | --- | --- | --- |
-| IDOR / broken access control | ownership server-side en servicio, scopes mínimos, IDs opacos, RLS opcional; el método de login nunca altera el owner UUID | usuario A lee/edita/borra recurso B en combinaciones password/password, Google/Google y password/Google |
+| IDOR / broken access control | ownership server-side en servicio, scopes mínimos, IDs opacos, RLS opcional; el método de login nunca altera el owner UUID | usuario Google A lee/edita/borra recurso de usuario Google B |
 | Enumeración / deduplicación lateral | respuestas uniformes, checksum consultado por userId, sin dedup observable global | mismo hash entre usuarios no revela existencia |
 | Malware | scanner privado antes de extracción, cuarentena fail closed | archivo de prueba antivirus no avanza |
 | Explotación de parser | proceso sin privilegios, filesystem efímero, CPU/RAM/timeouts, sin red ni credenciales | PDF malformado termina sin afectar worker/API |

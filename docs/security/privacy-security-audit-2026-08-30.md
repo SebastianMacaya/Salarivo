@@ -31,7 +31,7 @@ La evaluación jurídica es técnica e informativa. Fuentes oficiales consultada
 
 ## Evidencia ejecutable
 
-- Migraciones 001–012 aplicadas sobre PostgreSQL local.
+- Migraciones 001–014 aplicadas sobre PostgreSQL local.
 - Unit tests de API, MFA, worker y migraciones.
 - Integración HTTP con dos usuarios: IDOR, MFA, step-up, export, rectificación materializada, descarga y borrados.
 - Worker real contra PostgreSQL, Redis y MinIO locales con fixtures sintéticos: un replay de upload firmado y una ejecución activa mantienen cada baja `PENDING`; al vencer el upload o liberar el marcador de ejecución se eliminan keys, usuarios y relaciones, y cada recibo sobrevive como `COMPLETED` sin cruzar cuentas. Otra prueba demuestra que B progresa en el mismo ciclo aunque A tenga 101 tombstones anteriores.
@@ -44,7 +44,7 @@ La evaluación jurídica es técnica e informativa. Fuentes oficiales consultada
 3. **Proveedores y transferencias.** Inventariar hosting, DB, storage, backups, correo, OCR, observabilidad y subencargados; fijar países, DPA, no-training/no-retention y mecanismo válido de transferencia.
 4. **Infraestructura.** Cloudflare R2 Standard fue elegido para storage, con cifrado AES-256-GCM y claves administradas por el proveedor. Falta demostrar en el entorno efectivo bucket privado sin `r2.dev` ni custom domains, CORS/lifecycle esperados, TLS, credenciales de objetos limitadas al bucket, token account-wide `Workers R2 Storage Read` separado y alertas propias del tope global de 8.000.000.000 bytes. Ese token no escribe configuración, pero también permite leer/listar objetos y debe tratarse como secreto de datos. Las Budget Alerts account-wide a USD 1/USD 3 ya están activas; se evalúan diariamente y no detienen gasto. Cloudflare no ofrece un hard spending cap y las operaciones pueden superar el free tier. También debe demostrarse que una carga iniciada antes del vencimiento no puede finalizar después de la ventana de gracia; si el proveedor no lo garantiza, se requiere inventario y reborrado posterior antes de marcar la baja como `COMPLETED`. API y worker verifican la configuración de bucket al arrancar, pero siguen pendientes egress restringido, aislamiento real del parser sin credenciales ni red y evidencia operativa.
 5. **Backups.** Definir ventana, cifrado, acceso, restore drill, expiración y ledger de supresiones reaplicado antes de reabrir tráfico.
-6. **Recuperación y operación.** Implementar entrega productiva del reset de contraseña, alta/revocación segura de administradores, alertas y procedimiento de incidentes.
+6. **Recuperación y operación.** Definir recuperación excepcional de cuentas Google, alta/revocación segura de administradores, alertas y procedimiento de incidentes.
 
 ## Mejoras P1
 

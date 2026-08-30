@@ -15,7 +15,7 @@ type User = {
   authState: 'AUTHENTICATED' | 'MFA_REQUIRED' | 'MFA_SETUP_REQUIRED';
   mfaEnabled: boolean;
   onboardingCompleted: boolean;
-  authMethods: Array<'PASSWORD' | 'GOOGLE'>;
+  authMethods: 'GOOGLE'[];
 };
 type MfaStatus = { enabled: boolean; pendingEnrollment: boolean; recoveryCodesRemaining: number };
 type MfaEnrollmentResult = { secret: string; otpauthUri: string; expiresAt: string };
@@ -130,7 +130,7 @@ const googleAuthErrorMessages: Record<string, string> = {
   'google-failed': 'No pudimos iniciar sesión con Google. Intentá nuevamente.',
   'invalid-callback': 'No pudimos validar la respuesta de Google. Intentá nuevamente.',
   'account-disabled': 'Esta cuenta se encuentra deshabilitada.',
-  'account-link-required': 'Ese email ya pertenece a una cuenta. Iniciá sesión con su método actual.',
+  'account-link-required': 'Ese email ya pertenece a otra cuenta y no se puede vincular automáticamente.',
 };
 
 class ApiError extends Error {
@@ -484,34 +484,27 @@ function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => Promi
   );
 }
 
-function MfaEnrollment({ authMethods, pending = false, onComplete }: { authMethods: User['authMethods']; pending?: boolean; onComplete: () => Promise<void> | void }) {
+function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onComplete: () => Promise<void> | void }) {
   const [enrollment, setEnrollment] = useState<MfaEnrollmentResult | null>(null);
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const googleOnly = authMethods.length === 1 && authMethods[0] === 'GOOGLE';
 
-  async function beginEnrollment(password?: string) {
+  async function beginEnrollment() {
     setError(''); setBusy(true);
     try {
       setEnrollment(await api<MfaEnrollmentResult>('/auth/mfa/enrollment', {
-        method: 'POST', body: JSON.stringify(password === undefined ? {} : { password }),
+        method: 'POST', body: '{}',
       }));
     } catch (caught) {
       let failure = caught;
-      if (googleOnly && caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
+      if (caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
         try { await redirectToGoogle('/auth/google/step-up/start'); return; }
         catch (redirectError) { failure = redirectError; }
       }
       setError(failure instanceof Error ? failure.message : 'No pudimos iniciar la configuración.');
     }
     finally { setBusy(false); }
-  }
-
-  async function start(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    await beginEnrollment(String(form.get('password')));
   }
 
   async function confirmEnrollment(event: FormEvent<HTMLFormElement>) {
@@ -542,23 +535,13 @@ function MfaEnrollment({ authMethods, pending = false, onComplete }: { authMetho
       </div>
     );
   }
-  if (googleOnly) {
-    return (
-      <div className="stack-form">
-        {pending && <p className="message error">Hay una configuración incompleta. Iniciá una nueva para reemplazarla.</p>}
-        <p>Vamos a pedirte que confirmes tu cuenta de Google antes de configurar el segundo factor.</p>
-        {error && <p className="message error" role="alert">{error}</p>}
-        <button type="button" className="button primary" disabled={busy} onClick={() => void beginEnrollment()}>{busy ? 'Preparando…' : 'Configurar segundo factor'}</button>
-      </div>
-    );
-  }
   return (
-    <form className="stack-form" onSubmit={start}>
+    <div className="stack-form">
       {pending && <p className="message error">Hay una configuración incompleta. Iniciá una nueva para reemplazarla.</p>}
-      <label>Contraseña actual<input name="password" type="password" autoComplete="current-password" minLength={12} required /></label>
+      <p>Vamos a pedirte que confirmes tu cuenta de Google antes de configurar el segundo factor.</p>
       {error && <p className="message error" role="alert">{error}</p>}
-      <button className="button primary" disabled={busy}>{busy ? 'Preparando…' : 'Configurar segundo factor'}</button>
-    </form>
+      <button type="button" className="button primary" disabled={busy} onClick={() => void beginEnrollment()}>{busy ? 'Preparando…' : 'Configurar segundo factor'}</button>
+    </div>
   );
 }
 
@@ -593,7 +576,7 @@ function MfaAccessGate({ user, onAuthenticated, onLogout }: { user: User; onAuth
         <p className="eyebrow">{user.email}</p>
         <h2 id="mfa-access-title">{user.authState === 'MFA_SETUP_REQUIRED' ? 'Activá el segundo factor' : 'Ingresá tu segundo factor'}</h2>
         {user.authState === 'MFA_SETUP_REQUIRED'
-          ? <MfaEnrollment authMethods={user.authMethods} onComplete={async () => onAuthenticated(await api<User>('/auth/me'))} />
+          ? <MfaEnrollment onComplete={async () => onAuthenticated(await api<User>('/auth/me'))} />
           : <form className="stack-form" onSubmit={verify}>
               <label>Código de la app o de recuperación<input name="code" autoComplete="one-time-code" maxLength={39} required autoFocus /></label>
               {error && <p className="message error" role="alert">{error}</p>}
@@ -639,7 +622,7 @@ function OnboardingScreen({ user, onComplete, onLogout }: { user: User; onComple
   );
 }
 
-type AccessMode = 'login' | 'google-register' | 'forgot' | 'reset' | 'deletion';
+type AccessMode = 'login' | 'google-register' | 'deletion';
 
 function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegistrationCancelled, onReceiptToken }: {
   initialError: string;
@@ -650,7 +633,6 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
 }) {
   const [mode, setMode] = useState<AccessMode>(initialMode);
   const [error, setError] = useState(initialError);
-  const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
   const [legalVersions, setLegalVersions] = useState<{ terms: string; privacy: string } | null>(null);
@@ -666,12 +648,11 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
   function changeMode(next: AccessMode) {
     if (mode === 'google-register' && next !== 'google-register') onGoogleRegistrationCancelled();
     setError('');
-    setNotice('');
     setMode(next);
   }
 
   async function startGoogle() {
-    setError(''); setNotice(''); setGoogleBusy(true);
+    setError(''); setGoogleBusy(true);
     try { await redirectToGoogle('/auth/google/start'); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar sesión con Google.'); }
     finally { setGoogleBusy(false); }
@@ -681,28 +662,11 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
     event.preventDefault();
     const formElement = event.currentTarget;
     setError('');
-    setNotice('');
     setBusy(true);
     const form = new FormData(formElement);
     try {
       if (mode === 'deletion') {
         onReceiptToken(String(form.get('token')));
-      } else if (mode === 'forgot') {
-        const result = await api<{ resetToken?: string }>('/auth/forgot-password', {
-          method: 'POST',
-          body: JSON.stringify({ email: form.get('email') }),
-        });
-        setNotice(result.resetToken
-          ? `Modo local: tu código es ${result.resetToken}`
-          : 'Si la cuenta existe, enviamos las instrucciones.');
-        setMode('reset');
-      } else if (mode === 'reset') {
-        await api('/auth/reset-password', {
-          method: 'POST',
-          body: JSON.stringify({ token: form.get('token'), password: form.get('password') }),
-        });
-        setNotice('Contraseña actualizada. Ya podés ingresar.');
-        setMode('login');
       } else if (mode === 'google-register') {
         if (!legalVersions) throw new Error('Esperá a que carguen los documentos legales.');
         onAuthenticated(await api<User>('/auth/google/register', {
@@ -714,16 +678,6 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
             privacyVersion: legalVersions.privacy,
           }),
         }));
-      } else {
-        const credentials = {
-          email: form.get('email'),
-          password: form.get('password'),
-        };
-        const result = await api<User>(`/auth/${mode}`, {
-          method: 'POST',
-          body: JSON.stringify(credentials),
-        });
-        onAuthenticated(result);
       }
     } catch (caught) {
       if (legalRegistration && caught instanceof ApiError && caught.status === 409) {
@@ -759,25 +713,21 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
       <section className="access-panel" aria-labelledby="access-title">
         <div className="access-card">
           <p className="eyebrow">Espacio privado</p>
-          <h2 id="access-title">{mode === 'google-register' ? 'Completá tu registro' : mode === 'forgot' ? 'Recuperá el acceso' : mode === 'reset' ? 'Elegí una nueva clave' : mode === 'deletion' ? 'Consultá una eliminación' : 'Ingresá a Salarivo'}</h2>
+          <h2 id="access-title">{mode === 'google-register' ? 'Completá tu registro' : mode === 'deletion' ? 'Consultá una eliminación' : 'Ingresá a Salarivo'}</h2>
           <form onSubmit={submit} className="stack-form">
-            {mode === 'login' && <><button type="button" className="button secondary google-button" disabled={googleBusy || busy} onClick={startGoogle}><GoogleIcon />{googleBusy ? 'Abriendo Google…' : 'Continuar con Google'}</button><p className="auth-hint">Las cuentas nuevas se crean con Google. La contraseña queda disponible para cuentas existentes.</p></>}
+            {mode === 'login' && <><button type="button" className="button secondary google-button" disabled={googleBusy || busy} onClick={startGoogle}><GoogleIcon />{googleBusy ? 'Abriendo Google…' : 'Continuar con Google'}</button><p className="auth-hint">Usá Google para ingresar o crear tu cuenta.</p></>}
             {mode === 'google-register' && <p>Google verificó tu identidad. Revisá los documentos vigentes para crear tu cuenta.</p>}
-            {(mode === 'login' || mode === 'forgot') && <label>Email<input name="email" type="email" autoComplete="email" required /></label>}
-            {mode === 'reset' && <label>Código de recuperación<input name="token" autoComplete="one-time-code" required /></label>}
             {mode === 'deletion' && <label>Token del comprobante<input name="token" autoComplete="off" pattern="[A-Za-z0-9_-]{43}" minLength={43} maxLength={43} required autoFocus /></label>}
-            {(mode === 'login' || mode === 'reset') && <label>Contraseña<input name="password" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} required /></label>}
             {legalRegistration && <div className="legal-checks">
               <div className="legal-check"><input id="accepted-terms" name="acceptedTerms" type="checkbox" required /><span><label htmlFor="accepted-terms">Acepto los Términos de uso{legalVersions ? ` v${legalVersions.terms}` : ''} y autorizo expresamente el tratamiento de mis datos sólo para las funciones que solicite, según el Aviso de privacidad{legalVersions ? ` v${legalVersions.privacy}` : ''}.</label> <a href={legalVersions ? `/terms?version=${encodeURIComponent(legalVersions.terms)}` : '/terms'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
               <div className="legal-check"><input id="acknowledged-privacy" name="acknowledgedPrivacy" type="checkbox" required /><span><label htmlFor="acknowledged-privacy">Confirmo que leí el Aviso de privacidad{legalVersions ? ` v${legalVersions.privacy}` : ''}.</label> <a href={legalVersions ? `/privacy?version=${encodeURIComponent(legalVersions.privacy)}` : '/privacy'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
             </div>}
             {legalRegistration && legalError && <p className="message error" role="alert">{legalError}</p>}
             {error && <p className="message error" role="alert">{error}</p>}
-            {notice && <p className="message success" aria-live="polite">{notice}</p>}
-            <button className="button primary" disabled={busy || googleBusy || (legalRegistration && !legalVersions)}>{busy ? 'Procesando…' : mode === 'google-register' ? 'Aceptar y crear cuenta' : mode === 'forgot' ? 'Solicitar código' : mode === 'reset' ? 'Cambiar contraseña' : mode === 'deletion' ? 'Consultar estado' : 'Ingresar'}</button>
+            {mode !== 'login' && <button className="button primary" disabled={busy || googleBusy || (legalRegistration && !legalVersions)}>{busy ? 'Procesando…' : mode === 'google-register' ? 'Aceptar y crear cuenta' : 'Consultar estado'}</button>}
           </form>
           <div className="access-actions">
-            {mode === 'login' ? <><button className="text-button" onClick={() => changeMode('forgot')}>Olvidé mi contraseña</button><button className="text-button" onClick={() => changeMode('deletion')}>Consultar una eliminación</button></> : <button className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
+            {mode === 'login' ? <button className="text-button" onClick={() => changeMode('deletion')}>Consultar una eliminación</button> : <button className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
           </div>
         </div>
       </section>
@@ -856,15 +806,14 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
         {section === 'privacy' && <Privacy user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
         {section === 'admin' && user.role === 'ADMIN' && <Admin />}
       </main>
-      {pendingSensitiveAction && <StepUpDialog authMethods={user.authMethods} mfaEnabled={Boolean(user.mfaEnabled)} action={pendingSensitiveAction} onClose={() => setPendingSensitiveAction(null)} />}
+      {pendingSensitiveAction && <StepUpDialog mfaEnabled={Boolean(user.mfaEnabled)} action={pendingSensitiveAction} onClose={() => setPendingSensitiveAction(null)} />}
     </div>
   );
 }
 
-function StepUpDialog({ authMethods, mfaEnabled, action, onClose }: { authMethods: User['authMethods']; mfaEnabled: boolean; action: () => Promise<void>; onClose: () => void }) {
+function StepUpDialog({ mfaEnabled, action, onClose }: { mfaEnabled: boolean; action: () => Promise<void>; onClose: () => void }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const googleOnly = !mfaEnabled && authMethods.length === 1 && authMethods[0] === 'GOOGLE';
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError(''); setBusy(true);
@@ -872,7 +821,7 @@ function StepUpDialog({ authMethods, mfaEnabled, action, onClose }: { authMethod
     const value = form.get('credential');
     try {
       await api('/auth/step-up', {
-        method: 'POST', body: JSON.stringify(mfaEnabled ? { code: value } : { password: value }),
+        method: 'POST', body: JSON.stringify({ code: value }),
       });
       await action();
       onClose();
@@ -891,12 +840,12 @@ function StepUpDialog({ authMethods, mfaEnabled, action, onClose }: { authMethod
     <div className="modal-layer" role="presentation" onMouseDown={onClose}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="step-up-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, onClose)} onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-head"><div><p className="eyebrow">Acción sensible</p><h2 id="step-up-title">Confirmá tu identidad</h2></div><button className="icon-button" onClick={onClose} aria-label="Cerrar">×</button></div>
-        {googleOnly ? <div className="stack-form">
+        {!mfaEnabled ? <div className="stack-form">
           <p>Volvé a confirmar tu cuenta de Google para continuar.</p>
           {error && <p className="message error" role="alert">{error}</p>}
           <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancelar</button><button type="button" className="button primary google-button" disabled={busy} onClick={startGoogleStepUp}><GoogleIcon />{busy ? 'Abriendo Google…' : 'Continuar con Google'}</button></div>
         </div> : <form className="stack-form" onSubmit={submit}>
-          <label>{mfaEnabled ? 'Código de la app o de recuperación' : 'Contraseña actual'}<input name="credential" type={mfaEnabled ? 'text' : 'password'} autoComplete={mfaEnabled ? 'one-time-code' : 'current-password'} maxLength={mfaEnabled ? 39 : undefined} required autoFocus /></label>
+          <label>Código de la app o de recuperación<input name="credential" type="text" autoComplete="one-time-code" maxLength={39} required autoFocus /></label>
           {error && <p className="message error" role="alert">{error}</p>}
           <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancelar</button><button className="button primary" disabled={busy}>{busy ? 'Confirmando…' : 'Continuar'}</button></div>
         </form>}
@@ -1303,7 +1252,7 @@ function FieldEditor({ field, onSave }: { field: ExtractedField; onSave: (value:
   return <div className="field-editor"><label><span>{reviewFieldLabels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label><span className={`confidence ${confidence < 70 ? 'low' : ''}`}>{field.source === 'MANUAL_REQUIRED' ? field.correctedValue ? 'Manual' : 'Falta' : Number.isFinite(confidence) ? `${confidence}%` : '—'}</span><small>{!editable ? 'Sólo lectura' : field.correctedValue ? 'Corregido por vos' : field.source === 'MANUAL_REQUIRED' ? 'Completalo manualmente' : field.source}</small>{editable && <button className="button compact" disabled={busy || !value.trim() || value === (field.correctedValue ?? field.interpretedValue ?? '')} onClick={async () => { setBusy(true); await onSave(value); setBusy(false); }}>Guardar</button>}</div>;
 }
 
-function MfaSettings({ user, onUserChanged, runSensitive }: { user: User; onUserChanged: (user: User) => void; runSensitive: RunSensitive }) {
+function MfaSettings({ onUserChanged, runSensitive }: { onUserChanged: (user: User) => void; runSensitive: RunSensitive }) {
   const [status, setStatus] = useState<MfaStatus | null>(null);
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [message, setMessage] = useState('');
@@ -1352,7 +1301,7 @@ function MfaSettings({ user, onUserChanged, runSensitive }: { user: User; onUser
         <p>Activo. Además de tu acceso principal, Salarivo pedirá un código para ingresar y proteger acciones sensibles.</p>
         <p>Te quedan <strong>{status.recoveryCodesRemaining}</strong> códigos de recuperación.</p>
         <div className="setting-actions"><button className="button secondary" onClick={regenerateRecoveryCodes}>Generar códigos nuevos</button><button className="button danger-button" onClick={disable}>Desactivar</button></div>
-      </> : status ? <><p>Usá una app autenticadora compatible con códigos TOTP.</p><MfaEnrollment authMethods={user.authMethods} pending={status.pendingEnrollment} onComplete={refresh} /></> : null}
+      </> : status ? <><p>Usá una app autenticadora compatible con códigos TOTP.</p><MfaEnrollment pending={status.pendingEnrollment} onComplete={refresh} /></> : null}
     </div></section>
   );
 }
@@ -1365,10 +1314,8 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
 }) {
   const [exportJob, setExportJob] = useState<{ id: string; status: string; downloadUrl?: string | null } | null>(null);
   const [confirmation, setConfirmation] = useState('');
-  const [password, setPassword] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const hasPassword = user.authMethods.includes('PASSWORD');
   async function requestExport() {
     setError('');
     try { await runSensitive(async () => { setExportJob(await api('/privacy/exports', { method: 'POST', body: '{}' })); setMessage('Tu exportación quedó lista para descargar.'); }); }
@@ -1380,14 +1327,14 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos consultar la exportación.'); }
   }
   async function deleteAccount() {
-    if (confirmation !== 'ELIMINAR' || (hasPassword && !password)) return;
+    if (confirmation !== 'ELIMINAR') return;
     setError('');
     const receiptToken = browserOpaqueToken();
     try {
       await runSensitive(async () => {
         try {
           await api('/privacy/account', {
-            method: 'DELETE', body: JSON.stringify({ confirmation, receiptToken, ...(hasPassword ? { password } : {}) }),
+            method: 'DELETE', body: JSON.stringify({ confirmation, receiptToken }),
           });
           onDeletionRequested(receiptToken, 'accepted');
         } catch (caught) {
@@ -1422,12 +1369,12 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
     <div className="page narrow-page">
       <PageHeader eyebrow="Tus datos" title="Privacidad y seguridad" />
       {error && <p className="message error" role="alert">{error}</p>}{message && <p className="message success" aria-live="polite">{message}</p>}
-      <MfaSettings key={`${String(user.mfaEnabled)}-${user.authMethods.join('-')}`} user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} />
+      <MfaSettings key={String(user.mfaEnabled)} onUserChanged={onUserChanged} runSensitive={runSensitive} />
       <section className="settings-card"><div className="setting-icon">↪</div><div><h2>Sesiones activas</h2><p>Cerrá las sesiones abiertas en otros navegadores o dispositivos. Esta sesión seguirá activa.</p></div><div className="setting-actions"><button className="button secondary" onClick={revokeOtherSessions}>Cerrar otras sesiones</button></div></section>
       <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un JSON con tu cuenta, empleos, importaciones, documentos, extracciones, liquidaciones, correcciones y constancias de privacidad. Los PDFs y secretos no se incluyen.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <button className="button primary" onClick={downloadExport}>Descargar</button> : exportJob ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
       <section className="settings-card"><div className="setting-icon">◇</div><div><h2>Originales y datos estructurados</h2><p>Desde Historial podés borrar un PDF y conservar la liquidación revisada. Cada lifecycle es independiente.</p></div></section>
       <section className="settings-card"><div className="setting-icon">§</div><div><h2>Documentos legales</h2><p>Consultá la versión vigente de los <a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> y el <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a>.</p></div></section>
-      <section className="settings-card danger-zone"><div className="setting-icon">!</div><div><h2>Eliminar mi cuenta</h2><p>Inicia el borrado irreversible de documentos, datos estructurados, sesiones y exportaciones.</p>{hasPassword && <label>Contraseña actual<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>}<label>Escribí <strong>ELIMINAR</strong> para confirmar<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label></div><div className="setting-actions"><button className="button danger-button" disabled={confirmation !== 'ELIMINAR' || (hasPassword && !password)} onClick={deleteAccount}>Eliminar cuenta</button></div></section>
+      <section className="settings-card danger-zone"><div className="setting-icon">!</div><div><h2>Eliminar mi cuenta</h2><p>Inicia el borrado irreversible de documentos, datos estructurados, sesiones y exportaciones.</p><label>Escribí <strong>ELIMINAR</strong> para confirmar<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label></div><div className="setting-actions"><button className="button danger-button" disabled={confirmation !== 'ELIMINAR'} onClick={deleteAccount}>Eliminar cuenta</button></div></section>
     </div>
   );
 }

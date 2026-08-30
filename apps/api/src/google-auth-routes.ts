@@ -354,7 +354,6 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
         const account = await client.query(
           `SELECT users.id, users.email, users.display_name, users.role, users.created_at,
                   users.status, users.deleted_at, users.onboarding_completed_at,
-                  users.password_hash IS NOT NULL AS password_enabled,
                   true AS google_enabled,
                   EXISTS (SELECT 1 FROM mfa_factors factor
                     WHERE factor.user_id = users.id AND factor.status = 'ACTIVE') AS mfa_enabled
@@ -465,7 +464,6 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
         const existing = await client.query(
           `SELECT users.id, users.email, users.display_name, users.role, users.created_at,
                   users.status, users.deleted_at, users.onboarding_completed_at,
-                  users.password_hash IS NOT NULL AS password_enabled,
                   true AS google_enabled,
                   EXISTS (SELECT 1 FROM mfa_factors factor
                     WHERE factor.user_id = users.id AND factor.status = 'ACTIVE') AS mfa_enabled
@@ -509,7 +507,7 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
                email_verified_at, last_login_at
              ) VALUES ($1, $2, NULL, $3, 'ACTIVE', 'KEEP_ORIGINAL', now(), now())
              RETURNING id, email, display_name, role, created_at, onboarding_completed_at,
-                       false AS password_enabled, true AS google_enabled, false AS mfa_enabled`,
+                       true AS google_enabled, false AS mfa_enabled`,
             [userId, pending.pending_email, pending.pending_display_name],
           );
           row = inserted.rows[0];
@@ -567,7 +565,7 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
         throw new ApiError(403, "ACCOUNT_DISABLED", "La cuenta no está habilitada.");
       }
       if (outcome.status === "LINK_REQUIRED") {
-        throw new ApiError(409, "ACCOUNT_LINK_REQUIRED", "Ese email ya pertenece a una cuenta. Iniciá sesión con su método actual.");
+        throw new ApiError(409, "ACCOUNT_LINK_REQUIRED", "Ese email ya pertenece a otra cuenta y no se puede vincular automáticamente.");
       }
       clearAttemptCookie(reply);
       setSession(reply, token);

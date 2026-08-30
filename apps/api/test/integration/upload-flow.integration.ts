@@ -58,7 +58,7 @@ test("upload privado crea un único documento y un único intent durable", async
     { loadConfig },
     { pool, withTransaction },
     { generateTotpCode },
-    { hashPassword, opaqueToken, tokenHash },
+    { opaqueToken, sessionCookieName, tokenHash },
   ] = await Promise.all([
     import("../../src/app.ts"),
     import("../../src/config.ts"),
@@ -183,17 +183,23 @@ test("upload privado crea un único documento y un único intent durable", async
 
   const deletionReceiptToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
-  async function seedPasswordAccount(email: string): Promise<string> {
+  async function seedGoogleAccount(email: string): Promise<string> {
     const userId = crypto.randomUUID();
     const sessionId = crypto.randomUUID();
     const sessionToken = opaqueToken();
+    const providerAccountId = createHash("sha256").update(email).digest("base64url");
     await withTransaction(async (client) => {
       await client.query(
         `INSERT INTO users (
            id, email, password_hash, display_name, status, default_retention_policy,
            onboarding_completed_at, last_login_at
-         ) VALUES ($1, $2, $3, 'Persona Sintética', 'ACTIVE', 'KEEP_ORIGINAL', now(), now())`,
-        [userId, email, await hashPassword("frase local segura 2026")],
+         ) VALUES ($1, $2, NULL, 'Persona Sintética', 'ACTIVE', 'KEEP_ORIGINAL', now(), now())`,
+        [userId, email],
+      );
+      await client.query(
+        `INSERT INTO auth_accounts (id, user_id, provider, provider_account_id, last_login_at)
+         VALUES ($1, $2, 'GOOGLE', $3, now())`,
+        [crypto.randomUUID(), userId, providerAccountId],
       );
       const acknowledgements = await client.query(
         `INSERT INTO legal_acknowledgements (user_id, document_version_id)
@@ -261,15 +267,31 @@ test("upload privado crea un único documento y un único intent durable", async
     });
   }
 
-  async function login(email: string): Promise<string> {
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/v1/auth/login",
-      headers: { origin },
-      payload: { email, password: "frase local segura 2026" },
-    });
-    assert.equal(response.statusCode, 200, response.body);
-    return rotatedCookie(response, "");
+  async function createSession(email: string): Promise<string> {
+    const sessionToken = opaqueToken();
+    const inserted = await pool.query(
+      `INSERT INTO sessions (id, user_id, token_hash, expires_at)
+       SELECT $1, users.id, $2, $3
+         FROM users
+        WHERE users.email = $4
+          AND EXISTS (SELECT 1 FROM auth_accounts account
+            WHERE account.user_id = users.id AND account.provider = 'GOOGLE')
+       RETURNING id`,
+      [crypto.randomUUID(), tokenHash(sessionToken), new Date(Date.now() + config.sessionTtlSeconds * 1000), email],
+    );
+    assert.equal(inserted.rowCount, 1);
+    return `salarivo_session=${sessionToken}`;
+  }
+
+  async function grantStepUp(cookie: string): Promise<void> {
+    const sessionToken = cookie.split("=", 2)[1];
+    assert.ok(sessionToken);
+    const updated = await pool.query(
+      `UPDATE sessions SET step_up_expires_at = now() + interval '10 minutes'
+        WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()`,
+      [tokenHash(sessionToken)],
+    );
+    assert.equal(updated.rowCount, 1);
   }
 
   const suffix = crypto.randomUUID();
@@ -303,26 +325,40 @@ test("upload privado crea un único documento y un único intent durable", async
     { provisionStorage: false, googleOidc },
   );
   await productionApp.ready();
-  const productionEmail = `production-${suffix}@example.test`;
   const productionGoogleSubject = `production_google_${suffix.replaceAll("-", "_")}`;
   const productionGoogleEmail = `production-google-${suffix}@example.test`;
+  const legacyEmail = `legacy-${suffix}@example.test`;
   try {
-    const productionRegistration = await productionApp.inject({
-      method: "POST",
-      url: "/api/v1/auth/register",
-      headers: { origin },
-      payload: {
-        email: productionEmail,
-        password: "frase local segura 2026",
-        acceptedTerms: true,
-        acknowledgedPrivacy: true,
-        termsVersion: "1.0",
-        privacyVersion: "1.0",
-      },
+    for (const path of ["register", "login", "forgot-password", "reset-password"]) {
+      const legacyPasswordRoute = await productionApp.inject({
+        method: "POST",
+        url: `/api/v1/auth/${path}`,
+        headers: { origin },
+        payload: {},
+      });
+      assert.equal(legacyPasswordRoute.statusCode, 404, legacyPasswordRoute.body);
+    }
+
+    const legacyUserId = crypto.randomUUID();
+    const legacySessionToken = opaqueToken();
+    await withTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO users (id, email, password_hash, display_name, status, default_retention_policy)
+         VALUES ($1, $2, 'legacy-hash-never-verified', 'Cuenta legacy sintética', 'ACTIVE', 'KEEP_ORIGINAL')`,
+        [legacyUserId, legacyEmail],
+      );
+      await client.query(
+        `INSERT INTO sessions (id, user_id, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4)`,
+        [crypto.randomUUID(), legacyUserId, tokenHash(legacySessionToken), new Date(Date.now() + 60_000)],
+      );
     });
-    assert.equal(productionRegistration.statusCode, 403, productionRegistration.body);
-    assert.equal(productionRegistration.json().error.code, "PASSWORD_REGISTRATION_DISABLED");
-    assert.equal((await pool.query("SELECT 1 FROM users WHERE email = $1", [productionEmail])).rowCount, 0);
+    const legacySession = await productionApp.inject({
+      method: "GET",
+      url: "/api/v1/auth/me",
+      headers: { cookie: `${sessionCookieName("production")}=${legacySessionToken}` },
+    });
+    assert.equal(legacySession.statusCode, 401, legacySession.body);
 
     const productionGoogleCode = `production-google-${suffix}`;
     googleIdentities.set(productionGoogleCode, {
@@ -383,29 +419,8 @@ test("upload privado crea un único documento y un único intent durable", async
     );
   } finally {
     await productionApp.close();
-    await pool.query("DELETE FROM users WHERE email = $1", [productionGoogleEmail]);
+    await pool.query("DELETE FROM users WHERE email = ANY($1::text[])", [[productionGoogleEmail, legacyEmail]]);
   }
-  const disabledPasswordRegistrationEmail = `disabled-password-${suffix}@example.test`;
-  const disabledPasswordRegistration = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/register",
-    headers: { origin },
-    payload: {
-      email: disabledPasswordRegistrationEmail,
-      password: "frase local segura 2026",
-      acceptedTerms: true,
-      acknowledgedPrivacy: true,
-      termsVersion: "1.0",
-      privacyVersion: "1.0",
-    },
-  });
-  assert.equal(disabledPasswordRegistration.statusCode, 403, disabledPasswordRegistration.body);
-  assert.equal(disabledPasswordRegistration.json().error.code, "PASSWORD_REGISTRATION_DISABLED");
-  assert.equal(
-    (await pool.query("SELECT 1 FROM users WHERE email = $1", [disabledPasswordRegistrationEmail])).rowCount,
-    0,
-  );
-
   const deniedGoogleStart = await app.inject({
     method: "POST",
     url: "/api/v1/auth/google/start",
@@ -570,31 +585,12 @@ test("upload privado crea un único documento y un único intent durable", async
     { users: 1, accounts: 1, active_sessions: 1 },
   );
 
-  const googleForgotPassword = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/forgot-password",
-    headers: { origin },
-    payload: { email: googleEmail },
-  });
-  assert.equal(googleForgotPassword.statusCode, 202, googleForgotPassword.body);
-  assert.equal(
-    (await pool.query("SELECT count(*)::integer AS count FROM password_reset_tokens WHERE user_id = $1", [googleUserId]))
-      .rows[0].count,
-    0,
-  );
-  assert.equal(
-    (await pool.query("SELECT 1 FROM password_reset_tokens WHERE token_hash = $1", [
-      createHash("sha256").update(String(googleForgotPassword.json().data.resetToken)).digest("hex"),
-    ])).rowCount,
-    0,
-  );
-
   const collisionUserId = crypto.randomUUID();
-  const collisionEmail = `password-collision-${suffix}@example.test`;
+  const collisionEmail = `existing-collision-${suffix}@example.test`;
   await pool.query(
     `INSERT INTO users (id, email, password_hash, display_name, status, default_retention_policy)
-     VALUES ($1, $2, $3, 'Cuenta Password Sintética', 'ACTIVE', 'KEEP_ORIGINAL')`,
-    [collisionUserId, collisionEmail, await hashPassword("frase local segura 2026")],
+     VALUES ($1, $2, NULL, 'Cuenta Existente Sintética', 'ACTIVE', 'KEEP_ORIGINAL')`,
+    [collisionUserId, collisionEmail],
   );
   const collisionCode = `collision-${suffix}`;
   const collisionSubject = `collision_${subjectSuffix}`;
@@ -786,9 +782,9 @@ test("upload privado crea un único documento y un único intent durable", async
 
   const emailA = `a-${suffix}@example.test`;
   const emailB = `b-${suffix}@example.test`;
-  let cookieA = await seedPasswordAccount(emailA);
-  let cookieB = await seedPasswordAccount(emailB);
-  const secondaryCookieA = await login(emailA);
+  let cookieA = await seedGoogleAccount(emailA);
+  let cookieB = await seedGoogleAccount(emailB);
+  const secondaryCookieA = await createSession(emailA);
   const meA = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: cookieA } });
   assert.equal(meA.statusCode, 200, meA.body);
   assert.equal(meA.json().data.role, "USER");
@@ -797,49 +793,6 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(meB.statusCode, 200, meB.body);
   const userIdB = String(meB.json().data.id);
 
-  const racingResetRequest = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/forgot-password",
-    headers: { origin },
-    payload: { email: emailB },
-  });
-  assert.equal(racingResetRequest.statusCode, 202, racingResetRequest.body);
-  const [racingLogin, racingReset] = await Promise.all([
-    app.inject({
-      method: "POST",
-      url: "/api/v1/auth/login",
-      headers: { origin },
-      payload: { email: emailB, password: "frase local segura 2026" },
-    }),
-    app.inject({
-      method: "POST",
-      url: "/api/v1/auth/reset-password",
-      headers: { origin },
-      payload: { token: racingResetRequest.json().data.resetToken, password: "otra frase local segura 2026" },
-    }),
-  ]);
-  assert.equal(racingReset.statusCode, 200, racingReset.body);
-  if (racingLogin.statusCode === 200) {
-    const racedCookie = rotatedCookie(racingLogin, "");
-    const revokedRaceSession = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: racedCookie } });
-    assert.equal(revokedRaceSession.statusCode, 401, revokedRaceSession.body);
-  } else {
-    assert.equal(racingLogin.statusCode, 401, racingLogin.body);
-  }
-  const restoreResetRequest = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/forgot-password",
-    headers: { origin },
-    payload: { email: emailB },
-  });
-  const restoredPassword = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/reset-password",
-    headers: { origin },
-    payload: { token: restoreResetRequest.json().data.resetToken, password: "frase local segura 2026" },
-  });
-  assert.equal(restoredPassword.statusCode, 200, restoredPassword.body);
-  cookieB = await login(emailB);
   await pool.query(
     `INSERT INTO storage_deletion_tombstones (
        id, user_id, canonical_object_key, incoming_object_key,
@@ -895,11 +848,20 @@ test("upload privado crea un único documento y un único intent durable", async
   const blockedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
   assert.equal(blockedAdmin.statusCode, 403, blockedAdmin.body);
   assert.equal(blockedAdmin.json().error.code, "MFA_SETUP_REQUIRED");
+  const blockedEnrollment = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/mfa/enrollment",
+    headers: { origin, cookie: cookieA },
+    payload: {},
+  });
+  assert.equal(blockedEnrollment.statusCode, 403, blockedEnrollment.body);
+  assert.equal(blockedEnrollment.json().error.code, "STEP_UP_REQUIRED");
+  await grantStepUp(cookieA);
   const enrollment = await app.inject({
     method: "POST",
     url: "/api/v1/auth/mfa/enrollment",
     headers: { origin, cookie: cookieA },
-    payload: { password: "frase local segura 2026" },
+    payload: {},
   });
   assert.equal(enrollment.statusCode, 200, enrollment.body);
   const enrollmentCode = generateTotpCode(String(enrollment.json().data.secret));
@@ -962,20 +924,20 @@ test("upload privado crea un único documento y un único intent durable", async
   const employmentA = await createEmployment(cookieA, "Empresa Asociada A");
   const employmentB = await createEmployment(cookieB, "Empresa Ajena B");
   const googleEmployment = await createEmployment(googleCookie, "Empresa Google Sintética");
-  const googleCannotEditPasswordEmployment = await app.inject({
+  const googleCannotEditOtherEmployment = await app.inject({
     method: "PATCH",
     url: `/api/v1/employments/${employmentA}`,
     headers: { origin, cookie: googleCookie },
     payload: { role: "Acceso cruzado Google" },
   });
-  assert.equal(googleCannotEditPasswordEmployment.statusCode, 404, googleCannotEditPasswordEmployment.body);
-  const passwordCannotEditGoogleEmployment = await app.inject({
+  assert.equal(googleCannotEditOtherEmployment.statusCode, 404, googleCannotEditOtherEmployment.body);
+  const otherGoogleCannotEditEmployment = await app.inject({
     method: "PATCH",
     url: `/api/v1/employments/${googleEmployment}`,
     headers: { origin, cookie: cookieA },
-    payload: { role: "Acceso cruzado Password" },
+    payload: { role: "Acceso cruzado Google" },
   });
-  assert.equal(passwordCannotEditGoogleEmployment.statusCode, 404, passwordCannotEditGoogleEmployment.body);
+  assert.equal(otherGoogleCannotEditEmployment.statusCode, 404, otherGoogleCannotEditEmployment.body);
 
   const googleDeletionToken = deletionReceiptToken();
   const googleDeletion = await app.inject({
@@ -1037,7 +999,7 @@ test("upload privado crea un único documento y un único intent durable", async
       `r2-capacity-a-${suffix}@example.test`,
       `r2-capacity-b-${suffix}@example.test`,
     ];
-    const capacityCookies = await Promise.all(capacityEmails.map(seedPasswordAccount));
+    const capacityCookies = await Promise.all(capacityEmails.map(seedGoogleAccount));
     const capacityUsers = await pool.query<{ email: string; id: string }>(
       "SELECT id, email FROM users WHERE email = ANY($1::text[]) ORDER BY email",
       [capacityEmails],
@@ -1084,10 +1046,10 @@ test("upload privado crea un único documento y un único intent durable", async
       const remainderSize = baselineReservationBytes % 2n;
       await client.query(
         `INSERT INTO users (
-           id, email, password_hash, display_name, status, default_retention_policy,
+         id, email, password_hash, display_name, status, default_retention_policy,
            onboarding_completed_at, last_login_at
-         ) VALUES ($1, $2, $3, 'Reserva R2 Sintética', 'ACTIVE', 'KEEP_ORIGINAL', now(), now())`,
-        [baselineUserId, `r2-capacity-baseline-${suffix}@example.test`, "synthetic-password-hash-long-enough"],
+         ) VALUES ($1, $2, NULL, 'Reserva R2 Sintética', 'ACTIVE', 'KEEP_ORIGINAL', now(), now())`,
+        [baselineUserId, `r2-capacity-baseline-${suffix}@example.test`],
       );
       await client.query(
         `INSERT INTO import_batches (id, user_id, idempotency_key, request_fingerprint)
@@ -2011,14 +1973,14 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.match(signedOriginalUrl.search, /X-Amz-(?:Algorithm|Signature)=/i);
   assert.equal(signedOriginalUrl.searchParams.get("response-cache-control"), "no-store, private, max-age=0");
 
-  const blockedWrongPassword = await app.inject({
+  const blockedWithoutStepUp = await app.inject({
     method: "DELETE",
     url: "/api/v1/privacy/account",
     headers: { origin, cookie: cookieB },
-    payload: { confirmation: "ELIMINAR", password: "contraseña deliberadamente incorrecta", receiptToken: deletionReceiptToken() },
+    payload: { confirmation: "ELIMINAR", receiptToken: deletionReceiptToken() },
   });
-  assert.equal(blockedWrongPassword.statusCode, 403, blockedWrongPassword.body);
-  assert.equal(blockedWrongPassword.json().error.code, "STEP_UP_REQUIRED");
+  assert.equal(blockedWithoutStepUp.statusCode, 403, blockedWithoutStepUp.body);
+  assert.equal(blockedWithoutStepUp.json().error.code, "STEP_UP_REQUIRED");
   const blockedEmploymentDeletion = await app.inject({
     method: "DELETE",
     url: `/api/v1/employments/${employmentB}`,
@@ -2029,14 +1991,7 @@ test("upload privado crea un único documento y un único intent durable", async
     (await pool.query("SELECT 1 FROM employments WHERE id = $1 AND user_id = $2", [employmentB, userIdB])).rowCount,
     1,
   );
-  const stepUpB = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/step-up",
-    headers: { origin, cookie: cookieB },
-    payload: { password: "frase local segura 2026" },
-  });
-  assert.equal(stepUpB.statusCode, 200, stepUpB.body);
-  cookieB = rotatedCookie(stepUpB, cookieB);
+  await grantStepUp(cookieB);
   const foreignOriginal = await app.inject({
     method: "GET",
     url: `/api/v1/documents/${documentId}/original`,
@@ -2076,13 +2031,13 @@ test("upload privado crea un único documento y un único intent durable", async
     1,
   );
 
-  const wrongPassword = await app.inject({
+  const legacyPasswordPayload = await app.inject({
     method: "DELETE",
     url: "/api/v1/privacy/account",
     headers: { origin, cookie: cookieB },
     payload: { confirmation: "ELIMINAR", password: "contraseña deliberadamente incorrecta", receiptToken: deletionReceiptToken() },
   });
-  assert.equal(wrongPassword.statusCode, 401, wrongPassword.body);
+  assert.equal(legacyPasswordPayload.statusCode, 400, legacyPasswordPayload.body);
   const activeDocumentB = crypto.randomUUID();
   const activeJobB = crypto.randomUUID();
   const activeWorkerB = `synthetic-worker-${crypto.randomUUID()}`;
@@ -2116,7 +2071,7 @@ test("upload privado crea un único documento y un único intent durable", async
     method: "DELETE",
     url: "/api/v1/privacy/account",
     headers: { origin, cookie: cookieB },
-    payload: { confirmation: "ELIMINAR", password: "frase local segura 2026", receiptToken: receiptTokenB },
+    payload: { confirmation: "ELIMINAR", receiptToken: receiptTokenB },
   });
   assert.equal(deleteB.statusCode, 202, deleteB.body);
   const receiptB = deleteB.json().data as { receiptToken: string };
@@ -2144,7 +2099,7 @@ test("upload privado crea un único documento y un único intent durable", async
     method: "DELETE",
     url: "/api/v1/privacy/account",
     headers: { origin, cookie: cookieA },
-    payload: { confirmation: "ELIMINAR", password: "frase local segura 2026", receiptToken: receiptTokenA },
+    payload: { confirmation: "ELIMINAR", receiptToken: receiptTokenA },
   });
   assert.equal(deleteA.statusCode, 202, deleteA.body);
   assert.equal(deleteA.json().data.receiptToken, receiptTokenA);

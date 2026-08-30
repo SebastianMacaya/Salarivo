@@ -10,7 +10,6 @@ export type ApiConfig = Readonly<{
   publicOrigin: string;
   logLevel: "silent" | "fatal" | "error" | "warn" | "info" | "debug" | "trace";
   sessionTtlSeconds: number;
-  passwordResetTtlSeconds: number;
   googleOAuth: Readonly<{
     clientId: string;
     clientSecret: string;
@@ -257,13 +256,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
       production ? undefined : 604_800,
       300,
       2_592_000,
-    ),
-    passwordResetTtlSeconds: integer(
-      env.PASSWORD_RESET_TTL_SECONDS,
-      "PASSWORD_RESET_TTL_SECONDS",
-      production ? undefined : 1_800,
-      300,
-      86_400,
     ),
     googleOAuth: googleOAuth(env, production),
     mfaKeyring: mfaKeyring(env, production),

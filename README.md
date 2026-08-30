@@ -6,7 +6,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 
 ## Qué funciona
 
-- alta exclusiva con Google y aceptación legal versionada, login Google o por contraseña para cuentas existentes, onboarding, logout, revocación de otras sesiones y recuperación local de contraseña;
+- alta e inicio de sesión exclusivamente con Google y aceptación legal versionada, onboarding, logout y revocación de otras sesiones;
 - empleadores y empleos;
 - lotes persistentes de uno o muchos PDFs con upload directo privado;
 - ownership, idempotencia, límites, expiración y cleanup;
@@ -21,7 +21,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 
 El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argentinos y produce como máximo una liquidación por PDF; ampliar tipos, países o múltiples liquidaciones exige fixtures y tests nuevos.
 
-Google se integra mediante OIDC Authorization Code con PKCE, `state` y `nonce`. La cuenta conserva su UUID y sus sesiones opacas internas: `auth_accounts` relaciona `(provider, sub)` con ese usuario, el email de Google no identifica ni auto-vincula cuentas y no se persisten access, refresh ni ID tokens. El callback es `GET`, sólo admite redirects internos allowlisted y completa el alta en un segundo paso atómico junto con la aceptación legal. El step-up de una cuenta Google-only exige `max_age=0`, queda ligado a la sesión que lo inició y rota esa sesión al completarse. Ver [ADR 0010](docs/adr/0010-google-oidc-and-external-identities.md).
+Google se integra mediante OIDC Authorization Code con PKCE, `state` y `nonce`. La cuenta conserva su UUID y sus sesiones opacas internas: `auth_accounts` relaciona `(provider, sub)` con ese usuario, el email de Google no identifica ni auto-vincula cuentas y no se persisten access, refresh ni ID tokens. El callback es `GET`, sólo admite redirects internos allowlisted y completa el alta en un segundo paso atómico junto con la aceptación legal. No existen rutas de login, registro o recuperación por contraseña. El step-up sin MFA exige Google con `max_age=0`, queda ligado a la sesión que lo inició y rota esa sesión al completarse. Ver [ADR 0010](docs/adr/0010-google-oidc-and-external-identities.md).
 
 ## Estructura
 
