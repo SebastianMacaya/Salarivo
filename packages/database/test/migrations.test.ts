@@ -22,7 +22,7 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 11);
+  assert.equal(migrations.length, 12);
   const migration = migrations[0];
   assert.ok(migration);
   for (const item of migrations) assert.match(item.checksum, /^[0-9a-f]{64}$/);

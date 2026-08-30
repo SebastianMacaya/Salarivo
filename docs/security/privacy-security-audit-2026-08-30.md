@@ -31,7 +31,7 @@ La evaluación jurídica es técnica e informativa. Fuentes oficiales consultada
 
 ## Evidencia ejecutable
 
-- Migraciones 001–011 aplicadas sobre PostgreSQL local.
+- Migraciones 001–012 aplicadas sobre PostgreSQL local.
 - Unit tests de API, MFA, worker y migraciones.
 - Integración HTTP con dos usuarios: IDOR, MFA, step-up, export, rectificación materializada, descarga y borrados.
 - Worker real contra PostgreSQL, Redis y MinIO locales con fixtures sintéticos: un replay de upload firmado y una ejecución activa mantienen cada baja `PENDING`; al vencer el upload o liberar el marcador de ejecución se eliminan keys, usuarios y relaciones, y cada recibo sobrevive como `COMPLETED` sin cruzar cuentas. Otra prueba demuestra que B progresa en el mismo ciclo aunque A tenga 101 tombstones anteriores.
@@ -39,7 +39,7 @@ La evaluación jurídica es técnica e informativa. Fuentes oficiales consultada
 
 ## Bloqueos P0 antes de datos reales o acceso público
 
-1. **Responsable y derechos.** Aprobar con abogado identidad, domicilio, canal y procedimiento con constancia/SLA; inscribir las bases que correspondan en el RNBDP. Los textos versionados actuales siguen correctamente marcados como borradores y producción bloquea el alta.
+1. **Responsable y derechos.** La versión 1.1 está cerrada y aprobada por el titular sólo para acceso privado individual. Antes de habilitar terceros debe aprobarse con abogado identidad, domicilio, canal y procedimiento con constancia/SLA, e inscribir las bases que correspondan en el RNBDP; la aprobación operativa actual no equivale a cumplimiento jurídico general.
 2. **Base legal y datos sensibles incidentales.** Resolver si el PDF original puede conservar datos de salud o afiliación sindical, qué finalidad/base corresponde y cómo responder ante hallazgos no necesarios. La minimización implementada reduce la extracción, no cambia el contenido del PDF.
 3. **Proveedores y transferencias.** Inventariar hosting, DB, storage, backups, correo, OCR, observabilidad y subencargados; fijar países, DPA, no-training/no-retention y mecanismo válido de transferencia.
 4. **Infraestructura.** Elegir proveedor/región y demostrar bucket privado que nunca haya tenido versioning, KMS, TLS, secretos mínimos separados, egress restringido y aislamiento real del parser sin credenciales ni red. También debe demostrarse que una carga iniciada antes del vencimiento no puede finalizar después de la ventana de gracia; si el proveedor no lo garantiza, se requiere inventario y reborrado posterior antes de marcar la baja como `COMPLETED`. API y worker verifican las primeras condiciones al arrancar, pero falta la evidencia del entorno elegido.

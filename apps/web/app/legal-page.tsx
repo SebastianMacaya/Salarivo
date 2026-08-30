@@ -2,22 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { publishedLegalDocuments, type PublishedLegalDocument } from './legal-documents';
 
 const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
   ?? (process.env.NODE_ENV === 'production' ? '/api/v1' : 'http://localhost:3001/api/v1');
 
-type LegalDocument = {
-  documentType: 'TERMS' | 'PRIVACY_NOTICE';
-  version: string;
-  locale: string;
-  title: string;
-  content: string;
-  effectiveAt: string;
-  requiresAcceptance: boolean;
-};
-
 export function LegalPage({ type }: { type: 'terms' | 'privacy' }) {
-  const [document, setDocument] = useState<LegalDocument | null>(null);
+  const [document, setDocument] = useState<PublishedLegalDocument | null>(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -25,13 +16,17 @@ export function LegalPage({ type }: { type: 'terms' | 'privacy' }) {
     const query = version ? `?version=${encodeURIComponent(version)}` : '';
     fetch(`${API_ROOT}/legal/${type}${query}`)
       .then(async (response) => {
-        const body = await response.json() as { data?: LegalDocument; error?: { message?: string } };
+        const body = await response.json() as { data?: PublishedLegalDocument; error?: { message?: string } };
         if (!response.ok) throw new Error(body?.error?.message ?? 'No pudimos cargar el documento.');
         if (!body.data) throw new Error('El documento legal no está disponible.');
         return body.data;
       })
       .then(setDocument)
-      .catch((caught) => setError(caught instanceof Error ? caught.message : 'No pudimos cargar el documento.'));
+      .catch((caught) => {
+        const fallback = publishedLegalDocuments[type];
+        if (!version || version === fallback.version) setDocument(fallback);
+        else setError(caught instanceof Error ? caught.message : 'No pudimos cargar el documento.');
+      });
   }, [type]);
 
   return (

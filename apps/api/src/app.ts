@@ -52,6 +52,33 @@ class ApiError extends Error {
   }
 }
 
+type RegistrationLegalDocument = {
+  id: unknown;
+  document_type: unknown;
+  version: unknown;
+  requires_acceptance: unknown;
+  approved_for_production: unknown;
+};
+
+export function validateRegistrationLegalDocuments(
+  appEnv: ApiConfig["appEnv"],
+  documents: RegistrationLegalDocument[],
+): { terms: RegistrationLegalDocument; privacy: RegistrationLegalDocument } {
+  const byType = new Map(documents.map((document) => [String(document.document_type), document]));
+  const terms = byType.get("TERMS");
+  const privacy = byType.get("PRIVACY_NOTICE");
+  if (!terms || terms.requires_acceptance !== true || !privacy) {
+    throw new ApiError(503, "LEGAL_DOCUMENTS_UNAVAILABLE", "No se puede crear la cuenta sin los documentos legales vigentes.");
+  }
+  if (
+    appEnv === "production"
+    && (terms.approved_for_production !== true || privacy.approved_for_production !== true)
+  ) {
+    throw new ApiError(503, "LEGAL_REVIEW_REQUIRED", "El alta está cerrada hasta aprobar los documentos legales de producción.");
+  }
+  return { terms, privacy };
+}
+
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const DATE_PATTERN = "^\\d{4}-\\d{2}-\\d{2}$";
 const EMAIL_PATTERN = "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$";
@@ -631,18 +658,7 @@ export async function buildApp(
               AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
             ORDER BY document_type, effective_at DESC, published_at DESC`,
         );
-        const byType = new Map(legalDocuments.rows.map((document) => [String(document.document_type), document]));
-        const terms = byType.get("TERMS");
-        const privacy = byType.get("PRIVACY_NOTICE");
-        if (!terms || terms.requires_acceptance !== true || !privacy) {
-          throw new ApiError(503, "LEGAL_DOCUMENTS_UNAVAILABLE", "No se puede crear la cuenta sin los documentos legales vigentes.");
-        }
-        if (
-          config.appEnv === "production"
-          && (terms.approved_for_production !== true || privacy.approved_for_production !== true)
-        ) {
-          throw new ApiError(503, "LEGAL_REVIEW_REQUIRED", "El alta está cerrada hasta aprobar los documentos legales de producción.");
-        }
+        const { terms, privacy } = validateRegistrationLegalDocuments(config.appEnv, legalDocuments.rows);
         if (
           request.body.termsVersion !== String(terms.version)
           || request.body.privacyVersion !== String(privacy.version)

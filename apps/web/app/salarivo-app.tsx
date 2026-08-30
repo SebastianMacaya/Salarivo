@@ -555,7 +555,7 @@ function AccessScreen({ onAuthenticated, onReceiptToken }: {
           email: form.get('email'),
           password: form.get('password'),
           ...(mode === 'register' ? {
-            displayName: form.get('displayName'),
+            displayName: String(form.get('displayName') ?? '').trim() || null,
             acceptedTerms: form.get('acceptedTerms') === 'on',
             acknowledgedPrivacy: form.get('acknowledgedPrivacy') === 'on',
             termsVersion: legalVersions?.terms,
@@ -604,13 +604,13 @@ function AccessScreen({ onAuthenticated, onReceiptToken }: {
           <p className="eyebrow">Espacio privado</p>
           <h2 id="access-title">{mode === 'register' ? 'Creá tu cuenta' : mode === 'forgot' ? 'Recuperá el acceso' : mode === 'reset' ? 'Elegí una nueva clave' : mode === 'deletion' ? 'Consultá una eliminación' : 'Ingresá a Salarivo'}</h2>
           <form onSubmit={submit} className="stack-form">
-            {mode === 'register' && <label>Nombre<input name="displayName" autoComplete="name" minLength={2} maxLength={80} required /></label>}
+            {mode === 'register' && <label>Nombre (opcional)<input name="displayName" autoComplete="name" minLength={2} maxLength={80} /></label>}
             {(mode === 'login' || mode === 'register' || mode === 'forgot') && <label>Email<input name="email" type="email" autoComplete="email" required /></label>}
             {mode === 'reset' && <label>Código de recuperación<input name="token" autoComplete="one-time-code" required /></label>}
             {mode === 'deletion' && <label>Token del comprobante<input name="token" autoComplete="off" pattern="[A-Za-z0-9_-]{43}" minLength={43} maxLength={43} required autoFocus /></label>}
             {mode !== 'forgot' && mode !== 'deletion' && <label>Contraseña<input name="password" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} required /></label>}
             {mode === 'register' && <div className="legal-checks">
-              <div className="legal-check"><input id="accepted-terms" name="acceptedTerms" type="checkbox" required /><span><label htmlFor="accepted-terms">Acepto los Términos de uso{legalVersions ? ` v${legalVersions.terms}` : ''}.</label> <a href={legalVersions ? `/terms?version=${encodeURIComponent(legalVersions.terms)}` : '/terms'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
+              <div className="legal-check"><input id="accepted-terms" name="acceptedTerms" type="checkbox" required /><span><label htmlFor="accepted-terms">Acepto los Términos de uso{legalVersions ? ` v${legalVersions.terms}` : ''} y autorizo expresamente el tratamiento de mis datos sólo para las funciones que solicite, según el Aviso de privacidad{legalVersions ? ` v${legalVersions.privacy}` : ''}.</label> <a href={legalVersions ? `/terms?version=${encodeURIComponent(legalVersions.terms)}` : '/terms'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
               <div className="legal-check"><input id="acknowledged-privacy" name="acknowledgedPrivacy" type="checkbox" required /><span><label htmlFor="acknowledged-privacy">Confirmo que leí el Aviso de privacidad{legalVersions ? ` v${legalVersions.privacy}` : ''}.</label> <a href={legalVersions ? `/privacy?version=${encodeURIComponent(legalVersions.privacy)}` : '/privacy'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
             </div>}
             {mode === 'register' && legalError && <p className="message error" role="alert">{legalError}</p>}
