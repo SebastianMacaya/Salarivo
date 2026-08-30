@@ -27,6 +27,7 @@ type Options = {
 type CodeBody = { code: string };
 
 const ENROLLMENT_TTL_MS = 10 * 60_000;
+const RECENT_PRIMARY_TTL_MINUTES = 15;
 const LOCK_TTL_MS = 15 * 60_000;
 const MAX_ATTEMPTS = 5;
 const codeBodySchema = {
@@ -214,16 +215,22 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
       const outcome = await withTransaction(async (client) => {
         const user = await client.query(
           `SELECT session.id AS session_id,
-                  session.step_up_expires_at > now() AS stepped_up
+                  session.step_up_expires_at > now() AS stepped_up,
+                  session.created_at >= now() - ($3::integer * interval '1 minute') AS recent_primary,
+                  EXISTS (
+                    SELECT 1 FROM mfa_factors
+                     WHERE user_id = u.id AND status = 'ACTIVE'
+                  ) AS has_active_factor
              FROM users u
              JOIN sessions AS session
                ON session.user_id = u.id AND session.token_hash = $2
               AND session.revoked_at IS NULL AND session.expires_at > now()
             WHERE u.id = $1 FOR UPDATE OF u, session`,
-          [userId, request.authSessionHash],
+          [userId, request.authSessionHash, RECENT_PRIMARY_TTL_MINUTES],
         );
         if (user.rowCount !== 1) return "AUTHENTICATION_REQUIRED";
-        if (!user.rows[0].stepped_up) return "STEP_UP_REQUIRED";
+        if (user.rows[0].has_active_factor && !user.rows[0].stepped_up) return "STEP_UP_REQUIRED";
+        if (!user.rows[0].has_active_factor && !user.rows[0].recent_primary) return "MFA_ENROLLMENT_REAUTH_REQUIRED";
         await client.query(`DELETE FROM mfa_factors WHERE user_id = $1 AND status = 'PENDING'`, [userId]);
         await client.query(
           `INSERT INTO mfa_factors (
@@ -235,6 +242,9 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
       });
       if (outcome === "AUTHENTICATION_REQUIRED") throw new ApiError(401, outcome, "Iniciá sesión para continuar.");
       if (outcome === "STEP_UP_REQUIRED") throw new ApiError(403, outcome, "Confirmá tu identidad para continuar.");
+      if (outcome === "MFA_ENROLLMENT_REAUTH_REQUIRED") {
+        throw new ApiError(403, outcome, `Para configurar la protección, cerrá sesión, volvé a ingresar y repetí el intento dentro de ${RECENT_PRIMARY_TTL_MINUTES} minutos.`);
+      }
       return { data: { secret, otpauthUri: buildTotpUri(secret, request.authUser!.email), expiresAt: expiresAt.toISOString() } };
     },
   );

@@ -852,31 +852,21 @@ test("upload privado crea un único documento y un único intent durable", async
   const blockedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
   assert.equal(blockedAdmin.statusCode, 403, blockedAdmin.body);
   assert.equal(blockedAdmin.json().error.code, "MFA_SETUP_REQUIRED");
-  const blockedEnrollment = await app.inject({
+  await pool.query(
+    "UPDATE sessions SET created_at = now() - interval '16 minutes' WHERE token_hash = $1",
+    [tokenHash(cookieA.split("=", 2)[1]!)],
+  );
+  const staleEnrollment = await app.inject({
     method: "POST",
     url: "/api/v1/auth/mfa/enrollment",
     headers: { origin, cookie: cookieA },
     payload: {},
   });
-  assert.equal(blockedEnrollment.statusCode, 403, blockedEnrollment.body);
-  assert.equal(blockedEnrollment.json().error.code, "STEP_UP_REQUIRED");
-  const adminStepUpCode = `admin-step-up-${suffix}`;
-  const adminSubject = createHash("sha256").update(emailA).digest("base64url");
-  googleIdentities.set(adminStepUpCode, {
-    subject: adminSubject,
-    email: emailA,
-    emailVerified: true,
-    displayName: "Admin Sintético",
-  });
-  const adminStepUpAttempt = await startGoogle("/api/v1/auth/google/step-up/start", cookieA);
-  assert.equal(adminStepUpAttempt.loginHint, adminSubject);
-  const previousAdminCookie = cookieA;
-  const adminStepUpCallback = await googleCallback(adminStepUpAttempt, adminStepUpCode, cookieA);
-  assert.equal(adminStepUpCallback.headers.location, `${origin}/?auth=google-step-up`);
-  cookieA = namedCookie(adminStepUpCallback, "salarivo_session");
-  assert.equal(
-    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: previousAdminCookie } })).statusCode,
-    401,
+  assert.equal(staleEnrollment.statusCode, 403, staleEnrollment.body);
+  assert.equal(staleEnrollment.json().error.code, "MFA_ENROLLMENT_REAUTH_REQUIRED");
+  await pool.query(
+    "UPDATE sessions SET created_at = now() WHERE token_hash = $1",
+    [tokenHash(cookieA.split("=", 2)[1]!)],
   );
   const enrollment = await app.inject({
     method: "POST",
@@ -1807,6 +1797,14 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.deepEqual(isolatedView.json().data, []);
 
   await pool.query("UPDATE sessions SET step_up_expires_at = NULL WHERE user_id = $1", [userIdA]);
+  const blockedReplacementEnrollment = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/mfa/enrollment",
+    headers: { origin, cookie: cookieA },
+    payload: {},
+  });
+  assert.equal(blockedReplacementEnrollment.statusCode, 403, blockedReplacementEnrollment.body);
+  assert.equal(blockedReplacementEnrollment.json().error.code, "STEP_UP_REQUIRED");
   const blockedExport = await app.inject({
     method: "POST",
     url: "/api/v1/privacy/exports",

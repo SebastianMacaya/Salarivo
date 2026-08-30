@@ -1,7 +1,6 @@
 'use client';
 
-import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { isMfaEnrollmentFailure, MFA_ENROLLMENT_RESUME_KEY, shouldResumeMfaEnrollment } from './auth-flow';
+import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { money, percentage } from './format';
 import { uploadFile, type AuthorizedUpload } from './storage-upload';
 
@@ -175,23 +174,6 @@ function clearAuthQuery() {
   window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
 }
 
-function setMfaEnrollmentResume(enabled: boolean) {
-  try {
-    if (enabled) window.sessionStorage.setItem(MFA_ENROLLMENT_RESUME_KEY, '1');
-    else window.sessionStorage.removeItem(MFA_ENROLLMENT_RESUME_KEY);
-  } catch {
-    return;
-  }
-}
-
-function hasMfaEnrollmentResume(): boolean {
-  try {
-    return window.sessionStorage.getItem(MFA_ENROLLMENT_RESUME_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-
 async function downloadApiFile(path: string, filename: string) {
   const response = await fetch(apiUrl(path), { credentials: 'include' });
   if (!response.ok) {
@@ -336,26 +318,20 @@ export function SalarivoApp() {
   const [accessMode, setAccessMode] = useState<'login' | 'google-register'>('login');
   const [accessError, setAccessError] = useState('');
   const [authNotice, setAuthNotice] = useState('');
-  const [resumeMfaEnrollment, setResumeMfaEnrollment] = useState(false);
-  const [mfaEnrollmentError, setMfaEnrollmentError] = useState('');
 
   useEffect(() => {
     let stopped = false;
     const auth = new URLSearchParams(window.location.search).get('auth');
-    const resumeEnrollment = hasMfaEnrollmentResume();
-    const failedEnrollment = isMfaEnrollmentFailure(auth, resumeEnrollment);
 
     if (auth === 'google-registration') {
-      setMfaEnrollmentResume(false);
       void Promise.resolve().then(() => {
         if (!stopped) { setAccessMode('google-register'); setUser(null); }
       });
       return () => { stopped = true; };
     }
-    if (auth && auth !== 'google-success' && auth !== 'google-step-up' && !failedEnrollment) {
+    if (auth && auth !== 'google-success' && auth !== 'google-step-up') {
       void Promise.resolve().then(() => {
         if (!stopped) {
-          setMfaEnrollmentResume(false);
           clearAuthQuery();
           setAccessError(googleAuthErrorMessages[auth] ?? googleAuthErrorMessages['invalid-callback']!);
           setUser(null);
@@ -367,17 +343,12 @@ export function SalarivoApp() {
       (current) => {
         if (stopped) return;
         if (auth) clearAuthQuery();
-        setMfaEnrollmentResume(false);
         setUser(current);
-        if (failedEnrollment && current.authState === 'MFA_SETUP_REQUIRED') {
-          setMfaEnrollmentError('No se completó la confirmación con Google. Seguís conectado; intentá configurar el segundo factor nuevamente.');
-        } else if (shouldResumeMfaEnrollment(auth, current.authState, resumeEnrollment)) setResumeMfaEnrollment(true);
-        else if (auth === 'google-step-up') setAuthNotice('Identidad confirmada. Repetí la acción sensible para completarla.');
+        if (auth === 'google-step-up') setAuthNotice('Identidad confirmada. Repetí la acción sensible para completarla.');
       },
       (caught: unknown) => {
         if (stopped) return;
         if (auth) clearAuthQuery();
-        setMfaEnrollmentResume(false);
         setUser(null);
         if (auth || !(caught instanceof ApiError) || caught.status !== 401) {
           setAccessError(auth
@@ -410,10 +381,8 @@ export function SalarivoApp() {
   if (user.authState === 'MFA_REQUIRED' || user.authState === 'MFA_SETUP_REQUIRED') {
     return <MfaAccessGate
       user={user}
-      resumeEnrollment={resumeMfaEnrollment}
-      enrollmentError={mfaEnrollmentError}
-      onAuthenticated={(current) => { setResumeMfaEnrollment(false); setMfaEnrollmentError(''); setUser(current); }}
-      onLogout={() => { setResumeMfaEnrollment(false); setMfaEnrollmentError(''); setUser(null); }}
+      onAuthenticated={setUser}
+      onLogout={() => setUser(null)}
     />;
   }
   if (!user.onboardingCompleted) {
@@ -519,36 +488,23 @@ function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => Promi
   );
 }
 
-function MfaEnrollment({ pending = false, resume = false, initialError = '', onComplete }: { pending?: boolean; resume?: boolean; initialError?: string; onComplete: () => Promise<void> | void }) {
+function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onComplete: () => Promise<void> | void }) {
   const [enrollment, setEnrollment] = useState<MfaEnrollmentResult | null>(null);
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
-  const [error, setError] = useState(initialError);
+  const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const resumed = useRef(false);
 
-  const beginEnrollment = useCallback(async (redirectOnStepUp = true) => {
+  const beginEnrollment = useCallback(async () => {
     setError(''); setBusy(true);
     try {
       setEnrollment(await api<MfaEnrollmentResult>('/auth/mfa/enrollment', {
         method: 'POST', body: '{}',
       }));
     } catch (caught) {
-      let failure = caught;
-      if (redirectOnStepUp && caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
-        setMfaEnrollmentResume(true);
-        try { await redirectToGoogle('/auth/google/step-up/start'); return; }
-        catch (redirectError) { setMfaEnrollmentResume(false); failure = redirectError; }
-      }
-      setError(failure instanceof Error ? failure.message : 'No pudimos iniciar la configuración.');
+      setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la configuración.');
     }
     finally { setBusy(false); }
   }, []);
-
-  useEffect(() => {
-    if (!resume || resumed.current) return;
-    resumed.current = true;
-    void beginEnrollment(false);
-  }, [beginEnrollment, resume]);
 
   async function confirmEnrollment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError(''); setBusy(true);
@@ -581,14 +537,14 @@ function MfaEnrollment({ pending = false, resume = false, initialError = '', onC
   return (
     <div className="stack-form">
       {pending && <p className="message error">Hay una configuración incompleta. Iniciá una nueva para reemplazarla.</p>}
-      <p>Google puede pedirte que confirmes tu cuenta otra vez por seguridad. Después continuamos acá automáticamente.</p>
+      <p>Usá una app autenticadora compatible con códigos TOTP.</p>
       {error && <p className="message error" role="alert">{error}</p>}
       <button type="button" className="button primary" disabled={busy} onClick={() => void beginEnrollment()}>{busy ? 'Preparando…' : 'Configurar segundo factor'}</button>
     </div>
   );
 }
 
-function MfaAccessGate({ user, resumeEnrollment, enrollmentError, onAuthenticated, onLogout }: { user: User; resumeEnrollment: boolean; enrollmentError: string; onAuthenticated: (user: User) => void; onLogout: () => void }) {
+function MfaAccessGate({ user, onAuthenticated, onLogout }: { user: User; onAuthenticated: (user: User) => void; onLogout: () => void }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -619,7 +575,7 @@ function MfaAccessGate({ user, resumeEnrollment, enrollmentError, onAuthenticate
         <p className="eyebrow">{user.email}</p>
         <h2 id="mfa-access-title">{user.authState === 'MFA_SETUP_REQUIRED' ? 'Activá el segundo factor' : 'Ingresá tu segundo factor'}</h2>
         {user.authState === 'MFA_SETUP_REQUIRED'
-          ? <MfaEnrollment resume={resumeEnrollment} initialError={enrollmentError} onComplete={async () => onAuthenticated(await api<User>('/auth/me'))} />
+          ? <MfaEnrollment onComplete={async () => onAuthenticated(await api<User>('/auth/me'))} />
           : <form className="stack-form" onSubmit={verify}>
               <label>Código de la app o de recuperación<input name="code" autoComplete="one-time-code" maxLength={39} required autoFocus /></label>
               {error && <p className="message error" role="alert">{error}</p>}
