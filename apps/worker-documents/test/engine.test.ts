@@ -64,6 +64,7 @@ test('cleanup conserva la referencia durante la gracia y acota lotes sin upload'
   const grace = 15 * 60 * 1_000;
   assert.equal(uploadCleanupStatus(expiresAt, expiresAt + grace - 1, grace), 'EXPIRED');
   assert.equal(uploadCleanupStatus(expiresAt, expiresAt + grace, grace), 'CANCELLED');
+  assert.equal(uploadCleanupStatus(expiresAt, expiresAt, grace), 'EXPIRED');
   assert.equal(uploadCleanupStatus(expiresAt, expiresAt, grace, true), 'CANCELLED');
   assert.equal(
     pendingUploadCutoff(expiresAt + uploadTtl + grace, uploadTtl, grace).getTime(),

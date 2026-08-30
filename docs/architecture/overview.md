@@ -36,6 +36,8 @@ flowchart TB
 
 El navegador nunca recibe credenciales permanentes ni una URL pública. El acceso directo a storage usa una autorización breve, limitada a una key opaca creada por la API.
 
+El proveedor se selecciona explícitamente. La instancia productiva usa Cloudflare R2 Standard privado, con cifrado AES-256-GCM y claves administradas por Cloudflare; `r2.dev` y custom domains permanecen deshabilitados. API y worker comprueban esa configuración, CORS y lifecycle en modo read-only y fallan cerrados ante drift. El adapter AWS se conserva con sus controles SSE-KMS y Public Access Block. [ADR 0011](../adr/0011-cloudflare-r2-production-storage.md) registra la diferencia sin llevarla al dominio.
+
 ## Responsabilidades
 
 | Componente | Hace | No hace |
@@ -169,7 +171,8 @@ Toda variable se valida al arranque y se obtiene de entorno/secret manager. No h
 | Google OIDC | GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI |
 | Database | DATABASE_URL, DB_POOL_MIN, DB_POOL_MAX |
 | Queue | QUEUE_URL, OUTBOX_POLL_INTERVAL_MS, WORKER_CONCURRENCY, WORKER_CONCURRENCY_PER_USER, JOB_TIMEOUT_MS, JOB_MAX_RETRIES |
-| Storage | OBJECT_STORAGE_ENDPOINT, REGION, BUCKET, ACCESS_KEY, SECRET_KEY, SIGNED_URL_TTL_SECONDS |
+| Storage | OBJECT_STORAGE_PROVIDER, OBJECT_STORAGE_REGION, OBJECT_STORAGE_BUCKET, OBJECT_STORAGE_ACCESS_KEY, OBJECT_STORAGE_SECRET_KEY; API: OBJECT_STORAGE_INTERNAL_ENDPOINT y OBJECT_STORAGE_PUBLIC_ENDPOINT; worker: OBJECT_STORAGE_ENDPOINT; para AWS: OBJECT_STORAGE_KMS_KEY_ID; para R2: PUBLIC_ORIGIN, CLOUDFLARE_ACCOUNT_ID y CLOUDFLARE_R2_API_TOKEN |
+| Web | NEXT_PUBLIC_API_BASE_URL, NEXT_PUBLIC_STORAGE_ORIGIN (origen exacto de R2 para CSP, nunca una URL firmada) |
 | Upload | MAX_FILE_BYTES, MAX_FILES_PER_BATCH, MAX_BATCH_BYTES, MAX_ACTIVE_IMPORTS_PER_USER, MAX_USER_DOCUMENTS, MAX_USER_STORAGE_BYTES |
 | Parsing | MAX_PARSE_TIME_MS, MAX_OCR_TIME_MS, MAX_RENDER_PIXELS, MAX_WORKER_MEMORY_BYTES |
 | Classification | CLASSIFICATION_HIGH_THRESHOLD, CLASSIFICATION_LOW_THRESHOLD, BATCH_REJECTION_SAMPLE_SIZE, BATCH_REJECTION_RATIO |
@@ -179,6 +182,8 @@ Toda variable se valida al arranque y se obtiene de entorno/secret manager. No h
 | Observability | OTEL_ENDPOINT, ERROR_REPORTING_DSN, PII_REDACTION_ENABLED |
 
 Los valores del archivo .env.example sólo levantan infraestructura local. Límites de producto se fijarán junto con tests de abuso y carga, no por intuición.
+
+Para R2, un límite global no configurable de `8.000.000.000` bytes se evalúa dentro de la transacción que reserva cuota para nuevos uploads. Evita que dos requests concurrentes sobrepasen el límite por separado y falla cerrado; complementa, pero no reemplaza, las cuotas por usuario y batch.
 
 Los límites vigentes son defaults globales. En una evolución futura, un entitlement server-side resolverá capacidades y cuotas efectivas sin acoplar el dominio a billing. Un downgrade limitará nuevas operaciones, pero no borrará datos existentes.
 
@@ -212,4 +217,4 @@ El workflow `.github/workflows/ci.yml` ejecuta lint, typecheck, unit, build web,
 
 ## Decisiones abiertas
 
-El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, login local/Google OIDC y MFA TOTP. Siguen abiertos el proveedor cloud, región, cifrado y backups de producción. La integración con Google no levanta el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.
+El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, login local/Google OIDC y MFA TOTP. Cloudflare R2 fue elegido para object storage productivo con cifrado administrado por el proveedor; siguen abiertos la evaluación operativa/jurídica de ubicación y subencargados, el aislamiento final del parser y los backups de producción. La integración con Google y R2 no levanta el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.

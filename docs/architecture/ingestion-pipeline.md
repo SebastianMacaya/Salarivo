@@ -23,7 +23,10 @@ sequenceDiagram
     W->>W: preflight UX
     W->>A: crea sesión/batch
     A->>D: persiste batch + items
-    A-->>W: keys opacas + autorizaciones breves
+    A->>D: reserva sesión/capacidad
+    A->>S: crea marcador condicional
+    A->>D: persiste ETag + revalida capacidad
+    A-->>W: key opaca + autorización If-Match breve
     loop concurrencia acotada
         W->>S: upload directo a cuarentena
         W->>A: confirma item
@@ -36,7 +39,7 @@ sequenceDiagram
     K->>D: persiste cada transición
 ~~~
 
-El preflight del navegador mejora feedback, pero nunca reemplaza controles server-side. La API sólo completa un upload si key, owner, tamaño y metadata de storage coinciden con la sesión.
+El preflight del navegador mejora feedback, pero nunca reemplaza controles server-side. En R2, el primer PUT reemplaza atómicamente un marcador vacío ligado a la sesión; replays con su ETag anterior fallan. La API sólo completa un upload si key, owner, tamaño y metadata de storage coinciden con la sesión. La promoción crea otro marcador en la key canónica y condiciona tanto la fuente como el destino; una carrera se acepta como retry sólo si el objeto ganador coincide exactamente.
 
 El dispatcher reserva como PUBLISHED sólo los slots disponibles y confirma esa transacción antes de publicar en Redis, para que un consumer nunca vea un job aún invisible en DB. Si Redis rechaza la publicación vuelve a PENDING los IDs no enviados; una caída intermedia puede duplicar el mensaje y la idempotencia del worker lo vuelve seguro. El reconciliador recupera reservas vencidas.
 
@@ -201,7 +204,7 @@ Los detalles internos se sanitizan. La UI traduce códigos; no muestra sólo err
 
 ## Cleanup y borrado
 
-Temporales, renders y OCR intermedio tienen TTL corto y owner/documentId. Al cancelar o borrar se revocan URLs, cancelan jobs pendientes, borran objetos derivados y se registra auditoría sin contenido sensible. La política completa está en [Retención](../privacy/data-retention.md).
+Temporales, renders y OCR intermedio tienen TTL corto y owner/documentId. Al cancelar o borrar se cierran sesiones y jobs pendientes. En R2, el delete fuerte del marcador/objeto invalida el `If-Match` y permite cerrar el cleanup tras confirmar el borrado; AWS/local conserva el reborrado hasta vencer TTL y gracia. Cada acción registra auditoría sin contenido sensible. La política completa está en [Retención](../privacy/data-retention.md).
 
 ## Observabilidad
 

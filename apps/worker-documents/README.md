@@ -30,14 +30,17 @@ Una confirmación humana de tipo debe crear un job `TEXT_EXTRACTION` con un `pro
 
 ## Configuración
 
-En producción todas las variables son obligatorias; los defaults existen sólo con `APP_ENV` distinto de `production`.
+En producción las variables comunes son obligatorias. Las credenciales adicionales dependen del proveedor seleccionado y los defaults existen sólo con `APP_ENV` distinto de `production`.
 
 | Variable | Propósito |
 | --- | --- |
 | `DATABASE_URL` | conexión PostgreSQL, validada por `@salarivo/database` |
 | `QUEUE_URL` | conexión Redis |
+| `OBJECT_STORAGE_PROVIDER` | `aws` o `r2`; obligatorio en producción |
 | `OBJECT_STORAGE_ENDPOINT`, `OBJECT_STORAGE_REGION`, `OBJECT_STORAGE_BUCKET` | storage privado |
 | `OBJECT_STORAGE_ACCESS_KEY`, `OBJECT_STORAGE_SECRET_KEY` | credenciales del worker |
+| `PUBLIC_ORIGIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_R2_API_TOKEN` | validación fail-closed de la configuración privada de R2 en producción |
+| `OBJECT_STORAGE_KMS_KEY_ID` | clave KMS obligatoria sólo con AWS en producción; R2 usa cifrado administrado por Cloudflare |
 | `CLAMAV_HOST`, `CLAMAV_PORT` | scanner privado |
 | `MAX_FILE_BYTES`, `MAX_PAGES`, `MAX_RENDER_PIXELS` | límites del documento |
 | `MAX_PARSE_TIME_MS`, `MAX_OCR_TIME_MS`, `MAX_OCR_PAGES`, `MAX_EXTRACTED_TEXT_BYTES` | límites de procesos y output |

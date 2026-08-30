@@ -5,7 +5,8 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
 import { sessionCookieName, tokenHash, verifyPassword } from "./security.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
-import { createStorage } from "./storage.ts";
+import { lockR2UploadCapacity } from "./r2-capacity.ts";
+import { createStorage, waitForR2WriteWindow, type Storage } from "./storage.ts";
 
 type ErrorConstructor = new (statusCode: number, code: string, message: string) => Error;
 type RegisterOptions = {
@@ -14,6 +15,7 @@ type RegisterOptions = {
   requireStepUp: (request: FastifyRequest) => Promise<void>;
   ApiError: ErrorConstructor;
   provisionStorage: boolean;
+  storage?: Storage;
 };
 type IdParams = { id: string };
 type ImportItemInput = {
@@ -417,7 +419,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   const { config, requireAuth, requireStepUp, ApiError } = options;
   const sessionCookie = sessionCookieName(config.appEnv);
   const rateKey = (request: FastifyRequest) => authenticatedRateKey(request, sessionCookie);
-  const storage = createStorage(config);
+  const storage = options.storage ?? createStorage(config);
   const claimedExports = new WeakSet<FastifyRequest>();
   const failedExports = new WeakSet<FastifyRequest>();
   const exportReservations = new WeakSet<FastifyRequest>();
@@ -731,7 +733,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       },
     },
     async (request, reply) => {
-      const session = await withTransaction(async (client) => {
+      const prepared = await withTransaction(async (client) => {
         const activeUser = await client.query(
           "SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE",
           [request.authUser!.id],
@@ -754,18 +756,35 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         );
         await client.query(
           `UPDATE upload_sessions SET status = 'EXPIRED'
-            WHERE item_id = $1 AND status = 'OPEN' AND expires_at <= now()`,
+            WHERE item_id = $1 AND status = 'OPEN' AND expires_at < now() + interval '1 second'`,
           [request.body.itemId],
         );
         const current = await client.query(
-          `SELECT id, object_key, expected_size_bytes, expires_at
+          `SELECT id, object_key, expected_size_bytes, expires_at, upload_marker_etag
              FROM upload_sessions WHERE item_id = $1 AND status = 'OPEN'`,
           [request.body.itemId],
         );
-        if (current.rowCount) return current.rows[0];
+        if (current.rowCount) {
+          const row = current.rows[0];
+          if (config.storageProvider === "r2") return { ...row, signed: null };
+          const expiresIn = Math.max(1, Math.floor((new Date(row.expires_at).valueOf() - Date.now()) / 1_000));
+          const signed = await storage.authorizeUpload(
+            String(row.id),
+            String(row.object_key),
+            Number(row.expected_size_bytes),
+            expiresIn,
+          );
+          return { ...row, signed };
+        }
         const id = randomUUID();
         const objectKey = `incoming/${randomUUID()}.pdf`;
         const expiresAt = new Date(Date.now() + config.uploadTtlSeconds * 1000);
+        if (
+          config.storageProvider === "r2"
+          && !await lockR2UploadCapacity(client, Number(item.rows[0].expected_size_bytes))
+        ) {
+          throw new ApiError(503, "R2_STORAGE_CAPACITY_EXCEEDED", "El almacenamiento no tiene capacidad disponible temporalmente.");
+        }
         await client.query(
           `INSERT INTO upload_sessions (
              id, user_id, batch_id, item_id, object_key, expected_size_bytes,
@@ -773,10 +792,121 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
            ) VALUES ($1, $2, $3, $4, $5, $6, 'application/pdf', $7)`,
           [id, request.authUser!.id, item.rows[0].batch_id, request.body.itemId, objectKey, item.rows[0].expected_size_bytes, expiresAt],
         );
-        return { id, object_key: objectKey, expected_size_bytes: item.rows[0].expected_size_bytes, expires_at: expiresAt };
+        if (config.storageProvider === "r2") {
+          return {
+            id,
+            object_key: objectKey,
+            expected_size_bytes: item.rows[0].expected_size_bytes,
+            expires_at: expiresAt,
+            upload_marker_etag: null,
+            signed: null,
+          };
+        }
+        const signed = await storage.authorizeUpload(
+          id,
+          objectKey,
+          Number(item.rows[0].expected_size_bytes),
+          Math.floor((expiresAt.valueOf() - Date.now()) / 1_000),
+        );
+        return {
+          id,
+          object_key: objectKey,
+          expected_size_bytes: item.rows[0].expected_size_bytes,
+          expires_at: expiresAt,
+          upload_marker_etag: null,
+          signed,
+        };
       });
-      const signed = await storage.authorizeUpload(String(session.id), String(session.object_key), Number(session.expected_size_bytes));
-      return reply.code(201).send({ data: { id: String(session.id), url: signed.url, fields: signed.fields, expiresAt: timestamp(session.expires_at) } });
+      let upload = prepared;
+      if (config.storageProvider === "r2") {
+        let markerEtag = typeof prepared.upload_marker_etag === "string"
+          ? prepared.upload_marker_etag
+          : null;
+        if (!markerEtag) {
+          try {
+            markerEtag = await storage.createUploadMarker(String(prepared.id), String(prepared.object_key));
+          } catch {
+            throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente.");
+          }
+        }
+        // Keep the R2 same-key write window outside every database/advisory lock.
+        await waitForR2WriteWindow();
+        const finalized = await withTransaction(async (client) => {
+          const locked = await client.query(
+            `SELECT session.id, session.object_key, session.expected_size_bytes,
+                    session.status, session.expires_at, session.upload_marker_etag,
+                    item.status AS item_status, batch.status AS batch_status
+               FROM upload_sessions AS session
+               JOIN import_batch_items AS item
+                 ON item.id = session.item_id AND item.user_id = session.user_id
+               JOIN import_batches AS batch
+                 ON batch.id = session.batch_id AND batch.user_id = session.user_id
+               JOIN users ON users.id = session.user_id AND users.status = 'ACTIVE'
+              WHERE session.id = $1 AND session.user_id = $2
+              FOR UPDATE OF users, batch, item, session`,
+            [prepared.id, request.authUser!.id],
+          );
+          if (!locked.rowCount) return { kind: "not-found" as const };
+          const row = locked.rows[0];
+          if (
+            row.item_status !== "PENDING_UPLOAD"
+            || row.batch_status !== "ACTIVE"
+            || row.status !== "OPEN"
+            || new Date(row.expires_at).valueOf() <= Date.now() + 1_000
+          ) {
+            return { kind: "not-uploadable" as const };
+          }
+          if (row.upload_marker_etag && row.upload_marker_etag !== markerEtag) {
+            return { kind: "storage-error" as const };
+          }
+          if (!row.upload_marker_etag) {
+            await client.query(
+              `UPDATE upload_sessions SET upload_marker_etag = $2
+                WHERE id = $1 AND user_id = $3 AND status = 'OPEN'`,
+              [prepared.id, markerEtag, request.authUser!.id],
+            );
+          }
+          if (!await lockR2UploadCapacity(client, 0)) {
+            return { kind: "capacity" as const };
+          }
+          const expiresIn = Math.floor((new Date(row.expires_at).valueOf() - Date.now()) / 1_000);
+          try {
+            const signed = await storage.authorizeUpload(
+              String(row.id),
+              String(row.object_key),
+              Number(row.expected_size_bytes),
+              expiresIn,
+              markerEtag,
+            );
+            return { kind: "ready" as const, row, signed };
+          } catch {
+            return { kind: "storage-error" as const };
+          }
+        });
+        if (finalized.kind === "not-found") {
+          throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        }
+        if (finalized.kind === "not-uploadable") {
+          throw new ApiError(409, "ITEM_NOT_UPLOADABLE", "El archivo ya no admite una carga.");
+        }
+        if (finalized.kind === "capacity") {
+          throw new ApiError(503, "R2_STORAGE_CAPACITY_EXCEEDED", "El almacenamiento no tiene capacidad disponible temporalmente.");
+        }
+        if (finalized.kind === "storage-error") {
+          throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente.");
+        }
+        upload = { ...finalized.row, signed: finalized.signed };
+      }
+      return reply.code(201).send({
+        data: {
+          id: String(upload.id),
+          url: upload.signed.url,
+          fields: upload.signed.fields,
+          method: upload.signed.method,
+          headers: upload.signed.headers,
+          expiresAt: timestamp(upload.expires_at),
+        },
+      });
     },
   );
 
@@ -843,7 +973,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           throw new ApiError(409, "UPLOAD_OBJECT_MISMATCH", "El archivo recibido no coincide con la autorización.");
         }
         try {
-          await storage.makeCanonical(String(session.object_key), canonicalKey, etag);
+          await storage.makeCanonical(
+            request.params.id,
+            String(session.object_key),
+            canonicalKey,
+            etag,
+            Number(session.expected_size_bytes),
+          );
         } catch {
           throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente.");
         }
@@ -876,6 +1012,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       });
       try {
         await storage.deleteObject(String(session.object_key));
+        if (config.storageProvider === "r2") {
+          await pool.query(
+            `UPDATE upload_sessions SET object_key = $2
+              WHERE id = $1 AND status = 'CONFIRMED' AND object_key = $3`,
+            [request.params.id, canonicalKey, session.object_key],
+          );
+        }
       } catch {
         // El reconciliador reintenta; la respuesta no depende de este cleanup.
       }

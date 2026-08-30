@@ -12,6 +12,7 @@ import Fastify, {
 } from "fastify";
 import type { ApiConfig } from "./config.ts";
 import { registerDataRoutes } from "./data-routes.ts";
+import type { Storage } from "./storage.ts";
 import { registerGoogleAuthRoutes } from "./google-auth-routes.ts";
 import { createGoogleOidc, type GoogleOidcClient } from "./google-oidc.ts";
 import { registerMfaRoutes } from "./mfa-routes.ts";
@@ -381,7 +382,7 @@ const dummyPasswordHash = hashPassword("dummy password used only for timing");
 
 export async function buildApp(
   config: ApiConfig,
-  options: { provisionStorage?: boolean; googleOidc?: GoogleOidcClient } = {},
+  options: { provisionStorage?: boolean; googleOidc?: GoogleOidcClient; storage?: Storage } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
     bodyLimit: 256 * 1024,
@@ -1422,6 +1423,7 @@ export async function buildApp(
     requireStepUp,
     ApiError,
     provisionStorage: options.provisionStorage ?? config.appEnv !== "test",
+    ...(options.storage ? { storage: options.storage } : {}),
   });
 
   return app;

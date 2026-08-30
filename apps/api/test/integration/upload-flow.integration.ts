@@ -8,6 +8,11 @@ import test from "node:test";
 import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { createClient } from "redis";
 import type { GoogleIdentity, GoogleOidcClient } from "../../src/google-oidc.ts";
+import {
+  lockR2PhysicalStorageBytes,
+  R2_GLOBAL_STORAGE_CAP_BYTES,
+} from "../../src/r2-capacity.ts";
+import { createStorage } from "../../src/storage.ts";
 
 const origin = "http://localhost:3000";
 
@@ -139,6 +144,9 @@ test("upload privado crea un único documento y un único intent durable", async
           clearTimeout(timer);
           resolve();
         }
+      });
+      worker.stderr.on("data", (chunk) => {
+        output += String(chunk);
       });
       worker.once("error", (error) => {
         clearTimeout(timer);
@@ -993,6 +1001,178 @@ test("upload privado crea un único documento y un único intent durable", async
     createHash("sha256").update(googleDeletionToken).digest("hex"),
   ]);
 
+  const r2Config = loadConfig({
+    ...process.env,
+    APP_ENV: "test",
+    LOG_LEVEL: "silent",
+    PUBLIC_ORIGIN: origin,
+    OBJECT_STORAGE_PROVIDER: "r2",
+    CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+    CLOUDFLARE_R2_API_TOKEN: "synthetic-read-token",
+    OBJECT_STORAGE_ACCESS_KEY: "synthetic-r2-access-key",
+    OBJECT_STORAGE_SECRET_KEY: "synthetic-r2-secret-key",
+    OBJECT_STORAGE_BUCKET: config.storageBucket,
+    OBJECT_STORAGE_INTERNAL_ENDPOINT: undefined,
+    OBJECT_STORAGE_PUBLIC_ENDPOINT: undefined,
+    OBJECT_STORAGE_KMS_KEY_ID: undefined,
+    OBJECT_STORAGE_REGION: undefined,
+  });
+  const r2Storage = createStorage(r2Config);
+  let createdMarkers = 0;
+  const r2App = await buildApp(r2Config, {
+    provisionStorage: false,
+    googleOidc,
+    storage: {
+      ...r2Storage,
+      async createUploadMarker() {
+        createdMarkers += 1;
+        return '"synthetic-marker-etag"';
+      },
+    },
+  });
+  await r2App.ready();
+  const capacityUserIds: string[] = [];
+  try {
+    const capacityEmails = [
+      `r2-capacity-a-${suffix}@example.test`,
+      `r2-capacity-b-${suffix}@example.test`,
+    ];
+    const capacityCookies = await Promise.all(capacityEmails.map(seedPasswordAccount));
+    const capacityUsers = await pool.query<{ email: string; id: string }>(
+      "SELECT id, email FROM users WHERE email = ANY($1::text[]) ORDER BY email",
+      [capacityEmails],
+    );
+    assert.equal(capacityUsers.rowCount, 2);
+    capacityUserIds.push(...capacityUsers.rows.map((row) => row.id));
+
+    const capacityItemIds: string[] = [];
+    for (let index = 0; index < capacityCookies.length; index += 1) {
+      const response = await r2App.inject({
+        method: "POST",
+        url: "/api/v1/imports",
+        headers: {
+          origin,
+          cookie: capacityCookies[index],
+          "idempotency-key": crypto.randomUUID(),
+        },
+        payload: {
+          items: [{
+            clientItemKey: crypto.randomUUID(),
+            originalFilename: `capacidad-${index + 1}.pdf`,
+            declaredMimeType: "application/pdf",
+            expectedSizeBytes: 20_000_000,
+          }],
+        },
+      });
+      assert.equal(response.statusCode, 201, response.body);
+      capacityItemIds.push(String(response.json().data.items[0].id));
+    }
+
+    const baselineUserId = crypto.randomUUID();
+    const baselineBatchId = crypto.randomUUID();
+    const baselineItemId = crypto.randomUUID();
+    const baselineSessionId = crypto.randomUUID();
+    capacityUserIds.push(baselineUserId);
+    await withTransaction(async (client) => {
+      const currentPhysicalBytes = await lockR2PhysicalStorageBytes(client);
+      const candidateReservationBytes = 40_000_000n;
+      const baselineReservationBytes = R2_GLOBAL_STORAGE_CAP_BYTES
+        - currentPhysicalBytes
+        - candidateReservationBytes;
+      assert.ok(baselineReservationBytes > 2n);
+      const baselineExpectedSize = baselineReservationBytes / 2n;
+      const remainderSize = baselineReservationBytes % 2n;
+      await client.query(
+        `INSERT INTO users (
+           id, email, password_hash, display_name, status, default_retention_policy,
+           onboarding_completed_at, last_login_at
+         ) VALUES ($1, $2, $3, 'Reserva R2 Sintética', 'ACTIVE', 'KEEP_ORIGINAL', now(), now())`,
+        [baselineUserId, `r2-capacity-baseline-${suffix}@example.test`, "synthetic-password-hash-long-enough"],
+      );
+      await client.query(
+        `INSERT INTO import_batches (id, user_id, idempotency_key, request_fingerprint)
+         VALUES ($1, $2, $3, $4)`,
+        [baselineBatchId, baselineUserId, crypto.randomUUID(), "0".repeat(64)],
+      );
+      await client.query(
+        `INSERT INTO import_batch_items (
+           id, user_id, batch_id, client_item_key, ordinal, original_filename,
+           declared_mime_type, expected_size_bytes
+         ) VALUES ($1, $2, $3, $4, 0, 'reserva-global.pdf', 'application/pdf', $5)`,
+        [baselineItemId, baselineUserId, baselineBatchId, crypto.randomUUID(), baselineExpectedSize.toString()],
+      );
+      await client.query(
+        `INSERT INTO upload_sessions (
+           id, user_id, batch_id, item_id, object_key, expected_size_bytes,
+           expected_mime_type, expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'application/pdf', now() + interval '5 minutes')`,
+        [baselineSessionId, baselineUserId, baselineBatchId, baselineItemId, `incoming/${baselineSessionId}.pdf`, baselineExpectedSize.toString()],
+      );
+      if (remainderSize === 1n) {
+        const remainderItemId = crypto.randomUUID();
+        const remainderSessionId = crypto.randomUUID();
+        await client.query(
+          `INSERT INTO import_batch_items (
+             id, user_id, batch_id, client_item_key, ordinal, original_filename,
+             declared_mime_type, expected_size_bytes
+           ) VALUES ($1, $2, $3, $4, 1, 'reserva-global-resto.pdf', 'application/pdf', 1)`,
+          [remainderItemId, baselineUserId, baselineBatchId, crypto.randomUUID()],
+        );
+        await client.query(
+          `INSERT INTO upload_sessions (
+             id, user_id, batch_id, item_id, object_key, expected_size_bytes,
+             expected_mime_type, status, expires_at
+           ) VALUES ($1, $2, $3, $4, $5, 1, 'application/pdf', 'CANCELLED', now() + interval '5 minutes')`,
+          [remainderSessionId, baselineUserId, baselineBatchId, remainderItemId, `incoming/${remainderSessionId}.pdf`],
+        );
+        await client.query(
+          `INSERT INTO storage_deletion_tombstones (
+             id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+           ) VALUES ($1, $2, $3, $3, now() + interval '5 minutes')`,
+          [crypto.randomUUID(), baselineUserId, `incoming/${remainderSessionId}.pdf`],
+        );
+      }
+    });
+
+    const capacityResponses = await Promise.all(capacityItemIds.map((itemId, index) => r2App.inject({
+      method: "POST",
+      url: "/api/v1/upload-sessions",
+      headers: { origin, cookie: capacityCookies[index] },
+      payload: { itemId },
+    })));
+    assert.deepEqual(capacityResponses.map((response) => response.statusCode).sort(), [201, 503]);
+    const acceptedCapacity = capacityResponses.find((response) => response.statusCode === 201);
+    const deniedCapacity = capacityResponses.find((response) => response.statusCode === 503);
+    assert.ok(acceptedCapacity);
+    assert.ok(deniedCapacity);
+    assert.equal(acceptedCapacity.json().data.method, "PUT");
+    assert.match(String(acceptedCapacity.json().data.url), /X-Amz-SignedHeaders=[^&]*content-length/i);
+    assert.equal(acceptedCapacity.json().data.headers["Content-Length"], "20000000");
+    assert.equal(deniedCapacity.json().error.code, "R2_STORAGE_CAPACITY_EXCEEDED");
+
+    const reserved = await pool.query<{ count: number; owners: number }>(
+      `SELECT count(*)::integer AS count, count(DISTINCT user_id)::integer AS owners
+         FROM upload_sessions
+        WHERE user_id = ANY($1::uuid[]) AND status = 'OPEN'`,
+      [capacityUsers.rows.map((row) => row.id)],
+    );
+    const reservation = reserved.rows[0];
+    assert.ok(reservation);
+    assert.equal(reservation.count, 1);
+    assert.equal(reservation.owners, 1);
+    assert.equal(createdMarkers, 1);
+    assert.equal(
+      await withTransaction((client) => lockR2PhysicalStorageBytes(client)),
+      R2_GLOBAL_STORAGE_CAP_BYTES,
+    );
+  } finally {
+    await r2App.close();
+    if (capacityUserIds.length > 0) {
+      await pool.query("DELETE FROM storage_deletion_tombstones WHERE user_id = ANY($1::uuid[])", [capacityUserIds]);
+      await pool.query("DELETE FROM users WHERE id = ANY($1::uuid[])", [capacityUserIds]);
+    }
+  }
+
   const itemKey = crypto.randomUUID();
   const idempotencyKey = crypto.randomUUID();
   const pdfBytes = syntheticPayrollPdf();
@@ -1071,10 +1251,53 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(cancelledBatch.statusCode, 200, cancelledBatch.body);
   assert.equal(cancelledBatch.json().data.status, "CANCELLED");
   assert.equal(cancelledBatch.json().data.items[0].status, "CANCELLED");
-  assert.ok(
-    ["EXPIRED", "CANCELLED"].includes(
-      (await pool.query("SELECT status FROM upload_sessions WHERE id = $1", [cancelledUploadSession.json().data.id])).rows[0].status,
-    ),
+  assert.equal(
+    (await pool.query("SELECT status FROM upload_sessions WHERE id = $1", [cancelledUploadSession.json().data.id])).rows[0].status,
+    "EXPIRED",
+  );
+  const cancelledSessionId = String(cancelledUploadSession.json().data.id);
+  const cancelledObjectKey = String((await pool.query(
+    "SELECT object_key FROM upload_sessions WHERE id = $1",
+    [cancelledSessionId],
+  )).rows[0].object_key);
+  await runWorkerUntil("uploads_cleaned");
+  assert.equal(
+    (await pool.query("SELECT status FROM upload_sessions WHERE id = $1", [cancelledSessionId])).rows[0].status,
+    "EXPIRED",
+  );
+  assert.equal(await objectExists(cancelledObjectKey), false);
+  const capacityAfterFirstCleanup = await withTransaction((client) => lockR2PhysicalStorageBytes(client));
+
+  const cancelledPdf = new Blob([pdfBytes], { type: "application/pdf" });
+  const cancelledForm = new FormData();
+  for (const [name, value] of Object.entries(cancelledUploadSession.json().data.fields as Record<string, string>)) {
+    cancelledForm.append(name, value);
+  }
+  cancelledForm.append("file", cancelledPdf, "recibo-cancelado-sintetico.pdf");
+  const cancelledReplay = await fetch(String(cancelledUploadSession.json().data.url), {
+    method: "POST",
+    body: cancelledForm,
+  });
+  assert.equal(cancelledReplay.status, 204, await cancelledReplay.text());
+  assert.equal(await objectExists(cancelledObjectKey), true);
+  const capacityBeforeFinalCleanup = await withTransaction((client) => lockR2PhysicalStorageBytes(client));
+  assert.equal(capacityBeforeFinalCleanup, capacityAfterFirstCleanup);
+
+  await pool.query(
+    `UPDATE upload_sessions
+        SET created_at = now() - interval '3 minutes', expires_at = now() - interval '2 minutes'
+      WHERE id = $1 AND status = 'EXPIRED'`,
+    [cancelledSessionId],
+  );
+  await runWorkerUntil("uploads_cleaned");
+  assert.equal(await objectExists(cancelledObjectKey), false);
+  assert.equal(
+    (await pool.query("SELECT status FROM upload_sessions WHERE id = $1", [cancelledSessionId])).rows[0].status,
+    "CANCELLED",
+  );
+  assert.equal(
+    capacityBeforeFinalCleanup - await withTransaction((client) => lockR2PhysicalStorageBytes(client)),
+    BigInt(pdfBytes.byteLength) * 2n,
   );
 
   const repeated = await app.inject({

@@ -2,6 +2,7 @@
 
 import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { money, percentage } from './format';
+import { uploadFile, type AuthorizedUpload } from './storage-upload';
 
 const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
   ?? (process.env.NODE_ENV === 'production' ? '/api/v1' : 'http://localhost:3001/api/v1');
@@ -1126,11 +1127,8 @@ function Importer({ onDone }: { onDone: () => void }) {
         if (!file || !item) continue;
         update(index, { status: 'SUBIENDO', message: undefined });
         try {
-          const upload = await api<{ id: string; url: string; fields: Record<string, string> }>('/upload-sessions', { method: 'POST', body: JSON.stringify({ itemId: item.id }) });
-          const form = new FormData();
-          Object.entries(upload.fields).forEach(([name, value]) => form.append(name, value));
-          form.append('file', file);
-          const uploaded = await fetch(upload.url, { method: 'POST', body: form });
+          const upload = await api<{ id: string } & AuthorizedUpload>('/upload-sessions', { method: 'POST', body: JSON.stringify({ itemId: item.id }) });
+          const uploaded = await uploadFile(upload, file);
           if (!uploaded.ok) throw new Error(`El almacenamiento rechazó el archivo (${uploaded.status}).`);
           await api(`/upload-sessions/${upload.id}/complete`, { method: 'POST', body: '{}' });
           update(index, { status: 'EN_COLA', message: 'Validación de seguridad en curso' });

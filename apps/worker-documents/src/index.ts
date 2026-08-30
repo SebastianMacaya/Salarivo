@@ -1,9 +1,6 @@
 import {
   DeleteObjectCommand,
-  GetBucketEncryptionCommand,
-  GetBucketVersioningCommand,
   GetObjectCommand,
-  GetPublicAccessBlockCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
 import { migrate, pool, withTransaction } from '@salarivo/database';
@@ -33,6 +30,12 @@ import {
   type PayrollExtraction,
 } from './engine.ts';
 import { runtimeEnvironment, type RuntimeEnvironment } from './environment.ts';
+import {
+  assertProductionStorageConfig,
+  objectStorageProvider,
+  verifyProductionStorage,
+  type StorageProvider,
+} from './storage.ts';
 
 const QUEUE_NAME = 'salarivo:processing-jobs:documents';
 const WORKER_VERSION = '3';
@@ -44,6 +47,8 @@ type WorkerConfig = {
   clamavPort: number;
   classificationHighThreshold: number;
   classificationLowThreshold: number;
+  cloudflareAccountId: string | null;
+  cloudflareApiToken: string | null;
   dispatcherBatchSize: number;
   dispatcherPollMs: number;
   jobLeaseMs: number;
@@ -55,11 +60,13 @@ type WorkerConfig = {
   maxRenderPixels: number;
   maxTextBytes: number;
   publishedRetryMs: number;
+  publicOrigin: string | null;
   queueUrl: string;
   storageAccessKey: string;
   storageBucket: string;
   storageEndpoint: string;
   storageKmsKeyId: string | null;
+  storageProvider: StorageProvider;
   storageRegion: string;
   storageSecretKey: string;
   uploadCleanupGraceMs: number;
@@ -142,6 +149,7 @@ function probability(name: string, localDefault: number): number {
 
 function loadConfig(): WorkerConfig {
   const appEnv = runtimeEnvironment();
+  const storageProvider = objectStorageProvider(process.env.OBJECT_STORAGE_PROVIDER, appEnv === 'production');
   const localStorageAliases = appEnv === 'production' ? [] : ['MINIO_ROOT_USER'];
   const localStorageSecretAliases = appEnv === 'production' ? [] : ['MINIO_ROOT_PASSWORD'];
   const low = probability('CLASSIFICATION_LOW_THRESHOLD', 0.2);
@@ -153,6 +161,8 @@ function loadConfig(): WorkerConfig {
     clamavPort: positiveInt('CLAMAV_PORT', 3310, 1, 65_535),
     classificationHighThreshold: high,
     classificationLowThreshold: low,
+    cloudflareAccountId: storageProvider === 'r2' && appEnv === 'production' ? env('CLOUDFLARE_ACCOUNT_ID') : (process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || null),
+    cloudflareApiToken: storageProvider === 'r2' && appEnv === 'production' ? env('CLOUDFLARE_R2_API_TOKEN') : (process.env.CLOUDFLARE_R2_API_TOKEN?.trim() || null),
     dispatcherBatchSize: positiveInt('OUTBOX_BATCH_SIZE', 25, 1, 100),
     dispatcherPollMs: positiveInt('OUTBOX_POLL_INTERVAL_MS', 1_000, 100, 60_000),
     jobLeaseMs: positiveInt('JOB_TIMEOUT_MS', 600_000, 30_000, 3_600_000),
@@ -164,11 +174,13 @@ function loadConfig(): WorkerConfig {
     maxRenderPixels: positiveInt('MAX_RENDER_PIXELS', 40_000_000, 1_000_000, 200_000_000),
     maxTextBytes: positiveInt('MAX_EXTRACTED_TEXT_BYTES', 2 * 1024 * 1024, 8_192, 10 * 1024 * 1024),
     publishedRetryMs: positiveInt('PUBLISHED_RETRY_MS', 60_000, 5_000, 600_000),
+    publicOrigin: storageProvider === 'r2' && appEnv === 'production' ? env('PUBLIC_ORIGIN') : (process.env.PUBLIC_ORIGIN?.trim() || null),
     queueUrl: env('QUEUE_URL', `redis://127.0.0.1:${process.env.REDIS_PORT?.trim() || '6379'}`),
     storageAccessKey: env('OBJECT_STORAGE_ACCESS_KEY', 'salarivo', localStorageAliases),
     storageBucket: env('OBJECT_STORAGE_BUCKET', 'salarivo-documents-local'),
     storageEndpoint: env('OBJECT_STORAGE_ENDPOINT', `http://127.0.0.1:${process.env.MINIO_API_PORT?.trim() || '9000'}`),
-    storageKmsKeyId: appEnv === 'production' ? env('OBJECT_STORAGE_KMS_KEY_ID') : (process.env.OBJECT_STORAGE_KMS_KEY_ID?.trim() || null),
+    storageKmsKeyId: storageProvider === 'aws' && appEnv === 'production' ? env('OBJECT_STORAGE_KMS_KEY_ID') : (process.env.OBJECT_STORAGE_KMS_KEY_ID?.trim() || null),
+    storageProvider,
     storageRegion: env('OBJECT_STORAGE_REGION', 'us-east-1'),
     storageSecretKey: env('OBJECT_STORAGE_SECRET_KEY', 'salarivo_local_change_me_123', localStorageSecretAliases),
     uploadCleanupGraceMs: positiveInt('UPLOAD_CLEANUP_GRACE_MS', 15 * 60_000, 60_000, 86_400_000),
@@ -186,25 +198,8 @@ function loadConfig(): WorkerConfig {
     if (new URL(config.queueUrl).protocol !== 'rediss:') throw new Error('QUEUE_URL must use TLS in production');
     if (new URL(config.storageEndpoint).protocol !== 'https:') throw new Error('OBJECT_STORAGE_ENDPOINT must use HTTPS in production');
   }
+  assertProductionStorageConfig(config);
   return config;
-}
-
-async function verifyProductionStorage(s3: S3Client, config: WorkerConfig): Promise<void> {
-  if (config.appEnv !== 'production') return;
-  const [versioning, encryption, access] = await Promise.all([
-    s3.send(new GetBucketVersioningCommand({ Bucket: config.storageBucket }), { abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) }),
-    s3.send(new GetBucketEncryptionCommand({ Bucket: config.storageBucket }), { abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) }),
-    s3.send(new GetPublicAccessBlockCommand({ Bucket: config.storageBucket }), { abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) }),
-  ]);
-  if (versioning.Status !== undefined) throw new Error('OBJECT_STORAGE_BUCKET must never have versioning enabled');
-  const kms = encryption.ServerSideEncryptionConfiguration?.Rules?.some((rule) =>
-    rule.ApplyServerSideEncryptionByDefault?.SSEAlgorithm === 'aws:kms'
-    && rule.ApplyServerSideEncryptionByDefault.KMSMasterKeyID === config.storageKmsKeyId);
-  if (!kms) throw new Error('OBJECT_STORAGE_BUCKET must use the configured KMS key');
-  const block = access.PublicAccessBlockConfiguration;
-  if (!block?.BlockPublicAcls || !block.IgnorePublicAcls || !block.BlockPublicPolicy || !block.RestrictPublicBuckets) {
-    throw new Error('OBJECT_STORAGE_BUCKET must block all public access');
-  }
 }
 
 function deleteStorageObject(s3: S3Client, bucket: string, key: string) {
@@ -575,11 +570,10 @@ async function cleanupExpiredUploads(
   s3: S3Client,
   config: WorkerConfig,
 ): Promise<{ batches: number; items: number; objects: number }> {
-  const expired = await pool.query<{ expires_at: Date; id: string; object_key: string; user_cancelled: boolean }>(
+  const expired = await pool.query<{ expires_at: Date; id: string; object_key: string }>(
     `WITH candidates AS (
-       SELECT session.id, item.error_code = 'IMPORT_CANCELLED_BY_USER' AS user_cancelled
+       SELECT session.id
          FROM upload_sessions session
-         JOIN import_batch_items item ON item.id = session.item_id AND item.user_id = session.user_id
         WHERE (session.status = 'OPEN' AND session.expires_at <= now()) OR session.status = 'EXPIRED'
         ORDER BY session.expires_at
         FOR UPDATE OF session SKIP LOCKED
@@ -589,7 +583,7 @@ async function cleanupExpiredUploads(
         SET status = 'EXPIRED'
        FROM candidates
       WHERE session.id = candidates.id AND session.status IN ('OPEN', 'EXPIRED')
-      RETURNING session.id, session.object_key, session.expires_at, candidates.user_cancelled`,
+      RETURNING session.id, session.object_key, session.expires_at`,
   );
   const database = await withTransaction(async (db: PoolClient) => {
     const items = await db.query(
@@ -641,7 +635,8 @@ async function cleanupExpiredUploads(
         deleteStorageObject(s3, config.storageBucket, canonicalKey),
       ]);
       const status = uploadCleanupStatus(
-        session.expires_at.getTime(), Date.now(), config.uploadCleanupGraceMs, session.user_cancelled,
+        session.expires_at.getTime(), Date.now(), config.uploadCleanupGraceMs,
+        config.storageProvider === 'r2',
       );
       await pool.query(
         `UPDATE upload_sessions SET status = $2
@@ -667,6 +662,7 @@ async function cleanupExpiredUploads(
         session.expires_at.getTime(),
         Date.now(),
         config.uploadCleanupGraceMs,
+        config.storageProvider === 'r2',
       ) === 'CANCELLED') {
         const canonicalKey = `documents/${createHash('sha256').update(session.id).digest('hex')}.pdf`;
         await pool.query(

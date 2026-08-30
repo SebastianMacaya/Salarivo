@@ -64,6 +64,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 | JavaScript, adjuntos o acciones PDF | inspección estructural y política deny-active sobre allowlist PDF | fixture activo se rechaza |
 | Path traversal | object key generada por servidor, filename sólo metadata, paths temporales internos | filenames con rutas no escapan del sandbox |
 | SSRF | worker sin red por defecto, destinos externos allowlisted, no seguir URLs del documento | URLs embebidas nunca se solicitan |
+| Bucket público, cifrado o policy en drift | proveedor explícito; R2 Standard con AES-256-GCM administrado por Cloudflare, `r2.dev` y custom domains deshabilitados, CORS/lifecycle exactos y comprobación read-only fail-closed al arrancar; AWS conserva SSE-KMS, versioning ausente y Public Access Block | API y worker rechazan storage class, dominio, CORS o lifecycle R2 divergente y configuración AWS insegura |
 | URL firmada filtrada/reutilizada | TTL breve, método/key/tamaño limitados, autorización previa, no loguear URL | expiración, método incorrecto y otra key fallan |
 | Robo de sesión | cookies HttpOnly/Secure/SameSite, validación de Origin, rotación/revocación, MFA de sesión y step-up sensible | sesión revocada, cookie rotada y acción sin step-up |
 | Login CSRF, callback replay o intercepción OIDC | Authorization Code + PKCE, `state` y `nonce`; intento breve/de un solo uso ligado por cookie al navegador; callback `GET` sin query string en access logs; validación de issuer/audience/código; redirects internos allowlisted | cookie ausente/ajena, state/nonce/código repetido, PKCE inválido y redirect externo fallan cerrados |
@@ -74,7 +75,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 | Credential stuffing | rate limit local por identidad/IP, respuestas uniformes, MFA obligatorio para admin y opcional para usuario | tests de rate limit y enumeración; store distribuido antes de múltiples réplicas |
 | XSS desde documento/OCR | nunca renderizar HTML; output como texto escapado; CSP | payload OCR no ejecuta código |
 | DoS de CPU/RAM/storage/DB | límites tempranos, streaming, lote activo único, cuotas, timeout, backpressure y máximo local de dos exports | lote/archivo excesivo se rechaza antes de emitir uploads y la concurrencia por usuario no agota workers ni pool DB |
-| Ataque económico OCR/LLM | clasificación barata, budget por documento/user/batch, LLM último | batch inválido no dispara OCR/LLM masivo |
+| Ataque económico OCR/LLM/storage | clasificación barata, budget por documento/user/batch, LLM último, reserva transaccional y tope R2 global fijo de 8.000.000.000 bytes | batch inválido no dispara OCR/LLM masivo y uploads concurrentes no superan el tope global |
 | Monopolio de workers | concurrencia global y por usuario, fairness | usuario grande no bloquea uno pequeño |
 | Mensajes duplicados/retries | idempotency keys, constraints y state transitions transaccionales | delivery duplicado produce un resultado |
 | Fuga por logs/APM | sanitizer central, allowlist de campos, redacción en errores/traces | test captura logs y busca PII sintética |
@@ -107,6 +108,7 @@ Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle de
 - profundidad de cola sostenida;
 - OCR/proveedor degradado;
 - cuota o storage cerca del límite;
+- Budget Alerts account-wide a USD 1 y USD 3; se procesan diariamente y sólo informan, no frenan gasto;
 - fallos de eliminación;
 - marcadores de ejecución huérfanos que bloquean una baja;
 - errores de sanitizer o secret scan.
@@ -120,7 +122,8 @@ Las alertas sólo incluyen IDs internos y códigos.
 - Rate limit compartido y configuración probada de proxy/IP antes de escalar la API a múltiples réplicas.
 - Auditoría durable y alertas sanitizadas para intentos MFA denegados o bloqueados.
 - Alerta y procedimiento verificado para recuperar un `execution_owner` huérfano sin borrar temporales de un proceso vivo.
-- Proveedor cloud, región y KMS.
+- Evidencia operativa de R2, ubicación efectiva, contrato/subencargados y respuesta ante drift o indisponibilidad de su API de configuración; el cifrado queda bajo claves administradas por Cloudflare, no KMS propio.
+- Cloudflare no ofrece un hard spending cap: el tope de bytes reduce crecimiento normal, pero operaciones R2 y uso ajeno a Salarivo aún pueden superar el free tier antes de que una Budget Alert diaria notifique.
 - Parser PDF y perfil exacto de sandbox.
 - SLA, budgets y límites numéricos.
 - Plazos legales de retención y backup.

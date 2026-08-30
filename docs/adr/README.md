@@ -9,7 +9,7 @@ Los ADR registran decisiones arquitectónicas materiales, no tareas ni preferenc
 - Superseded: reemplazada por otro ADR.
 - Rejected: evaluada y descartada.
 
-Los ADR 0001, 0002, 0007, 0008, 0009 y 0010 están Accepted y respaldados por el corte vertical. Los ADR 0003, 0004, 0005 y 0006 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
+Los ADR 0001, 0002, 0007, 0008, 0009, 0010 y 0011 están Accepted y respaldados por el corte vertical. Los ADR 0003, 0004, 0005 y 0006 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
 
 ## Índice
 
@@ -23,6 +23,7 @@ Los ADR 0001, 0002, 0007, 0008, 0009 y 0010 están Accepted y respaldados por el
 - [0008 — Garantía de sesión y MFA TOTP](0008-session-assurance-and-totp-mfa.md)
 - [0009 — Borrado durable y constancias de privacidad](0009-durable-deletion-and-privacy-receipts.md)
 - [0010 — Google OIDC e identidades externas](0010-google-oidc-and-external-identities.md)
+- [0011 — Cloudflare R2 para storage productivo](0011-cloudflare-r2-production-storage.md)
 
 ## Formato
 

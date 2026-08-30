@@ -1,6 +1,7 @@
 import type { MfaKeyring } from "./mfa.ts";
 
 export type AppEnvironment = "development" | "test" | "production";
+export type ObjectStorageProvider = "aws" | "r2";
 
 export type ApiConfig = Readonly<{
   appEnv: AppEnvironment;
@@ -23,6 +24,7 @@ export type ApiConfig = Readonly<{
   maxUserDocuments: number;
   maxUserStorageBytes: number;
   uploadTtlSeconds: number;
+  storageProvider: ObjectStorageProvider;
   storageAccessKey: string;
   storageSecretKey: string;
   storageBucket: string;
@@ -30,6 +32,8 @@ export type ApiConfig = Readonly<{
   storageKmsKeyId: string | null;
   storagePublicEndpoint: string;
   storageRegion: string;
+  cloudflareAccountId: string | null;
+  cloudflareR2ApiToken: string | null;
 }>;
 
 const LOG_LEVELS = new Set<ApiConfig["logLevel"]>([
@@ -204,6 +208,43 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   const host = production ? required(env.API_HOST, "API_HOST") : (env.API_HOST ?? "127.0.0.1");
   if (/\s/.test(host)) throw new Error("API_HOST is invalid");
 
+  const configuredStorageProvider = env.OBJECT_STORAGE_PROVIDER?.trim();
+  if (production && !configuredStorageProvider) {
+    throw new Error("OBJECT_STORAGE_PROVIDER is required in production");
+  }
+  if (configuredStorageProvider && !["aws", "r2"].includes(configuredStorageProvider)) {
+    throw new Error("OBJECT_STORAGE_PROVIDER must be aws or r2");
+  }
+  const storageProvider = (configuredStorageProvider ?? "aws") as ObjectStorageProvider;
+  const cloudflareAccountId = storageProvider === "r2"
+    ? required(env.CLOUDFLARE_ACCOUNT_ID?.trim(), "CLOUDFLARE_ACCOUNT_ID").toLowerCase()
+    : null;
+  if (cloudflareAccountId !== null && !/^[a-f0-9]{32}$/.test(cloudflareAccountId)) {
+    throw new Error("CLOUDFLARE_ACCOUNT_ID must be a 32-character hexadecimal account ID");
+  }
+  const cloudflareR2ApiToken = storageProvider === "r2"
+    ? required(env.CLOUDFLARE_R2_API_TOKEN?.trim(), "CLOUDFLARE_R2_API_TOKEN")
+    : null;
+  const r2Endpoint = cloudflareAccountId === null
+    ? null
+    : `https://${cloudflareAccountId}.r2.cloudflarestorage.com`;
+  if (storageProvider === "r2") {
+    if (env.OBJECT_STORAGE_KMS_KEY_ID?.trim()) {
+      throw new Error("OBJECT_STORAGE_KMS_KEY_ID must be absent for r2");
+    }
+    for (const [name, value] of [
+      ["OBJECT_STORAGE_INTERNAL_ENDPOINT", env.OBJECT_STORAGE_INTERNAL_ENDPOINT],
+      ["OBJECT_STORAGE_PUBLIC_ENDPOINT", env.OBJECT_STORAGE_PUBLIC_ENDPOINT],
+    ] as const) {
+      if (value !== undefined && endpoint(value, name, true) !== r2Endpoint) {
+        throw new Error(`${name} must match the Cloudflare account R2 endpoint`);
+      }
+    }
+    if (env.OBJECT_STORAGE_REGION !== undefined && env.OBJECT_STORAGE_REGION !== "auto") {
+      throw new Error("OBJECT_STORAGE_REGION must be auto for r2");
+    }
+  }
+
   return Object.freeze({
     appEnv: appEnv as AppEnvironment,
     host,
@@ -233,6 +274,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     maxUserDocuments: integer(env.MAX_USER_DOCUMENTS, "MAX_USER_DOCUMENTS", production ? undefined : 5_000, 1, 100_000),
     maxUserStorageBytes: integer(env.MAX_USER_STORAGE_BYTES, "MAX_USER_STORAGE_BYTES", production ? undefined : 5 * 1024 * 1024 * 1024, 1_024, 1024 * 1024 * 1024 * 1024),
     uploadTtlSeconds: integer(env.UPLOAD_TTL_SECONDS, "UPLOAD_TTL_SECONDS", 300, 60, 900),
+    storageProvider,
     storageAccessKey: production
       ? required(env.OBJECT_STORAGE_ACCESS_KEY, "OBJECT_STORAGE_ACCESS_KEY")
       : (env.OBJECT_STORAGE_ACCESS_KEY ?? env.MINIO_ROOT_USER ?? "salarivo"),
@@ -243,22 +285,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
       ? required(env.OBJECT_STORAGE_BUCKET, "OBJECT_STORAGE_BUCKET")
       : (env.OBJECT_STORAGE_BUCKET ?? "salarivo-documents-local"),
     storageInternalEndpoint: endpoint(
-      production
+      r2Endpoint ?? (production
         ? required(env.OBJECT_STORAGE_INTERNAL_ENDPOINT, "OBJECT_STORAGE_INTERNAL_ENDPOINT")
-        : (env.OBJECT_STORAGE_INTERNAL_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`),
+        : (env.OBJECT_STORAGE_INTERNAL_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`)),
       "OBJECT_STORAGE_INTERNAL_ENDPOINT",
       production,
     ),
-    storageKmsKeyId: production
+    storageKmsKeyId: storageProvider === "r2"
+      ? null
+      : production
       ? required(env.OBJECT_STORAGE_KMS_KEY_ID, "OBJECT_STORAGE_KMS_KEY_ID")
       : (env.OBJECT_STORAGE_KMS_KEY_ID ?? null),
     storagePublicEndpoint: endpoint(
-      production
+      r2Endpoint ?? (production
         ? required(env.OBJECT_STORAGE_PUBLIC_ENDPOINT, "OBJECT_STORAGE_PUBLIC_ENDPOINT")
-        : (env.OBJECT_STORAGE_PUBLIC_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`),
+        : (env.OBJECT_STORAGE_PUBLIC_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`)),
       "OBJECT_STORAGE_PUBLIC_ENDPOINT",
       production,
     ),
-    storageRegion: env.OBJECT_STORAGE_REGION ?? "us-east-1",
+    storageRegion: storageProvider === "r2" ? "auto" : (env.OBJECT_STORAGE_REGION ?? "us-east-1"),
+    cloudflareAccountId,
+    cloudflareR2ApiToken,
   });
 }

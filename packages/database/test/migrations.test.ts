@@ -22,11 +22,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 13);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 13 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 14);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 14 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 13, name: "google_identity_foundation" },
+    { version: 14, name: "upload_session_marker_etag" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -41,7 +41,7 @@ test("migration history detects edits and only returns unapplied files", async (
 });
 
 test("Google identity migration keeps provider identity separate and transient OAuth data minimal", async () => {
-  const migration = (await loadMigrations()).at(-1);
+  const migration = (await loadMigrations()).find(({ version }) => version === 13);
   assert.ok(migration);
   assert.equal(migration.version, 13);
   assert.equal(migration.name, "google_identity_foundation");
@@ -94,4 +94,14 @@ test("Google identity migration keeps provider identity separate and transient O
   assert.match(sql, /no se persisten access tokens, refresh tokens ni ID tokens/);
   assert.match(sql, /\$terms\$,\n\s+'2026-08-30T12:30:00Z',\n\s+'2026-08-30T12:30:00Z',\n\s+true,\n\s+true/);
   assert.match(sql, /\$privacy\$,\n\s+'2026-08-30T12:30:00Z',\n\s+'2026-08-30T12:30:00Z',\n\s+false,\n\s+true/);
+});
+
+test("upload marker migration adds a bounded nullable ETag without rewriting history", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 14);
+  assert.ok(migration);
+  assert.equal(migration.name, "upload_session_marker_etag");
+  assert.match(migration.sql, /ALTER TABLE upload_sessions\s+ADD COLUMN upload_marker_etag text/);
+  assert.match(migration.sql, /upload_marker_etag IS NULL/);
+  assert.match(migration.sql, /length\(upload_marker_etag\) BETWEEN 1 AND 128/);
+  assert.match(migration.sql, /upload_marker_etag !~ '\[\[:cntrl:\]\]'/);
 });

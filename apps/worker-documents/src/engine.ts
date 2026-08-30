@@ -125,9 +125,9 @@ export function uploadCleanupStatus(
   expiresAtMs: number,
   nowMs: number,
   graceMs: number,
-  userCancelled = false,
+  markerProtected = false,
 ): 'EXPIRED' | 'CANCELLED' {
-  return userCancelled || nowMs >= expiresAtMs + graceMs ? 'CANCELLED' : 'EXPIRED';
+  return markerProtected || nowMs >= expiresAtMs + graceMs ? 'CANCELLED' : 'EXPIRED';
 }
 
 export function pendingUploadCutoff(nowMs: number, uploadTtlMs: number, graceMs: number): Date {
