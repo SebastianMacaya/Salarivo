@@ -1,0 +1,119 @@
+# Threat model
+
+> Estado: Proposed para la arquitectura objetivo. Debe actualizarse con cada nuevo flujo sensible y validarse contra la implementación.
+
+## Alcance
+
+Web, API, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, observabilidad, exports y operaciones de borrado.
+
+## Activos
+
+- PDFs y derivados;
+- salarios, conceptos y timeline;
+- PII e identificadores fiscales;
+- sesiones, credenciales y MFA futuro;
+- claves de cifrado y credenciales de proveedores;
+- exports y autorizaciones firmadas;
+- correcciones humanas y audit trail;
+- disponibilidad y presupuesto de procesamiento.
+
+## Atacantes
+
+- visitante externo;
+- usuario autenticado malicioso;
+- atacante con credenciales robadas;
+- insider o soporte con acceso excesivo;
+- proveedor/dependencia comprometida;
+- archivo diseñado para explotar parsers;
+- contenido con prompt injection dirigido a agentes o modelos.
+
+## Trust boundaries
+
+~~~mermaid
+flowchart LR
+    Internet --> Edge
+    Edge --> Web
+    Web --> API
+    Web -. autorización limitada .-> Storage
+    API --> DB
+    API --> Storage
+    Dispatcher --> DB
+    Dispatcher --> Queue
+    Queue --> Worker
+    Storage --> Worker
+    Worker --> DB
+    Worker --> Sandbox[Parsers / OCR aislados]
+    Worker -. datos mínimos .-> Vendor[Proveedor externo]
+    API --> Telemetry[Logs / métricas sanitizados]
+    Worker --> Telemetry
+~~~
+
+Nada que cruce desde Internet, navegador, storage o documento se considera confiable. Un resultado OCR o LLM tampoco es una instrucción ni un dato verificado.
+
+## Amenazas y controles
+
+| Amenaza | Controles requeridos | Verificación |
+| --- | --- | --- |
+| IDOR / broken access control | ownership server-side en servicio, scopes mínimos, IDs opacos, RLS opcional | usuario A lee/edita/borra recurso B |
+| Enumeración / deduplicación lateral | respuestas uniformes, checksum consultado por userId, sin dedup observable global | mismo hash entre usuarios no revela existencia |
+| Malware | scanner privado antes de extracción, cuarentena fail closed | archivo de prueba antivirus no avanza |
+| Explotación de parser | proceso sin privilegios, filesystem efímero, CPU/RAM/timeouts, sin red ni credenciales | PDF malformado termina sin afectar worker/API |
+| JavaScript, adjuntos o acciones PDF | inspección estructural y política deny-active sobre allowlist PDF | fixture activo se rechaza |
+| Path traversal | object key generada por servidor, filename sólo metadata, paths temporales internos | filenames con rutas no escapan del sandbox |
+| SSRF | worker sin red por defecto, destinos externos allowlisted, no seguir URLs del documento | URLs embebidas nunca se solicitan |
+| URL firmada filtrada/reutilizada | TTL breve, método/key/tamaño limitados, autorización previa, no loguear URL | expiración, método incorrecto y otra key fallan |
+| Robo de sesión | cookies HttpOnly/Secure/SameSite, CSRF según auth, rotación/revocación, reauth sensible | sesión revocada y CSRF |
+| Credential stuffing | rate limit por identidad/IP, respuestas uniformes, alertas, MFA futura | tests de rate limit y enumeración |
+| XSS desde documento/OCR | nunca renderizar HTML; output como texto escapado; CSP | payload OCR no ejecuta código |
+| DoS de CPU/RAM/storage | límites tempranos, streaming, lote activo único, cuotas de documentos/bytes, timeout y backpressure | lote/archivo excesivo se rechaza antes de emitir uploads y la concurrencia por usuario no bloquea a otro |
+| Ataque económico OCR/LLM | clasificación barata, budget por documento/user/batch, LLM último | batch inválido no dispara OCR/LLM masivo |
+| Monopolio de workers | concurrencia global y por usuario, fairness | usuario grande no bloquea uno pequeño |
+| Mensajes duplicados/retries | idempotency keys, constraints y state transitions transaccionales | delivery duplicado produce un resultado |
+| Fuga por logs/APM | sanitizer central, allowlist de campos, redacción en errores/traces | test captura logs y busca PII sintética |
+| Secretos expuestos | secret manager, rotación, scanning y no incluirlos en imágenes/repositorio | secret scanning y revisión de config |
+| Insider | least privilege, acceso just-in-time, auditoría, separación de funciones | revisión periódica de accesos y eventos |
+| Escalamiento a admin | rol sólo en DB, nunca desde body/cookie; guard server-side en cada ruta; respuestas agregadas sin PII ni salarios | registro con `role` falla, USER recibe 403 y revocación aplica al siguiente request |
+| Reidentificación en benchmark futuro | feature apagada; antes de habilitar: cohortes amplias predefinidas, k mínimo, redondeo, demora, anti-differencing, query budget, mitigación Sybil/poisoning y opt-in separado | ataques de membership inference y consultas diferenciales no recuperan aportes individuales |
+| Supply chain | lockfile, versiones evaluadas, SCA/SAST, imágenes/versiones reproducibles | scans bloqueantes y actualización controlada |
+| Borrado incompleto | orquestación idempotente sobre DB/storage/cache/cola/temporales/backups | prueba de account deletion y reconciliación |
+| Prompt injection / exfiltración IA | documentos como datos, prompts fijos, tool allowlist, minimización/redacción, sin secretos | fixture con órdenes no cambia flujo ni herramientas |
+
+## Riesgos de privacidad específicos
+
+- El original contiene más datos que los necesarios para analytics.
+- Un error puede incluir OCR o metadata sensible.
+- Un proveedor externo puede retener payload.
+- Una métrica con labels libres puede filtrar salario o identidad.
+- Un export o share puede sobrevivir a una revocación si no se coordina el cleanup.
+
+Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle del original. Cualquier proveedor requiere evaluación de retención, región, entrenamiento, subprocesadores y borrado antes de producción.
+
+## Alertas mínimas
+
+- incrementos anormales de uploads/rechazos;
+- detección de malware;
+- múltiples fallos de ownership o enumeración;
+- retries y timeouts crecientes;
+- profundidad de cola sostenida;
+- OCR/proveedor degradado;
+- cuota o storage cerca del límite;
+- fallos de eliminación;
+- errores de sanitizer o secret scan.
+
+Las alertas sólo incluyen IDs internos y códigos.
+
+## Riesgos abiertos
+
+- Proveedor de auth y política MFA.
+- MFA/step-up y proceso operativo de alta/revocación para administradores antes de producción.
+- Proveedor cloud, región y KMS.
+- Parser PDF y perfil exacto de sandbox.
+- SLA, budgets y límites numéricos.
+- Plazos legales de retención y backup.
+- Condiciones contractuales de OCR/IA.
+
+Ninguno puede marcarse como mitigado hasta existir configuración, test y evidencia operativa.
+
+## Cuándo actualizar
+
+Actualizar este archivo al agregar un tipo documental, proveedor, flujo de descarga/export/share, privilegio, superficie de red, parser, feature de IA o cambio de retención. Una amenaza nueva material puede requerir ADR.

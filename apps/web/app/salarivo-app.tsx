@@ -1,0 +1,899 @@
+'use client';
+
+import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { money, percentage } from './format';
+
+const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001/api/v1';
+
+type User = { id: string; email: string; displayName: string | null; role: 'USER' | 'ADMIN' };
+type Employment = {
+  id: string;
+  employerId: string;
+  employerName: string;
+  role?: string | null;
+  startDate: string;
+  endDate?: string | null;
+  status: 'ACTIVE' | 'ENDED';
+  currencyCode: string;
+};
+type DocumentItem = {
+  id: string;
+  employmentId?: string | null;
+  originalFilename: string;
+  displayFilename?: string;
+  createdAt: string;
+  processingStatus: string;
+  documentType?: string | null;
+  confidence?: string | null;
+  originalAvailable?: boolean;
+  needsReview?: boolean;
+  errorCode?: string | null;
+};
+type ExtractedField = {
+  id: string | null;
+  fieldPath: string;
+  interpretedValue: string | null;
+  correctedValue?: string | null;
+  confidence: string;
+  source: string;
+};
+type Settlement = {
+  id: string;
+  payrollPeriod: string;
+  employerName?: string | null;
+  settlementType: string;
+  currencyCode: string;
+  grossAmount?: string | null;
+  netAmount?: string | null;
+  deductionsAmount?: string | null;
+  deductionsPercentage?: string | null;
+  deductionsMatchTotal?: boolean;
+  deductionsDifferenceAmount?: string | null;
+  deductionsDifferenceKind?: 'MATCHED' | 'TOTAL_MISSING' | 'MISSING_ITEMS' | 'ITEMS_EXCEED_TOTAL';
+  deductions?: Array<{
+    normalizedConceptCode?: string | null;
+    rawDescription: string;
+    amount: string;
+    grossPercentage?: string | null;
+    confidence?: string | null;
+  }>;
+  confidence?: string | null;
+  documentId?: string | null;
+};
+type Dashboard = {
+  activeEmployments: number;
+  documents: number;
+  pendingReview: number;
+  latestNetAmount?: string | null;
+  currencyCode?: string | null;
+  evolution: Array<{ period: string; gross: string | null; net: string | null }>;
+};
+type ImportProgress = {
+  key: string;
+  name: string;
+  status: 'PENDIENTE' | 'SUBIENDO' | 'EN_COLA' | 'LISTO' | 'REVISAR' | 'ERROR';
+  message?: string;
+};
+type ImportBatchItem = {
+  id: string;
+  clientItemKey: string;
+  originalFilename: string;
+  employmentId?: string | null;
+  status: string;
+  errorCode?: string | null;
+};
+type ImportBatch = {
+  id: string;
+  status: string;
+  progress: { total: number; resolved: number; percentage: number };
+  totals: Record<string, number>;
+  items: ImportBatchItem[];
+};
+type AdminOverview = {
+  metrics: {
+    totalUsers: number;
+    activeUsers: number;
+    totalDocuments: number;
+    pendingReview: number;
+    activeImports: number;
+    failedDocuments: number;
+  };
+  legalDocuments: Array<{
+    documentType: 'TERMS' | 'PRIVACY_NOTICE';
+    version: string;
+    effectiveAt: string;
+    requiresAcceptance: boolean;
+    approvedForProduction: boolean;
+    acknowledgementCount: number;
+  }>;
+};
+type LegalSummary = { version: string };
+
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(`${API_ROOT}${path}`, {
+    ...init,
+    credentials: 'include',
+    headers: {
+      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+      ...init.headers,
+    },
+  });
+  if (response.status === 204) return undefined as T;
+  const body = (await response.json().catch(() => ({}))) as {
+    data?: T;
+    error?: { message?: string } | string;
+  };
+  if (!response.ok) {
+    const message = typeof body.error === 'string'
+      ? body.error
+      : body.error?.message ?? 'No pudimos completar la operación.';
+    throw new ApiError(message, response.status);
+  }
+  return (Object.prototype.hasOwnProperty.call(body, 'data') ? body.data : body) as T;
+}
+
+function shortDate(value?: string | null) {
+  if (!value) return 'Actualidad';
+  return new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium' }).format(
+    new Date(`${value.slice(0, 10)}T12:00:00`),
+  );
+}
+
+function apiUrl(path: string) {
+  return path.startsWith('/api/v1/') ? `${API_ROOT}${path.slice('/api/v1'.length)}` : path;
+}
+
+function documentName(document: DocumentItem) {
+  return document.displayFilename || document.originalFilename;
+}
+
+const deductionLabels: Record<string, string> = {
+  RETIREMENT: 'Jubilación',
+  HEALTH_INSURANCE: 'Obra social',
+  PAMI: 'PAMI / Ley 19.032',
+  INCOME_TAX: 'Ganancias / Ingresos personales',
+  UNION_DUES: 'Cuota sindical',
+};
+const reviewFieldLabels: Record<string, string> = {
+  'employer.name': 'Empresa detectada',
+  'settlement.payrollPeriod': 'Período',
+  'settlement.basicAmount': 'Sueldo básico',
+  'settlement.grossAmount': 'Bruto',
+  'settlement.deductionsAmount': 'Descuentos',
+  'settlement.netAmount': 'Neto',
+};
+
+function handleDialogKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    close();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]',
+  ));
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (!first || !last) return;
+  if (event.shiftKey && (document.activeElement === first || document.activeElement === event.currentTarget)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+const statusLabels: Record<string, string> = {
+  UPLOADED: 'Recibido',
+  SECURITY_VALIDATION: 'Validando seguridad',
+  DOCUMENT_CLASSIFICATION: 'Clasificando',
+  TEXT_EXTRACTION: 'Extrayendo texto',
+  OCR: 'Leyendo imagen',
+  PARSING: 'Interpretando',
+  NORMALIZATION: 'Normalizando',
+  VALIDATION: 'Validando datos',
+  PROCESSING: 'Procesando',
+  NEEDS_REVIEW: 'Requiere revisión',
+  NEEDS_TYPE_CONFIRMATION: 'Confirmar tipo',
+  COMPLETED: 'Listo',
+  DUPLICATE: 'Duplicado',
+  QUARANTINED: 'En cuarentena',
+  FAILED_RETRYABLE: 'Reintentando',
+  FAILED_PERMANENT: 'No procesado',
+  REJECTED_UNSUPPORTED: 'Tipo no soportado',
+  RETRY_SCHEDULED: 'Reintento programado',
+  CANCELLED: 'Cancelado',
+  DELETED: 'Eliminado',
+};
+const associationReadyStatuses = new Set([
+  'COMPLETED', 'NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION', 'REJECTED_UNSUPPORTED',
+  'QUARANTINED', 'FAILED_PERMANENT', 'CANCELLED',
+]);
+const importErrorLabels: Record<string, string> = {
+  DOCUMENT_DUPLICATE: 'Ya estaba cargado; no se volvió a guardar.',
+  DOCUMENT_UNSUPPORTED: 'No parece un recibo salarial soportado.',
+  DOCUMENT_CORRUPTED: 'El PDF está dañado o no tiene una estructura válida.',
+  DOCUMENT_INVALID_TYPE: 'El contenido real no es un PDF admitido.',
+  DOCUMENT_TEXT_UNREADABLE: 'No se pudo leer texto suficiente del recibo.',
+  DOCUMENT_ACTIVE_CONTENT: 'El PDF contiene acciones activas bloqueadas por seguridad.',
+  DOCUMENT_EMBEDDED_FILE: 'El PDF contiene archivos adjuntos no permitidos.',
+  DOCUMENT_SIZE_MISMATCH: 'El tamaño recibido no coincide con el declarado.',
+  DOCUMENT_ENCRYPTED: 'El PDF está protegido con contraseña.',
+  DOCUMENT_TOO_LARGE: 'El PDF supera el tamaño permitido.',
+  DOCUMENT_TOO_MANY_PAGES: 'El PDF supera la cantidad de páginas permitida.',
+  DOCUMENT_MALWARE_DETECTED: 'El archivo fue bloqueado por seguridad.',
+  PROCESSING_TIMEOUT: 'El análisis superó el tiempo seguro permitido.',
+  WORKER_LEASE_EXHAUSTED: 'El análisis agotó sus reintentos.',
+  IMPORT_CANCELLED_BY_USER: 'Carga cancelada.',
+};
+
+function importProgressItem(server: ImportBatchItem, current?: ImportProgress): ImportProgress {
+  const base = { key: server.clientItemKey, name: server.originalFilename };
+  if (server.status === 'PENDING_UPLOAD' && (current?.status === 'SUBIENDO' || current?.status === 'ERROR')) return current;
+  if (server.status === 'CANCELLED' && current?.status === 'ERROR') return current;
+  if (server.status === 'PENDING_UPLOAD') return { ...base, status: 'PENDIENTE', message: 'Esperando carga' };
+  if (server.status === 'COMPLETED') return { ...base, status: 'LISTO', message: 'Procesado correctamente' };
+  if (server.status === 'NEEDS_REVIEW') return { ...base, status: 'REVISAR', message: 'Necesita tu revisión' };
+  if (['REJECTED', 'FAILED', 'CANCELLED'].includes(server.status)) {
+    return { ...base, status: 'ERROR', message: importErrorLabels[server.errorCode ?? ''] ?? server.errorCode ?? 'No se pudo procesar' };
+  }
+  return { ...base, status: 'EN_COLA', message: server.status === 'PROCESSING' ? 'Procesando' : 'En cola' };
+}
+
+export function SalarivoApp() {
+  const [user, setUser] = useState<User | null | undefined>(undefined);
+
+  useEffect(() => {
+    api<User>('/auth/me')
+      .then(setUser)
+      .catch(() => setUser(null));
+  }, []);
+
+  if (user === undefined) {
+    return (
+      <main className="center-screen" aria-busy="true">
+        <div className="loader" />
+        <p>Abriendo tu espacio privado…</p>
+      </main>
+    );
+  }
+  if (!user) return <AccessScreen onAuthenticated={setUser} />;
+  return <PrivateApp user={user} onLogout={() => setUser(null)} />;
+}
+
+function Brand() {
+  return (
+    <div className="brand" aria-label="Salarivo">
+      <span className="brand-mark" aria-hidden="true">S</span>
+      <span>Salarivo</span>
+    </div>
+  );
+}
+
+function AccessScreen({ onAuthenticated }: { onAuthenticated: (user: User) => void }) {
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [legalVersions, setLegalVersions] = useState<{ terms: string; privacy: string } | null>(null);
+  const [legalError, setLegalError] = useState('');
+
+  useEffect(() => {
+    Promise.all([api<LegalSummary>('/legal/terms'), api<LegalSummary>('/legal/privacy')])
+      .then(([terms, privacy]) => setLegalVersions({ terms: terms.version, privacy: privacy.version }))
+      .catch(() => setLegalError('No pudimos cargar los documentos legales vigentes.'));
+  }, []);
+
+  function changeMode(next: 'login' | 'register' | 'forgot' | 'reset') {
+    setError('');
+    setNotice('');
+    setMode(next);
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    setError('');
+    setNotice('');
+    setBusy(true);
+    const form = new FormData(formElement);
+    try {
+      if (mode === 'forgot') {
+        const result = await api<{ resetToken?: string }>('/auth/forgot-password', {
+          method: 'POST',
+          body: JSON.stringify({ email: form.get('email') }),
+        });
+        setNotice(result.resetToken
+          ? `Modo local: tu código es ${result.resetToken}`
+          : 'Si la cuenta existe, enviamos las instrucciones.');
+        setMode('reset');
+      } else if (mode === 'reset') {
+        await api('/auth/reset-password', {
+          method: 'POST',
+          body: JSON.stringify({ token: form.get('token'), password: form.get('password') }),
+        });
+        setNotice('Contraseña actualizada. Ya podés ingresar.');
+        setMode('login');
+      } else {
+        if (mode === 'register' && !legalVersions) throw new Error('Esperá a que carguen los documentos legales.');
+        const credentials = {
+          email: form.get('email'),
+          password: form.get('password'),
+          ...(mode === 'register' ? {
+            displayName: form.get('displayName'),
+            acceptedTerms: form.get('acceptedTerms') === 'on',
+            acknowledgedPrivacy: form.get('acknowledgedPrivacy') === 'on',
+            termsVersion: legalVersions?.terms,
+            privacyVersion: legalVersions?.privacy,
+          } : {}),
+        };
+        const result = await api<User>(`/auth/${mode}`, {
+          method: 'POST',
+          body: JSON.stringify(credentials),
+        });
+        onAuthenticated(result);
+      }
+    } catch (caught) {
+      if (mode === 'register' && caught instanceof ApiError && caught.status === 409) {
+        try {
+          const [terms, privacy] = await Promise.all([api<LegalSummary>('/legal/terms'), api<LegalSummary>('/legal/privacy')]);
+          setLegalVersions({ terms: terms.version, privacy: privacy.version });
+          formElement.reset();
+        } catch {
+          setLegalError('No pudimos actualizar los documentos legales vigentes.');
+        }
+      }
+      setError(caught instanceof Error ? caught.message : 'No pudimos continuar.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="access-layout">
+      <section className="access-story">
+        <Brand />
+        <div>
+          <p className="eyebrow">Tu carrera, bajo tu control</p>
+          <h1>Convertí recibos dispersos en una historia salarial clara.</h1>
+          <p className="lead">Salarivo organiza tus empleos y liquidaciones sin hacer pública tu información ni compartirla con otros usuarios.</p>
+        </div>
+        <ul className="trust-list">
+          <li>Archivos privados y análisis asíncrono</li>
+          <li>Importación masiva con progreso por recibo</li>
+          <li>Vos corregís, exportás y eliminás tus datos</li>
+        </ul>
+      </section>
+      <section className="access-panel" aria-labelledby="access-title">
+        <div className="access-card">
+          <p className="eyebrow">Espacio privado</p>
+          <h2 id="access-title">{mode === 'register' ? 'Creá tu cuenta' : mode === 'forgot' ? 'Recuperá el acceso' : mode === 'reset' ? 'Elegí una nueva clave' : 'Ingresá a Salarivo'}</h2>
+          <form onSubmit={submit} className="stack-form">
+            {mode === 'register' && <label>Nombre<input name="displayName" autoComplete="name" minLength={2} maxLength={80} required /></label>}
+            {(mode === 'login' || mode === 'register' || mode === 'forgot') && <label>Email<input name="email" type="email" autoComplete="email" required /></label>}
+            {mode === 'reset' && <label>Código de recuperación<input name="token" autoComplete="one-time-code" required /></label>}
+            {mode !== 'forgot' && <label>Contraseña<input name="password" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} required /></label>}
+            {mode === 'register' && <div className="legal-checks">
+              <div className="legal-check"><input id="accepted-terms" name="acceptedTerms" type="checkbox" required /><span><label htmlFor="accepted-terms">Acepto los Términos de uso{legalVersions ? ` v${legalVersions.terms}` : ''}.</label> <a href={legalVersions ? `/terms?version=${encodeURIComponent(legalVersions.terms)}` : '/terms'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
+              <div className="legal-check"><input id="acknowledged-privacy" name="acknowledgedPrivacy" type="checkbox" required /><span><label htmlFor="acknowledged-privacy">Confirmo que leí el Aviso de privacidad{legalVersions ? ` v${legalVersions.privacy}` : ''}.</label> <a href={legalVersions ? `/privacy?version=${encodeURIComponent(legalVersions.privacy)}` : '/privacy'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
+            </div>}
+            {mode === 'register' && legalError && <p className="message error" role="alert">{legalError}</p>}
+            {error && <p className="message error" role="alert">{error}</p>}
+            {notice && <p className="message success" aria-live="polite">{notice}</p>}
+            <button className="button primary" disabled={busy || (mode === 'register' && !legalVersions)}>{busy ? 'Procesando…' : mode === 'register' ? 'Crear cuenta' : mode === 'forgot' ? 'Solicitar código' : mode === 'reset' ? 'Cambiar contraseña' : 'Ingresar'}</button>
+          </form>
+          <div className="access-actions">
+            {mode === 'login' ? <><button className="text-button" onClick={() => changeMode('forgot')}>Olvidé mi contraseña</button><button className="text-button" onClick={() => changeMode('register')}>Crear una cuenta</button></> : <button className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+type Section = 'summary' | 'jobs' | 'import' | 'history' | 'privacy' | 'admin';
+const sections: Array<{ id: Section; label: string; icon: string }> = [
+  { id: 'summary', label: 'Resumen', icon: '⌂' },
+  { id: 'jobs', label: 'Empleos', icon: '▣' },
+  { id: 'import', label: 'Importar', icon: '↑' },
+  { id: 'history', label: 'Historial', icon: '≋' },
+  { id: 'privacy', label: 'Privacidad', icon: '◇' },
+];
+
+function PrivateApp({ user, onLogout }: { user: User; onLogout: () => void }) {
+  const [section, setSection] = useState<Section>('summary');
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const visibleSections = user.role === 'ADMIN'
+    ? [...sections, { id: 'admin' as const, label: 'Administración', icon: '⚙' }]
+    : sections;
+
+  async function logout() {
+    await api('/auth/logout', { method: 'POST', body: '{}' }).catch(() => undefined);
+    onLogout();
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
+        <div className="sidebar-head"><Brand /><button className="icon-button mobile-only" onClick={() => setMenuOpen(false)} aria-label="Cerrar menú">×</button></div>
+        <nav aria-label="Navegación principal">
+          {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
+        </nav>
+        <div className="sidebar-user">
+          <span className="avatar">{(user.displayName || user.email).slice(0, 1).toUpperCase()}</span>
+          <span><strong>{user.displayName || 'Mi cuenta'}</strong><small>{user.email}</small></span>
+          <button className="icon-button" onClick={logout} title="Cerrar sesión" aria-label="Cerrar sesión">↪</button>
+        </div>
+      </aside>
+      {menuOpen && <button className="backdrop" aria-label="Cerrar menú" onClick={() => setMenuOpen(false)} />}
+      <main className="content">
+        <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú">☰</button><Brand /></header>
+        {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={setSection} />}
+        {section === 'jobs' && <Employments key={refreshKey} onChanged={() => setRefreshKey((n) => n + 1)} />}
+        {section === 'import' && <Importer onDone={() => setRefreshKey((n) => n + 1)} />}
+        {section === 'history' && <History key={refreshKey} />}
+        {section === 'privacy' && <Privacy />}
+        {section === 'admin' && user.role === 'ADMIN' && <Admin />}
+      </main>
+    </div>
+  );
+}
+
+function PageHeader({ eyebrow, title, action }: { eyebrow: string; title: string; action?: React.ReactNode }) {
+  return <header className="page-header"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1></div>{action}</header>;
+}
+
+function EmptyState({ title, body, action }: { title: string; body: string; action?: React.ReactNode }) {
+  return <div className="empty-state"><span className="empty-mark" aria-hidden="true">∿</span><h3>{title}</h3><p>{body}</p>{action}</div>;
+}
+
+function Summary({ user, onNavigate }: { user: User; onNavigate: (section: Section) => void }) {
+  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    Promise.all([api<Dashboard>('/dashboard'), api<DocumentItem[]>('/documents?limit=5')])
+      .then(([summary, recent]) => { setDashboard(summary); setDocuments(recent); })
+      .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'No pudimos cargar el resumen.'));
+  }, []);
+
+  const maxValue = useMemo(() => Math.max(1, ...(dashboard?.evolution.flatMap((point) => [Number(point.gross ?? 0), Number(point.net ?? 0)]) ?? [])), [dashboard]);
+
+  return (
+    <div className="page">
+      <PageHeader eyebrow="Resumen personal" title={`Hola, ${user.displayName?.split(' ')[0] || 'bienvenido'}`} action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />
+      {error && <p className="message error" role="alert">{error}</p>}
+      <section className="metric-grid" aria-label="Indicadores">
+        <article className="metric"><small>Último neto</small><strong>{money(dashboard?.latestNetAmount, dashboard?.currencyCode ?? 'ARS')}</strong><span>Dato estructurado más reciente</span></article>
+        <article className="metric"><small>Empleos activos</small><strong>{dashboard?.activeEmployments ?? '—'}</strong><span>Relaciones laborales abiertas</span></article>
+        <article className="metric accent"><small>Para revisar</small><strong>{dashboard?.pendingReview ?? '—'}</strong><button onClick={() => onNavigate('history')}>Ver pendientes →</button></article>
+        <article className="metric"><small>Documentos</small><strong>{dashboard?.documents ?? '—'}</strong><span>Recibos en tu espacio</span></article>
+      </section>
+      <div className="dashboard-grid">
+        <section className="panel chart-panel">
+          <div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Bruto y neto por período</h2></div><div className="legend"><span className="gross">Bruto</span><span className="net">Neto</span></div></div>
+          {dashboard?.evolution.length ? <div className="bar-chart" role="img" aria-label="Evolución de salario bruto y neto">{dashboard.evolution.map((point) => <div className="bar-group" key={point.period} title={`${point.period}: bruto ${money(point.gross)}, neto ${money(point.net)}`}><div className="bars"><i className="bar gross" style={{ height: `${(Number(point.gross ?? 0) / maxValue) * 100}%` }} /><i className="bar net" style={{ height: `${(Number(point.net ?? 0) / maxValue) * 100}%` }} /></div><small>{point.period.slice(0, 7)}</small></div>)}</div> : <EmptyState title="Todavía no hay evolución" body="Importá tu primer recibo para empezar a construirla." action={<button className="button secondary" onClick={() => onNavigate('import')}>Importar ahora</button>} />}
+        </section>
+        <section className="panel recent-panel">
+          <div className="panel-heading"><div><p className="eyebrow">Actividad</p><h2>Documentos recientes</h2></div><button className="text-button" onClick={() => onNavigate('history')}>Ver todos</button></div>
+          {documents.length ? <ul className="recent-list">{documents.map((document) => <li key={document.id}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{shortDate(document.createdAt)}</small></span><Status value={document.processingStatus} /></li>)}</ul> : <EmptyState title="Sin documentos" body="Tus recibos importados aparecerán acá." />}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function Status({ value }: { value: string }) {
+  const risky = /FAILED|QUARANTINED|REJECTED|CANCELLED/.test(value);
+  const pending = /UPLOADED|VALIDATION|PROCESSING|RETRY|CLASSIFICATION|EXTRACTION|OCR|PARSING|NORMALIZATION|NEEDS_REVIEW|NEEDS_TYPE_CONFIRMATION/.test(value);
+  return <span className={`status ${risky ? 'danger' : pending ? 'pending' : 'ready'}`}>{statusLabels[value] ?? value}</span>;
+}
+
+function DeductionBreakdown({ settlement }: { settlement: Settlement }) {
+  const items = settlement.deductions ?? [];
+  const difference = money(settlement.deductionsDifferenceAmount, settlement.currencyCode);
+  const mismatch = settlement.deductionsDifferenceKind === 'TOTAL_MISSING'
+    ? `Se detectaron conceptos por ${difference}, pero no el total.`
+    : settlement.deductionsDifferenceKind === 'MISSING_ITEMS'
+      ? `Falta identificar ${difference} del total.`
+      : settlement.deductionsDifferenceKind === 'ITEMS_EXCEED_TOTAL'
+        ? `Los conceptos superan el total por ${difference}.`
+        : null;
+  return <div className="deduction-cell"><strong>{money(settlement.deductionsAmount, settlement.currencyCode)}</strong>{settlement.deductionsPercentage && <small>{percentage(settlement.deductionsPercentage)} del bruto</small>}{mismatch && <small className="deduction-warning">{mismatch}</small>}{items.length > 0 && <details><summary>Ver desglose ({items.length})</summary><ul>{items.map((item, index) => <li key={`${item.normalizedConceptCode ?? 'OTHER'}-${index}`}><span>{item.normalizedConceptCode ? deductionLabels[item.normalizedConceptCode] ?? item.rawDescription : item.rawDescription}{item.grossPercentage && <small>{percentage(item.grossPercentage)} del bruto</small>}</span><strong>{money(item.amount, settlement.currencyCode)}</strong></li>)}</ul></details>}</div>;
+}
+
+function Employments({ onChanged }: { onChanged: () => void }) {
+  const [items, setItems] = useState<Employment[]>([]);
+  const [editing, setEditing] = useState<Employment | null | 'new'>(null);
+  const [error, setError] = useState('');
+  const load = useCallback(() => api<Employment[]>('/employments').then(setItems).catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'No pudimos cargar tus empleos.')), []);
+  useEffect(() => { void load(); }, [load]);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError('');
+    if (!editing) return;
+    const currentEmployment = editing;
+    const form = new FormData(event.currentTarget);
+    const employerName = String(form.get('employerName') ?? '');
+    try {
+      const employerId = currentEmployment === 'new'
+        ? (await api<{ id: string }>('/employers', {
+            method: 'POST', body: JSON.stringify({ name: employerName, countryCode: 'AR' }),
+          })).id
+        : currentEmployment.employerId;
+      if (currentEmployment !== 'new' && employerName !== currentEmployment.employerName) {
+        await api(`/employers/${currentEmployment.employerId}`, {
+          method: 'PATCH', body: JSON.stringify({ name: employerName }),
+        });
+      }
+      const payload = {
+        employerId, role: form.get('role') || null,
+        startDate: form.get('startDate'), endDate: form.get('endDate') || null,
+        countryCode: 'AR', currencyCode: form.get('currencyCode') || 'ARS',
+      };
+      const path = currentEmployment === 'new' ? '/employments' : `/employments/${currentEmployment.id}`;
+      await api(path, { method: currentEmployment === 'new' ? 'POST' : 'PATCH', body: JSON.stringify(payload) });
+      setEditing(null); await load(); onChanged();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar el empleo.'); }
+  }
+
+  async function remove(item: Employment) {
+    if (!confirm(`¿Eliminar el empleo en ${item.employerName}? Las liquidaciones no se borrarán.`)) return;
+    try {
+      await api(`/employments/${item.id}`, { method: 'DELETE', body: '{}' });
+      await api(`/employers/${item.employerId}`, { method: 'DELETE', body: '{}' }).catch(() => undefined);
+      await load(); onChanged();
+    }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminarlo.'); }
+  }
+
+  return (
+    <div className="page">
+      <PageHeader eyebrow="Trayectoria" title="Empleos" action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />
+      <p className="page-intro">Usalos para agrupar recibos y entender cada etapa de tu carrera.</p>
+      {error && <p className="message error" role="alert">{error}</p>}
+      {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p></div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{shortDate(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{shortDate(item.endDate)}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : <EmptyState title="Sumá tu primer empleo" body="Podés empezar por tu trabajo actual y completar el resto después." action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />}
+      {editing && <div className="modal-layer" role="presentation" onMouseDown={() => setEditing(null)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setEditing(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" onClick={() => setEditing(null)} aria-label="Cerrar">×</button></div><form className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><label>Moneda<select name="currencyCode" defaultValue={editing === 'new' ? 'ARS' : editing.currencyCode}><option value="ARS">ARS — Peso argentino</option><option value="USD">USD — Dólar</option><option value="EUR">EUR — Euro</option></select></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setEditing(null)}>Cancelar</button><button className="button primary">Guardar</button></div></form></section></div>}
+    </div>
+  );
+}
+
+function Importer({ onDone }: { onDone: () => void }) {
+  const [files, setFiles] = useState<File[]>([]);
+  const [progress, setProgress] = useState<ImportProgress[]>([]);
+  const [batch, setBatch] = useState<ImportBatch | null>(null);
+  const [employments, setEmployments] = useState<Employment[]>([]);
+  const [employmentId, setEmploymentId] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const hasActiveBatch = batch !== null && ['ACTIVE', 'PAUSED'].includes(batch.status);
+
+  const applyBatch = useCallback((snapshot: ImportBatch) => {
+    setBatch(snapshot);
+    setProgress((current) => snapshot.items.map((item) => importProgressItem(
+      item,
+      current.find((candidate) => candidate.key === item.clientItemKey),
+    )));
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    Promise.all([api<Employment[]>('/employments'), api<ImportBatch | null>('/imports/active')])
+      .then(([jobs, active]) => {
+        if (stopped) return;
+        setEmployments(jobs);
+        if (active) {
+          applyBatch(active);
+          const associated = new Set(active.items.map((item) => item.employmentId).filter(Boolean));
+          if (associated.size === 1) setEmploymentId(String([...associated][0]));
+        }
+      })
+      .catch((caught: unknown) => {
+        if (!stopped) setError(caught instanceof Error ? caught.message : 'No pudimos recuperar tus importaciones.');
+      });
+    return () => { stopped = true; };
+  }, [applyBatch]);
+
+  useEffect(() => {
+    if (!batch?.id || !['ACTIVE', 'PAUSED'].includes(batch.status)) return;
+    let stopped = false;
+    let timer = 0;
+    const refresh = async () => {
+      try {
+        const snapshot = await api<ImportBatch>(`/imports/${batch.id}`);
+        if (stopped) return;
+        applyBatch(snapshot);
+        if (['ACTIVE', 'PAUSED'].includes(snapshot.status)) timer = window.setTimeout(refresh, 2_500);
+      } catch {
+        if (!stopped) timer = window.setTimeout(refresh, 2_500);
+      }
+    };
+    timer = window.setTimeout(refresh, 500);
+    return () => { stopped = true; window.clearTimeout(timer); };
+  }, [applyBatch, batch?.id, batch?.status]);
+
+  function choose(list: FileList | null) {
+    if (!list || hasActiveBatch) return;
+    const selected = Array.from(list);
+    const valid = selected.filter((file) => file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf'));
+    setFiles(valid);
+    setBatch(null);
+    setProgress(valid.map((file) => ({ key: crypto.randomUUID(), name: file.name, status: 'PENDIENTE' })));
+    setError(valid.length !== selected.length ? 'Omitimos archivos que no parecen ser PDF.' : '');
+  }
+
+  function update(index: number, patch: Partial<ImportProgress>) {
+    setProgress((current) => current.map((item, position) => position === index ? { ...item, ...patch } : item));
+  }
+
+  async function start() {
+    if (!files.length || busy) return;
+    setBusy(true); setError('');
+    try {
+      const batch = await api<{ id: string; items: Array<{ id: string; clientItemKey: string }> }>('/imports', {
+        method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({ items: files.map((file, index) => ({
+          clientItemKey: progress[index]?.key,
+          originalFilename: file.name,
+          declaredMimeType: 'application/pdf',
+          expectedSizeBytes: file.size,
+          employmentId: employmentId || null,
+        })) }),
+      });
+      setBatch({
+        id: batch.id,
+        status: 'ACTIVE',
+        progress: { total: batch.items.length, resolved: 0, percentage: 0 },
+        totals: { PENDING_UPLOAD: batch.items.length },
+        items: batch.items.map((item, index) => ({
+          ...item,
+          originalFilename: files[index]?.name ?? progress[index]?.name ?? 'document.pdf',
+          employmentId: employmentId || null,
+          status: 'PENDING_UPLOAD',
+        })),
+      });
+      let uploadFailed = false;
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index]; const item = batch.items[index];
+        if (!file || !item) continue;
+        update(index, { status: 'SUBIENDO', message: undefined });
+        try {
+          const upload = await api<{ id: string; url: string; fields: Record<string, string> }>('/upload-sessions', { method: 'POST', body: JSON.stringify({ itemId: item.id }) });
+          const form = new FormData();
+          Object.entries(upload.fields).forEach(([name, value]) => form.append(name, value));
+          form.append('file', file);
+          const uploaded = await fetch(upload.url, { method: 'POST', body: form });
+          if (!uploaded.ok) throw new Error(`El almacenamiento rechazó el archivo (${uploaded.status}).`);
+          await api(`/upload-sessions/${upload.id}/complete`, { method: 'POST', body: '{}' });
+          update(index, { status: 'EN_COLA', message: 'Validación de seguridad en curso' });
+        } catch (caught) {
+          uploadFailed = true;
+          update(index, { status: 'ERROR', message: caught instanceof Error ? caught.message : 'No se pudo subir.' });
+        }
+      }
+      if (uploadFailed) applyBatch(await api<ImportBatch>(`/imports/${batch.id}/cancel`, { method: 'POST', body: '{}' }));
+      setFiles([]);
+      onDone();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la importación.'); }
+    finally { setBusy(false); }
+  }
+
+  async function cancelPending() {
+    if (!batch || busy) return;
+    setError('');
+    try {
+      applyBatch(await api<ImportBatch>(`/imports/${batch.id}/cancel`, { method: 'POST', body: '{}' }));
+      setFiles([]);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos cancelar las cargas pendientes.'); }
+  }
+
+  return (
+    <div className="page">
+      <PageHeader eyebrow="Carga privada" title="Importar recibos" />
+      <p className="page-intro">Seleccioná uno o muchos PDFs. Cada archivo avanza por separado y podés cerrar esta pantalla cuando termine la carga.</p>
+      <label className="import-employment">Asociar todo el lote a<select value={employmentId} disabled={hasActiveBatch || busy} onChange={(event) => setEmploymentId(event.target.value)}><option value="">Sin asociar · detectar empresa</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}</select><small>Si mezclás empresas, dejalo sin asociar y usá los checkboxes del historial después.</small></label>
+      <label className={`drop-zone${hasActiveBatch ? ' disabled' : ''}`} aria-disabled={hasActiveBatch} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); choose(event.dataTransfer.files); }}><input type="file" accept="application/pdf,.pdf" multiple disabled={hasActiveBatch} onChange={(event) => choose(event.target.files)} /><span className="upload-mark">↑</span><strong>{hasActiveBatch ? 'Hay un lote en curso' : 'Arrastrá tus recibos acá'}</strong><span>{hasActiveBatch ? 'Cuando termine vas a poder iniciar otro' : 'o hacé clic para elegir PDFs'}</span><small>El servidor limita archivos, tamaño total, espacio por cuenta y trabajo simultáneo.</small></label>
+      {error && <p className="message error" role="alert">{error}</p>}
+      {progress.length > 0 && <section className="panel upload-list" aria-live="polite"><div className="panel-heading"><div><p className="eyebrow">Lote</p><h2>{progress.length} archivo{progress.length === 1 ? '' : 's'}</h2></div>{batch && <span className="batch-id">Lote {batch.id.slice(0, 8)}</span>}</div>{batch && <div className="upload-summary"><progress max={batch.progress.total} value={batch.progress.resolved} aria-label="Progreso del lote" /><strong>{batch.progress.resolved} de {batch.progress.total} resueltos · {batch.progress.percentage}%</strong><small>{batch.totals.PROCESSING ?? 0} procesando · {(batch.totals.UPLOADED ?? 0) + (batch.totals.PENDING_UPLOAD ?? 0)} pendientes · {batch.totals.NEEDS_REVIEW ?? 0} para revisar · {(batch.totals.REJECTED ?? 0) + (batch.totals.FAILED ?? 0)} no procesados</small></div>}<ul>{progress.map((item) => <li key={item.key}><span className="file-icon">PDF</span><span className="upload-name"><strong>{item.name}</strong><small>{item.message ?? (item.status === 'PENDIENTE' ? 'Listo para subir' : 'Enviando…')}</small></span><span className={`upload-state ${item.status.toLowerCase()}`}>{item.status.replace('_', ' ')}</span></li>)}</ul><div className="upload-footer"><p>Los errores de un archivo no detienen el resto del lote.</p>{hasActiveBatch ? (batch.totals.PENDING_UPLOAD ?? 0) > 0 && <button className="button secondary" disabled={busy} onClick={cancelPending}>Cancelar pendientes</button> : <button className="button primary" disabled={busy || !files.length} onClick={start}>{busy ? 'Subiendo…' : 'Iniciar importación'}</button>}</div></section>}
+      <aside className="privacy-note"><span aria-hidden="true">◇</span><div><strong>Privado por diseño</strong><p>Los PDFs se guardan con claves opacas. Antes de extraer datos pasan por validación de formato y malware.</p></div></aside>
+    </div>
+  );
+}
+
+function History() {
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [settlements, setSettlements] = useState<Settlement[]>([]);
+  const [employments, setEmployments] = useState<Employment[]>([]);
+  const [checkedDocumentIds, setCheckedDocumentIds] = useState<string[]>([]);
+  const [employmentChoice, setEmploymentChoice] = useState('');
+  const [associating, setAssociating] = useState(false);
+  const [selected, setSelected] = useState<DocumentItem | null>(null);
+  const [fields, setFields] = useState<ExtractedField[]>([]);
+  const [acceptDeductionsMismatch, setAcceptDeductionsMismatch] = useState(false);
+  const [tab, setTab] = useState<'settlements' | 'documents'>('settlements');
+  const [error, setError] = useState('');
+  const selectedId = selected?.id;
+  const selectedStatus = selected?.processingStatus;
+  const load = useCallback(() => Promise.all([api<DocumentItem[]>('/documents'), api<Settlement[]>('/settlements'), api<Employment[]>('/employments')]).then(([docs, rows, jobs]) => {
+    setDocuments(docs);
+    setSettlements(rows);
+    setEmployments(jobs);
+    setCheckedDocumentIds((current) => current.filter((id) => docs.some((document) => document.id === id && associationReadyStatuses.has(document.processingStatus))));
+    setSelected((current) => current ? docs.find((document) => document.id === current.id) ?? current : null);
+  }).catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'No pudimos cargar el historial.')), []);
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    if (!documents.some((document) => /UPLOADED|VALIDATION|PROCESSING|RETRY|CLASSIFICATION|EXTRACTION|OCR|PARSING|NORMALIZATION/.test(document.processingStatus))) return;
+    const timer = window.setInterval(() => void load(), 3_000);
+    return () => window.clearInterval(timer);
+  }, [documents, load]);
+  useEffect(() => {
+    if (!selectedId) return;
+    let stopped = false;
+    api<{ extractedFields: ExtractedField[] }>(`/documents/${selectedId}`)
+      .then((detail) => { if (!stopped) setFields(detail.extractedFields ?? []); })
+      .catch((caught: unknown) => { if (!stopped) setError(caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.'); });
+    return () => { stopped = true; };
+  }, [selectedId, selectedStatus]);
+
+  function openDocument(document: DocumentItem) {
+    setSelected(document); setFields([]); setAcceptDeductionsMismatch(false); setError('');
+  }
+  async function correct(field: ExtractedField, value: string) {
+    try {
+      await api(`/documents/${selected?.id}/corrections`, {
+        method: 'POST',
+        body: JSON.stringify({ ...(field.id ? { extractedFieldId: field.id } : { fieldPath: field.fieldPath }), correctedValue: value }),
+      });
+      setFields((current) => current.map((item) => item.fieldPath === field.fieldPath ? { ...item, correctedValue: value } : item));
+      await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar la corrección.'); }
+  }
+  async function deleteOriginal() {
+    if (!selected || !confirm('¿Eliminar el PDF original? Los datos estructurados se conservarán.')) return;
+    try { await api(`/documents/${selected.id}/original`, { method: 'DELETE', body: '{}' }); setSelected({ ...selected, originalAvailable: false }); await load(); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminar el original.'); }
+  }
+  async function deleteDocument() {
+    if (!selected || !confirm('¿Eliminar el PDF y todos sus datos extraídos? Esta acción no se puede deshacer.')) return;
+    try { await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' }); setSelected(null); await load(); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminar el documento.'); }
+  }
+  async function confirmType(documentType: 'PAYROLL' | 'UNSUPPORTED') {
+    if (!selected) return;
+    try {
+      const result = await api<{ processingStatus: string }>(`/documents/${selected.id}/type-confirmation`, {
+        method: 'POST', body: JSON.stringify({ documentType }),
+      });
+      setSelected({ ...selected, processingStatus: result.processingStatus });
+      await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar la confirmación.'); }
+  }
+  async function completeReview() {
+    if (!selected) return;
+    try {
+      const result = await api<{ processingStatus: string }>(`/documents/${selected.id}/review-complete`, {
+        method: 'POST',
+        body: JSON.stringify({ acceptDeductionsMismatch }),
+      });
+      setSelected({ ...selected, processingStatus: result.processingStatus });
+      await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos finalizar la revisión.'); }
+  }
+  async function associateDocuments() {
+    if (!checkedDocumentIds.length || !employmentChoice || associating) return;
+    setAssociating(true); setError('');
+    try {
+      await api('/documents/employment', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          documentIds: checkedDocumentIds,
+          employmentId: employmentChoice === 'none' ? null : employmentChoice,
+        }),
+      });
+      setCheckedDocumentIds([]); setEmploymentChoice(''); await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos asociar los documentos.'); }
+    finally { setAssociating(false); }
+  }
+
+  const assignableDocuments = documents.filter((document) => associationReadyStatuses.has(document.processingStatus));
+  const allAssignableSelected = assignableDocuments.length > 0
+    && assignableDocuments.every((document) => checkedDocumentIds.includes(document.id));
+  const missingReviewFields = fields.filter((field) => field.source === 'MANUAL_REQUIRED' && !field.correctedValue);
+  const selectedSettlement = settlements.find((settlement) => settlement.documentId === selected?.id);
+
+  return (
+    <div className="page">
+      <PageHeader eyebrow="Datos estructurados" title="Historial salarial" />
+      <div className="tabs" role="tablist"><button role="tab" aria-selected={tab === 'settlements'} className={tab === 'settlements' ? 'active' : ''} onClick={() => setTab('settlements')}>Liquidaciones</button><button role="tab" aria-selected={tab === 'documents'} className={tab === 'documents' ? 'active' : ''} onClick={() => setTab('documents')}>Documentos</button></div>
+      {error && <p className="message error" role="alert">{error}</p>}
+      {tab === 'documents' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}<option value="none">Quitar asociación</option></select><button className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={associateDocuments}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
+      {tab === 'settlements' ? (settlements.length ? <div className="table-wrap"><table><thead><tr><th>Período</th><th>Empresa</th><th>Tipo</th><th>Bruto</th><th>Descuentos</th><th>Neto</th></tr></thead><tbody>{settlements.map((row) => <tr key={row.id}><td>{row.payrollPeriod.slice(0, 7)}</td><td>{row.employerName || 'Sin asociar'}</td><td>{row.settlementType}</td><td>{money(row.grossAmount, row.currencyCode)}</td><td><DeductionBreakdown settlement={row} /></td><td><strong>{money(row.netAmount, row.currencyCode)}</strong></td></tr>)}</tbody></table></div> : <EmptyState title="Todavía no hay liquidaciones" body="Cuando el worker termine de analizar tus recibos, aparecerán acá." />) : (documents.length ? <div className="document-list">{documents.map((document) => { const assignable = associationReadyStatuses.has(document.processingStatus); return <div className="document-entry" key={document.id}><label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${documentName(document)}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label><button className="document-row" onClick={() => openDocument(document)}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{shortDate(document.createdAt)} · {document.documentType || 'Clasificando'}{document.errorCode ? ` · ${importErrorLabels[document.errorCode] ?? document.errorCode}` : ''}</small></span><Status value={document.processingStatus} /><span aria-hidden="true">›</span></button></div>; })}</div> : <EmptyState title="No hay documentos" body="Importá PDFs para ver su estado y revisar los campos extraídos." />)}
+      {selected && <div className="modal-layer" role="presentation" onMouseDown={() => setSelected(null)}><section className="modal wide" role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setSelected(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Revisión humana</p><h2 id="review-title">{documentName(selected)}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Cerrar">×</button></div><div className="review-summary"><Status value={selected.processingStatus} /><span>{selected.errorCode ? importErrorLabels[selected.errorCode] ?? selected.errorCode : missingReviewFields.length ? `Falta completar: ${missingReviewFields.map((field) => reviewFieldLabels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : selectedSettlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total; revisá los valores y confirmá la diferencia.' : 'Tus correcciones quedan guardadas en esta extracción.'}</span></div>{selected.processingStatus === 'NEEDS_TYPE_CONFIRMATION' ? <div className="type-confirmation"><h3>¿Este PDF es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente. Confirmalo para continuar con la extracción.</p><div><button className="button primary" onClick={() => confirmType('PAYROLL')}>Sí, es un recibo</button><button className="button secondary" onClick={() => confirmType('UNSUPPORTED')}>No corresponde</button></div></div> : fields.length ? <div className="field-list">{fields.map((field) => <FieldEditor key={field.fieldPath} field={field} onSave={(value) => correct(field, value)} />)}</div> : <EmptyState title="Sin campos disponibles" body="El documento todavía está procesándose o no produjo datos utilizables." />}{selected.processingStatus === 'NEEDS_REVIEW' && selectedSettlement?.deductionsMatchTotal === false && <label className="review-acceptance"><input type="checkbox" checked={acceptDeductionsMismatch} onChange={(event) => setAcceptDeductionsMismatch(event.target.checked)} />Revisé los conceptos y acepto esta diferencia.</label>}<div className="modal-actions">{selected.processingStatus === 'NEEDS_REVIEW' && <button className="button primary" disabled={missingReviewFields.length > 0 || (selectedSettlement?.deductionsMatchTotal === false && !acceptDeductionsMismatch)} onClick={completeReview}>Finalizar revisión</button>}<button className="button danger-button" disabled={selected.originalAvailable === false || !associationReadyStatuses.has(selected.processingStatus)} onClick={deleteOriginal}>{selected.originalAvailable === false ? 'Original eliminado' : 'Eliminar sólo el PDF'}</button><button className="button danger-button" onClick={deleteDocument}>Eliminar PDF y datos</button><button className="button secondary" onClick={() => setSelected(null)}>Cerrar</button></div></section></div>}
+    </div>
+  );
+}
+
+function FieldEditor({ field, onSave }: { field: ExtractedField; onSave: (value: string) => Promise<void> }) {
+  const [value, setValue] = useState(field.correctedValue ?? field.interpretedValue ?? '');
+  const [busy, setBusy] = useState(false);
+  const confidence = Math.round(Number(field.confidence) * 100);
+  return <div className="field-editor"><label><span>{reviewFieldLabels[field.fieldPath] ?? field.fieldPath}</span><input type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={field.fieldPath.includes('Amount') ? 'decimal' : undefined} value={value} onChange={(event) => setValue(event.target.value)} /></label><span className={`confidence ${confidence < 70 ? 'low' : ''}`}>{field.source === 'MANUAL_REQUIRED' ? field.correctedValue ? 'Manual' : 'Falta' : Number.isFinite(confidence) ? `${confidence}%` : '—'}</span><small>{field.correctedValue ? 'Corregido por vos' : field.source === 'MANUAL_REQUIRED' ? 'Completalo manualmente' : field.source}</small><button className="button compact" disabled={busy || !value.trim() || value === (field.correctedValue ?? field.interpretedValue ?? '')} onClick={async () => { setBusy(true); await onSave(value); setBusy(false); }}>Guardar</button></div>;
+}
+
+function Privacy() {
+  const [exportJob, setExportJob] = useState<{ id: string; status: string; downloadUrl?: string | null } | null>(null);
+  const [confirmation, setConfirmation] = useState('');
+  const [password, setPassword] = useState('');
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  async function requestExport() {
+    setError('');
+    try { setExportJob(await api('/privacy/exports', { method: 'POST', body: '{}' })); setMessage('Preparamos tu exportación en segundo plano.'); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la exportación.'); }
+  }
+  async function refreshExport() {
+    if (!exportJob) return;
+    try { setExportJob(await api(`/privacy/exports/${exportJob.id}`)); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos consultar la exportación.'); }
+  }
+  async function deleteAccount() {
+    if (confirmation !== 'ELIMINAR' || !password) return;
+    setError('');
+    try { await api('/privacy/account', { method: 'DELETE', body: JSON.stringify({ confirmation, password }) }); window.location.reload(); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la eliminación.'); }
+  }
+
+  return (
+    <div className="page narrow-page">
+      <PageHeader eyebrow="Tus datos" title="Privacidad y control" />
+      {error && <p className="message error" role="alert">{error}</p>}{message && <p className="message success" aria-live="polite">{message}</p>}
+      <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un archivo JSON con empleos, liquidaciones, campos y correcciones. Los PDFs no se incluyen.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <a className="button primary" href={apiUrl(exportJob.downloadUrl)}>Descargar</a> : exportJob ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
+      <section className="settings-card"><div className="setting-icon">◇</div><div><h2>Originales y datos estructurados</h2><p>Desde Historial podés borrar un PDF y conservar la liquidación revisada. Cada lifecycle es independiente.</p></div></section>
+      <section className="settings-card"><div className="setting-icon">§</div><div><h2>Documentos legales</h2><p>Consultá la versión vigente de los <a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> y el <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a>.</p></div></section>
+      <section className="settings-card danger-zone"><div className="setting-icon">!</div><div><h2>Eliminar mi cuenta</h2><p>Inicia el borrado irreversible de documentos, datos estructurados, sesiones y exportaciones.</p><label>Contraseña actual<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><label>Escribí <strong>ELIMINAR</strong> para confirmar<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label></div><div className="setting-actions"><button className="button danger-button" disabled={confirmation !== 'ELIMINAR' || !password} onClick={deleteAccount}>Eliminar cuenta</button></div></section>
+    </div>
+  );
+}
+
+function Admin() {
+  const [overview, setOverview] = useState<AdminOverview | null>(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    api<AdminOverview>('/admin/overview').then(setOverview).catch((caught) => {
+      setError(caught instanceof Error ? caught.message : 'No pudimos abrir el panel.');
+    });
+  }, []);
+
+  const metrics = overview?.metrics;
+  return (
+    <div className="page">
+      <PageHeader eyebrow="Operación segura" title="Administración" />
+      <p className="page-intro">Sólo muestra conteos operativos y adopción legal. No expone salarios, PDFs, OCR, nombres de archivo ni datos personales.</p>
+      {error && <p className="message error" role="alert">{error}</p>}
+      {!overview ? !error && <div className="loader" role="status" aria-label="Cargando panel" /> : <>
+        <div className="metric-grid admin-metrics">
+          <article className="metric"><small>Usuarios activos</small><strong>{metrics?.activeUsers ?? 0}</strong><span>{metrics?.totalUsers ?? 0} cuentas totales</span></article>
+          <article className="metric"><small>Documentos</small><strong>{metrics?.totalDocuments ?? 0}</strong><span>sin mostrar contenido</span></article>
+          <article className="metric"><small>Revisión pendiente</small><strong>{metrics?.pendingReview ?? 0}</strong><span>documentos que requieren acción</span></article>
+          <article className="metric"><small>Importaciones activas</small><strong>{metrics?.activeImports ?? 0}</strong><span>{metrics?.failedDocuments ?? 0} documentos fallidos</span></article>
+        </div>
+        <section className="panel">
+          <div className="panel-heading"><div><p className="eyebrow">Versiones inmutables</p><h2>Documentos legales</h2></div></div>
+          <div className="table-wrap"><table><thead><tr><th>Documento</th><th>Versión</th><th>Vigente desde</th><th>Registro</th><th>Producción</th><th>Confirmaciones</th></tr></thead><tbody>{overview.legalDocuments.map((document) => <tr key={`${document.documentType}-${document.version}`}><td>{document.documentType === 'TERMS' ? 'Términos' : 'Aviso de privacidad'}</td><td>{document.version}</td><td>{new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium', timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date(document.effectiveAt))}</td><td>{document.requiresAcceptance ? 'Aceptación' : 'Lectura confirmada'}</td><td>{document.approvedForProduction ? 'Aprobado' : 'Borrador'}</td><td>{document.acknowledgementCount}</td></tr>)}</tbody></table></div>
+        </section>
+      </>}
+    </div>
+  );
+}

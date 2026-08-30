@@ -1,0 +1,17 @@
+{
+  "name": "@salarivo/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "migrate": "node --experimental-strip-types ./scripts/migrate.ts",
+    "test": "node --experimental-strip-types --test ./test/migrations.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "salarivo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:integration": "npm run test:integration --workspace @salarivo/api",
+    "lint": "npm run lint --workspace @salarivo/web",
+    "db:migrate": "npm run migrate --workspace @salarivo/database",
+    "dev:web": "npm run dev --workspace @salarivo/web",
+    "dev:api": "npm run dev --workspace @salarivo/api",
+    "dev:worker": "npm run dev --workspace @salarivo/worker-documents"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/pg": "8.23.1",
+    "typescript": "5.9.3"
+  }
+}

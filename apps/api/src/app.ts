@@ -1,0 +1,1274 @@
+import { randomUUID } from "node:crypto";
+import cookie from "@fastify/cookie";
+import cors from "@fastify/cors";
+import helmet from "@fastify/helmet";
+import rateLimit from "@fastify/rate-limit";
+import { pool, withTransaction } from "@salarivo/database";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from "fastify";
+import type { ApiConfig } from "./config.ts";
+import { registerDataRoutes } from "./data-routes.ts";
+import {
+  hashPassword,
+  hasTrustedMutationOrigin,
+  opaqueToken,
+  tokenHash,
+  verifyPassword,
+} from "./security.ts";
+
+type AuthUser = {
+  id: string;
+  email: string;
+  displayName: string | null;
+  role: "USER" | "ADMIN";
+  createdAt: string;
+};
+
+declare module "fastify" {
+  interface FastifyRequest {
+    authUser: AuthUser | null;
+    authSessionHash: string | null;
+  }
+}
+
+class ApiError extends Error {
+  readonly statusCode: number;
+  readonly code: string;
+
+  constructor(statusCode: number, code: string, message: string) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
+const DATE_PATTERN = "^\\d{4}-\\d{2}-\\d{2}$";
+const EMAIL_PATTERN = "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$";
+const TOKEN_PATTERN = "^[A-Za-z0-9_-]{43}$";
+const nullableText = (maximum: number) => ({
+  anyOf: [
+    { type: "string", minLength: 1, maxLength: maximum },
+    { type: "null" },
+  ],
+});
+
+const errorSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["error"],
+  properties: {
+    error: {
+      type: "object",
+      additionalProperties: false,
+      required: ["code", "message"],
+      properties: {
+        code: { type: "string" },
+        message: { type: "string" },
+        requestId: { type: "string" },
+      },
+    },
+  },
+};
+
+const userSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "email", "displayName", "role", "createdAt"],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN },
+    email: { type: "string" },
+    displayName: nullableText(100),
+    role: { type: "string", enum: ["USER", "ADMIN"] },
+    createdAt: { type: "string" },
+  },
+};
+
+const legalDocumentSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["documentType", "version", "locale", "title", "content", "effectiveAt", "requiresAcceptance"],
+  properties: {
+    documentType: { type: "string", enum: ["TERMS", "PRIVACY_NOTICE"] },
+    version: { type: "string" },
+    locale: { type: "string" },
+    title: { type: "string" },
+    content: { type: "string" },
+    effectiveAt: { type: "string" },
+    requiresAcceptance: { type: "boolean" },
+  },
+};
+
+const employerSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "name", "countryCode", "createdAt", "updatedAt"],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN },
+    name: { type: "string" },
+    countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
+    createdAt: { type: "string" },
+    updatedAt: { type: "string" },
+  },
+};
+
+const employmentSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "id",
+    "employerId",
+    "employerName",
+    "status",
+    "startDate",
+    "endDate",
+    "role",
+    "category",
+    "modality",
+    "countryCode",
+    "currencyCode",
+    "createdAt",
+    "updatedAt",
+  ],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN },
+    employerId: { type: "string", pattern: UUID_PATTERN },
+    employerName: { type: "string" },
+    status: { type: "string", enum: ["ACTIVE", "ENDED"] },
+    startDate: { type: "string", pattern: DATE_PATTERN },
+    endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
+    role: nullableText(120),
+    category: nullableText(120),
+    modality: nullableText(80),
+    countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
+    currencyCode: { type: "string", pattern: "^[A-Z]{3}$" },
+    createdAt: { type: "string" },
+    updatedAt: { type: "string" },
+  },
+};
+
+const idParamsSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id"],
+  properties: { id: { type: "string", pattern: UUID_PATTERN } },
+};
+
+function envelope(data: object): object {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["data"],
+    properties: { data },
+  };
+}
+
+function responses(status: number, data: object): Record<number, object> {
+  return {
+    [status]: envelope(data),
+    400: errorSchema,
+    401: errorSchema,
+    403: errorSchema,
+    404: errorSchema,
+    409: errorSchema,
+    413: errorSchema,
+    415: errorSchema,
+    429: errorSchema,
+    500: errorSchema,
+    503: errorSchema,
+  };
+}
+
+function timestamp(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+function userFrom(row: Record<string, unknown>): AuthUser {
+  return {
+    id: String(row.id),
+    email: String(row.email),
+    displayName: row.display_name === null ? null : String(row.display_name),
+    role: row.role === "ADMIN" ? "ADMIN" : "USER",
+    createdAt: timestamp(row.created_at as Date | string),
+  };
+}
+
+function legalDocumentFrom(row: Record<string, unknown>) {
+  return {
+    documentType: String(row.document_type),
+    version: String(row.version),
+    locale: String(row.locale),
+    title: String(row.title),
+    content: String(row.content),
+    effectiveAt: timestamp(row.effective_at as Date | string),
+    requiresAcceptance: Boolean(row.requires_acceptance),
+  };
+}
+
+function employerFrom(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    countryCode: String(row.country_code),
+    createdAt: timestamp(row.created_at as Date | string),
+    updatedAt: timestamp(row.updated_at as Date | string),
+  };
+}
+
+function employmentFrom(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    employerId: String(row.employer_id),
+    employerName: String(row.employer_name),
+    status: String(row.status),
+    startDate: row.start_date instanceof Date
+      ? row.start_date.toISOString().slice(0, 10)
+      : String(row.start_date),
+    endDate: row.end_date === null
+      ? null
+      : row.end_date instanceof Date
+        ? row.end_date.toISOString().slice(0, 10)
+        : String(row.end_date),
+    role: row.role === null ? null : String(row.role),
+    category: row.category === null ? null : String(row.category),
+    modality: row.modality === null ? null : String(row.modality),
+    countryCode: String(row.country_code),
+    currencyCode: String(row.currency_code),
+    createdAt: timestamp(row.created_at as Date | string),
+    updatedAt: timestamp(row.updated_at as Date | string),
+  };
+}
+
+function normalizeEmail(value: string): string {
+  const email = value.trim().toLowerCase();
+  if (email.length > 254 || !new RegExp(EMAIL_PATTERN).test(email)) {
+    throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
+  }
+  return email;
+}
+
+function text(value: string, maximum: number): string {
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > maximum) {
+    throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
+  }
+  return normalized;
+}
+
+function optionalText(value: string | null | undefined, maximum: number): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  return text(value, maximum);
+}
+
+function countryCode(value: string): string {
+  const normalized = value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(normalized)) {
+    throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
+  }
+  return normalized;
+}
+
+function currencyCode(value: string): string {
+  const normalized = value.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(normalized)) {
+    throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
+  }
+  return normalized;
+}
+
+function date(value: string): string {
+  if (!new RegExp(DATE_PATTERN).test(value)) {
+    throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
+  }
+  return value;
+}
+
+function isDatabaseError(error: unknown): error is { code: string } {
+  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string";
+}
+
+type RegisterBody = {
+  email: string;
+  password: string;
+  displayName?: string | null;
+  acceptedTerms: true;
+  acknowledgedPrivacy: true;
+  termsVersion: string;
+  privacyVersion: string;
+};
+type LoginBody = { email: string; password: string };
+type ForgotPasswordBody = { email: string };
+type ResetPasswordBody = { token: string; password: string };
+type EmployerBody = { name: string; countryCode: string };
+type EmployerPatch = { name?: string; countryCode?: string };
+type EmploymentBody = {
+  employerId: string;
+  startDate: string;
+  endDate?: string | null;
+  role?: string | null;
+  category?: string | null;
+  modality?: string | null;
+  countryCode: string;
+  currencyCode: string;
+};
+type EmploymentPatch = Partial<EmploymentBody>;
+type IdParams = { id: string };
+type LegalParams = { type: "terms" | "privacy" };
+type LegalQuery = { version?: string };
+
+const dummyPasswordHash = hashPassword("dummy password used only for timing");
+
+export async function buildApp(
+  config: ApiConfig,
+  options: { provisionStorage?: boolean } = {},
+): Promise<FastifyInstance> {
+  const app = Fastify({
+    bodyLimit: 256 * 1024,
+    ajv: { customOptions: { removeAdditional: false } },
+    logger:
+      config.logLevel === "silent"
+        ? false
+        : {
+            level: config.logLevel,
+            redact: {
+              paths: [
+                "req.headers.authorization",
+                "req.headers.cookie",
+                "res.headers.set-cookie",
+              ],
+              censor: "[REDACTED]",
+            },
+          },
+  });
+  app.decorateRequest("authUser", null);
+  app.decorateRequest("authSessionHash", null);
+
+  await app.register(cookie);
+  await app.register(cors, {
+    origin: config.publicOrigin,
+    credentials: true,
+    methods: ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"],
+  });
+  await app.register(helmet);
+  // ponytail: local in-memory limit; move counters to Redis when the API runs in more than one process.
+  await app.register(rateLimit, { global: true, max: 300, timeWindow: "1 minute" });
+
+  app.addHook("onRequest", async (request) => {
+    if (
+      request.url.startsWith("/api/v1/") &&
+      !hasTrustedMutationOrigin(request.method, request.headers.origin, config.publicOrigin)
+    ) {
+      throw new ApiError(403, "UNTRUSTED_ORIGIN", "Origen no autorizado.");
+    }
+  });
+
+  app.setErrorHandler((error, request, reply) => {
+    let statusCode = 500;
+    let code = "INTERNAL_ERROR";
+    let message = "No se pudo completar la operación.";
+    const errorObject = typeof error === "object" && error !== null ? error : null;
+    const errorStatus = errorObject && "statusCode" in errorObject && typeof errorObject.statusCode === "number"
+      ? errorObject.statusCode
+      : undefined;
+
+    if (error instanceof ApiError) {
+      ({ statusCode, code, message } = error);
+    } else if (errorObject && "validation" in errorObject && errorObject.validation) {
+      statusCode = 400;
+      code = "VALIDATION_ERROR";
+      message = "Los datos enviados no son válidos.";
+    } else if (errorStatus === 429) {
+      statusCode = 429;
+      code = "RATE_LIMITED";
+      message = "Demasiados intentos. Probá nuevamente más tarde.";
+    } else if (errorStatus === 413) {
+      statusCode = 413;
+      code = "PAYLOAD_TOO_LARGE";
+      message = "El cuerpo de la solicitud supera el límite permitido.";
+    } else if (errorStatus === 415) {
+      statusCode = 415;
+      code = "UNSUPPORTED_MEDIA_TYPE";
+      message = "El tipo de contenido no está soportado.";
+    } else if (errorStatus === 400) {
+      statusCode = 400;
+      code = "VALIDATION_ERROR";
+      message = "Los datos enviados no son válidos.";
+    } else if (isDatabaseError(error)) {
+      if (error.code === "23505") {
+        statusCode = 409;
+        code = "CONFLICT";
+        message = "El recurso ya existe.";
+      } else if (["23502", "23514", "22P02"].includes(error.code)) {
+        statusCode = 400;
+        code = "VALIDATION_ERROR";
+        message = "Los datos enviados no son válidos.";
+      } else if (error.code === "23503") {
+        statusCode = 409;
+        code = "RESOURCE_IN_USE";
+        message = "El recurso está en uso y no se puede eliminar.";
+      }
+    }
+
+    if (statusCode === 500) {
+      request.log.error({ requestId: request.id, errorCode: code }, "request failed");
+    }
+    void reply.code(statusCode).send({ error: { code, message, requestId: request.id } });
+  });
+
+  app.setNotFoundHandler((request, reply) => {
+    void reply.code(404).send({
+      error: { code: "NOT_FOUND", message: "Recurso no encontrado.", requestId: request.id },
+    });
+  });
+
+  const sessionCookie = "salarivo_session";
+  const cookieOptions = {
+    httpOnly: true,
+    secure: config.appEnv === "production",
+    sameSite: "lax" as const,
+    path: "/",
+  };
+
+  async function requireAuth(request: FastifyRequest): Promise<void> {
+    const rawToken = request.cookies[sessionCookie];
+    if (!rawToken || !new RegExp(TOKEN_PATTERN).test(rawToken)) {
+      throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
+    }
+
+    const digest = tokenHash(rawToken);
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.display_name, u.role, u.created_at
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.token_hash = $1
+          AND s.revoked_at IS NULL
+          AND s.expires_at > now()
+          AND u.status = 'ACTIVE'
+          AND u.deleted_at IS NULL`,
+      [digest],
+    );
+    if (result.rowCount !== 1) {
+      throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
+    }
+    request.authUser = userFrom(result.rows[0]);
+    request.authSessionHash = digest;
+  }
+
+  async function requireAdmin(request: FastifyRequest): Promise<void> {
+    await requireAuth(request);
+    if (request.authUser!.role !== "ADMIN") {
+      throw new ApiError(403, "ADMIN_REQUIRED", "No tenés permisos para acceder al panel de administración.");
+    }
+  }
+
+  function setSession(reply: FastifyReply, token: string): void {
+    reply.setCookie(sessionCookie, token, {
+      ...cookieOptions,
+      maxAge: config.sessionTtlSeconds,
+    });
+  }
+
+  app.get(
+    "/health",
+    {
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: false,
+            required: ["status"],
+            properties: { status: { type: "string", const: "ok" } },
+          },
+        },
+      },
+    },
+    async () => ({ status: "ok" }),
+  );
+
+  app.get<{ Params: LegalParams; Querystring: LegalQuery }>(
+    "/api/v1/legal/:type",
+    {
+      schema: {
+        params: {
+          type: "object",
+          additionalProperties: false,
+          required: ["type"],
+          properties: { type: { type: "string", enum: ["terms", "privacy"] } },
+        },
+        querystring: {
+          type: "object",
+          additionalProperties: false,
+          properties: { version: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" } },
+        },
+        response: responses(200, legalDocumentSchema),
+      },
+    },
+    async (request, reply) => {
+      const documentType = request.params.type === "terms" ? "TERMS" : "PRIVACY_NOTICE";
+      const values: unknown[] = [documentType];
+      let versionFilter = "";
+      if (request.query.version) {
+        values.push(request.query.version);
+        versionFilter = `AND version = $${values.length}`;
+      }
+      const result = await pool.query(
+        `SELECT document_type, version, locale, title, content, effective_at, requires_acceptance
+           FROM legal_document_versions
+          WHERE document_type = $1 AND locale = 'es-AR'
+            AND published_at <= now() AND effective_at <= now()
+            ${versionFilter}
+          ORDER BY effective_at DESC, published_at DESC
+          LIMIT 1`,
+        values,
+      );
+      if (result.rowCount !== 1) throw new ApiError(404, "LEGAL_DOCUMENT_NOT_FOUND", "Documento legal no encontrado.");
+      reply.header("Cache-Control", "public, max-age=300");
+      return { data: legalDocumentFrom(result.rows[0]) };
+    },
+  );
+
+  app.post<{ Body: RegisterBody }>(
+    "/api/v1/auth/register",
+    {
+      config: { rateLimit: { max: 5, timeWindow: "15 minutes" } },
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["email", "password", "acceptedTerms", "acknowledgedPrivacy", "termsVersion", "privacyVersion"],
+          properties: {
+            email: { type: "string", minLength: 3, maxLength: 254, pattern: EMAIL_PATTERN },
+            password: { type: "string", minLength: 12, maxLength: 128 },
+            displayName: nullableText(100),
+            acceptedTerms: { type: "boolean", const: true },
+            acknowledgedPrivacy: { type: "boolean", const: true },
+            termsVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+            privacyVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+          },
+        },
+        response: responses(201, userSchema),
+      },
+    },
+    async (request, reply) => {
+      const email = normalizeEmail(request.body.email);
+      const displayName = optionalText(request.body.displayName, 100) ?? null;
+      const passwordHash = await hashPassword(request.body.password);
+      const userId = randomUUID();
+      const sessionId = randomUUID();
+      const token = opaqueToken();
+      const expiresAt = new Date(Date.now() + config.sessionTtlSeconds * 1000);
+
+      const row = await withTransaction(async (client) => {
+        const legalDocuments = await client.query(
+          `SELECT DISTINCT ON (document_type) id, document_type, version, requires_acceptance, approved_for_production
+             FROM legal_document_versions
+            WHERE document_type IN ('TERMS', 'PRIVACY_NOTICE')
+              AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
+            ORDER BY document_type, effective_at DESC, published_at DESC`,
+        );
+        const byType = new Map(legalDocuments.rows.map((document) => [String(document.document_type), document]));
+        const terms = byType.get("TERMS");
+        const privacy = byType.get("PRIVACY_NOTICE");
+        if (!terms || terms.requires_acceptance !== true || !privacy) {
+          throw new ApiError(503, "LEGAL_DOCUMENTS_UNAVAILABLE", "No se puede crear la cuenta sin los documentos legales vigentes.");
+        }
+        if (
+          config.appEnv === "production"
+          && (terms.approved_for_production !== true || privacy.approved_for_production !== true)
+        ) {
+          throw new ApiError(503, "LEGAL_REVIEW_REQUIRED", "El alta está cerrada hasta aprobar los documentos legales de producción.");
+        }
+        if (
+          request.body.termsVersion !== String(terms.version)
+          || request.body.privacyVersion !== String(privacy.version)
+        ) {
+          throw new ApiError(409, "LEGAL_DOCUMENTS_CHANGED", "Los documentos legales cambiaron. Revisá las versiones vigentes antes de continuar.");
+        }
+        const inserted = await client.query(
+          `INSERT INTO users (
+             id, email, password_hash, display_name, status, default_retention_policy
+           ) VALUES ($1, $2, $3, $4, 'ACTIVE', 'KEEP_ORIGINAL')
+           RETURNING id, email, display_name, role, created_at`,
+          [userId, email, passwordHash, displayName],
+        );
+        await client.query(
+          `INSERT INTO legal_acknowledgements (user_id, document_version_id)
+           SELECT $1, unnest($2::uuid[])`,
+          [userId, [terms.id, privacy.id]],
+        );
+        await client.query(
+          `INSERT INTO sessions (id, user_id, token_hash, expires_at)
+           VALUES ($1, $2, $3, $4)`,
+          [sessionId, userId, tokenHash(token), expiresAt],
+        );
+        await client.query(
+          `INSERT INTO audit_events (
+             id, user_id, actor_user_id, action, resource_type, resource_id, result, metadata_no_sensitive
+           ) VALUES ($1, $2, $2, 'LEGAL_DOCUMENTS_RECORDED', 'ACCOUNT', $2, 'SUCCESS', $3::jsonb)`,
+          [randomUUID(), userId, JSON.stringify({
+            termsAcceptedVersion: terms.version,
+            privacyAcknowledgedVersion: privacy.version,
+          })],
+        );
+        return inserted.rows[0];
+      });
+
+      setSession(reply, token);
+      return reply.code(201).send({ data: userFrom(row) });
+    },
+  );
+
+  app.post<{ Body: LoginBody }>(
+    "/api/v1/auth/login",
+    {
+      config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["email", "password"],
+          properties: {
+            email: { type: "string", minLength: 3, maxLength: 254, pattern: EMAIL_PATTERN },
+            password: { type: "string", minLength: 1, maxLength: 128 },
+          },
+        },
+        response: responses(200, userSchema),
+      },
+    },
+    async (request, reply) => {
+      const email = normalizeEmail(request.body.email);
+      const result = await pool.query(
+        `SELECT id, email, password_hash, display_name, role, created_at
+           FROM users
+          WHERE email = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
+        [email],
+      );
+      const row = result.rows[0];
+      const valid = await verifyPassword(
+        request.body.password,
+        row ? String(row.password_hash) : await dummyPasswordHash,
+      );
+      if (!row || !valid) {
+        throw new ApiError(401, "INVALID_CREDENTIALS", "Email o contraseña incorrectos.");
+      }
+
+      const token = opaqueToken();
+      await pool.query(
+        `INSERT INTO sessions (id, user_id, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4)`,
+        [
+          randomUUID(),
+          row.id,
+          tokenHash(token),
+          new Date(Date.now() + config.sessionTtlSeconds * 1000),
+        ],
+      );
+      setSession(reply, token);
+      return { data: userFrom(row) };
+    },
+  );
+
+  app.post(
+    "/api/v1/auth/logout",
+    {
+      schema: { response: responses(200, { type: "null" }) },
+    },
+    async (request, reply) => {
+      const rawToken = request.cookies[sessionCookie];
+      if (rawToken && new RegExp(TOKEN_PATTERN).test(rawToken)) {
+        await pool.query(
+          `UPDATE sessions SET revoked_at = now()
+            WHERE token_hash = $1 AND revoked_at IS NULL`,
+          [tokenHash(rawToken)],
+        );
+      }
+      reply.clearCookie(sessionCookie, cookieOptions);
+      return { data: null };
+    },
+  );
+
+  app.get(
+    "/api/v1/auth/me",
+    {
+      preHandler: requireAuth,
+      schema: { response: responses(200, userSchema) },
+    },
+    async (request) => ({ data: request.authUser }),
+  );
+
+  app.get(
+    "/api/v1/admin/overview",
+    {
+      preHandler: requireAdmin,
+      schema: {
+        response: responses(200, {
+          type: "object",
+          additionalProperties: false,
+          required: ["metrics", "legalDocuments"],
+          properties: {
+            metrics: {
+              type: "object",
+              additionalProperties: false,
+              required: ["totalUsers", "activeUsers", "totalDocuments", "pendingReview", "activeImports", "failedDocuments"],
+              properties: {
+                totalUsers: { type: "integer", minimum: 0 },
+                activeUsers: { type: "integer", minimum: 0 },
+                totalDocuments: { type: "integer", minimum: 0 },
+                pendingReview: { type: "integer", minimum: 0 },
+                activeImports: { type: "integer", minimum: 0 },
+                failedDocuments: { type: "integer", minimum: 0 },
+              },
+            },
+            legalDocuments: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["documentType", "version", "effectiveAt", "requiresAcceptance", "approvedForProduction", "acknowledgementCount"],
+                properties: {
+                  documentType: { type: "string", enum: ["TERMS", "PRIVACY_NOTICE"] },
+                  version: { type: "string" },
+                  effectiveAt: { type: "string" },
+                  requiresAcceptance: { type: "boolean" },
+                  approvedForProduction: { type: "boolean" },
+                  acknowledgementCount: { type: "integer", minimum: 0 },
+                },
+              },
+            },
+          },
+        }),
+      },
+    },
+    async (_request, reply) => {
+      const [metrics, legalDocuments] = await Promise.all([
+        pool.query(
+          `SELECT
+             (SELECT count(*)::integer FROM users) AS total_users,
+             (SELECT count(*)::integer FROM users WHERE status = 'ACTIVE' AND deleted_at IS NULL) AS active_users,
+             (SELECT count(*)::integer FROM documents WHERE deleted_at IS NULL) AS total_documents,
+             (SELECT count(*)::integer FROM documents WHERE deleted_at IS NULL
+               AND processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION')) AS pending_review,
+             (SELECT count(*)::integer FROM import_batches WHERE status IN ('ACTIVE', 'PAUSED')) AS active_imports,
+             (SELECT count(*)::integer FROM documents WHERE deleted_at IS NULL
+               AND processing_status IN ('FAILED_PERMANENT', 'QUARANTINED', 'REJECTED_UNSUPPORTED')) AS failed_documents`,
+        ),
+        pool.query(
+          `SELECT version.document_type, version.version, version.effective_at, version.requires_acceptance,
+                  version.approved_for_production,
+                  count(acknowledgement.user_id)::integer AS acknowledgement_count
+             FROM legal_document_versions version
+             LEFT JOIN legal_acknowledgements acknowledgement ON acknowledgement.document_version_id = version.id
+            GROUP BY version.id
+            ORDER BY version.document_type, version.effective_at DESC`,
+        ),
+      ]);
+      const row = metrics.rows[0];
+      reply.header("Cache-Control", "no-store");
+      return {
+        data: {
+          metrics: {
+            totalUsers: row.total_users,
+            activeUsers: row.active_users,
+            totalDocuments: row.total_documents,
+            pendingReview: row.pending_review,
+            activeImports: row.active_imports,
+            failedDocuments: row.failed_documents,
+          },
+          legalDocuments: legalDocuments.rows.map((document) => ({
+            documentType: String(document.document_type),
+            version: String(document.version),
+            effectiveAt: timestamp(document.effective_at),
+            requiresAcceptance: Boolean(document.requires_acceptance),
+            approvedForProduction: Boolean(document.approved_for_production),
+            acknowledgementCount: Number(document.acknowledgement_count),
+          })),
+        },
+      };
+    },
+  );
+
+  app.post<{ Body: ForgotPasswordBody }>(
+    "/api/v1/auth/forgot-password",
+    {
+      config: { rateLimit: { max: 5, timeWindow: "15 minutes" } },
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["email"],
+          properties: {
+            email: { type: "string", minLength: 3, maxLength: 254, pattern: EMAIL_PATTERN },
+          },
+        },
+        response: responses(202, {
+          type: "object",
+          additionalProperties: false,
+          required: ["accepted"],
+          properties: {
+            accepted: { type: "boolean", const: true },
+            resetToken: { type: "string", pattern: TOKEN_PATTERN },
+          },
+        }),
+      },
+    },
+    async (request, reply) => {
+      if (config.appEnv === "production") {
+        throw new ApiError(503, "RECOVERY_DELIVERY_UNAVAILABLE", "La recuperación no está disponible temporalmente.");
+      }
+
+      const email = normalizeEmail(request.body.email);
+      const token = opaqueToken();
+      const user = await pool.query(
+        `SELECT id FROM users
+          WHERE email = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
+        [email],
+      );
+      if (user.rowCount === 1) {
+        await withTransaction(async (client) => {
+          await client.query(
+            `UPDATE password_reset_tokens SET used_at = now()
+              WHERE user_id = $1 AND used_at IS NULL`,
+            [user.rows[0].id],
+          );
+          await client.query(
+            `INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
+             VALUES ($1, $2, $3, $4)`,
+            [
+              randomUUID(),
+              user.rows[0].id,
+              tokenHash(token),
+              new Date(Date.now() + config.passwordResetTtlSeconds * 1000),
+            ],
+          );
+        });
+      }
+
+      return reply.code(202).send({ data: { accepted: true, resetToken: token } });
+    },
+  );
+
+  app.post<{ Body: ResetPasswordBody }>(
+    "/api/v1/auth/reset-password",
+    {
+      config: { rateLimit: { max: 5, timeWindow: "15 minutes" } },
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["token", "password"],
+          properties: {
+            token: { type: "string", pattern: TOKEN_PATTERN },
+            password: { type: "string", minLength: 12, maxLength: 128 },
+          },
+        },
+        response: responses(200, {
+          type: "object",
+          additionalProperties: false,
+          required: ["reset"],
+          properties: { reset: { type: "boolean", const: true } },
+        }),
+      },
+    },
+    async (request, reply) => {
+      const passwordHash = await hashPassword(request.body.password);
+      const reset = await withTransaction(async (client) => {
+        const found = await client.query(
+          `SELECT t.id, t.user_id
+             FROM password_reset_tokens t
+             JOIN users u ON u.id = t.user_id
+            WHERE t.token_hash = $1
+              AND t.used_at IS NULL
+              AND t.expires_at > now()
+              AND u.status = 'ACTIVE'
+              AND u.deleted_at IS NULL
+            FOR UPDATE OF t`,
+          [tokenHash(request.body.token)],
+        );
+        if (found.rowCount !== 1) return false;
+
+        const userId = found.rows[0].user_id;
+        await client.query(
+          `UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`,
+          [passwordHash, userId],
+        );
+        await client.query(
+          `UPDATE password_reset_tokens SET used_at = now()
+            WHERE user_id = $1 AND used_at IS NULL`,
+          [userId],
+        );
+        await client.query(
+          `UPDATE sessions SET revoked_at = now()
+            WHERE user_id = $1 AND revoked_at IS NULL`,
+          [userId],
+        );
+        return true;
+      });
+      if (!reset) {
+        throw new ApiError(400, "INVALID_RESET_TOKEN", "El enlace de recuperación no es válido o venció.");
+      }
+
+      reply.clearCookie(sessionCookie, cookieOptions);
+      return { data: { reset: true } };
+    },
+  );
+
+  app.get(
+    "/api/v1/employers",
+    {
+      preHandler: requireAuth,
+      schema: {
+        response: responses(200, { type: "array", items: employerSchema }),
+      },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `SELECT id, name, country_code, created_at, updated_at
+           FROM employers
+          WHERE user_id = $1
+          ORDER BY lower(name), id`,
+        [request.authUser!.id],
+      );
+      return { data: result.rows.map(employerFrom) };
+    },
+  );
+
+  app.post<{ Body: EmployerBody }>(
+    "/api/v1/employers",
+    {
+      preHandler: requireAuth,
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "countryCode"],
+          properties: {
+            name: { type: "string", minLength: 1, maxLength: 160 },
+            countryCode: { type: "string", minLength: 2, maxLength: 2 },
+          },
+        },
+        response: responses(201, employerSchema),
+      },
+    },
+    async (request, reply) => {
+      const result = await pool.query(
+        `INSERT INTO employers (id, user_id, name, country_code)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, name, country_code, created_at, updated_at`,
+        [
+          randomUUID(),
+          request.authUser!.id,
+          text(request.body.name, 160),
+          countryCode(request.body.countryCode),
+        ],
+      );
+      return reply.code(201).send({ data: employerFrom(result.rows[0]) });
+    },
+  );
+
+  app.get<{ Params: IdParams }>(
+    "/api/v1/employers/:id",
+    {
+      preHandler: requireAuth,
+      schema: { params: idParamsSchema, response: responses(200, employerSchema) },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `SELECT id, name, country_code, created_at, updated_at
+           FROM employers WHERE id = $1 AND user_id = $2`,
+        [request.params.id, request.authUser!.id],
+      );
+      if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: employerFrom(result.rows[0]) };
+    },
+  );
+
+  app.patch<{ Params: IdParams; Body: EmployerPatch }>(
+    "/api/v1/employers/:id",
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object",
+          additionalProperties: false,
+          minProperties: 1,
+          properties: {
+            name: { type: "string", minLength: 1, maxLength: 160 },
+            countryCode: { type: "string", minLength: 2, maxLength: 2 },
+          },
+        },
+        response: responses(200, employerSchema),
+      },
+    },
+    async (request) => {
+      const values: unknown[] = [request.params.id, request.authUser!.id];
+      const updates: string[] = [];
+      if (request.body.name !== undefined) {
+        values.push(text(request.body.name, 160));
+        updates.push(`name = $${values.length}`);
+      }
+      if (request.body.countryCode !== undefined) {
+        values.push(countryCode(request.body.countryCode));
+        updates.push(`country_code = $${values.length}`);
+      }
+      updates.push("updated_at = now()");
+
+      const result = await pool.query(
+        `UPDATE employers SET ${updates.join(", ")}
+          WHERE id = $1 AND user_id = $2
+          RETURNING id, name, country_code, created_at, updated_at`,
+        values,
+      );
+      if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: employerFrom(result.rows[0]) };
+    },
+  );
+
+  app.delete<{ Params: IdParams }>(
+    "/api/v1/employers/:id",
+    {
+      preHandler: requireAuth,
+      schema: { params: idParamsSchema, response: responses(200, { type: "null" }) },
+    },
+    async (request) => {
+      const outcome = await withTransaction(async (client) => {
+        const employer = await client.query(
+          `SELECT id FROM employers WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (employer.rowCount !== 1) return "NOT_FOUND";
+        const employment = await client.query(
+          `SELECT 1 FROM employments WHERE employer_id = $1 AND user_id = $2 LIMIT 1`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (employment.rowCount !== 0) return "IN_USE";
+        await client.query(`DELETE FROM employers WHERE id = $1 AND user_id = $2`, [
+          request.params.id,
+          request.authUser!.id,
+        ]);
+        return "DELETED";
+      });
+      if (outcome === "NOT_FOUND") throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      if (outcome === "IN_USE") {
+        throw new ApiError(409, "RESOURCE_IN_USE", "El empleador tiene empleos asociados.");
+      }
+      return { data: null };
+    },
+  );
+
+  const employmentSelect = `
+    SELECT e.id, e.employer_id, employer.name AS employer_name, e.status,
+           e.start_date, e.end_date, e.role, e.category, e.modality,
+           e.country_code, e.currency_code, e.created_at, e.updated_at
+      FROM employments e
+      JOIN employers employer ON employer.id = e.employer_id AND employer.user_id = e.user_id`;
+
+  app.get(
+    "/api/v1/employments",
+    {
+      preHandler: requireAuth,
+      schema: {
+        response: responses(200, { type: "array", items: employmentSchema }),
+      },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `${employmentSelect}
+          WHERE e.user_id = $1
+          ORDER BY e.start_date DESC, e.id`,
+        [request.authUser!.id],
+      );
+      return { data: result.rows.map(employmentFrom) };
+    },
+  );
+
+  app.post<{ Body: EmploymentBody }>(
+    "/api/v1/employments",
+    {
+      preHandler: requireAuth,
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["employerId", "startDate", "countryCode", "currencyCode"],
+          properties: {
+            employerId: { type: "string", pattern: UUID_PATTERN },
+            startDate: { type: "string", pattern: DATE_PATTERN },
+            endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
+            role: nullableText(120),
+            category: nullableText(120),
+            modality: nullableText(80),
+            countryCode: { type: "string", minLength: 2, maxLength: 2 },
+            currencyCode: { type: "string", minLength: 3, maxLength: 3 },
+          },
+        },
+        response: responses(201, employmentSchema),
+      },
+    },
+    async (request, reply) => {
+      const startDate = date(request.body.startDate);
+      const endDate = request.body.endDate === undefined || request.body.endDate === null
+        ? null
+        : date(request.body.endDate);
+      if (endDate !== null && endDate < startDate) {
+        throw new ApiError(400, "VALIDATION_ERROR", "La fecha de fin no puede ser anterior al inicio.");
+      }
+
+      const created = await withTransaction(async (client) => {
+        const result = await client.query(
+          `INSERT INTO employments (
+             id, user_id, employer_id, status, start_date, end_date, role, category,
+             modality, country_code, currency_code
+           )
+           SELECT $1, $2, employer.id, $4, $5, $6, $7, $8, $9, $10, $11
+             FROM employers employer
+            WHERE employer.id = $3 AND employer.user_id = $2
+           RETURNING id`,
+          [
+            randomUUID(),
+            request.authUser!.id,
+            request.body.employerId,
+            endDate === null ? "ACTIVE" : "ENDED",
+            startDate,
+            endDate,
+            optionalText(request.body.role, 120) ?? null,
+            optionalText(request.body.category, 120) ?? null,
+            optionalText(request.body.modality, 80) ?? null,
+            countryCode(request.body.countryCode),
+            currencyCode(request.body.currencyCode),
+          ],
+        );
+        if (result.rowCount !== 1) {
+          throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
+        }
+        const selected = await client.query(
+          `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
+          [result.rows[0].id, request.authUser!.id],
+        );
+        return selected.rows[0];
+      });
+      return reply.code(201).send({ data: employmentFrom(created) });
+    },
+  );
+
+  app.get<{ Params: IdParams }>(
+    "/api/v1/employments/:id",
+    {
+      preHandler: requireAuth,
+      schema: { params: idParamsSchema, response: responses(200, employmentSchema) },
+    },
+    async (request) => {
+      const result = await pool.query(`${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`, [
+        request.params.id,
+        request.authUser!.id,
+      ]);
+      if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: employmentFrom(result.rows[0]) };
+    },
+  );
+
+  app.patch<{ Params: IdParams; Body: EmploymentPatch }>(
+    "/api/v1/employments/:id",
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object",
+          additionalProperties: false,
+          minProperties: 1,
+          properties: {
+            employerId: { type: "string", pattern: UUID_PATTERN },
+            startDate: { type: "string", pattern: DATE_PATTERN },
+            endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
+            role: nullableText(120),
+            category: nullableText(120),
+            modality: nullableText(80),
+            countryCode: { type: "string", minLength: 2, maxLength: 2 },
+            currencyCode: { type: "string", minLength: 3, maxLength: 3 },
+          },
+        },
+        response: responses(200, employmentSchema),
+      },
+    },
+    async (request) => {
+      const userId = request.authUser!.id;
+      const values: unknown[] = [request.params.id, userId];
+      const updates: string[] = [];
+      const add = (column: string, value: unknown) => {
+        values.push(value);
+        updates.push(`${column} = $${values.length}`);
+      };
+      if (request.body.employerId !== undefined) add("employer_id", request.body.employerId);
+      if (request.body.startDate !== undefined) add("start_date", date(request.body.startDate));
+      if (request.body.endDate !== undefined) {
+        add("end_date", request.body.endDate === null ? null : date(request.body.endDate));
+        add("status", request.body.endDate === null ? "ACTIVE" : "ENDED");
+      }
+      if (request.body.role !== undefined) add("role", optionalText(request.body.role, 120));
+      if (request.body.category !== undefined) add("category", optionalText(request.body.category, 120));
+      if (request.body.modality !== undefined) add("modality", optionalText(request.body.modality, 80));
+      if (request.body.countryCode !== undefined) add("country_code", countryCode(request.body.countryCode));
+      if (request.body.currencyCode !== undefined) add("currency_code", currencyCode(request.body.currencyCode));
+      updates.push("updated_at = now()");
+
+      const row = await withTransaction(async (client) => {
+        if (request.body.employerId !== undefined) {
+          const employer = await client.query(
+            `SELECT 1 FROM employers WHERE id = $1 AND user_id = $2 FOR KEY SHARE`,
+            [request.body.employerId, userId],
+          );
+          if (employer.rowCount !== 1) {
+            throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
+          }
+        }
+        const updated = await client.query(
+          `UPDATE employments SET ${updates.join(", ")}
+            WHERE id = $1 AND user_id = $2 RETURNING id`,
+          values,
+        );
+        if (updated.rowCount !== 1) {
+          throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        }
+        const selected = await client.query(
+          `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
+          [request.params.id, userId],
+        );
+        return selected.rows[0];
+      });
+      return { data: employmentFrom(row) };
+    },
+  );
+
+  app.delete<{ Params: IdParams }>(
+    "/api/v1/employments/:id",
+    {
+      preHandler: requireAuth,
+      schema: { params: idParamsSchema, response: responses(200, { type: "null" }) },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `DELETE FROM employments WHERE id = $1 AND user_id = $2 RETURNING id`,
+        [request.params.id, request.authUser!.id],
+      );
+      if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: null };
+    },
+  );
+
+  await registerDataRoutes(app, {
+    config,
+    requireAuth,
+    ApiError,
+    provisionStorage: options.provisionStorage ?? config.appEnv !== "test",
+  });
+
+  return app;
+}

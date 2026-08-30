@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+build/
+coverage/
+*.log
+*.tsbuildinfo
+
+.local/
+data/
+uploads/
+exports/
+tmp/
+temp/
+
+# Evita subir recibos reales; sólo se permiten fixtures PDF sintéticos.
+*.pdf
+!tests/fixtures/**/*.pdf
+
+.DS_Store
+Thumbs.db
