@@ -1,24 +1,105 @@
-export type PublishedLegalDocument = {
-  documentType: 'TERMS' | 'PRIVACY_NOTICE';
-  version: string;
-  locale: 'es-AR';
-  title: string;
-  content: string;
-  effectiveAt: string;
-  requiresAcceptance: boolean;
-};
+ALTER TABLE users
+    DROP CONSTRAINT users_status_check,
+    ALTER COLUMN password_hash DROP NOT NULL,
+    ADD COLUMN email_verified_at timestamptz,
+    ADD COLUMN onboarding_completed_at timestamptz,
+    ADD COLUMN last_login_at timestamptz;
 
-const effectiveAt = '2026-08-30T12:30:00.000Z';
+UPDATE users AS app_user
+   SET onboarding_completed_at = app_user.created_at,
+       last_login_at = COALESCE(
+           (SELECT max(session.created_at) FROM sessions AS session WHERE session.user_id = app_user.id),
+           app_user.created_at
+       );
 
-export const publishedLegalDocuments: Record<'terms' | 'privacy', PublishedLegalDocument> = {
-  terms: {
-    documentType: 'TERMS',
-    version: '1.2',
-    locale: 'es-AR',
-    title: 'Términos de uso de Salarivo — acceso privado individual',
-    effectiveAt,
-    requiresAcceptance: true,
-    content: `1. Alcance y aceptación
+ALTER TABLE users
+    ADD CONSTRAINT users_status_check
+        CHECK (status IN ('ACTIVE', 'SUSPENDED', 'BLOCKED', 'DELETION_PENDING', 'DELETED')),
+    ADD CONSTRAINT users_email_verified_at_check
+        CHECK (email_verified_at IS NULL OR email_verified_at >= created_at),
+    ADD CONSTRAINT users_onboarding_completed_at_check
+        CHECK (onboarding_completed_at IS NULL OR onboarding_completed_at >= created_at),
+    ADD CONSTRAINT users_last_login_at_check
+        CHECK (last_login_at IS NULL OR last_login_at >= created_at);
+
+CREATE TABLE auth_accounts (
+    id uuid PRIMARY KEY,
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider text NOT NULL,
+    provider_account_id text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    last_login_at timestamptz,
+    UNIQUE (provider, provider_account_id),
+    UNIQUE (user_id, provider),
+    CHECK (provider ~ '^[A-Z][A-Z0-9_]{0,31}$'),
+    CHECK (length(provider_account_id) BETWEEN 1 AND 255),
+    CHECK (updated_at >= created_at),
+    CHECK (last_login_at IS NULL OR last_login_at >= created_at)
+);
+
+CREATE INDEX auth_accounts_user_idx ON auth_accounts (user_id);
+
+CREATE TABLE oauth_attempts (
+    id uuid PRIMARY KEY,
+    browser_token_hash text NOT NULL UNIQUE,
+    state_hash text NOT NULL UNIQUE,
+    provider text NOT NULL CHECK (provider = 'GOOGLE'),
+    purpose text NOT NULL CHECK (purpose IN ('LOGIN', 'STEP_UP')),
+    user_id uuid,
+    session_id uuid,
+    pkce_verifier text NOT NULL,
+    nonce text NOT NULL,
+    status text NOT NULL DEFAULT 'STARTED'
+        CHECK (status IN ('STARTED', 'EXCHANGING', 'IDENTITY_VERIFIED')),
+    pending_subject text,
+    pending_email text,
+    pending_display_name text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL DEFAULT (now() + interval '10 minutes'),
+    FOREIGN KEY (user_id, session_id)
+        REFERENCES sessions(user_id, id) MATCH FULL ON DELETE CASCADE,
+    CHECK (browser_token_hash ~ '^[0-9a-f]{64}$'),
+    CHECK (state_hash ~ '^[0-9a-f]{64}$'),
+    CHECK (pkce_verifier ~ '^[A-Za-z0-9._~-]{43,128}$'),
+    CHECK (nonce ~ '^[A-Za-z0-9_-]{16,128}$'),
+    CHECK ((purpose = 'STEP_UP') = (user_id IS NOT NULL AND session_id IS NOT NULL)),
+    CHECK (
+        (status = 'IDENTITY_VERIFIED'
+            AND pending_subject IS NOT NULL
+            AND pending_email IS NOT NULL)
+        OR (status IN ('STARTED', 'EXCHANGING')
+            AND pending_subject IS NULL
+            AND pending_email IS NULL
+            AND pending_display_name IS NULL)
+    ),
+    CHECK (pending_subject IS NULL OR length(pending_subject) BETWEEN 1 AND 255),
+    CHECK (
+        pending_email IS NULL
+        OR (pending_email = lower(pending_email) AND length(pending_email) BETWEEN 3 AND 320)
+    ),
+    CHECK (pending_display_name IS NULL OR length(pending_display_name) BETWEEN 1 AND 120),
+    CHECK (updated_at >= created_at),
+    CHECK (expires_at = created_at + interval '10 minutes')
+);
+
+CREATE INDEX oauth_attempts_expiry_idx ON oauth_attempts (expires_at);
+CREATE INDEX oauth_attempts_step_up_idx
+    ON oauth_attempts (user_id, session_id, created_at DESC)
+    WHERE purpose = 'STEP_UP';
+
+INSERT INTO legal_document_versions (
+    id, document_type, version, locale, title, content,
+    published_at, effective_at, requires_acceptance, approved_for_production
+) VALUES
+(
+    '00000000-0000-4000-8000-000000000131',
+    'TERMS',
+    '1.2',
+    'es-AR',
+    'Términos de uso de Salarivo — acceso privado individual',
+    $terms$1. Alcance y aceptación
 
 Estos Términos rigen exclusivamente la instancia privada e individual de Salarivo. La persona titular que administra la instancia es su única usuaria autorizada. Esta versión no autoriza ofrecer acceso a terceros, prestar servicios a otras personas ni tratar documentos ajenos sin autorización. Al crear una cuenta o usar Salarivo aceptás estos Términos y el Aviso de Privacidad vigente.
 
@@ -64,16 +145,19 @@ El acceso puede suspenderse o terminarse ante abuso, riesgo técnico, incumplimi
 
 12. Versiones, ley aplicable y jurisdicción
 
-Cada versión se conserva de forma inmutable con su fecha de vigencia. Una versión nueva sólo queda vinculada a una aceptación expresa y no altera la constancia de versiones anteriores. Se aplica la ley de la República Argentina. Cualquier controversia corresponde a los tribunales legalmente competentes, sin desplazar fueros ni derechos inderogables.`,
-  },
-  privacy: {
-    documentType: 'PRIVACY_NOTICE',
-    version: '1.2',
-    locale: 'es-AR',
-    title: 'Aviso de privacidad de Salarivo — acceso privado individual',
-    effectiveAt,
-    requiresAcceptance: false,
-    content: `1. Alcance y responsable
+Cada versión se conserva de forma inmutable con su fecha de vigencia. Una versión nueva sólo queda vinculada a una aceptación expresa y no altera la constancia de versiones anteriores. Se aplica la ley de la República Argentina. Cualquier controversia corresponde a los tribunales legalmente competentes, sin desplazar fueros ni derechos inderogables.$terms$,
+    '2026-08-30T12:30:00Z',
+    '2026-08-30T12:30:00Z',
+    true,
+    true
+),
+(
+    '00000000-0000-4000-8000-000000000132',
+    'PRIVACY_NOTICE',
+    '1.2',
+    'es-AR',
+    'Aviso de privacidad de Salarivo — acceso privado individual',
+    $privacy$1. Alcance y responsable
 
 Este Aviso rige la instancia privada e individual de Salarivo. La persona titular que administra la instancia es el responsable de los datos y su única usuaria autorizada. La identidad y el domicilio del responsable coinciden con los de esa persona titular. Las solicitudes se presentan por el mismo canal privado utilizado para habilitar y administrar el acceso. La instancia no está destinada a dar informes sobre terceros ni a ofrecer cuentas al público.
 
@@ -123,6 +207,9 @@ Podés ejercer gratuitamente los derechos de información, acceso, rectificació
 
 13. Versiones
 
-Cada versión del Aviso se conserva de forma inmutable con su fecha de vigencia y su confirmación queda registrada al crear la cuenta. Una versión posterior se aplica únicamente cuando exista una nueva confirmación expresa.`,
-  },
-};
+Cada versión del Aviso se conserva de forma inmutable con su fecha de vigencia y su confirmación queda registrada al crear la cuenta. Una versión posterior se aplica únicamente cuando exista una nueva confirmación expresa.$privacy$,
+    '2026-08-30T12:30:00Z',
+    '2026-08-30T12:30:00Z',
+    false,
+    true
+);

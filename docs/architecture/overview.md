@@ -16,8 +16,10 @@ Comparten dominio y contratos. Separar el proceso pesado protege latencia y memo
 ~~~mermaid
 flowchart TB
     U[Usuario / navegador] --> E[CDN + WAF]
+    U -. Authorization Code + PKCE .-> G[Google OIDC]
     E --> W[Web]
     W --> A[API / BFF<br/>monolito modular]
+    G -. callback GET validado .-> A
     A --> P[(PostgreSQL)]
     A --> O[(Object storage privado)]
     W -. upload con autorización breve .-> O
@@ -39,7 +41,7 @@ El navegador nunca recibe credenciales permanentes ni una URL pública. El acces
 | Componente | Hace | No hace |
 | --- | --- | --- |
 | Web | preflight UX, upload directo, progreso y revisión | decidir seguridad o ownership |
-| API/BFF | auth, ownership, sesiones de upload, batches, consultas y comandos | OCR síncrono o cargar PDFs completos |
+| API/BFF | auth local/Google, sesiones propias, ownership, sesiones de upload, batches, consultas y comandos | OCR síncrono, cargar PDFs completos o delegar autorización al IdP |
 | PostgreSQL | metadata, dominio estructurado, estados, job/outbox durable, auditoría e idempotencia | almacenar binarios |
 | Redis/cola | scheduling, backpressure, retries y fairness | ser la única fuente de verdad del batch |
 | Object storage | originales, cuarentena y objetos temporales controlados | exposición pública |
@@ -57,10 +59,11 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 5. Worker a parser/OCR: ejecución con CPU, RAM, tiempo, filesystem y red limitados.
 6. Aplicación a proveedor externo: salida mínima, redactada y autorizada.
 7. Aplicación a observabilidad: sólo IDs internos, códigos y métricas no sensibles.
+8. Navegador/API a Google OIDC: `state`, `nonce` y PKCE por intento; callback, issuer, audience y redirects validados server-side.
 
 ## Módulos de dominio
 
-- identity: usuarios, sesiones, MFA TOTP, step-up y recuperación;
+- identity: usuarios internos, cuentas de autenticación, sesiones opacas, Google OIDC, MFA TOTP, step-up y recuperación;
 - employment: empleadores, relaciones laborales y eventos;
 - imports: sesiones, batches, items y progreso;
 - documents: metadata, lifecycle, seguridad y retención;
@@ -117,6 +120,7 @@ Recursos iniciales:
 
 | Recurso | Operaciones MVP |
 | --- | --- |
+| auth | alta e inicio/callback Google, login local sólo para cuentas existentes, onboarding, logout, revocación de otras sesiones, MFA y step-up |
 | upload-sessions | crear y confirmar upload |
 | imports | crear, consultar, recuperar el lote activo y cancelar uploads pendientes; pausa/reanudación quedan pendientes |
 | documents | listar, consultar, asociar masivamente a un empleo, corregir, cerrar revisión, eliminar y confirmar tipo; reproceso queda pendiente |
@@ -127,6 +131,14 @@ Recursos iniciales:
 | privacy | eliminar cuenta; preferencias editables quedan pendientes |
 
 Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se incorpore OpenAPI describirá auth, schemas, límites y respuestas; los detalles de proveedor quedarán fuera del contrato HTTP.
+
+### Identidad externa y sesión interna
+
+Google usa OIDC Authorization Code con PKCE, `state` y `nonce`; el callback es `GET`. Cada intento es breve, de un solo uso y queda ligado al navegador por una cookie y estado server-side. El redirect posterior sólo puede apuntar a destinos internos allowlisted.
+
+La respuesta válida se resuelve por `(provider, sub)` en `auth_accounts`. El email recibido es un atributo verificable del perfil, no una clave de login ni de vinculación: una colisión nunca auto-vincula una cuenta. No se persisten access, refresh ni ID tokens. Tanto password como Google terminan en el UUID y la sesión opaca interna ya usados por los guards y por ownership.
+
+Para una identidad nueva, el callback deja un onboarding pendiente, pero no crea una cuenta activa. El segundo paso crea usuario, aceptación legal, `auth_account`, sesión y auditoría en una única transacción. `BLOCKED` y `SUSPENDED` fallan cerrados. En una cuenta Google-only, el step-up inicia otra autorización con `max_age=0`, ligada a la sesión actual, y rota esa sesión cuando termina; la persona también puede revocar el resto de sus sesiones. [ADR 0010](../adr/0010-google-oidc-and-external-identities.md) conserva sin cambios el modelo de ownership.
 
 ## Ports principales
 
@@ -154,6 +166,7 @@ Toda variable se valida al arranque y se obtiene de entorno/secret manager. No h
 | Grupo | Variables previstas |
 | --- | --- |
 | Runtime | APP_ENV, LOG_LEVEL, PUBLIC_ORIGIN |
+| Google OIDC | GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI |
 | Database | DATABASE_URL, DB_POOL_MIN, DB_POOL_MAX |
 | Queue | QUEUE_URL, OUTBOX_POLL_INTERVAL_MS, WORKER_CONCURRENCY, WORKER_CONCURRENCY_PER_USER, JOB_TIMEOUT_MS, JOB_MAX_RETRIES |
 | Storage | OBJECT_STORAGE_ENDPOINT, REGION, BUCKET, ACCESS_KEY, SECRET_KEY, SIGNED_URL_TTL_SECONDS |
@@ -177,6 +190,7 @@ El benchmark futuro agregará, fuera del historial privado, sólo contribuciones
 - Cola caída: uploads ya confirmados permanecen en DB/storage y se reconcilian.
 - Worker caído: el lease lógico expira, pero el marcador de ejecución queda fail-closed y bloquea retry y baja hasta verificar que el proceso y su temporal terminaron; la recuperación operativa segura sigue pendiente.
 - Proveedor externo caído: no tumba el dominio; se usa fallback permitido o estado visible.
+- Google caído: no se abre ni eleva una sesión mediante ese proveedor; las sesiones internas ya válidas conservan sus controles normales.
 - Storage caído: no se marca upload como completo.
 - Malware scanner no disponible: fail closed; el objeto no avanza.
 
@@ -184,7 +198,7 @@ El benchmark futuro agregará, fuera del historial privado, sólo contribuciones
 
 - Unit: invariantes de dominio, estados, dinero y precedencia de correcciones.
 - Integration: PostgreSQL, cola, storage, idempotencia y cleanup.
-- Security: ownership/IDOR, MIME falso, magic bytes, malware, PDF corrupto/cifrado, límites y URLs firmadas.
+- Security: ownership/IDOR por cada método de login, colisiones de identidad OIDC, replay/callback/redirect, MIME falso, magic bytes, malware, PDF corrupto/cifrado, límites y URLs firmadas.
 - Load: un usuario con 500 documentos y varios usuarios simultáneos; la memoria API debe mantenerse acotada.
 - Fixtures: sólo PDFs sintéticos válidos, SAC, bono, factura, corrupto, renombrado, vacío, escaneado, sobredimensionado, cifrado y ambiguo.
 
@@ -198,4 +212,4 @@ El workflow `.github/workflows/ci.yml` ejecuta lint, typecheck, unit, build web,
 
 ## Decisiones abiertas
 
-El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias y MFA TOTP. Siguen abiertos el proveedor cloud, región, cifrado y backups de producción. Las decisiones materiales se registran mediante ADR.
+El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, login local/Google OIDC y MFA TOTP. Siguen abiertos el proveedor cloud, región, cifrado y backups de producción. La integración con Google no levanta el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.

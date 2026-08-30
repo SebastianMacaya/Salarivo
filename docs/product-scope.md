@@ -21,7 +21,7 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 
 ### Incluye
 
-- registro con aceptación versionada de Términos y confirmación del Aviso de Privacidad, login, logout y recuperación;
+- alta exclusiva con Google, aceptación versionada de Términos y confirmación del Aviso de Privacidad; login Google o por contraseña para cuentas existentes, onboarding, logout, revocación de otras sesiones y recuperación local de contraseña;
 - alta, edición y cierre de múltiples empleadores y empleos simultáneos o sucesivos;
 - carga individual y masiva de PDFs;
 - ImportBatch persistente, recuperable al volver a la pantalla, con progreso agregado y por archivo;
@@ -35,6 +35,8 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - exportación de datos;
 - auditoría de acciones sensibles.
 - administración mínima de sólo lectura con conteos sanitizados, sin acceso a salarios, PDFs, OCR ni PII.
+
+La identidad del dominio sigue siendo el UUID interno. Google OIDC agrega una cuenta de autenticación identificada sólo por `(provider, sub)` y emite la misma sesión opaca propia: un email coincidente no identifica ni auto-vincula usuarios, y la aplicación no conserva access, refresh ni ID tokens del proveedor. Las cuentas `BLOCKED` o `SUSPENDED` fallan cerradas. El ownership de empleos, imports, documentos, liquidaciones, analytics, exports y operaciones de privacidad no cambia con el método de login.
 
 ### No incluye
 
@@ -73,6 +75,8 @@ Contratos y adendas en allowlist, sin OCR inicial y siempre asociados a un emple
 - Una corrección humana tiene precedencia dentro de la corrida de extracción vigente.
 - El dashboard no lee PDFs; consulta datos estructurados.
 - El usuario puede eliminar originales sin perder datos estructurados cuando elige conservarlos.
+- Una colisión de email entre una cuenta existente y Google nunca vincula, modifica ni expone detalles de la cuenta existente.
+- El callback OIDC no crea una cuenta activa antes de que el navegador ligado al intento complete el registro y la aceptación legal; el onboarding permanece pendiente después del alta.
 
 ## Invariantes del modelo mental
 

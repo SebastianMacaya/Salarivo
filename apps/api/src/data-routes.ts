@@ -61,6 +61,8 @@ const requiredPayrollReviewPaths = [
   "settlement.deductionsAmount",
 ];
 const exportSections = [
+  ["authAccounts", `SELECT provider, provider_account_id, created_at, updated_at, last_login_at
+      FROM auth_accounts WHERE user_id = $1 ORDER BY provider`],
   ["employers", `SELECT id, name, country_code, tax_identifier_type,
       (tax_identifier_ciphertext IS NOT NULL) AS tax_identifier_stored, created_at, updated_at
       FROM employers WHERE user_id = $1 ORDER BY id`],
@@ -355,7 +357,8 @@ function privacyExportStream(
         [String(EXPORT_QUERY_TTL_MS), String(EXPORT_STREAM_TTL_MS)],
       );
       const account = await client.query(
-        `SELECT id, email, display_name, role, status, default_retention_policy, created_at, updated_at
+        `SELECT id, email, display_name, role, status, default_retention_policy,
+                email_verified_at, onboarding_completed_at, last_login_at, created_at, updated_at
            FROM users WHERE id = $1 AND status = 'ACTIVE'`,
         [userId],
       );
@@ -371,6 +374,9 @@ function privacyExportStream(
           role: row.role,
           status: row.status,
           defaultRetentionPolicy: row.default_retention_policy,
+          emailVerifiedAt: row.email_verified_at,
+          onboardingCompletedAt: row.onboarding_completed_at,
+          lastLoginAt: row.last_login_at,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
         },
@@ -2006,14 +2012,14 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     },
   );
 
-  app.delete<{ Body: { confirmation: string; password: string; receiptToken: string } }>(
+  app.delete<{ Body: { confirmation: string; password?: string; receiptToken: string } }>(
     "/api/v1/privacy/account",
     {
       preHandler: requireStepUp,
       config: { rateLimit: { max: 3, timeWindow: "15 minutes", keyGenerator: rateKey } },
       schema: {
         body: {
-          type: "object", additionalProperties: false, required: ["confirmation", "password", "receiptToken"],
+          type: "object", additionalProperties: false, required: ["confirmation", "receiptToken"],
           properties: {
             confirmation: { type: "string", const: "ELIMINAR" },
             password: { type: "string", minLength: 1, maxLength: 128 },
@@ -2030,10 +2036,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
         [request.authUser!.id],
       );
-      if (!account.rowCount || !await verifyPassword(request.body.password, String(account.rows[0].password_hash))) {
+      if (!account.rowCount) {
+        throw new ApiError(401, "INVALID_CREDENTIALS", "No se pudo verificar la cuenta.");
+      }
+      const verifiedHash = account.rows[0].password_hash === null ? null : String(account.rows[0].password_hash);
+      if (verifiedHash !== null && (!request.body.password || !await verifyPassword(request.body.password, verifiedHash))) {
         throw new ApiError(401, "INVALID_CREDENTIALS", "La contraseña actual no es correcta.");
       }
-      const verifiedHash = String(account.rows[0].password_hash);
       await withTransaction(async (client) => {
         if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
@@ -2043,8 +2052,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE`,
           [request.authUser!.id],
         );
-        if (!current.rowCount || String(current.rows[0].password_hash) !== verifiedHash) {
-          throw new ApiError(401, "INVALID_CREDENTIALS", "La contraseña actual no es correcta.");
+        const currentHash = current.rows[0]?.password_hash === null ? null : String(current.rows[0]?.password_hash);
+        if (!current.rowCount || currentHash !== verifiedHash) {
+          throw new ApiError(401, "INVALID_CREDENTIALS", "No se pudo verificar la cuenta.");
         }
         await client.query(
           `INSERT INTO privacy_operations (

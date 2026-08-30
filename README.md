@@ -6,7 +6,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 
 ## Qué funciona
 
-- registro con aceptación legal versionada, login, logout y recuperación local de contraseña;
+- alta exclusiva con Google y aceptación legal versionada, login Google o por contraseña para cuentas existentes, onboarding, logout, revocación de otras sesiones y recuperación local de contraseña;
 - empleadores y empleos;
 - lotes persistentes de uno o muchos PDFs con upload directo privado;
 - ownership, idempotencia, límites, expiración y cleanup;
@@ -20,6 +20,8 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - reglas para agentes y mejora supervisada en [AGENTS.md](AGENTS.md).
 
 El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argentinos y produce como máximo una liquidación por PDF; ampliar tipos, países o múltiples liquidaciones exige fixtures y tests nuevos.
+
+Google se integra mediante OIDC Authorization Code con PKCE, `state` y `nonce`. La cuenta conserva su UUID y sus sesiones opacas internas: `auth_accounts` relaciona `(provider, sub)` con ese usuario, el email de Google no identifica ni auto-vincula cuentas y no se persisten access, refresh ni ID tokens. El callback es `GET`, sólo admite redirects internos allowlisted y completa el alta en un segundo paso atómico junto con la aceptación legal. El step-up de una cuenta Google-only exige `max_age=0`, queda ligado a la sesión que lo inició y rota esa sesión al completarse. Ver [ADR 0010](docs/adr/0010-google-oidc-and-external-identities.md).
 
 ## Estructura
 
@@ -50,13 +52,15 @@ npm run dev:web
 
 Abrí `http://localhost:3000`. La web local llama a `http://localhost:3001/api/v1`; para otro entorno definí `NEXT_PUBLIC_API_BASE_URL` al compilar.
 
+La configuración de Google usa `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` y `GOOGLE_OAUTH_REDIRECT_URI`.
+
 El rol `ADMIN` nunca se acepta desde registro ni desde la web. En una instalación local, un operador puede promover una cuenta existente directamente en PostgreSQL usando un email exacto; no expongas ese acceso de base de datos en producción:
 
 ~~~powershell
 docker compose exec postgres psql -U salarivo -d salarivo -c "UPDATE users SET role = 'ADMIN', updated_at = now() WHERE email = 'tu-email@example.com';"
 ~~~
 
-Las versiones legales 1.1 están cerradas y aprobadas por el titular para esta vista privada de uso individual. No equivalen a una revisión profesional ni habilitan acceso de terceros; esa ampliación requiere una versión nueva con identidad, domicilio, canal y operación legal acordes al servicio real.
+Las versiones legales 1.1 y 1.2 están cerradas y aprobadas por el titular para esta vista privada de uso individual; 1.2 es la vigente para el alta exclusiva con Google. Ninguna equivale a una revisión profesional ni habilita acceso de terceros; esa ampliación requiere una versión nueva con identidad, domicilio, canal y operación legal acordes al servicio real.
 
 Para detener todo sin borrar los volúmenes:
 
@@ -95,4 +99,5 @@ npm run test:integration
 - [Clasificación de datos](docs/privacy/data-classification.md)
 - [Retención](docs/privacy/data-retention.md)
 - [Políticas legales](docs/legal/policies.md)
+- [Google OIDC e identidades externas](docs/adr/0010-google-oidc-and-external-identities.md)
 - [ADRs](docs/adr/README.md)

@@ -4,7 +4,7 @@
 
 ## Alcance
 
-Web, API, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, observabilidad, exports y operaciones de borrado.
+Web, API, Google OIDC, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, observabilidad, exports y operaciones de borrado.
 
 ## Activos
 
@@ -12,6 +12,7 @@ Web, API, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, ob
 - salarios, conceptos y timeline;
 - PII e identificadores fiscales;
 - sesiones, credenciales, secretos MFA y recovery codes;
+- relaciones `(provider, sub)`, intentos OIDC y códigos/tokens transitorios;
 - claves de cifrado y credenciales de proveedores;
 - exports y autorizaciones firmadas;
 - correcciones humanas y audit trail;
@@ -34,6 +35,8 @@ flowchart LR
     Internet --> Edge
     Edge --> Web
     Web --> API
+    Web -. Authorization Code + PKCE .-> Google[Google OIDC]
+    Google -. callback GET .-> API
     Web -. autorización limitada .-> Storage
     API --> DB
     API --> Storage
@@ -54,7 +57,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 
 | Amenaza | Controles requeridos | Verificación |
 | --- | --- | --- |
-| IDOR / broken access control | ownership server-side en servicio, scopes mínimos, IDs opacos, RLS opcional | usuario A lee/edita/borra recurso B |
+| IDOR / broken access control | ownership server-side en servicio, scopes mínimos, IDs opacos, RLS opcional; el método de login nunca altera el owner UUID | usuario A lee/edita/borra recurso B en combinaciones password/password, Google/Google y password/Google |
 | Enumeración / deduplicación lateral | respuestas uniformes, checksum consultado por userId, sin dedup observable global | mismo hash entre usuarios no revela existencia |
 | Malware | scanner privado antes de extracción, cuarentena fail closed | archivo de prueba antivirus no avanza |
 | Explotación de parser | proceso sin privilegios, filesystem efímero, CPU/RAM/timeouts, sin red ni credenciales | PDF malformado termina sin afectar worker/API |
@@ -63,6 +66,11 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 | SSRF | worker sin red por defecto, destinos externos allowlisted, no seguir URLs del documento | URLs embebidas nunca se solicitan |
 | URL firmada filtrada/reutilizada | TTL breve, método/key/tamaño limitados, autorización previa, no loguear URL | expiración, método incorrecto y otra key fallan |
 | Robo de sesión | cookies HttpOnly/Secure/SameSite, validación de Origin, rotación/revocación, MFA de sesión y step-up sensible | sesión revocada, cookie rotada y acción sin step-up |
+| Login CSRF, callback replay o intercepción OIDC | Authorization Code + PKCE, `state` y `nonce`; intento breve/de un solo uso ligado por cookie al navegador; callback `GET` sin query string en access logs; validación de issuer/audience/código; redirects internos allowlisted | cookie ausente/ajena, state/nonce/código repetido, PKCE inválido y redirect externo fallan cerrados |
+| Account takeover por email o linking confuso | identidad externa sólo por `(provider, sub)`; email no identifica ni auto-vincula; conflicto uniforme sin detalles ante colisión | mismo email en cuenta local y Google no crea vínculo, sesión ni expone detalles de la cuenta |
+| Fuga de tokens OAuth | canje server-side; access, refresh e ID tokens sólo en memoria durante la validación y nunca en DB, cookie, URL, logs o auditoría | inspección de persistencia/logs y errores del callback no encuentra tokens, código, nonce ni verifier |
+| Bypass de step-up Google-only | nueva autorización con `max_age=0`, purpose y sesión origen en el intento; validación de autenticación reciente; rotación de la sesión al completar | login previo, intento de otra sesión y replay no elevan garantía |
+| Usuario externo bloqueado o suspendido | estado interno revalidado antes de emitir/aceptar sesión; `BLOCKED` y `SUSPENDED` fallan cerrados | callback válido del IdP no inicia sesión para ambos estados |
 | Credential stuffing | rate limit local por identidad/IP, respuestas uniformes, MFA obligatorio para admin y opcional para usuario | tests de rate limit y enumeración; store distribuido antes de múltiples réplicas |
 | XSS desde documento/OCR | nunca renderizar HTML; output como texto escapado; CSP | payload OCR no ejecuta código |
 | DoS de CPU/RAM/storage/DB | límites tempranos, streaming, lote activo único, cuotas, timeout, backpressure y máximo local de dos exports | lote/archivo excesivo se rechaza antes de emitir uploads y la concurrencia por usuario no agota workers ni pool DB |
@@ -83,6 +91,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 - El original contiene más datos que los necesarios para analytics.
 - Un error puede incluir OCR o metadata sensible.
 - Un proveedor externo puede retener payload.
+- El IdP conoce cada autenticación Google; Salarivo minimiza scopes y no usa el email para correlacionar cuentas locales.
 - Una métrica con labels libres puede filtrar salario o identidad.
 - Un export o share puede sobrevivir a una revocación si no se coordina el cleanup.
 
@@ -93,6 +102,7 @@ Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle de
 - incrementos anormales de uploads/rechazos;
 - detección de malware;
 - múltiples fallos de ownership o enumeración;
+- anomalías sanitizadas de intentos/callbacks OIDC, colisiones y replays;
 - retries y timeouts crecientes;
 - profundidad de cola sostenida;
 - OCR/proveedor degradado;
@@ -105,7 +115,8 @@ Las alertas sólo incluyen IDs internos y códigos.
 
 ## Riesgos abiertos
 
-- Proveedor definitivo de identidad y proceso operativo de alta/recuperación/revocación para administradores.
+- Proceso operativo de alta, recuperación y revocación para administradores.
+- Validación operativa de Google OIDC y rotación del client secret antes de producción; la versión legal 1.2 ya fue aprobada para la instancia privada.
 - Rate limit compartido y configuración probada de proxy/IP antes de escalar la API a múltiples réplicas.
 - Auditoría durable y alertas sanitizadas para intentos MFA denegados o bloqueados.
 - Alerta y procedimiento verificado para recuperar un `execution_owner` huérfano sin borrar temporales de un proceso vivo.

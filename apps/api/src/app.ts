@@ -12,6 +12,8 @@ import Fastify, {
 } from "fastify";
 import type { ApiConfig } from "./config.ts";
 import { registerDataRoutes } from "./data-routes.ts";
+import { registerGoogleAuthRoutes } from "./google-auth-routes.ts";
+import { createGoogleOidc, type GoogleOidcClient } from "./google-oidc.ts";
 import { registerMfaRoutes } from "./mfa-routes.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 import {
@@ -31,6 +33,8 @@ type AuthUser = {
   createdAt: string;
   authState: "AUTHENTICATED" | "MFA_REQUIRED" | "MFA_SETUP_REQUIRED";
   mfaEnabled: boolean;
+  onboardingCompleted: boolean;
+  authMethods: ("PASSWORD" | "GOOGLE")[];
 };
 
 declare module "fastify" {
@@ -111,7 +115,10 @@ const errorSchema = {
 const userSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["id", "email", "displayName", "role", "createdAt", "authState", "mfaEnabled"],
+  required: [
+    "id", "email", "displayName", "role", "createdAt", "authState", "mfaEnabled",
+    "onboardingCompleted", "authMethods",
+  ],
   properties: {
     id: { type: "string", pattern: UUID_PATTERN },
     email: { type: "string" },
@@ -120,6 +127,12 @@ const userSchema = {
     createdAt: { type: "string" },
     authState: { type: "string", enum: ["AUTHENTICATED", "MFA_REQUIRED", "MFA_SETUP_REQUIRED"] },
     mfaEnabled: { type: "boolean" },
+    onboardingCompleted: { type: "boolean" },
+    authMethods: {
+      type: "array",
+      uniqueItems: true,
+      items: { type: "string", enum: ["PASSWORD", "GOOGLE"] },
+    },
   },
 };
 
@@ -230,6 +243,9 @@ function userFrom(row: Record<string, unknown>): AuthUser {
     : mfaEnabled && !row.mfa_verified_at
       ? "MFA_REQUIRED"
       : "AUTHENTICATED";
+  const authMethods: ("PASSWORD" | "GOOGLE")[] = [];
+  if (row.password_enabled === true) authMethods.push("PASSWORD");
+  if (row.google_enabled === true) authMethods.push("GOOGLE");
   return {
     id: String(row.id),
     email: String(row.email),
@@ -238,6 +254,8 @@ function userFrom(row: Record<string, unknown>): AuthUser {
     createdAt: timestamp(row.created_at as Date | string),
     authState,
     mfaEnabled,
+    onboardingCompleted: row.onboarding_completed_at !== null && row.onboarding_completed_at !== undefined,
+    authMethods,
   };
 }
 
@@ -339,15 +357,6 @@ function isDatabaseError(error: unknown): error is { code: string } {
   return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string";
 }
 
-type RegisterBody = {
-  email: string;
-  password: string;
-  displayName?: string | null;
-  acceptedTerms: true;
-  acknowledgedPrivacy: true;
-  termsVersion: string;
-  privacyVersion: string;
-};
 type LoginBody = { email: string; password: string };
 type ForgotPasswordBody = { email: string };
 type ResetPasswordBody = { token: string; password: string };
@@ -372,7 +381,7 @@ const dummyPasswordHash = hashPassword("dummy password used only for timing");
 
 export async function buildApp(
   config: ApiConfig,
-  options: { provisionStorage?: boolean } = {},
+  options: { provisionStorage?: boolean; googleOidc?: GoogleOidcClient } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
     bodyLimit: 256 * 1024,
@@ -396,6 +405,7 @@ export async function buildApp(
   app.decorateRequest("authUser", null);
   app.decorateRequest("authSessionHash", null);
   app.decorateRequest("authStepUp", false);
+  const googleOidc = options.googleOidc ?? createGoogleOidc(config.googleOAuth);
 
   await app.register(cookie);
   await app.register(cors, {
@@ -482,6 +492,14 @@ export async function buildApp(
     });
   });
 
+  const oauthAttemptCleanup = setInterval(() => {
+    void pool.query(`DELETE FROM oauth_attempts WHERE expires_at <= now()`).catch(() => {
+      app.log.warn({ errorCode: "OAUTH_ATTEMPT_CLEANUP_FAILED" }, "oauth attempt cleanup failed");
+    });
+  }, 60_000);
+  oauthAttemptCleanup.unref();
+  app.addHook("onClose", async () => clearInterval(oauthAttemptCleanup));
+
   const legacySessionCookie = "salarivo_session";
   const sessionCookie = sessionCookieName(config.appEnv);
   const cookieOptions = {
@@ -500,6 +518,12 @@ export async function buildApp(
     const digest = tokenHash(rawToken);
     const result = await pool.query(
       `SELECT u.id, u.email, u.display_name, u.role, u.created_at,
+              u.onboarding_completed_at,
+              u.password_hash IS NOT NULL AS password_enabled,
+              EXISTS (
+                SELECT 1 FROM auth_accounts account
+                 WHERE account.user_id = u.id AND account.provider = 'GOOGLE'
+              ) AS google_enabled,
               s.mfa_verified_at, s.step_up_expires_at,
               EXISTS (
                 SELECT 1 FROM mfa_factors factor
@@ -619,83 +643,13 @@ export async function buildApp(
     },
   );
 
-  app.post<{ Body: RegisterBody }>(
+  app.post(
     "/api/v1/auth/register",
     {
       config: { rateLimit: { max: 5, timeWindow: "15 minutes" } },
-      schema: {
-        body: {
-          type: "object",
-          additionalProperties: false,
-          required: ["email", "password", "acceptedTerms", "acknowledgedPrivacy", "termsVersion", "privacyVersion"],
-          properties: {
-            email: { type: "string", minLength: 3, maxLength: 254, pattern: EMAIL_PATTERN },
-            password: { type: "string", minLength: 12, maxLength: 128 },
-            displayName: nullableText(100),
-            acceptedTerms: { type: "boolean", const: true },
-            acknowledgedPrivacy: { type: "boolean", const: true },
-            termsVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
-            privacyVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
-          },
-        },
-        response: responses(201, userSchema),
-      },
     },
-    async (request, reply) => {
-      const email = normalizeEmail(request.body.email);
-      const displayName = optionalText(request.body.displayName, 100) ?? null;
-      const passwordHash = await hashPassword(request.body.password);
-      const userId = randomUUID();
-      const sessionId = randomUUID();
-      const token = opaqueToken();
-      const expiresAt = new Date(Date.now() + config.sessionTtlSeconds * 1000);
-
-      const row = await withTransaction(async (client) => {
-        const legalDocuments = await client.query(
-          `SELECT DISTINCT ON (document_type) id, document_type, version, requires_acceptance, approved_for_production
-             FROM legal_document_versions
-            WHERE document_type IN ('TERMS', 'PRIVACY_NOTICE')
-              AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
-            ORDER BY document_type, effective_at DESC, published_at DESC`,
-        );
-        const { terms, privacy } = validateRegistrationLegalDocuments(config.appEnv, legalDocuments.rows);
-        if (
-          request.body.termsVersion !== String(terms.version)
-          || request.body.privacyVersion !== String(privacy.version)
-        ) {
-          throw new ApiError(409, "LEGAL_DOCUMENTS_CHANGED", "Los documentos legales cambiaron. Revisá las versiones vigentes antes de continuar.");
-        }
-        const inserted = await client.query(
-          `INSERT INTO users (
-             id, email, password_hash, display_name, status, default_retention_policy
-           ) VALUES ($1, $2, $3, $4, 'ACTIVE', 'KEEP_ORIGINAL')
-           RETURNING id, email, display_name, role, created_at`,
-          [userId, email, passwordHash, displayName],
-        );
-        await client.query(
-          `INSERT INTO legal_acknowledgements (user_id, document_version_id)
-           SELECT $1, unnest($2::uuid[])`,
-          [userId, [terms.id, privacy.id]],
-        );
-        await client.query(
-          `INSERT INTO sessions (id, user_id, token_hash, expires_at)
-           VALUES ($1, $2, $3, $4)`,
-          [sessionId, userId, tokenHash(token), expiresAt],
-        );
-        await client.query(
-          `INSERT INTO audit_events (
-             id, user_id, actor_user_id, action, resource_type, resource_id, result, metadata_no_sensitive
-           ) VALUES ($1, $2, $2, 'LEGAL_DOCUMENTS_RECORDED', 'ACCOUNT', $2, 'SUCCESS', $3::jsonb)`,
-          [randomUUID(), userId, JSON.stringify({
-            termsAcceptedVersion: terms.version,
-            privacyAcknowledgedVersion: privacy.version,
-          })],
-        );
-        return inserted.rows[0];
-      });
-
-      setSession(reply, token);
-      return reply.code(201).send({ data: userFrom(row) });
+    async () => {
+      throw new ApiError(403, "PASSWORD_REGISTRATION_DISABLED", "El alta está disponible únicamente con Google.");
     },
   );
 
@@ -720,6 +674,12 @@ export async function buildApp(
       const email = normalizeEmail(request.body.email);
       const result = await pool.query(
         `SELECT id, email, password_hash, display_name, role, created_at,
+                onboarding_completed_at,
+                password_hash IS NOT NULL AS password_enabled,
+                EXISTS (
+                  SELECT 1 FROM auth_accounts account
+                   WHERE account.user_id = users.id AND account.provider = 'GOOGLE'
+                ) AS google_enabled,
                 EXISTS (
                   SELECT 1 FROM mfa_factors factor
                    WHERE factor.user_id = users.id AND factor.status = 'ACTIVE'
@@ -731,9 +691,9 @@ export async function buildApp(
       const row = result.rows[0];
       const valid = await verifyPassword(
         request.body.password,
-        row ? String(row.password_hash) : await dummyPasswordHash,
+        row?.password_hash === null || !row ? await dummyPasswordHash : String(row.password_hash),
       );
-      if (!row || !valid) {
+      if (!row || row.password_hash === null || !valid) {
         throw new ApiError(401, "INVALID_CREDENTIALS", "Email o contraseña incorrectos.");
       }
 
@@ -757,6 +717,7 @@ export async function buildApp(
             new Date(Date.now() + config.sessionTtlSeconds * 1000),
           ],
         );
+        await client.query(`UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = $1`, [row.id]);
         return true;
       });
       if (!sessionCreated) {
@@ -794,6 +755,87 @@ export async function buildApp(
     },
     async (request) => ({ data: request.authUser }),
   );
+
+  app.post(
+    "/api/v1/auth/onboarding/complete",
+    {
+      preHandler: requireAuth,
+      schema: { response: responses(200, userSchema) },
+    },
+    async (request) => {
+      const completed = await withTransaction(async (client) => {
+        const updated = await client.query(
+          `UPDATE users SET onboarding_completed_at = now(), updated_at = now()
+            WHERE id = $1 AND status = 'ACTIVE' AND onboarding_completed_at IS NULL
+            RETURNING id`,
+          [request.authUser!.id],
+        );
+        if (updated.rowCount === 1) {
+          await client.query(
+            `INSERT INTO audit_events (
+               id, user_id, actor_user_id, action, resource_type, resource_id, result, metadata_no_sensitive
+             ) VALUES ($1, $2, $2, 'ONBOARDING_COMPLETED', 'ACCOUNT', $2, 'SUCCESS', '{}'::jsonb)`,
+            [randomUUID(), request.authUser!.id],
+          );
+        }
+        return updated.rowCount === 1;
+      });
+      return { data: completed ? { ...request.authUser!, onboardingCompleted: true } : request.authUser! };
+    },
+  );
+
+  app.post(
+    "/api/v1/auth/sessions/revoke-others",
+    {
+      preHandler: requireStepUp,
+      schema: {
+        response: responses(200, {
+          type: "object",
+          additionalProperties: false,
+          required: ["revokedSessions"],
+          properties: { revokedSessions: { type: "integer", minimum: 0 } },
+        }),
+      },
+    },
+    async (request) => {
+      const revokedSessions = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
+        const activeUser = await client.query(
+          `SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE`,
+          [request.authUser!.id],
+        );
+        if (activeUser.rowCount !== 1) {
+          throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
+        }
+        const revoked = await client.query(
+          `UPDATE sessions SET revoked_at = now()
+            WHERE user_id = $1 AND token_hash <> $2 AND revoked_at IS NULL AND expires_at > now()`,
+          [request.authUser!.id, request.authSessionHash],
+        );
+        await client.query(
+          `INSERT INTO audit_events (
+             id, user_id, actor_user_id, action, resource_type, resource_id, result, metadata_no_sensitive
+           ) VALUES ($1, $2, $2, 'OTHER_SESSIONS_REVOKED', 'ACCOUNT', $2, 'SUCCESS', $3::jsonb)`,
+          [randomUUID(), request.authUser!.id, JSON.stringify({ revokedSessions: revoked.rowCount ?? 0 })],
+        );
+        return revoked.rowCount ?? 0;
+      });
+      return { data: { revokedSessions } };
+    },
+  );
+
+  await registerGoogleAuthRoutes(app, {
+    config,
+    google: googleOidc,
+    ApiError,
+    requirePrimaryAuth,
+    setSession,
+    userSchema,
+    userFrom,
+    validateLegalDocuments: validateRegistrationLegalDocuments,
+  });
 
   await registerMfaRoutes(app, {
     config,
@@ -929,7 +971,8 @@ export async function buildApp(
       const token = opaqueToken();
       const user = await pool.query(
         `SELECT id FROM users
-          WHERE email = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
+          WHERE email = $1 AND status = 'ACTIVE' AND deleted_at IS NULL
+            AND password_hash IS NOT NULL`,
         [email],
       );
       if (user.rowCount === 1) {

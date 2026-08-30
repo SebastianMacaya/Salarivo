@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   hashPassword,
   hasTrustedMutationOrigin,
+  oauthCookieName,
   opaqueToken,
   sessionCookieName,
   tokenHash,
@@ -38,4 +39,6 @@ test("cookie-backed mutations require the configured browser origin", () => {
 test("production sessions use a host-only cookie prefix", () => {
   assert.equal(sessionCookieName("production"), "__Host-salarivo_session");
   assert.equal(sessionCookieName("test"), "salarivo_session");
+  assert.equal(oauthCookieName("production"), "__Host-salarivo_oauth");
+  assert.equal(oauthCookieName("test"), "salarivo_oauth");
 });

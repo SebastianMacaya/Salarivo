@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { createClient } from "redis";
+import type { GoogleIdentity, GoogleOidcClient } from "../../src/google-oidc.ts";
 
 const origin = "http://localhost:3000";
 
@@ -47,11 +48,18 @@ function syntheticPayrollPdf(): Uint8Array<ArrayBuffer> {
 }
 
 test("upload privado crea un único documento y un único intent durable", async (context) => {
-  const [{ buildApp }, { loadConfig }, { pool }, { generateTotpCode }] = await Promise.all([
+  const [
+    { buildApp },
+    { loadConfig },
+    { pool, withTransaction },
+    { generateTotpCode },
+    { hashPassword, opaqueToken, tokenHash },
+  ] = await Promise.all([
     import("../../src/app.ts"),
     import("../../src/config.ts"),
     import("@salarivo/database"),
     import("../../src/mfa.ts"),
+    import("../../src/security.ts"),
   ]);
   const config = loadConfig({
     ...process.env,
@@ -59,7 +67,44 @@ test("upload privado crea un único documento y un único intent durable", async
     LOG_LEVEL: "silent",
     PUBLIC_ORIGIN: origin,
   });
-  const app = await buildApp(config, { provisionStorage: true });
+  const googleIdentities = new Map<string, GoogleIdentity>();
+  const googleStarts = new Map<string, {
+    nonce: string;
+    codeChallenge: string;
+    stepUp: boolean;
+  }>();
+  let googleExchangeCalls = 0;
+  const googleOidc: GoogleOidcClient = {
+    async authorizationUrl(input) {
+      googleStarts.set(input.state, {
+        nonce: input.nonce,
+        codeChallenge: input.codeChallenge,
+        stepUp: input.stepUp,
+      });
+      const url = new URL("https://accounts.google.test/authorize");
+      url.searchParams.set("state", input.state);
+      url.searchParams.set("nonce", input.nonce);
+      url.searchParams.set("code_challenge", input.codeChallenge);
+      url.searchParams.set("step_up", String(input.stepUp));
+      return url.href;
+    },
+    async exchange(input) {
+      googleExchangeCalls += 1;
+      const started = googleStarts.get(input.state);
+      assert.ok(started, "Google exchange must use a state issued by authorizationUrl");
+      assert.equal(input.callbackUrl.searchParams.get("state"), input.state);
+      assert.equal(input.nonce, started.nonce);
+      assert.equal(
+        createHash("sha256").update(input.codeVerifier, "utf8").digest("base64url"),
+        started.codeChallenge,
+      );
+      assert.equal(input.stepUp, started.stepUp);
+      const identity = googleIdentities.get(input.callbackUrl.searchParams.get("code") ?? "");
+      assert.ok(identity, "Google exchange code must identify a synthetic account");
+      return identity;
+    },
+  };
+  const app = await buildApp(config, { provisionStorage: true, googleOidc });
   const s3 = new S3Client({
     credentials: { accessKeyId: config.storageAccessKey, secretAccessKey: config.storageSecretKey },
     endpoint: config.storageInternalEndpoint,
@@ -130,30 +175,82 @@ test("upload privado crea un único documento y un único intent durable", async
 
   const deletionReceiptToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
-  async function register(email: string) {
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/v1/auth/register",
-      headers: { origin },
-      payload: {
-        displayName: "Persona Sintética",
-        email,
-        password: "frase local segura 2026",
-        acceptedTerms: true,
-        acknowledgedPrivacy: true,
-        termsVersion: "1.1",
-        privacyVersion: "1.1",
-      },
+  async function seedPasswordAccount(email: string): Promise<string> {
+    const userId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const sessionToken = opaqueToken();
+    await withTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO users (
+           id, email, password_hash, display_name, status, default_retention_policy,
+           onboarding_completed_at, last_login_at
+         ) VALUES ($1, $2, $3, 'Persona Sintética', 'ACTIVE', 'KEEP_ORIGINAL', now(), now())`,
+        [userId, email, await hashPassword("frase local segura 2026")],
+      );
+      const acknowledgements = await client.query(
+        `INSERT INTO legal_acknowledgements (user_id, document_version_id)
+         SELECT $1, version.id
+           FROM (
+             SELECT DISTINCT ON (document_type) id, document_type
+               FROM legal_document_versions
+              WHERE document_type IN ('TERMS', 'PRIVACY_NOTICE')
+                AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
+              ORDER BY document_type, effective_at DESC, published_at DESC
+           ) AS version`,
+        [userId],
+      );
+      assert.equal(acknowledgements.rowCount, 2);
+      await client.query(
+        `INSERT INTO sessions (id, user_id, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4)`,
+        [sessionId, userId, tokenHash(sessionToken), new Date(Date.now() + config.sessionTtlSeconds * 1000)],
+      );
     });
-    assert.equal(response.statusCode, 201, response.body);
-    const cookie = response.headers["set-cookie"];
-    assert.ok(cookie);
-    return String(Array.isArray(cookie) ? cookie[0] : cookie).split(";", 1)[0]!;
+    return `salarivo_session=${sessionToken}`;
   }
 
   function rotatedCookie(response: { headers: Record<string, string | string[] | number | undefined> }, current: string): string {
     const value = response.headers["set-cookie"];
     return value ? String(Array.isArray(value) ? value[0] : value).split(";", 1)[0]! : current;
+  }
+
+  function namedCookie(
+    response: { headers: Record<string, string | string[] | number | undefined> },
+    name: string,
+  ): string {
+    const raw = response.headers["set-cookie"];
+    const values = Array.isArray(raw) ? raw.map(String) : raw === undefined ? [] : [String(raw)];
+    for (const value of values) {
+      const match = new RegExp(`(?:^|,\\s*)${name}=([^;]*)`).exec(value);
+      if (match) return `${name}=${match[1] ?? ""}`;
+    }
+    assert.fail(`${name} cookie is missing`);
+  }
+
+  async function startGoogle(path = "/api/v1/auth/google/start", sessionCookie?: string) {
+    const response = await app.inject({
+      method: "POST",
+      url: path,
+      headers: { origin, ...(sessionCookie ? { cookie: sessionCookie } : {}) },
+      payload: {},
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    const authorizationUrl = new URL(String(response.json().data.authorizationUrl));
+    const state = authorizationUrl.searchParams.get("state");
+    assert.ok(state);
+    return { oauthCookie: namedCookie(response, "salarivo_oauth"), state };
+  }
+
+  function googleCallback(
+    attempt: { oauthCookie: string; state: string },
+    code: string,
+    sessionCookie?: string,
+  ) {
+    return app.inject({
+      method: "GET",
+      url: `/api/v1/auth/google/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(attempt.state)}`,
+      headers: { cookie: [sessionCookie, attempt.oauthCookie].filter(Boolean).join("; ") },
+    });
   }
 
   async function login(email: string): Promise<string> {
@@ -170,11 +267,11 @@ test("upload privado crea un único documento y un único intent durable", async
   const suffix = crypto.randomUUID();
   const publicTerms = await app.inject({ method: "GET", url: "/api/v1/legal/terms" });
   assert.equal(publicTerms.statusCode, 200, publicTerms.body);
-  assert.equal(publicTerms.json().data.version, "1.1");
-  assert.doesNotMatch(publicTerms.json().data.content, /BORRADOR|TODO|completar|revisión legal antes de producción/i);
+  assert.equal(publicTerms.json().data.version, "1.2");
+  assert.doesNotMatch(publicTerms.json().data.content, /(?:^|\n)(?:BORRADOR|TODO)\b|revisión legal antes de producción/i);
   const publicPrivacy = await app.inject({ method: "GET", url: "/api/v1/legal/privacy" });
   assert.equal(publicPrivacy.statusCode, 200, publicPrivacy.body);
-  assert.equal(publicPrivacy.json().data.version, "1.1");
+  assert.equal(publicPrivacy.json().data.version, "1.2");
   const historicalTerms = await app.inject({ method: "GET", url: "/api/v1/legal/terms?version=1.0" });
   assert.equal(historicalTerms.statusCode, 200, historicalTerms.body);
   await assert.rejects(
@@ -194,9 +291,27 @@ test("upload privado crea un único documento y un único intent durable", async
       { document_type: "TERMS", approved_for_production: true },
     ],
   );
-  const productionApp = await buildApp({ ...config, appEnv: "production" }, { provisionStorage: false });
+  const currentDocuments = await pool.query(
+    `SELECT document_type, approved_for_production
+       FROM legal_document_versions
+      WHERE version = '1.2'
+      ORDER BY document_type`,
+  );
+  assert.deepEqual(
+    currentDocuments.rows,
+    [
+      { document_type: "PRIVACY_NOTICE", approved_for_production: true },
+      { document_type: "TERMS", approved_for_production: true },
+    ],
+  );
+  const productionApp = await buildApp(
+    { ...config, appEnv: "production" },
+    { provisionStorage: false, googleOidc },
+  );
   await productionApp.ready();
   const productionEmail = `production-${suffix}@example.test`;
+  const productionGoogleSubject = `production_google_${suffix.replaceAll("-", "_")}`;
+  const productionGoogleEmail = `production-google-${suffix}@example.test`;
   try {
     const productionRegistration = await productionApp.inject({
       method: "POST",
@@ -207,55 +322,478 @@ test("upload privado crea un único documento y un único intent durable", async
         password: "frase local segura 2026",
         acceptedTerms: true,
         acknowledgedPrivacy: true,
-        termsVersion: "1.1",
-        privacyVersion: "1.1",
+        termsVersion: "1.2",
+        privacyVersion: "1.2",
       },
     });
-    assert.equal(productionRegistration.statusCode, 201, productionRegistration.body);
+    assert.equal(productionRegistration.statusCode, 403, productionRegistration.body);
+    assert.equal(productionRegistration.json().error.code, "PASSWORD_REGISTRATION_DISABLED");
+    assert.equal((await pool.query("SELECT 1 FROM users WHERE email = $1", [productionEmail])).rowCount, 0);
+
+    const productionGoogleCode = `production-google-${suffix}`;
+    googleIdentities.set(productionGoogleCode, {
+      subject: productionGoogleSubject,
+      email: productionGoogleEmail,
+      emailVerified: true,
+      displayName: "Google Producción Sintético",
+    });
+    const productionGoogleStart = await productionApp.inject({
+      method: "POST",
+      url: "/api/v1/auth/google/start",
+      headers: { origin },
+      payload: {},
+    });
+    assert.equal(productionGoogleStart.statusCode, 200, productionGoogleStart.body);
+    const productionGoogleState = new URL(
+      String(productionGoogleStart.json().data.authorizationUrl),
+    ).searchParams.get("state");
+    assert.ok(productionGoogleState);
+    const productionGoogleOauthCookie = namedCookie(productionGoogleStart, "__Host-salarivo_oauth");
+    const productionGoogleCallback = await productionApp.inject({
+      method: "GET",
+      url: `/api/v1/auth/google/callback?code=${encodeURIComponent(productionGoogleCode)}&state=${encodeURIComponent(productionGoogleState)}`,
+      headers: { cookie: productionGoogleOauthCookie },
+    });
+    assert.equal(productionGoogleCallback.statusCode, 302, productionGoogleCallback.body);
+    assert.equal(productionGoogleCallback.headers.location, `${origin}/?auth=google-registration`);
+    const productionGoogleRegistration = await productionApp.inject({
+      method: "POST",
+      url: "/api/v1/auth/google/register",
+      headers: { origin, cookie: productionGoogleOauthCookie },
+      payload: {
+        acceptedTerms: true,
+        acknowledgedPrivacy: true,
+        termsVersion: "1.2",
+        privacyVersion: "1.2",
+      },
+    });
+    assert.equal(productionGoogleRegistration.statusCode, 201, productionGoogleRegistration.body);
+    assert.ok(namedCookie(productionGoogleRegistration, "__Host-salarivo_session"));
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT
+           (SELECT count(*)::integer FROM users WHERE email = $1) AS users,
+           (SELECT count(*)::integer FROM auth_accounts
+             WHERE provider = 'GOOGLE' AND provider_account_id = $2) AS accounts,
+           (SELECT count(*)::integer FROM sessions session
+             JOIN users ON users.id = session.user_id WHERE users.email = $1) AS sessions`,
+        [productionGoogleEmail, productionGoogleSubject],
+      )).rows[0],
+      { users: 1, accounts: 1, sessions: 1 },
+    );
+    assert.equal(
+      (await pool.query("SELECT 1 FROM oauth_attempts WHERE state_hash = $1", [
+        createHash("sha256").update(productionGoogleState).digest("hex"),
+      ])).rowCount,
+      0,
+    );
   } finally {
     await productionApp.close();
-    await pool.query("DELETE FROM users WHERE email = $1", [productionEmail]);
+    await pool.query("DELETE FROM users WHERE email = $1", [productionGoogleEmail]);
   }
-  const missingLegalAcceptance = await app.inject({
-    method: "POST",
-    url: "/api/v1/auth/register",
-    headers: { origin },
-    payload: { email: `missing-${suffix}@example.test`, password: "frase local segura 2026" },
-  });
-  assert.equal(missingLegalAcceptance.statusCode, 400, missingLegalAcceptance.body);
-  const attemptedRoleEscalation = await app.inject({
+  const disabledPasswordRegistrationEmail = `disabled-password-${suffix}@example.test`;
+  const disabledPasswordRegistration = await app.inject({
     method: "POST",
     url: "/api/v1/auth/register",
     headers: { origin },
     payload: {
-      email: `role-${suffix}@example.test`,
+      email: disabledPasswordRegistrationEmail,
       password: "frase local segura 2026",
       acceptedTerms: true,
       acknowledgedPrivacy: true,
-      termsVersion: "1.1",
-      privacyVersion: "1.1",
-      role: "ADMIN",
+      termsVersion: "1.2",
+      privacyVersion: "1.2",
     },
   });
-  assert.equal(attemptedRoleEscalation.statusCode, 400, attemptedRoleEscalation.body);
-  const staleLegalVersion = await app.inject({
+  assert.equal(disabledPasswordRegistration.statusCode, 403, disabledPasswordRegistration.body);
+  assert.equal(disabledPasswordRegistration.json().error.code, "PASSWORD_REGISTRATION_DISABLED");
+  assert.equal(
+    (await pool.query("SELECT 1 FROM users WHERE email = $1", [disabledPasswordRegistrationEmail])).rowCount,
+    0,
+  );
+
+  const deniedGoogleStart = await app.inject({
     method: "POST",
-    url: "/api/v1/auth/register",
-    headers: { origin },
+    url: "/api/v1/auth/google/start",
+    payload: {},
+  });
+  assert.equal(deniedGoogleStart.statusCode, 403, deniedGoogleStart.body);
+  assert.equal(deniedGoogleStart.json().error.code, "UNTRUSTED_ORIGIN");
+
+  const invalidAttempt = await startGoogle();
+  const otherBrowserAttempt = await startGoogle();
+  const identityCountsBefore = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer FROM users) AS users,
+       (SELECT count(*)::integer FROM auth_accounts) AS accounts,
+       (SELECT count(*)::integer FROM sessions) AS sessions`,
+  );
+  const exchangeCallsBeforeInvalidState = googleExchangeCalls;
+  const invalidCallback = await app.inject({
+    method: "GET",
+    url: `/api/v1/auth/google/callback?code=unused&state=${otherBrowserAttempt.state}`,
+    headers: { cookie: invalidAttempt.oauthCookie },
+  });
+  assert.equal(invalidCallback.statusCode, 302, invalidCallback.body);
+  assert.equal(invalidCallback.headers.location, `${origin}/?auth=invalid-callback`);
+  assert.equal(googleExchangeCalls, exchangeCallsBeforeInvalidState);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT
+         (SELECT count(*)::integer FROM users) AS users,
+         (SELECT count(*)::integer FROM auth_accounts) AS accounts,
+         (SELECT count(*)::integer FROM sessions) AS sessions`,
+    )).rows[0],
+    identityCountsBefore.rows[0],
+  );
+  await pool.query("DELETE FROM oauth_attempts WHERE state_hash = $1", [
+    createHash("sha256").update(invalidAttempt.state).digest("hex"),
+  ]);
+  await pool.query("DELETE FROM oauth_attempts WHERE state_hash = $1", [
+    createHash("sha256").update(otherBrowserAttempt.state).digest("hex"),
+  ]);
+
+  const subjectSuffix = suffix.replaceAll("-", "_");
+  const googleCode = `new-${suffix}`;
+  const googleSubject = `google_${subjectSuffix}`;
+  const googleEmail = `google-${suffix}@example.test`;
+  googleIdentities.set(googleCode, {
+    subject: googleSubject,
+    email: googleEmail,
+    emailVerified: true,
+    displayName: "Persona Google Sintética",
+  });
+  const googleRegistrationAttempt = await startGoogle();
+  const googleRegistrationCallback = await googleCallback(googleRegistrationAttempt, googleCode);
+  assert.equal(googleRegistrationCallback.statusCode, 302, googleRegistrationCallback.body);
+  assert.equal(googleRegistrationCallback.headers.location, `${origin}/?auth=google-registration`);
+  const googleRegistration = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/google/register",
+    headers: { origin, cookie: googleRegistrationAttempt.oauthCookie },
     payload: {
-      email: `stale-${suffix}@example.test`,
-      password: "frase local segura 2026",
       acceptedTerms: true,
       acknowledgedPrivacy: true,
-      termsVersion: "0.9",
-      privacyVersion: "1.1",
+      termsVersion: "1.2",
+      privacyVersion: "1.2",
     },
   });
-  assert.equal(staleLegalVersion.statusCode, 409, staleLegalVersion.body);
+  assert.equal(googleRegistration.statusCode, 201, googleRegistration.body);
+  assert.equal(googleRegistration.json().data.onboardingCompleted, false);
+  assert.deepEqual(googleRegistration.json().data.authMethods, ["GOOGLE"]);
+  let googleCookie = namedCookie(googleRegistration, "salarivo_session");
+  const googlePersisted = await pool.query(
+    `SELECT users.id, users.password_hash, users.email_verified_at,
+            users.onboarding_completed_at,
+            (SELECT count(*)::integer FROM auth_accounts account WHERE account.user_id = users.id) AS accounts,
+            (SELECT count(*)::integer FROM sessions session WHERE session.user_id = users.id) AS sessions
+       FROM users WHERE users.email = $1`,
+    [googleEmail],
+  );
+  assert.equal(googlePersisted.rowCount, 1);
+  assert.equal(googlePersisted.rows[0].password_hash, null);
+  assert.ok(googlePersisted.rows[0].email_verified_at instanceof Date);
+  assert.equal(googlePersisted.rows[0].onboarding_completed_at, null);
+  assert.equal(googlePersisted.rows[0].accounts, 1);
+  assert.equal(googlePersisted.rows[0].sessions, 1);
+  const googleUserId = String(googlePersisted.rows[0].id);
+  assert.equal(
+    (await pool.query(
+      `SELECT count(*)::integer AS count
+         FROM legal_acknowledgements acknowledgement
+         JOIN legal_document_versions version ON version.id = acknowledgement.document_version_id
+        WHERE acknowledgement.user_id = $1 AND version.version = '1.2'`,
+      [googleUserId],
+    )).rows[0].count,
+    2,
+  );
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT table_name, column_name
+         FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name IN ('auth_accounts', 'oauth_attempts')
+          AND column_name IN ('access_token', 'refresh_token', 'id_token')
+        ORDER BY table_name, column_name`,
+    )).rows,
+    [],
+  );
+  const exchangeCallsBeforeReplay = googleExchangeCalls;
+  const replayedRegistrationCallback = await googleCallback(googleRegistrationAttempt, googleCode);
+  assert.equal(replayedRegistrationCallback.statusCode, 302, replayedRegistrationCallback.body);
+  assert.equal(replayedRegistrationCallback.headers.location, `${origin}/?auth=invalid-callback`);
+  assert.equal(googleExchangeCalls, exchangeCallsBeforeReplay);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT
+         (SELECT count(*)::integer FROM users WHERE id = $1) AS users,
+         (SELECT count(*)::integer FROM auth_accounts WHERE user_id = $1) AS accounts,
+         (SELECT count(*)::integer FROM sessions WHERE user_id = $1) AS sessions`,
+      [googleUserId],
+    )).rows[0],
+    { users: 1, accounts: 1, sessions: 1 },
+  );
+
+  const completedGoogleOnboarding = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/onboarding/complete",
+    headers: { origin, cookie: googleCookie },
+    payload: {},
+  });
+  assert.equal(completedGoogleOnboarding.statusCode, 200, completedGoogleOnboarding.body);
+  assert.equal(completedGoogleOnboarding.json().data.onboardingCompleted, true);
+  assert.ok(
+    (await pool.query("SELECT onboarding_completed_at FROM users WHERE id = $1", [googleUserId]))
+      .rows[0].onboarding_completed_at instanceof Date,
+  );
+  const googleLogout = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/logout",
+    headers: { origin, cookie: googleCookie },
+    payload: {},
+  });
+  assert.equal(googleLogout.statusCode, 200, googleLogout.body);
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: googleCookie } })).statusCode,
+    401,
+  );
+
+  const googleLoginCode = `login-${suffix}`;
+  googleIdentities.set(googleLoginCode, googleIdentities.get(googleCode)!);
+  const googleLoginAttempt = await startGoogle();
+  const googleLoginCallback = await googleCallback(googleLoginAttempt, googleLoginCode);
+  assert.equal(googleLoginCallback.statusCode, 302, googleLoginCallback.body);
+  assert.equal(googleLoginCallback.headers.location, `${origin}/?auth=google-success`);
+  googleCookie = namedCookie(googleLoginCallback, "salarivo_session");
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT
+         (SELECT count(*)::integer FROM users WHERE email = $1) AS users,
+         (SELECT count(*)::integer FROM auth_accounts WHERE provider = 'GOOGLE' AND provider_account_id = $2) AS accounts,
+         (SELECT count(*)::integer FROM sessions WHERE user_id = $3 AND revoked_at IS NULL) AS active_sessions`,
+      [googleEmail, googleSubject, googleUserId],
+    )).rows[0],
+    { users: 1, accounts: 1, active_sessions: 1 },
+  );
+
+  const googleForgotPassword = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/forgot-password",
+    headers: { origin },
+    payload: { email: googleEmail },
+  });
+  assert.equal(googleForgotPassword.statusCode, 202, googleForgotPassword.body);
+  assert.equal(
+    (await pool.query("SELECT count(*)::integer AS count FROM password_reset_tokens WHERE user_id = $1", [googleUserId]))
+      .rows[0].count,
+    0,
+  );
+  assert.equal(
+    (await pool.query("SELECT 1 FROM password_reset_tokens WHERE token_hash = $1", [
+      createHash("sha256").update(String(googleForgotPassword.json().data.resetToken)).digest("hex"),
+    ])).rowCount,
+    0,
+  );
+
+  const collisionUserId = crypto.randomUUID();
+  const collisionEmail = `password-collision-${suffix}@example.test`;
+  await pool.query(
+    `INSERT INTO users (id, email, password_hash, display_name, status, default_retention_policy)
+     VALUES ($1, $2, $3, 'Cuenta Password Sintética', 'ACTIVE', 'KEEP_ORIGINAL')`,
+    [collisionUserId, collisionEmail, await hashPassword("frase local segura 2026")],
+  );
+  const collisionCode = `collision-${suffix}`;
+  const collisionSubject = `collision_${subjectSuffix}`;
+  googleIdentities.set(collisionCode, {
+    subject: collisionSubject,
+    email: collisionEmail,
+    emailVerified: true,
+    displayName: "Colisión Sintética",
+  });
+  const collisionAttempt = await startGoogle();
+  const collisionCallback = await googleCallback(collisionAttempt, collisionCode);
+  assert.equal(collisionCallback.statusCode, 302, collisionCallback.body);
+  assert.equal(collisionCallback.headers.location, `${origin}/?auth=account-link-required`);
+  assert.equal((await pool.query("SELECT count(*)::integer AS count FROM users WHERE email = $1", [collisionEmail])).rows[0].count, 1);
+  assert.equal(
+    (await pool.query(
+      "SELECT 1 FROM auth_accounts WHERE provider = 'GOOGLE' AND provider_account_id = $1",
+      [collisionSubject],
+    )).rowCount,
+    0,
+  );
+  await pool.query("DELETE FROM users WHERE id = $1", [collisionUserId]);
+
+  for (const status of ["BLOCKED", "SUSPENDED"] as const) {
+    const disabledUserId = crypto.randomUUID();
+    const disabledSubject = `${status.toLowerCase()}_${subjectSuffix}`;
+    const disabledEmail = `${status.toLowerCase()}-google-${suffix}@example.test`;
+    await pool.query(
+      `INSERT INTO users (
+         id, email, password_hash, display_name, status, default_retention_policy, email_verified_at
+       ) VALUES ($1, $2, NULL, 'Google Deshabilitado Sintético', $3, 'KEEP_ORIGINAL', now())`,
+      [disabledUserId, disabledEmail, status],
+    );
+    await pool.query(
+      `INSERT INTO auth_accounts (id, user_id, provider, provider_account_id)
+       VALUES ($1, $2, 'GOOGLE', $3)`,
+      [crypto.randomUUID(), disabledUserId, disabledSubject],
+    );
+    const disabledCode = `${status.toLowerCase()}-${suffix}`;
+    googleIdentities.set(disabledCode, {
+      subject: disabledSubject,
+      email: disabledEmail,
+      emailVerified: true,
+      displayName: "Google Deshabilitado Sintético",
+    });
+    const disabledAttempt = await startGoogle();
+    const disabledCallback = await googleCallback(disabledAttempt, disabledCode);
+    assert.equal(disabledCallback.statusCode, 302, disabledCallback.body);
+    assert.equal(disabledCallback.headers.location, `${origin}/?auth=account-disabled`);
+    assert.equal((await pool.query("SELECT 1 FROM sessions WHERE user_id = $1", [disabledUserId])).rowCount, 0);
+    await pool.query("DELETE FROM oauth_attempts WHERE state_hash = $1", [
+      createHash("sha256").update(disabledAttempt.state).digest("hex"),
+    ]);
+    await pool.query("DELETE FROM users WHERE id = $1", [disabledUserId]);
+  }
+
+  const concurrentSubject = `concurrent_${subjectSuffix}`;
+  const concurrentEmail = `concurrent-google-${suffix}@example.test`;
+  const concurrentCodes = [`concurrent-a-${suffix}`, `concurrent-b-${suffix}`];
+  for (const code of concurrentCodes) {
+    googleIdentities.set(code, {
+      subject: concurrentSubject,
+      email: concurrentEmail,
+      emailVerified: true,
+      displayName: "Google Concurrente Sintético",
+    });
+  }
+  const concurrentAttempts = await Promise.all([startGoogle(), startGoogle()]);
+  const concurrentCallbacks = await Promise.all([
+    googleCallback(concurrentAttempts[0]!, concurrentCodes[0]!),
+    googleCallback(concurrentAttempts[1]!, concurrentCodes[1]!),
+  ]);
+  assert.deepEqual(
+    concurrentCallbacks.map((response) => response.headers.location),
+    [`${origin}/?auth=google-registration`, `${origin}/?auth=google-registration`],
+  );
+  const concurrentRegistrations = await Promise.all(concurrentAttempts.map((attempt) => app.inject({
+    method: "POST",
+    url: "/api/v1/auth/google/register",
+    headers: { origin, cookie: attempt.oauthCookie },
+    payload: {
+      acceptedTerms: true,
+      acknowledgedPrivacy: true,
+      termsVersion: "1.2",
+      privacyVersion: "1.2",
+    },
+  })));
+  assert.deepEqual(
+    concurrentRegistrations.map(({ statusCode }) => statusCode),
+    [201, 201],
+    concurrentRegistrations.map(({ body }) => body).join("\n"),
+  );
+  const concurrentIdentity = await pool.query(
+    `SELECT users.id,
+            (SELECT count(*)::integer FROM auth_accounts account WHERE account.user_id = users.id) AS accounts,
+            (SELECT count(*)::integer FROM sessions session WHERE session.user_id = users.id) AS sessions
+       FROM users WHERE users.email = $1`,
+    [concurrentEmail],
+  );
+  assert.equal(concurrentIdentity.rowCount, 1);
+  assert.deepEqual(
+    { accounts: concurrentIdentity.rows[0].accounts, sessions: concurrentIdentity.rows[0].sessions },
+    { accounts: 1, sessions: 2 },
+  );
+  await pool.query("DELETE FROM users WHERE id = $1", [concurrentIdentity.rows[0].id]);
+
+  const googleOtherSessionCode = `other-session-${suffix}`;
+  googleIdentities.set(googleOtherSessionCode, googleIdentities.get(googleCode)!);
+  const googleOtherSessionAttempt = await startGoogle();
+  const googleOtherSessionCallback = await googleCallback(googleOtherSessionAttempt, googleOtherSessionCode);
+  assert.equal(googleOtherSessionCallback.headers.location, `${origin}/?auth=google-success`);
+  const googleOtherSessionCookie = namedCookie(googleOtherSessionCallback, "salarivo_session");
+
+  const sessionBoundStepUpCode = `session-bound-step-up-${suffix}`;
+  googleIdentities.set(sessionBoundStepUpCode, googleIdentities.get(googleCode)!);
+  const sessionBoundStepUpAttempt = await startGoogle("/api/v1/auth/google/step-up/start", googleCookie);
+  const wrongSessionStepUp = await googleCallback(
+    sessionBoundStepUpAttempt,
+    sessionBoundStepUpCode,
+    googleOtherSessionCookie,
+  );
+  assert.equal(wrongSessionStepUp.statusCode, 302, wrongSessionStepUp.body);
+  assert.equal(wrongSessionStepUp.headers.location, `${origin}/?auth=invalid-callback`);
+  await pool.query("DELETE FROM oauth_attempts WHERE state_hash = $1", [
+    createHash("sha256").update(sessionBoundStepUpAttempt.state).digest("hex"),
+  ]);
+
+  const wrongSubjectStepUpCode = `wrong-subject-step-up-${suffix}`;
+  googleIdentities.set(wrongSubjectStepUpCode, {
+    subject: `unlinked_${subjectSuffix}`,
+    email: `unlinked-google-${suffix}@example.test`,
+    emailVerified: true,
+    displayName: "Google No Vinculado Sintético",
+  });
+  const wrongSubjectStepUpAttempt = await startGoogle("/api/v1/auth/google/step-up/start", googleCookie);
+  const wrongSubjectStepUp = await googleCallback(
+    wrongSubjectStepUpAttempt,
+    wrongSubjectStepUpCode,
+    googleCookie,
+  );
+  assert.equal(wrongSubjectStepUp.statusCode, 302, wrongSubjectStepUp.body);
+  assert.equal(wrongSubjectStepUp.headers.location, `${origin}/?auth=invalid-callback`);
+  await pool.query("DELETE FROM oauth_attempts WHERE state_hash = $1", [
+    createHash("sha256").update(wrongSubjectStepUpAttempt.state).digest("hex"),
+  ]);
+  for (const cookie of [googleCookie, googleOtherSessionCookie]) {
+    const deniedSensitiveAction = await app.inject({
+      method: "POST",
+      url: "/api/v1/privacy/exports",
+      headers: { origin, cookie },
+      payload: {},
+    });
+    assert.equal(deniedSensitiveAction.statusCode, 403, deniedSensitiveAction.body);
+    assert.equal(deniedSensitiveAction.json().error.code, "STEP_UP_REQUIRED");
+  }
+
+  const googleStepUpCode = `step-up-${suffix}`;
+  googleIdentities.set(googleStepUpCode, googleIdentities.get(googleCode)!);
+  const googleStepUpAttempt = await startGoogle("/api/v1/auth/google/step-up/start", googleCookie);
+  const previousGoogleCookie = googleCookie;
+  const googleStepUpCallback = await googleCallback(googleStepUpAttempt, googleStepUpCode, googleCookie);
+  assert.equal(googleStepUpCallback.statusCode, 302, googleStepUpCallback.body);
+  assert.equal(googleStepUpCallback.headers.location, `${origin}/?auth=google-step-up`);
+  googleCookie = namedCookie(googleStepUpCallback, "salarivo_session");
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: previousGoogleCookie } })).statusCode,
+    401,
+  );
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: googleCookie } })).statusCode,
+    200,
+  );
+  const revokedGoogleSessions = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/sessions/revoke-others",
+    headers: { origin, cookie: googleCookie },
+    payload: {},
+  });
+  assert.equal(revokedGoogleSessions.statusCode, 200, revokedGoogleSessions.body);
+  assert.equal(revokedGoogleSessions.json().data.revokedSessions, 1);
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: googleOtherSessionCookie } })).statusCode,
+    401,
+  );
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: googleCookie } })).statusCode,
+    200,
+  );
+
   const emailA = `a-${suffix}@example.test`;
   const emailB = `b-${suffix}@example.test`;
-  let cookieA = await register(emailA);
-  let cookieB = await register(emailB);
+  let cookieA = await seedPasswordAccount(emailA);
+  let cookieB = await seedPasswordAccount(emailB);
   const secondaryCookieA = await login(emailA);
   const meA = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: cookieA } });
   assert.equal(meA.statusCode, 200, meA.body);
@@ -354,7 +892,7 @@ test("upload privado crea un único documento y un único intent durable", async
   );
   assert.deepEqual(
     legalAcknowledgements.rows.map((row) => [row.document_type, row.version]),
-    [["PRIVACY_NOTICE", "1.1"], ["TERMS", "1.1"]],
+    [["PRIVACY_NOTICE", "1.2"], ["TERMS", "1.2"]],
   );
   assert.ok(legalAcknowledgements.rows.every((row) => row.accepted_at instanceof Date));
   const deniedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieB } });
@@ -429,6 +967,46 @@ test("upload privado crea un único documento y un único intent durable", async
   }
   const employmentA = await createEmployment(cookieA, "Empresa Asociada A");
   const employmentB = await createEmployment(cookieB, "Empresa Ajena B");
+  const googleEmployment = await createEmployment(googleCookie, "Empresa Google Sintética");
+  const googleCannotEditPasswordEmployment = await app.inject({
+    method: "PATCH",
+    url: `/api/v1/employments/${employmentA}`,
+    headers: { origin, cookie: googleCookie },
+    payload: { role: "Acceso cruzado Google" },
+  });
+  assert.equal(googleCannotEditPasswordEmployment.statusCode, 404, googleCannotEditPasswordEmployment.body);
+  const passwordCannotEditGoogleEmployment = await app.inject({
+    method: "PATCH",
+    url: `/api/v1/employments/${googleEmployment}`,
+    headers: { origin, cookie: cookieA },
+    payload: { role: "Acceso cruzado Password" },
+  });
+  assert.equal(passwordCannotEditGoogleEmployment.statusCode, 404, passwordCannotEditGoogleEmployment.body);
+
+  const googleDeletionToken = deletionReceiptToken();
+  const googleDeletion = await app.inject({
+    method: "DELETE",
+    url: "/api/v1/privacy/account",
+    headers: { origin, cookie: googleCookie },
+    payload: { confirmation: "ELIMINAR", receiptToken: googleDeletionToken },
+  });
+  assert.equal(googleDeletion.statusCode, 202, googleDeletion.body);
+  assert.equal(googleDeletion.json().data.receiptToken, googleDeletionToken);
+  await runWorkerUntil("accounts_deleted");
+  assert.equal((await pool.query("SELECT 1 FROM users WHERE id = $1", [googleUserId])).rowCount, 0);
+  assert.equal(
+    (await app.inject({
+      method: "POST",
+      url: "/api/v1/privacy/account-deletion/status",
+      headers: { origin },
+      payload: { token: googleDeletionToken },
+    })).json().data.status,
+    "COMPLETED",
+  );
+  await pool.query("DELETE FROM account_deletion_receipts WHERE token_hash = $1", [
+    createHash("sha256").update(googleDeletionToken).digest("hex"),
+  ]);
+
   const itemKey = crypto.randomUUID();
   const idempotencyKey = crypto.randomUUID();
   const pdfBytes = syntheticPayrollPdf();

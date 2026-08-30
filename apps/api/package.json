@@ -18,7 +18,8 @@
     "@fastify/helmet": "13.1.1",
     "@fastify/rate-limit": "11.2.0",
     "@salarivo/database": "0.1.0",
-    "fastify": "5.12.1"
+    "fastify": "5.12.1",
+    "openid-client": "6.8.7"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

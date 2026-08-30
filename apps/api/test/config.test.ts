@@ -11,6 +11,7 @@ test("config keeps local defaults but requires explicit production security sett
   assert.equal(local.maxUserDocuments, 5_000);
   assert.equal(local.mfaKeyring.activeVersion, 1);
   assert.equal(local.mfaKeyring.keys.get(1)?.length, 32);
+  assert.equal(local.googleOAuth, null);
 
   assert.throws(() => loadConfig({ NODE_ENV: "production" }), /PUBLIC_ORIGIN/);
   assert.throws(
@@ -22,6 +23,18 @@ test("config keeps local defaults but requires explicit production security sett
     /forbidden/,
   );
   assert.throws(() => loadConfig({ APP_ENV: "production" }), /PUBLIC_ORIGIN/);
+  assert.throws(
+    () => loadConfig({
+      APP_ENV: "production",
+      PUBLIC_ORIGIN: "https://example.test",
+      API_HOST: "0.0.0.0",
+      API_PORT: "3001",
+      LOG_LEVEL: "info",
+      SESSION_TTL_SECONDS: "3600",
+      PASSWORD_RESET_TTL_SECONDS: "900",
+    }),
+    /GOOGLE_CLIENT_ID/,
+  );
   assert.throws(
     () =>
       loadConfig({
@@ -46,9 +59,39 @@ test("config keeps local defaults but requires explicit production security sett
       PASSWORD_RESET_TTL_SECONDS: "900",
       MFA_ENCRYPTION_KEY_VERSION: "1",
       MFA_ENCRYPTION_KEY_BASE64: "bG9jYWwtbWZhLWtleS1vbmx5LWZvci10ZXN0cyEhISE=",
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_OAUTH_REDIRECT_URI: "https://api.example.test/api/v1/auth/google/callback",
     }),
     /MAX_FILE_BYTES/,
   );
+});
+
+test("Google OAuth configuration is all-or-nothing and validates its fixed callback", () => {
+  assert.throws(
+    () => loadConfig({ APP_ENV: "test", GOOGLE_CLIENT_ID: "client-id" }),
+    /configured together/,
+  );
+  assert.throws(
+    () => loadConfig({
+      APP_ENV: "test",
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_OAUTH_REDIRECT_URI: "http://localhost:3001/other/callback",
+    }),
+    /google\/callback/,
+  );
+  const configured = loadConfig({
+    APP_ENV: "test",
+    GOOGLE_CLIENT_ID: "client-id",
+    GOOGLE_CLIENT_SECRET: "client-secret",
+    GOOGLE_OAUTH_REDIRECT_URI: "http://localhost:3001/api/v1/auth/google/callback",
+  });
+  assert.deepEqual(configured.googleOAuth, {
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    redirectUri: "http://localhost:3001/api/v1/auth/google/callback",
+  });
 });
 
 test("config rejects non-origin URLs and unsafe integer values", () => {

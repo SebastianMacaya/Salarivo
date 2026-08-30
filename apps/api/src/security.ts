@@ -69,6 +69,10 @@ export function sessionCookieName(appEnv: string): string {
   return appEnv === "production" ? "__Host-salarivo_session" : "salarivo_session";
 }
 
+export function oauthCookieName(appEnv: string): string {
+  return appEnv === "production" ? "__Host-salarivo_oauth" : "salarivo_oauth";
+}
+
 export function hasTrustedMutationOrigin(
   method: string,
   requestOrigin: string | undefined,

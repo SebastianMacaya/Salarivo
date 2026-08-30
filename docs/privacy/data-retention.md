@@ -31,6 +31,9 @@ El esquema ya conserva una política por cuenta y la copia al documento, pero el
 | datos estructurados | PostgreSQL | hasta eliminación del documento/cuenta según elección |
 | audit event | PostgreSQL/archivo seguro | plazo aprobado, metadata no sensible |
 | aceptación legal | PostgreSQL | mientras exista la cuenta; la versión publicada permanece sin relación personal al borrar la cuenta |
+| cuenta de autenticación `(provider, sub)` | PostgreSQL | mientras exista la cuenta; se elimina con ella |
+| intento/cookie OIDC | PostgreSQL + navegador | TTL corto, un solo uso; se consume al resolver callback/registro/step-up o expira |
+| access, refresh e ID tokens Google | no se persisten | sólo memoria durante canje y validación; se descartan en la misma operación |
 | contribución de benchmark | no implementada | futura: hasta revocación/borrado; retirar mapping y recomputar agregados afectados |
 | export | PostgreSQL + respuesta HTTPS autenticada | autorización breve; JSON generado bajo demanda |
 | tombstone de storage | PostgreSQL sin FK | hasta confirmar borrado canónico y temporal; luego se elimina |
@@ -68,7 +71,7 @@ La UI distingue claramente “eliminar original” de “eliminar documento y da
 
 La orquestación actual recorre:
 
-- sesiones y acceso;
+- sesiones, cuentas de autenticación e intentos OIDC;
 - imports y cola;
 - DB y proyecciones;
 - object storage;
@@ -103,6 +106,6 @@ Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se 
 - semántica exacta de borrado de ExtractionRun;
 - proveedor y lifecycle de backups;
 - plazos y comunicación del borrado diferido en producción;
-- revisión legal de la retención de evidencia de aceptación antes de producción; el MVP prioriza borrado de cuenta y no conserva una identidad separada.
+- verificación operativa de la retención de evidencia de aceptación y del mapping de identidad externa antes de producción; la versión legal 1.2 ya fue aprobada para la instancia privada.
 
 Estas decisiones requieren producto, seguridad y asesoramiento legal aplicable; no deben inventarse en código.

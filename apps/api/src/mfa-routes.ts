@@ -11,8 +11,8 @@ import {
   recoveryCodeHash,
   validateTotpCode,
 } from "./mfa.ts";
-import { opaqueToken, tokenHash, verifyPassword } from "./security.ts";
-import { lockValidStepUpSession } from "./session-assurance.ts";
+import { tokenHash, verifyPassword } from "./security.ts";
+import { lockValidStepUpSession, rotateSession } from "./session-assurance.ts";
 
 type ErrorConstructor = new (statusCode: number, code: string, message: string) => Error;
 type Options = {
@@ -29,7 +29,6 @@ type CodeBody = { code: string };
 type StepUpBody = { password?: string; code?: string };
 
 const ENROLLMENT_TTL_MS = 10 * 60_000;
-const STEP_UP_TTL_MS = 10 * 60_000;
 const LOCK_TTL_MS = 15 * 60_000;
 const MAX_ATTEMPTS = 5;
 const codeBodySchema = {
@@ -55,45 +54,6 @@ async function audit(client: PoolClient, userId: string, action: string, factorI
      ) VALUES ($1, $2, $2, $3, 'MFA_FACTOR', $4, 'SUCCESS', '{}'::jsonb)`,
     [randomUUID(), userId, action, factorId],
   );
-}
-
-async function rotateSession(
-  client: PoolClient,
-  sessionHash: string,
-  options: { mfaVerified?: boolean; clearAssurance?: boolean; stepUp?: boolean } = {},
-): Promise<{ token: string; stepUpExpiresAt: string | null }> {
-  const token = opaqueToken();
-  const now = new Date();
-  const stepUpExpiresAt = options.stepUp ? new Date(now.valueOf() + STEP_UP_TTL_MS) : null;
-  const result = await client.query(
-    `UPDATE sessions
-        SET token_hash = $2,
-            mfa_verified_at = CASE
-              WHEN $3 THEN NULL
-              WHEN $4 THEN $5
-              ELSE mfa_verified_at
-            END,
-            step_up_expires_at = CASE
-              WHEN $3 THEN NULL
-              WHEN $6 THEN $7
-              ELSE step_up_expires_at
-            END
-      WHERE token_hash = $1
-        AND revoked_at IS NULL
-        AND expires_at > $5
-      RETURNING user_id`,
-    [
-      sessionHash,
-      tokenHash(token),
-      options.clearAssurance === true,
-      options.mfaVerified === true,
-      now,
-      options.stepUp === true,
-      stepUpExpiresAt,
-    ],
-  );
-  if (result.rowCount !== 1) throw new Error("SESSION_ROTATION_FAILED");
-  return { token, stepUpExpiresAt: stepUpExpiresAt?.toISOString() ?? null };
 }
 
 type Verification = { ok: true; factorId: string } | { ok: false; locked: boolean } | { ok: false; missing: true };
@@ -268,7 +228,9 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
         if (user.rowCount !== 1) return "AUTHENTICATION_REQUIRED";
         if (user.rows[0].enabled && !user.rows[0].stepped_up) return "STEP_UP_REQUIRED";
         if (!user.rows[0].enabled) {
-          if (!request.body.password || !await verifyPassword(request.body.password, String(user.rows[0].password_hash))) {
+          if (user.rows[0].password_hash === null) {
+            if (!user.rows[0].stepped_up) return "STEP_UP_REQUIRED";
+          } else if (!request.body.password || !await verifyPassword(request.body.password, String(user.rows[0].password_hash))) {
             return "INVALID_CREDENTIALS";
           }
         }
@@ -440,7 +402,12 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
           if (!verification.ok) return { status: "FACTOR_FAILED", verification } as const;
         } else {
           const user = await client.query(`SELECT password_hash FROM users WHERE id = $1 FOR UPDATE`, [userId]);
-          if (!request.body.password || user.rowCount !== 1 || !await verifyPassword(request.body.password, String(user.rows[0].password_hash))) {
+          if (
+            !request.body.password
+            || user.rowCount !== 1
+            || user.rows[0].password_hash === null
+            || !await verifyPassword(request.body.password, String(user.rows[0].password_hash))
+          ) {
             return { status: "INVALID" } as const;
           }
         }

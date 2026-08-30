@@ -10,6 +10,11 @@ export type ApiConfig = Readonly<{
   logLevel: "silent" | "fatal" | "error" | "warn" | "info" | "debug" | "trace";
   sessionTtlSeconds: number;
   passwordResetTtlSeconds: number;
+  googleOAuth: Readonly<{
+    clientId: string;
+    clientSecret: string;
+    redirectUri: string;
+  }> | null;
   mfaKeyring: MfaKeyring;
   maxFileBytes: number;
   maxFilesPerBatch: number;
@@ -89,6 +94,39 @@ function endpoint(value: string, name: string, production: boolean): string {
   }
   if (production && parsed.protocol !== "https:") throw new Error(`${name} must use HTTPS in production`);
   return parsed.origin;
+}
+
+function googleOAuth(env: NodeJS.ProcessEnv, production: boolean): ApiConfig["googleOAuth"] {
+  const values = [env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.GOOGLE_OAUTH_REDIRECT_URI]
+    .map((value) => value?.trim());
+  if (values.every((value) => !value)) {
+    if (production) throw new Error("GOOGLE_CLIENT_ID is required in production");
+    return null;
+  }
+  if (values.some((value) => !value)) {
+    throw new Error("GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI must be configured together");
+  }
+
+  let redirect: URL;
+  try {
+    redirect = new URL(values[2]!);
+  } catch {
+    throw new Error("GOOGLE_OAUTH_REDIRECT_URI must be an absolute HTTP(S) URL");
+  }
+  if (
+    !["http:", "https:"].includes(redirect.protocol)
+    || redirect.username !== ""
+    || redirect.password !== ""
+    || redirect.search !== ""
+    || redirect.hash !== ""
+    || redirect.pathname !== "/api/v1/auth/google/callback"
+  ) {
+    throw new Error("GOOGLE_OAUTH_REDIRECT_URI must be an absolute HTTP(S) URL ending at /api/v1/auth/google/callback");
+  }
+  if (production && redirect.protocol !== "https:") {
+    throw new Error("GOOGLE_OAUTH_REDIRECT_URI must use HTTPS in production");
+  }
+  return Object.freeze({ clientId: values[0]!, clientSecret: values[1]!, redirectUri: redirect.href });
 }
 
 function encryptionKey(value: string, name: string): Buffer {
@@ -186,6 +224,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
       300,
       86_400,
     ),
+    googleOAuth: googleOAuth(env, production),
     mfaKeyring: mfaKeyring(env, production),
     maxFileBytes: integer(env.MAX_FILE_BYTES, "MAX_FILE_BYTES", production ? undefined : 20 * 1024 * 1024, 1_024, 100 * 1024 * 1024),
     maxFilesPerBatch: integer(env.MAX_FILES_PER_BATCH, "MAX_FILES_PER_BATCH", production ? undefined : 200, 1, 1_000),

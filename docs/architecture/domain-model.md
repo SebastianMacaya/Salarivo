@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–011. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–013. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -15,6 +15,8 @@ Cada procesamiento completado conserva su ExtractionRun. El reproceso explícito
 
 ~~~mermaid
 erDiagram
+    USER ||--o{ AUTH_ACCOUNT : authenticates_with
+    USER ||--o{ SESSION : opens
     USER ||--o{ EMPLOYMENT : owns
     EMPLOYER ||--o{ EMPLOYMENT : participates
     USER ||--o{ IMPORT_BATCH : starts
@@ -44,7 +46,15 @@ erDiagram
 
 ### User
 
-Propietario y boundary de aislamiento. Conserva preferencias de privacidad y referencia a identidad; no debe acumular metadata documental.
+Propietario y boundary de aislamiento. Su UUID interno es la identidad estable que referencian ownership, auditoría y sesiones; ningún identificador de proveedor lo reemplaza. Conserva preferencias de privacidad, estado de onboarding y referencia a identidad; no debe acumular metadata documental. `BLOCKED` y `SUSPENDED`, además de cualquier estado no activo, fallan cerrados al crear o usar una sesión.
+
+### AuthAccount y sesión
+
+AuthAccount relaciona un usuario interno con una identidad externa mediante la clave única `(provider, sub)`. Para Google, `sub` es el único identificador de cuenta del proveedor: el email es metadata normalizada y verificada para UX/comunicación, pero no identifica ni auto-vincula usuarios. Una colisión de email se devuelve como conflicto sin revelar detalles ni modificar la cuenta preexistente. No se persisten access, refresh ni ID tokens.
+
+El intento OIDC conserva por un TTL corto los hashes de `state` y del vínculo con el navegador, además de `nonce`, PKCE verifier y propósito para validar y canjear el callback. Es de un solo uso, no sustituye una Session y no acepta un redirect del cliente. Para una identidad nueva, el callback deja un registro verificado transitorio; el segundo paso crea User, LegalAcknowledgement, AuthAccount, Session y AuditEvent en una sola transacción, con onboarding todavía pendiente.
+
+Session sigue siendo propia y opaca: sólo su hash se persiste y su UUID interno determina revocación, expiración y garantía. El login local y el de Google convergen en la misma entidad. Revocar otras sesiones conserva únicamente la actual. El step-up Google-only inicia OIDC con `max_age=0`, queda ligado a esa Session y rota su token al elevar la garantía.
 
 ### Employer y Employment
 
@@ -181,13 +191,13 @@ Nunca contiene salario, OCR, documento, token o identificador fiscal completo.
 
 ### LegalDocumentVersion y LegalAcknowledgement
 
-LegalDocumentVersion conserva una versión append-only de Términos o Aviso de Privacidad con locale, contenido, publicación, vigencia y aprobación explícita para producción. LegalAcknowledgement vincula un usuario con la versión exacta y un `acceptedAt` generado por servidor: para Términos representa aceptación; para el Aviso, lectura confirmada. El registro resuelve la versión vigente y compara las versiones mostradas; el navegador no selecciona IDs legales.
+LegalDocumentVersion conserva una versión append-only de Términos o Aviso de Privacidad con locale, contenido, publicación, vigencia y aprobación explícita para producción. LegalAcknowledgement vincula un usuario con la versión exacta y un `acceptedAt` generado por servidor: para Términos representa aceptación; para el Aviso, lectura confirmada. El segundo paso del alta Google resuelve la versión vigente y compara las versiones mostradas; el navegador no selecciona IDs legales. Usuario, aceptación/confirmación, AuthAccount, Session y auditoría se crean atómicamente después del callback, nunca antes de la aceptación. El alta local por email y contraseña está deshabilitada; ese método queda sólo para cuentas existentes.
 
 User tiene sólo `USER` o `ADMIN`. `ADMIN` habilita rutas explícitas de métricas sanitizadas y no altera ownership ni concede acceso a recursos de otra cuenta. El rol se relee desde DB en cada request privilegiado.
 
 ### MFAFactor, sesión y constancias de privacidad
 
-MFAFactor conserva un secreto TOTP cifrado y versionado, estado pendiente/activo, contador anti-replay y lock temporal. Los recovery codes se guardan sólo como hashes. `mfaVerifiedAt` y `stepUpExpiresAt` pertenecen a la sesión exacta; elevar garantía rota su token.
+MFAFactor conserva un secreto TOTP cifrado y versionado, estado pendiente/activo, contador anti-replay y lock temporal. Los recovery codes se guardan sólo como hashes. `mfaVerifiedAt` y `stepUpExpiresAt` pertenecen a la sesión exacta; elevar garantía rota su token. Si una cuenta Google-only no tiene contraseña ni un factor activo, el step-up usa otra autenticación Google con `max_age=0`, ligada al ID de la sesión original y con la misma rotación al completarse.
 
 StorageDeletionTombstone sobrevive a cascades y conserva únicamente las dos keys opacas necesarias para reconciliar un borrado físico. AccountDeletionReceipt conserva el hash de una constancia opaca y el estado de la baja sin email, nombre, userId ni FK personal después de completarse.
 
@@ -219,6 +229,8 @@ countryCode es explícito. Un adapter de nómina contiene reglas locales; AR es 
 Las migraciones vigentes materializan:
 
 - FK y ownership coherentes entre user, employment, document y settlement;
+- unique de AuthAccount por provider + sub y vínculo a un único User;
+- intentos OIDC de un solo uso, expirables y ligados al navegador y propósito;
 - unique por userId + checksum para duplicado lógico vigente;
 - unique por documentId + processingVersion;
 - unique de ProcessingJob por documentId + processingVersion + stage;
@@ -245,7 +257,7 @@ Original y estructura tienen lifecycle separado:
 
 - borrar original elimina object storage y derivados, pero puede conservar settlements;
 - borrar documento elimina o anonimiza toda relación según elección/política;
-- borrar cuenta coordina hoy DB, storage, cola, exports y temporales; cualquier cache externa, share o índice futuro deberá sumarse a esa orquestación antes de habilitarse.
+- borrar cuenta coordina hoy sesiones, cuentas externas, intentos OIDC, DB, storage, cola, exports y temporales; cualquier cache externa, share o índice futuro deberá sumarse a esa orquestación antes de habilitarse.
 
 Los detalles están en [Retención](../privacy/data-retention.md).
 
