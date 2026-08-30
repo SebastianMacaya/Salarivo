@@ -11,8 +11,9 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - lotes persistentes de uno o muchos PDFs con upload directo privado;
 - ownership, idempotencia, límites, expiración y cleanup;
 - validación PDF, ClamAV, rechazo de contenido activo, clasificación y OCR acotado;
-- extracción determinística de recibos argentinos, campos trazables, liquidación y conceptos;
-- confirmación de tipo, correcciones humanas e historial bruto/neto;
+- extracción determinística de recibos argentinos, campos trazables, importes remunerativos/no remunerativos, liquidación, reintegros y conceptos;
+- confirmación de tipo, correcciones humanas y un historial salarial derivado con resumen, evolución, análisis anual y comparación por empleo y moneda;
+- detección no persistida de empleos a partir de recibos sin asociar, siempre sujeta a confirmación;
 - borrado separado de original o documento completo;
 - MFA TOTP, recovery codes y step-up de acciones sensibles; MFA obligatorio para administración;
 - exportación JSON completa y eliminación durable de cuenta con constancia consultable;
@@ -20,6 +21,8 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - reglas para agentes y mejora supervisada en [AGENTS.md](AGENTS.md).
 
 El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argentinos y produce como máximo una liquidación por PDF; ampliar tipos, países o múltiples liquidaciones exige fixtures y tests nuevos.
+
+El historial `salary-analytics-v1` usa únicamente documentos `COMPLETED`; los `NEEDS_REVIEW` quedan informados pero fuera de los cálculos. El salario comparable inicial es sólo el básico de una liquidación `NORMAL` recurrente dentro de un contexto laboral y una moneda; ante falta o ambigüedad devuelve N/D. Los posibles duplicados estructurados son advertencias para revisión, nunca borrados automáticos.
 
 Google se integra mediante OIDC Authorization Code con PKCE, `state` y `nonce`. La cuenta conserva su UUID y sus sesiones opacas internas: `auth_accounts` relaciona `(provider, sub)` con ese usuario, el email de Google no identifica ni auto-vincula cuentas y no se persisten access, refresh ni ID tokens. El callback es `GET`, sólo admite redirects internos allowlisted y completa el alta en un segundo paso atómico junto con la aceptación legal. No existen rutas de login, registro o recuperación por contraseña. El primer factor TOTP se inicia desde una sesión primaria creada en los últimos 15 minutos, sin otro redirect; el step-up sin MFA usa otra autorización Google con selección explícita de la misma cuenta, ligada a la sesión original, y rota esa sesión al completarse. Ver [ADR 0010](docs/adr/0010-google-oidc-and-external-identities.md).
 

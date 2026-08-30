@@ -71,7 +71,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 - imports: sesiones, batches, items y progreso;
 - documents: metadata, lifecycle, seguridad y retención;
 - payroll: liquidaciones, conceptos y correcciones;
-- analytics: proyecciones sobre datos estructurados;
+- analytics: proyecciones `salary-analytics-v1` sobre liquidaciones estructuradas y verificadas, separadas por empleo y moneda;
 - privacy: preferencias, exportación y eliminación;
 - audit: eventos sensibles sin payload salarial.
 - admin: consultas transversales de metadata, capacidades fijas y comandos operativos auditados.
@@ -130,12 +130,22 @@ Recursos iniciales:
 | documents | listar, consultar, asociar masivamente a un empleo, corregir, cerrar revisión, eliminar y confirmar tipo; reproceso queda pendiente |
 | employments | listar, crear y editar/finalizar |
 | payroll-settlements | listar la proyección; las correcciones se aplican desde documents |
-| analytics | evolución salarial estructurada |
+| salary-history | resumen, evolución y anual agregados; comparación y conceptos paginados owner-only; posibles duplicados sólo como advertencia |
 | exports | solicitar y consultar export privado |
 | privacy | eliminar cuenta; preferencias editables quedan pendientes |
 | admin | dashboard, metadata paginada, diagnóstico y comandos acotados por capacidad; sin acceso a contenido privado |
 
 Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se incorpore OpenAPI describirá auth, schemas, límites y respuestas; los detalles de proveedor quedarán fuera del contrato HTTP.
+
+### Analytics salarial
+
+`GET /api/v1/salary-history` deriva `salary-analytics-v1` desde la última corrida completada de cada documento PAYROLL `COMPLETED`; `NEEDS_REVIEW` sólo integra la cobertura pendiente. Su payload es agregado y no envía liquidaciones ni conceptos históricos. `GET /api/v1/salary-history/concepts` pagina directamente en SQL sólo los haberes normalizados de un contexto y moneda owner-scoped, con páginas de hasta 100 filas y filtros por año/categoría; no expone descripciones originales y un concepto desconocido no oculta los normalizados del mismo recibo. `GET /api/v1/salary-history/comparison` exige contexto laboral, currencyCode y dos períodos. Ningún cálculo cruza empleos o monedas, y varias liquidaciones del mismo mes se conservan. Una explicación sólo atribuye la variación neta cuando los conceptos están completos, la porción regular permanece estable y extraordinarios menos descuentos reconcilian exactamente; de lo contrario declara evidencia insuficiente o variación no explicada.
+
+El comparable inicial es únicamente basicAmount de una liquidación `NORMAL` recurrente verificada; falta o ambigüedad devuelven N/D. Dinero y porcentajes se calculan con BigInt/decimal exacto y variación compuesta, no con FLOAT ni suma de porcentajes. El agregado incluye remunerativo/no remunerativo, categorías anuales, totales normalizados y posibles duplicados sujetos a confirmación; nunca expone categorías ni descripciones crudas de deducciones minimizadas.
+
+La cobertura usa los límites confirmados del empleo cuando existen y, en una detección, sólo el rango observado; los huecos son siempre `possibleMissingPeriods`. Sin un contexto laboral determinable no inventa rango ni faltantes. La lista de documentos se pagina con cursor estable y admite filtros owner-only por búsqueda, año, empleo, estado, clase y tipo de liquidación.
+
+La decisión, sus alternativas y el límite deliberado de IPC están en el [ADR 0013](../adr/0013-derived-salary-history-analytics.md).
 
 ### Identidad externa y sesión interna
 

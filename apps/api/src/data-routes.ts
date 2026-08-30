@@ -3,6 +3,14 @@ import { Readable } from "node:stream";
 import { pool, withTransaction, type PoolClient } from "@salarivo/database";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
+import {
+  analyzeSalaryHistory,
+  compareSalaryPeriods,
+  salaryCategoryForEarning,
+  SALARY_CATEGORIES,
+  type SalaryCategory,
+  type SalarySettlement,
+} from "./salary-analytics.ts";
 import { sessionCookieName, tokenHash } from "./security.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 import { lockR2UploadCapacity } from "./r2-capacity.ts";
@@ -30,6 +38,32 @@ type UploadBody = { itemId: string };
 type CorrectionBody = { extractedFieldId?: string; fieldPath?: string; correctedValue: string };
 type ReviewCompleteBody = { acceptDeductionsMismatch?: boolean };
 type DocumentEmploymentBody = { documentIds: string[]; employmentId: string | null };
+type SalaryComparisonQuery = {
+  employmentContext: string;
+  currencyCode: string;
+  fromPeriod: string;
+  toPeriod: string;
+};
+type SalaryConceptQuery = {
+  employmentContext: string;
+  currencyCode: string;
+  employerName?: string;
+  year?: string;
+  category?: SalaryCategory;
+  limit?: string;
+  cursor?: string;
+};
+type DocumentListQuery = {
+  limit?: string;
+  before?: string;
+  beforeId?: string;
+  search?: string;
+  year?: string;
+  employmentId?: string;
+  processingStatus?: string;
+  documentType?: string;
+  settlementType?: string;
+};
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const TOKEN_PATTERN = "^[A-Za-z0-9_-]{43}$";
@@ -46,12 +80,14 @@ const terminalImportItemStatuses = new Set(["COMPLETED", "NEEDS_REVIEW", "REJECT
 const settlementAmountColumns = new Map([
   ["settlement.basicAmount", "basic_amount"],
   ["settlement.grossAmount", "gross_amount"],
+  ["settlement.remunerativeAmount", "remunerative_amount"],
+  ["settlement.nonRemunerativeAmount", "non_remunerative_amount"],
   ["settlement.netAmount", "net_amount"],
   ["settlement.deductionsAmount", "deductions_amount"],
 ]);
 const settlementTypes = new Set([
   "NORMAL", "SAC", "VACACIONES", "BONO", "RETROACTIVO", "COMISION",
-  "HORAS_EXTRA", "LIQUIDACION_FINAL", "INDEMNIZACION", "AJUSTE", "OTRO_LABORAL",
+  "HORAS_EXTRA", "LIQUIDACION_FINAL", "INDEMNIZACION", "AJUSTE", "REINTEGRO", "OTRO_LABORAL",
 ]);
 const manualCorrectionPaths = new Set([
   "settlement.type", "settlement.payrollPeriod", ...settlementAmountColumns.keys(),
@@ -179,6 +215,10 @@ const documentProjectionJoin = `
           WHERE settlement.user_id = document.user_id AND settlement.document_id = document.id
           ORDER BY settlement.created_at DESC LIMIT 1)
       ) AS payroll_period,
+      (SELECT settlement.settlement_type
+         FROM payroll_settlements settlement
+        WHERE settlement.user_id = document.user_id AND settlement.document_id = document.id
+        ORDER BY settlement.created_at DESC LIMIT 1) AS settlement_type,
       max(correction.corrected_value #>> '{}')
         FILTER (WHERE field.field_path = 'employer.name') AS corrected_employer_name,
       max(field.interpreted_value #>> '{}')
@@ -245,6 +285,9 @@ function documentView(row: Record<string, unknown>) {
     createdAt: timestamp(row.created_at),
     processingStatus: String(row.processing_status),
     documentType: value(row, "document_type"),
+    payrollPeriod: value(row, "payroll_period"),
+    settlementType: value(row, "settlement_type"),
+    employerName: value(row, "employer_name"),
     confidence: value(row, "classification_confidence"),
     errorCode: value(row, "error_code"),
     originalAvailable: row.original_deleted_at === null && row.deleted_at === null,
@@ -268,6 +311,55 @@ function deductionViews(input: unknown) {
       confidence: value(row, "confidence"),
     }];
   });
+}
+
+function earningDetailViews(input: unknown) {
+  if (!Array.isArray(input)) return [];
+  return input.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const row = entry as Record<string, unknown>;
+    const rawDescription = value(row, "rawDescription");
+    const amount = value(row, "amount");
+    if (!rawDescription || !amount) return [];
+    return [{
+      normalizedConceptCode: value(row, "normalizedConceptCode"),
+      rawDescription,
+      amount,
+      isRecurring: typeof row.isRecurring === "boolean" ? row.isRecurring : null,
+      confidence: value(row, "confidence"),
+    }];
+  });
+}
+
+function settlementView(row: Record<string, unknown>) {
+  const deductionsAmount = value(row, "deductions_amount");
+  const reimbursementsAmount = deductionsAmount?.startsWith("-") ? deductionsAmount.slice(1) : null;
+  return {
+    id: String(row.id),
+    documentId: String(row.document_id),
+    employmentId: value(row, "employment_id"),
+    payrollPeriod: String(row.payroll_period),
+    employerName: value(row, "employer_name"),
+    settlementType: String(row.settlement_type),
+    isRecurring: row.is_recurring === true,
+    currencyCode: String(row.currency_code),
+    basicAmount: value(row, "basic_amount"),
+    grossAmount: value(row, "gross_amount"),
+    netAmount: value(row, "net_amount"),
+    remunerativeAmount: value(row, "remunerative_amount"),
+    nonRemunerativeAmount: value(row, "non_remunerative_amount"),
+    deductionsAmount,
+    deductionsChargedAmount: reimbursementsAmount ? "0.00" : deductionsAmount,
+    reimbursementsAmount,
+    confidence: value(row, "confidence"),
+    deductionsPercentage: reimbursementsAmount ? null : value(row, "deductions_percentage"),
+    deductions: deductionViews(row.deductions),
+    earnings: earningDetailViews(row.earnings),
+    totalsBalance: row.totals_balance === true,
+    deductionsMatchTotal: row.deductions_match_total === true,
+    deductionsDifferenceAmount: value(row, "deductions_difference_amount"),
+    deductionsDifferenceKind: String(row.deductions_difference_kind),
+  };
 }
 
 async function audit(
@@ -321,6 +413,263 @@ function normalizeDecimal(input: string): string | null {
     ? compact.replaceAll(".", "").replace(",", ".")
     : compact;
   return /^-?\d{1,18}(?:\.\d{1,2})?$/.test(normalized) ? normalized : null;
+}
+
+function earningViews(input: unknown) {
+  if (!Array.isArray(input)) return [];
+  return input.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const row = entry as Record<string, unknown>;
+    const code = value(row, "code");
+    const amount = value(row, "amount");
+    if (!code || !amount) return [];
+    return [{ code, amount, isRecurring: typeof row.isRecurring === "boolean" ? row.isRecurring : null }];
+  });
+}
+
+type SalaryConceptCursor = {
+  period: string;
+  settlementCreatedMicros: string;
+  settlementOrdinal: number;
+  settlementId: string;
+  itemOrdinal: number;
+  itemId: string;
+};
+
+function salaryConceptCursor(cursor: SalaryConceptCursor): string {
+  return Buffer.from(JSON.stringify([
+    cursor.period,
+    cursor.settlementCreatedMicros,
+    cursor.settlementOrdinal,
+    cursor.settlementId,
+    cursor.itemOrdinal,
+    cursor.itemId,
+  ])).toString("base64url");
+}
+
+function parseSalaryConceptCursor(input: string): SalaryConceptCursor | null {
+  if (!/^[A-Za-z0-9_-]{1,512}$/.test(input)) return null;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(input, "base64url").toString("utf8"));
+    if (!Array.isArray(parsed) || parsed.length !== 6
+      || typeof parsed[0] !== "string" || !/^20\d{2}-(0[1-9]|1[0-2])$/.test(parsed[0])
+      || typeof parsed[1] !== "string" || !/^\d{1,30}$/.test(parsed[1])
+      || typeof parsed[2] !== "number" || !Number.isSafeInteger(parsed[2]) || parsed[2] < 1 || parsed[2] > 2_147_483_647
+      || typeof parsed[3] !== "string" || !uuid.test(parsed[3])
+      || typeof parsed[4] !== "number" || !Number.isSafeInteger(parsed[4]) || parsed[4] < 1 || parsed[4] > 2_147_483_647
+      || typeof parsed[5] !== "string" || !uuid.test(parsed[5])) return null;
+    return {
+      period: parsed[0],
+      settlementCreatedMicros: parsed[1],
+      settlementOrdinal: parsed[2],
+      settlementId: parsed[3],
+      itemOrdinal: parsed[4],
+      itemId: parsed[5],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function detectedEmploymentIdentity(employerName: string) {
+  const key = employerName.trim().normalize("NFKC").toLowerCase();
+  if (!key || key.includes("\0")) return null;
+  return {
+    key,
+    context: `detected:${createHash("sha256").update(key).digest("hex").slice(0, 24)}`,
+  };
+}
+
+const salaryConceptCategorySql = `CASE
+  WHEN item.normalized_concept_code = 'NORMAL' THEN 'NORMAL'
+  WHEN item.normalized_concept_code = 'SAC' THEN 'SAC'
+  WHEN item.normalized_concept_code IN ('BONO', 'BONUS', 'PREMIO') THEN 'BONO'
+  WHEN item.normalized_concept_code IN ('RETROACTIVO', 'RETROACTIVE') THEN 'RETROACTIVO'
+  WHEN item.normalized_concept_code IN ('VACACIONES', 'VACATION') THEN 'VACACIONES'
+  WHEN item.normalized_concept_code IN ('HORAS_EXTRA', 'OVERTIME') THEN 'HORAS_EXTRA'
+  WHEN item.normalized_concept_code IN ('AJUSTE', 'ADJUSTMENT') THEN 'AJUSTE'
+  WHEN item.normalized_concept_code IN ('REINTEGRO', 'REIMBURSEMENT') THEN 'REINTEGRO'
+  WHEN item.normalized_concept_code IN ('COMISION', 'COMMISSION') THEN 'COMISION'
+  WHEN item.normalized_concept_code IN ('LIQUIDACION_FINAL', 'FINAL_SETTLEMENT') THEN 'LIQUIDACION_FINAL'
+  WHEN item.normalized_concept_code IN ('INDEMNIZACION', 'INDEMNITY', 'SEVERANCE') THEN 'INDEMNIZACION'
+  WHEN item.is_recurring IS TRUE THEN 'NORMAL'
+  ELSE 'OTRO'
+END`;
+
+const detectedEmployerNameJoin = `LEFT JOIN LATERAL (
+  SELECT COALESCE(correction.corrected_value #>> '{}', field.interpreted_value #>> '{}') AS name
+    FROM extracted_fields field
+    LEFT JOIN LATERAL (
+      SELECT current.corrected_value FROM user_corrections current
+       WHERE current.user_id = field.user_id
+         AND current.extraction_run_id = field.extraction_run_id
+         AND current.field_path = field.field_path
+       ORDER BY current.correction_version DESC LIMIT 1
+    ) correction ON true
+   WHERE field.user_id = settlement.user_id
+     AND field.extraction_run_id = settlement.extraction_run_id
+     AND field.field_path = 'employer.name'
+   LIMIT 1
+) detected_employer ON true`;
+
+async function loadSalaryHistory(userId: string) {
+  const [result, coverageResult] = await Promise.all([
+    pool.query(
+      `WITH latest_runs AS (
+         SELECT DISTINCT ON (run.document_id) run.id, run.document_id, run.user_id
+           FROM extraction_runs run
+          WHERE run.user_id = $1 AND run.status = 'COMPLETED'
+          ORDER BY run.document_id, run.processing_version DESC
+       )
+       SELECT settlement.id, settlement.document_id, settlement.employment_id,
+              to_char(settlement.payroll_period, 'YYYY-MM') AS payroll_period,
+              settlement.settlement_type, settlement.is_recurring, settlement.currency_code,
+              settlement.basic_amount, settlement.gross_amount, settlement.net_amount,
+              settlement.deductions_amount, settlement.remunerative_amount,
+              settlement.non_remunerative_amount, employment.status AS employment_status,
+              to_char(employment.start_date, 'YYYY-MM-DD') AS employment_start_date,
+              to_char(employment.end_date, 'YYYY-MM-DD') AS employment_end_date,
+              COALESCE(employer.name, detected_employer.name) AS employer_name,
+              COALESCE(earnings.items, '[]'::jsonb) AS earnings,
+              COALESCE(earnings.earning_count, 0)::integer AS earning_count,
+              COALESCE(earnings.unknown_count, 0)::integer AS unknown_earning_count
+         FROM documents document
+         JOIN latest_runs run ON run.document_id = document.id AND run.user_id = document.user_id
+         JOIN payroll_settlements settlement
+           ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
+         LEFT JOIN employments employment
+           ON employment.id = settlement.employment_id AND employment.user_id = settlement.user_id
+         LEFT JOIN employers employer
+           ON employer.id = employment.employer_id AND employer.user_id = settlement.user_id
+         ${detectedEmployerNameJoin}
+         LEFT JOIN LATERAL (
+           SELECT jsonb_agg(jsonb_build_object(
+                    'code', item.normalized_concept_code,
+                    'amount', item.amount::text,
+                    'isRecurring', item.is_recurring
+                  ) ORDER BY item.item_ordinal) FILTER (WHERE item.normalized_concept_code IS NOT NULL) AS items,
+                  count(*) AS earning_count,
+                  count(*) FILTER (WHERE item.normalized_concept_code IS NULL) AS unknown_count
+             FROM payroll_line_items item
+            WHERE item.user_id = settlement.user_id
+              AND item.settlement_id = settlement.id
+              AND item.item_type = 'EARNING'
+         ) earnings ON true
+        WHERE document.user_id = $1 AND document.deleted_at IS NULL
+          AND document.document_type = 'PAYROLL' AND document.processing_status = 'COMPLETED'
+        ORDER BY settlement.payroll_period, settlement.created_at, settlement.id`,
+      [userId],
+    ),
+    pool.query(
+      `SELECT count(*)::integer AS documents,
+              count(*) FILTER (WHERE processing_status = 'COMPLETED')::integer AS completed_documents,
+              count(*) FILTER (WHERE processing_status = 'NEEDS_REVIEW')::integer AS needs_review_documents,
+              count(*) FILTER (WHERE processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION'))::integer
+                AS pending_review_documents,
+              count(*) FILTER (WHERE processing_status = 'COMPLETED' AND employment_id IS NULL)::integer
+                AS unassociated_documents,
+              (SELECT count(*)::integer FROM employments
+                WHERE user_id = $1 AND status = 'ACTIVE') AS active_employments
+         FROM documents
+        WHERE user_id = $1 AND deleted_at IS NULL AND document_type = 'PAYROLL'`,
+      [userId],
+    ),
+  ]);
+
+  const contextMetadata = new Map<string, {
+    employmentContext: string;
+    employmentId: string | null;
+    employerName: string | null;
+    state: "CONFIRMED" | "DETECTED" | "UNCONFIRMED";
+    currencyCode: string;
+    employmentStatus: string | null;
+    startDate: string | null;
+    endDate: string | null;
+  }>();
+  const settlements: SalarySettlement[] = result.rows.map((row) => {
+    const employmentId = value(row, "employment_id");
+    const employerName = value(row, "employer_name")?.trim() || null;
+    const currency = String(row.currency_code);
+    const documentId = String(row.document_id);
+    const employmentContext = employmentId
+      ?? (employerName
+        ? detectedEmploymentIdentity(employerName)!.context
+        : `unconfirmed:${documentId}`);
+    const metadataKey = JSON.stringify([employmentContext, currency]);
+    if (!contextMetadata.has(metadataKey)) {
+      contextMetadata.set(metadataKey, {
+        employmentContext,
+        employmentId,
+        employerName,
+        state: employmentId ? "CONFIRMED" : employerName ? "DETECTED" : "UNCONFIRMED",
+        currencyCode: currency,
+        employmentStatus: value(row, "employment_status"),
+        startDate: value(row, "employment_start_date"),
+        endDate: value(row, "employment_end_date"),
+      });
+    }
+    return {
+      id: String(row.id),
+      documentId,
+      employmentContext,
+      employmentStartPeriod: value(row, "employment_start_date")?.slice(0, 7) ?? null,
+      employmentEndPeriod: value(row, "employment_end_date")?.slice(0, 7) ?? null,
+      employmentStatus: value(row, "employment_status"),
+      currencyCode: currency,
+      payrollPeriod: String(row.payroll_period),
+      settlementType: String(row.settlement_type),
+      isRecurring: row.is_recurring === true,
+      basicAmount: value(row, "basic_amount"),
+      grossAmount: value(row, "gross_amount"),
+      netAmount: value(row, "net_amount"),
+      deductionsAmount: value(row, "deductions_amount"),
+      remunerativeAmount: value(row, "remunerative_amount"),
+      nonRemunerativeAmount: value(row, "non_remunerative_amount"),
+      ...(Number(row.earning_count) > 0 && Number(row.unknown_earning_count) === 0
+        ? { earnings: earningViews(row.earnings) }
+        : {}),
+    };
+  });
+  const analytics = analyzeSalaryHistory(settlements);
+  const publicAnalytics = {
+    ...analytics,
+    scopes: analytics.scopes.map((scope) => ({
+      ...scope,
+      evolution: scope.evolution.map((point) => ({
+        period: point.period,
+        totals: point.totals,
+        regular: point.regular,
+        comparableSalary: point.comparableSalary,
+      })),
+    })),
+  };
+  const coverage = coverageResult.rows[0] ?? {};
+  return {
+    response: {
+      calculationVersion: "salary-analytics-v1",
+      contexts: analytics.scopes.map((scope) => {
+        const metadata = contextMetadata.get(JSON.stringify([scope.employmentContext, scope.currencyCode]));
+        if (!metadata) throw new Error("SALARY_CONTEXT_METADATA_MISSING");
+        return {
+          ...metadata,
+          firstPeriod: scope.evolution[0]?.period ?? null,
+          lastPeriod: scope.evolution.at(-1)?.period ?? null,
+        };
+      }),
+      coverage: {
+        documents: Number(coverage.documents ?? 0),
+        completedDocuments: Number(coverage.completed_documents ?? 0),
+        needsReviewDocuments: Number(coverage.needs_review_documents ?? 0),
+        pendingReviewDocuments: Number(coverage.pending_review_documents ?? 0),
+        unassociatedDocuments: Number(coverage.unassociated_documents ?? 0),
+        activeEmployments: Number(coverage.active_employments ?? 0),
+        analyzedSettlements: settlements.length,
+      },
+      analytics: publicAnalytics,
+    },
+    analytics,
+    settlements,
+  };
 }
 
 function authenticatedRateKey(request: FastifyRequest, cookieName: string): string {
@@ -1039,7 +1388,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     { preHandler: requireAuth },
     async (request) => {
       const userId = request.authUser!.id;
-      const [counts, latest, evolution] = await Promise.all([
+      const [counts, history] = await Promise.all([
         pool.query(
           `SELECT
              (SELECT count(*)::integer FROM employments WHERE user_id = $1 AND status = 'ACTIVE') AS active_employments,
@@ -1048,48 +1397,263 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 AND processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION')) AS pending_review`,
           [userId],
         ),
-        pool.query(
-          `SELECT net_amount, currency_code FROM payroll_settlements
-            WHERE user_id = $1 ORDER BY payroll_period DESC, created_at DESC LIMIT 1`,
-          [userId],
-        ),
-        pool.query(
-          `SELECT DISTINCT ON (payroll_period) to_char(payroll_period, 'YYYY-MM-DD') AS period,
-                  gross_amount, net_amount
-             FROM payroll_settlements
-            WHERE user_id = $1 AND is_recurring = true
-            ORDER BY payroll_period, created_at DESC`,
-          [userId],
-        ),
+        loadSalaryHistory(userId),
       ]);
       const row = counts.rows[0];
+      const eligibleScopes = history.response.analytics.scopes.filter((_, index) => (
+        history.response.contexts[index]?.state !== "UNCONFIRMED"
+      ));
+      const scope = eligibleScopes.length === 1 ? eligibleScopes[0] : null;
       return { data: {
         activeEmployments: Number(row.active_employments),
         documents: Number(row.documents),
         pendingReview: Number(row.pending_review),
-        latestNetAmount: latest.rowCount ? value(latest.rows[0], "net_amount") : null,
-        currencyCode: latest.rowCount ? value(latest.rows[0], "currency_code") : null,
-        evolution: evolution.rows.slice(-18).map((point) => ({
-          period: String(point.period), gross: value(point, "gross_amount"), net: value(point, "net_amount"),
+        latestNetAmount: scope?.current?.amounts.netAmount ?? null,
+        currencyCode: scope?.currencyCode ?? null,
+        evolution: (scope?.evolution ?? []).slice(-18).map((point) => ({
+          period: point.period, gross: point.regular.grossAmount, net: point.regular.netAmount,
         })),
       } };
     },
   );
 
   app.get(
+    "/api/v1/salary-history",
+    { preHandler: requireAuth },
+    async (request) => ({ data: (await loadSalaryHistory(request.authUser!.id)).response }),
+  );
+
+  app.get<{ Querystring: SalaryConceptQuery }>(
+    "/api/v1/salary-history/concepts",
+    {
+      preHandler: requireAuth,
+      schema: {
+        querystring: {
+          type: "object",
+          additionalProperties: false,
+          required: ["employmentContext", "currencyCode"],
+          properties: {
+            employmentContext: { type: "string", minLength: 1, maxLength: 128 },
+            currencyCode: { type: "string", pattern: "^[A-Z]{3}$" },
+            employerName: { type: "string", minLength: 1, maxLength: 160 },
+            year: { type: "string", pattern: "^20\\d{2}$" },
+            category: { type: "string", enum: [...SALARY_CATEGORIES] },
+            limit: { type: "string", pattern: "^(?:[1-9]|[1-9][0-9]|100)$" },
+            cursor: { type: "string", pattern: "^[A-Za-z0-9_-]{1,512}$" },
+          },
+        },
+      },
+    },
+    async (request) => {
+      const limit = request.query.limit === undefined ? 50 : Number(request.query.limit);
+      const cursor = request.query.cursor === undefined ? null : parseSalaryConceptCursor(request.query.cursor);
+      if (request.query.cursor !== undefined && cursor === null) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El cursor no es válido.");
+      }
+      const parameters: unknown[] = [request.authUser!.id, request.query.currencyCode];
+      const parameter = (input: unknown) => {
+        parameters.push(input);
+        return `$${parameters.length}`;
+      };
+      const conditions = [
+        "document.user_id = $1",
+        "document.deleted_at IS NULL",
+        "document.document_type = 'PAYROLL'",
+        "document.processing_status = 'COMPLETED'",
+        "settlement.currency_code = $2",
+        "item.item_type = 'EARNING'",
+        "item.normalized_concept_code IS NOT NULL",
+      ];
+      let includeDetectedEmployer = false;
+      const detectedContext = /^detected:[0-9a-f]{24}$/.test(request.query.employmentContext);
+      const unconfirmedContext = /^unconfirmed:([0-9a-f-]{36})$/.exec(request.query.employmentContext);
+      if (uuid.test(request.query.employmentContext)) {
+        conditions.push(`settlement.employment_id = ${parameter(request.query.employmentContext)}::uuid`);
+      } else if (detectedContext) {
+        const identity = request.query.employerName === undefined
+          ? null
+          : detectedEmploymentIdentity(request.query.employerName);
+        if (identity === null || identity.context !== request.query.employmentContext) {
+          throw new ApiError(400, "VALIDATION_ERROR", "El contexto laboral no es válido.");
+        }
+        includeDetectedEmployer = true;
+        conditions.push("settlement.employment_id IS NULL");
+        conditions.push(`lower(normalize(btrim(detected_employer.name), NFKC) COLLATE "und-x-icu") = ${parameter(identity.key)}`);
+      } else if (unconfirmedContext !== null && uuid.test(unconfirmedContext[1]!)) {
+        includeDetectedEmployer = true;
+        conditions.push("settlement.employment_id IS NULL");
+        conditions.push(`document.id = ${parameter(unconfirmedContext[1])}::uuid`);
+        conditions.push("NULLIF(btrim(detected_employer.name), '') IS NULL");
+      } else {
+        return { data: { items: [], nextCursor: null } };
+      }
+      if (request.query.year !== undefined) {
+        conditions.push(`settlement.payroll_period >= ${parameter(`${request.query.year}-01-01`)}::date`);
+        conditions.push(`settlement.payroll_period < ${parameter(`${Number(request.query.year) + 1}-01-01`)}::date`);
+      }
+      if (request.query.category !== undefined) {
+        conditions.push(`(${salaryConceptCategorySql}) = ${parameter(request.query.category)}`);
+      }
+      if (cursor !== null) {
+        const cursorPeriod = parameter(`${cursor.period}-01`);
+        const cursorCreated = parameter(cursor.settlementCreatedMicros);
+        const cursorOrdinal = parameter(cursor.settlementOrdinal);
+        const cursorSettlementId = parameter(cursor.settlementId);
+        const cursorItemOrdinal = parameter(cursor.itemOrdinal);
+        const cursorItemId = parameter(cursor.itemId);
+        const createdMicros = "extract(epoch FROM settlement.created_at) * 1000000";
+        conditions.push(`(
+          settlement.payroll_period < ${cursorPeriod}::date
+          OR (settlement.payroll_period = ${cursorPeriod}::date
+            AND ${createdMicros} < ${cursorCreated}::numeric)
+          OR (settlement.payroll_period = ${cursorPeriod}::date
+            AND ${createdMicros} = ${cursorCreated}::numeric
+            AND (settlement.settlement_ordinal, settlement.id, item.item_ordinal, item.id)
+              > (${cursorOrdinal}::integer, ${cursorSettlementId}::uuid, ${cursorItemOrdinal}::integer, ${cursorItemId}::uuid))
+        )`);
+      }
+      parameters.push(limit + 1);
+      const result = await pool.query(
+        `WITH latest_runs AS (
+           SELECT DISTINCT ON (run.document_id) run.id, run.document_id, run.user_id
+             FROM extraction_runs run
+            WHERE run.user_id = $1 AND run.status = 'COMPLETED'
+            ORDER BY run.document_id, run.processing_version DESC
+         )
+         SELECT to_char(settlement.payroll_period, 'YYYY-MM') AS period,
+                (extract(epoch FROM settlement.created_at) * 1000000)::numeric(30, 0)::text
+                  AS settlement_created_micros,
+                settlement.settlement_ordinal, settlement.id AS settlement_id,
+                settlement.settlement_type, item.item_ordinal, item.id AS item_id,
+                item.normalized_concept_code, item.is_recurring, item.amount
+           FROM documents document
+           JOIN latest_runs run ON run.document_id = document.id AND run.user_id = document.user_id
+           JOIN payroll_settlements settlement
+             ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
+           JOIN payroll_line_items item
+             ON item.settlement_id = settlement.id AND item.user_id = settlement.user_id
+           ${includeDetectedEmployer ? detectedEmployerNameJoin : ""}
+          WHERE ${conditions.join(" AND ")}
+          ORDER BY settlement.payroll_period DESC, settlement.created_at DESC,
+                   settlement.settlement_ordinal, settlement.id, item.item_ordinal, item.id
+          LIMIT $${parameters.length}`,
+        parameters,
+      );
+      const page = result.rows.slice(0, limit);
+      const items = page.map((row) => ({
+        period: String(row.period),
+        settlementId: String(row.settlement_id),
+        settlementType: String(row.settlement_type),
+        earningIndex: Number(row.item_ordinal),
+        category: salaryCategoryForEarning(String(row.normalized_concept_code), row.is_recurring as boolean | null),
+        code: String(row.normalized_concept_code),
+        isRecurring: typeof row.is_recurring === "boolean" ? row.is_recurring : null,
+        amount: String(row.amount),
+      }));
+      const last = page.at(-1);
+      return { data: {
+        items,
+        nextCursor: last && result.rows.length > limit ? salaryConceptCursor({
+          period: String(last.period),
+          settlementCreatedMicros: String(last.settlement_created_micros),
+          settlementOrdinal: Number(last.settlement_ordinal),
+          settlementId: String(last.settlement_id),
+          itemOrdinal: Number(last.item_ordinal),
+          itemId: String(last.item_id),
+        }) : null,
+      } };
+    },
+  );
+
+  app.get<{ Querystring: SalaryComparisonQuery }>(
+    "/api/v1/salary-history/comparison",
+    {
+      preHandler: requireAuth,
+      schema: {
+        querystring: {
+          type: "object",
+          additionalProperties: false,
+          required: ["employmentContext", "currencyCode", "fromPeriod", "toPeriod"],
+          properties: {
+            employmentContext: { type: "string", minLength: 1, maxLength: 128 },
+            currencyCode: { type: "string", pattern: "^[A-Z]{3}$" },
+            fromPeriod: { type: "string", pattern: "^20\\d{2}-(0[1-9]|1[0-2])$" },
+            toPeriod: { type: "string", pattern: "^20\\d{2}-(0[1-9]|1[0-2])$" },
+          },
+        },
+      },
+    },
+    async (request) => {
+      const history = await loadSalaryHistory(request.authUser!.id);
+      const comparison = compareSalaryPeriods(history.settlements, request.query);
+      return { data: comparison };
+    },
+  );
+
+  app.get<{ Querystring: DocumentListQuery }>(
     "/api/v1/documents",
     { preHandler: requireAuth },
     async (request) => {
-      const rawLimit = (request.query as { limit?: string }).limit;
-      const limit = rawLimit === undefined ? 500 : Number(rawLimit);
+      const limit = request.query.limit === undefined ? 100 : Number(request.query.limit);
       if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
         throw new ApiError(400, "VALIDATION_ERROR", "El límite no es válido.");
       }
+      if ((request.query.before === undefined) !== (request.query.beforeId === undefined)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El cursor no es válido.");
+      }
+      const before = request.query.before === undefined ? null : new Date(request.query.before);
+      if (before && Number.isNaN(before.getTime())) throw new ApiError(400, "VALIDATION_ERROR", "El cursor no es válido.");
+      if (request.query.beforeId !== undefined && !uuid.test(request.query.beforeId)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El cursor no es válido.");
+      }
+      const search = request.query.search?.trim();
+      if (search && search.length > 100) throw new ApiError(400, "VALIDATION_ERROR", "La búsqueda es demasiado larga.");
+      if (request.query.year !== undefined && !/^20\d{2}$/.test(request.query.year)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El año no es válido.");
+      }
+      if (request.query.employmentId !== undefined
+        && request.query.employmentId !== "unassociated"
+        && !uuid.test(request.query.employmentId)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El empleo no es válido.");
+      }
+      if (request.query.documentType !== undefined && !["PAYROLL", "UNSUPPORTED"].includes(request.query.documentType)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El tipo de documento no es válido.");
+      }
+      if (request.query.settlementType !== undefined && !settlementTypes.has(request.query.settlementType)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El tipo de liquidación no es válido.");
+      }
+      if (request.query.processingStatus !== undefined && !/^[A-Z_]{2,40}$/.test(request.query.processingStatus)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El estado no es válido.");
+      }
+      const parameters: unknown[] = [request.authUser!.id];
+      const conditions = ["document.user_id = $1", "document.deleted_at IS NULL"];
+      const parameter = (input: unknown) => {
+        parameters.push(input);
+        return `$${parameters.length}`;
+      };
+      if (before && request.query.beforeId) {
+        const beforeParameter = parameter(before.toISOString());
+        const idParameter = parameter(request.query.beforeId);
+        conditions.push(`(document.created_at, document.id) < (${beforeParameter}::timestamptz, ${idParameter}::uuid)`);
+      }
+      if (search) {
+        const searchParameter = parameter(`%${search.replace(/[\\%_]/g, "\\$&")}%`);
+        conditions.push(`(document.original_filename ILIKE ${searchParameter} ESCAPE '\\'
+          OR COALESCE(employer.name, projection.corrected_employer_name, projection.extracted_employer_name, '')
+             ILIKE ${searchParameter} ESCAPE '\\')`);
+      }
+      if (request.query.year) conditions.push(`projection.payroll_period LIKE ${parameter(`${request.query.year}-%`)}`);
+      if (request.query.employmentId === "unassociated") conditions.push("document.employment_id IS NULL");
+      else if (request.query.employmentId) conditions.push(`document.employment_id = ${parameter(request.query.employmentId)}::uuid`);
+      if (request.query.processingStatus) conditions.push(`document.processing_status = ${parameter(request.query.processingStatus)}`);
+      if (request.query.documentType) conditions.push(`document.document_type = ${parameter(request.query.documentType)}`);
+      if (request.query.settlementType) conditions.push(`projection.settlement_type = ${parameter(request.query.settlementType)}`);
+      parameters.push(limit);
       const result = await pool.query(
         `SELECT document.id, document.employment_id, document.original_filename, document.created_at,
                 document.processing_status, document.document_type,
                 document.classification_confidence, document.original_deleted_at,
-                document.deleted_at, item.error_code, projection.payroll_period,
+                document.deleted_at, item.error_code, projection.payroll_period, projection.settlement_type,
                 COALESCE(employer.name, projection.corrected_employer_name,
                          projection.extracted_employer_name) AS employer_name
            FROM documents document
@@ -1097,12 +1661,12 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
              ON item.id = document.import_batch_item_id AND item.user_id = document.user_id
            LEFT JOIN employments employment
              ON employment.id = document.employment_id AND employment.user_id = document.user_id
-           LEFT JOIN employers employer
-             ON employer.id = employment.employer_id AND employer.user_id = document.user_id
+            LEFT JOIN employers employer
+              ON employer.id = employment.employer_id AND employer.user_id = document.user_id
            ${documentProjectionJoin}
-          WHERE document.user_id = $1 AND document.deleted_at IS NULL
-          ORDER BY document.created_at DESC LIMIT $2`,
-        [request.authUser!.id, limit],
+          WHERE ${conditions.join(" AND ")}
+          ORDER BY document.created_at DESC, document.id DESC LIMIT $${parameters.length}`,
+        parameters,
       );
       return { data: result.rows.map(documentView) };
     },
@@ -1116,7 +1680,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         `SELECT document.id, document.employment_id, document.original_filename, document.created_at,
                 document.processing_status, document.document_type,
                 document.classification_confidence, document.original_deleted_at,
-                document.deleted_at, item.error_code, projection.payroll_period,
+                document.deleted_at, item.error_code, projection.payroll_period, projection.settlement_type,
                 COALESCE(employer.name, projection.corrected_employer_name,
                          projection.extracted_employer_name) AS employer_name
            FROM documents document
@@ -1161,10 +1725,55 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         [request.authUser!.id, request.params.id, extractionRunId],
       ) : { rows: [] as Record<string, unknown>[] };
       const settlement = extractionRunId ? await pool.query(
-        `SELECT payroll_period, gross_amount, net_amount, deductions_amount
-           FROM payroll_settlements
-          WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3
-          ORDER BY settlement_ordinal LIMIT 1`,
+        `SELECT settlement.id, settlement.document_id, settlement.employment_id,
+                to_char(settlement.payroll_period, 'YYYY-MM-DD') AS payroll_period,
+                settlement.settlement_type, settlement.is_recurring, settlement.currency_code,
+                settlement.basic_amount, settlement.gross_amount, settlement.net_amount,
+                settlement.remunerative_amount, settlement.non_remunerative_amount,
+                settlement.deductions_amount, run.confidence,
+                settlement.gross_amount IS NOT NULL AND settlement.net_amount IS NOT NULL
+                  AND settlement.deductions_amount IS NOT NULL
+                  AND settlement.gross_amount - settlement.deductions_amount = settlement.net_amount AS totals_balance,
+                CASE WHEN settlement.gross_amount > 0 AND settlement.deductions_amount > 0
+                  THEN round(settlement.deductions_amount * 100 / settlement.gross_amount, 2)::text
+                  ELSE NULL END AS deductions_percentage,
+                COALESCE(items.deductions, '[]'::jsonb) AS deductions,
+                COALESCE(items.earnings, '[]'::jsonb) AS earnings,
+                settlement.deductions_amount IS NOT NULL
+                  AND COALESCE(items.deductions_total, 0) = settlement.deductions_amount AS deductions_match_total,
+                CASE WHEN settlement.deductions_amount IS NULL AND items.deductions_total IS NULL THEN NULL
+                  ELSE abs(COALESCE(items.deductions_total, 0) - COALESCE(settlement.deductions_amount, 0))::text
+                  END AS deductions_difference_amount,
+                CASE
+                  WHEN settlement.deductions_amount IS NULL THEN 'TOTAL_MISSING'
+                  WHEN COALESCE(items.deductions_total, 0) = COALESCE(settlement.deductions_amount, 0) THEN 'MATCHED'
+                  WHEN COALESCE(items.deductions_total, 0) < COALESCE(settlement.deductions_amount, 0) THEN 'MISSING_ITEMS'
+                  ELSE 'ITEMS_EXCEED_TOTAL'
+                END AS deductions_difference_kind
+           FROM payroll_settlements settlement
+           JOIN extraction_runs run ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
+           LEFT JOIN LATERAL (
+             SELECT sum(item.amount) FILTER (WHERE item.item_type = 'DEDUCTION') AS deductions_total,
+                    jsonb_agg(jsonb_build_object(
+                      'normalizedConceptCode', item.normalized_concept_code,
+                      'rawDescription', item.raw_description,
+                      'amount', item.amount::text,
+                      'grossPercentage', CASE WHEN settlement.gross_amount > 0
+                        THEN round(item.amount * 100 / settlement.gross_amount, 2)::text ELSE NULL END,
+                      'confidence', item.confidence::text
+                    ) ORDER BY item.item_ordinal) FILTER (WHERE item.item_type = 'DEDUCTION') AS deductions,
+                    jsonb_agg(jsonb_build_object(
+                      'normalizedConceptCode', item.normalized_concept_code,
+                      'rawDescription', item.raw_description,
+                      'amount', item.amount::text,
+                      'isRecurring', item.is_recurring,
+                      'confidence', item.confidence::text
+                    ) ORDER BY item.item_ordinal) FILTER (WHERE item.item_type = 'EARNING') AS earnings
+               FROM payroll_line_items item
+              WHERE item.user_id = settlement.user_id AND item.settlement_id = settlement.id
+           ) items ON true
+          WHERE settlement.user_id = $1 AND settlement.document_id = $2 AND settlement.extraction_run_id = $3
+          ORDER BY settlement.settlement_ordinal LIMIT 1`,
         [request.authUser!.id, request.params.id, extractionRunId],
       ) : { rows: [] as Record<string, unknown>[] };
       const manualValues = new Map(manual.rows.map((row) => [String(row.field_path), row.corrected_value]));
@@ -1213,6 +1822,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       return { data: {
         ...documentView(document.rows[0]),
         extractedFields,
+        settlement: settlement.rows.length ? settlementView(settlement.rows[0]!) : null,
       } };
     },
   );
@@ -1282,19 +1892,22 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     { preHandler: requireAuth },
     async (request) => {
       const result = await pool.query(
-        `SELECT settlement.id, to_char(settlement.payroll_period, 'YYYY-MM-DD') AS payroll_period,
+        `SELECT settlement.id, settlement.document_id, settlement.employment_id,
+                to_char(settlement.payroll_period, 'YYYY-MM-DD') AS payroll_period,
                 COALESCE(employer.name, extracted_employer.corrected_name,
-                         extracted_employer.extracted_name) AS employer_name,
-                settlement.settlement_type,
-                settlement.currency_code, settlement.gross_amount, settlement.net_amount,
-                settlement.deductions_amount, run.confidence, settlement.document_id,
+                          extracted_employer.extracted_name) AS employer_name,
+                settlement.settlement_type, settlement.is_recurring, settlement.currency_code,
+                settlement.basic_amount, settlement.gross_amount, settlement.net_amount,
+                settlement.remunerative_amount, settlement.non_remunerative_amount,
+                settlement.deductions_amount, run.confidence,
                 settlement.gross_amount IS NOT NULL AND settlement.net_amount IS NOT NULL
                   AND settlement.deductions_amount IS NOT NULL
                   AND settlement.gross_amount - settlement.deductions_amount = settlement.net_amount AS totals_balance,
                 CASE WHEN settlement.gross_amount > 0 AND settlement.deductions_amount IS NOT NULL
                   THEN round(settlement.deductions_amount * 100 / settlement.gross_amount, 2)::text
                   ELSE NULL END AS deductions_percentage,
-                COALESCE(breakdown.items, '[]'::jsonb) AS deductions,
+                COALESCE(breakdown.deductions, '[]'::jsonb) AS deductions,
+                COALESCE(breakdown.earnings, '[]'::jsonb) AS earnings,
                 settlement.deductions_amount IS NOT NULL
                   AND COALESCE(breakdown.total_amount, 0) = settlement.deductions_amount AS deductions_match_total,
                 CASE WHEN settlement.deductions_amount IS NULL AND breakdown.total_amount IS NULL THEN NULL
@@ -1327,7 +1940,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
               LIMIT 1
            ) extracted_employer ON true
            LEFT JOIN LATERAL (
-             SELECT sum(item.amount) AS total_amount,
+             SELECT sum(item.amount) FILTER (WHERE item.item_type = 'DEDUCTION') AS total_amount,
                     jsonb_agg(jsonb_build_object(
                       'normalizedConceptCode', item.normalized_concept_code,
                       'rawDescription', item.raw_description,
@@ -1336,12 +1949,18 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                         THEN round(item.amount * 100 / settlement.gross_amount, 2)::text
                         ELSE NULL END,
                       'confidence', item.confidence::text
-                    ) ORDER BY item.item_ordinal) AS items
+                    ) ORDER BY item.item_ordinal) FILTER (WHERE item.item_type = 'DEDUCTION') AS deductions,
+                    jsonb_agg(jsonb_build_object(
+                      'normalizedConceptCode', item.normalized_concept_code,
+                      'rawDescription', item.raw_description,
+                      'amount', item.amount::text,
+                      'isRecurring', item.is_recurring,
+                      'confidence', item.confidence::text
+                    ) ORDER BY item.item_ordinal) FILTER (WHERE item.item_type = 'EARNING') AS earnings
                FROM payroll_line_items item
               WHERE item.user_id = settlement.user_id
                 AND item.settlement_id = settlement.id
-                AND item.item_type = 'DEDUCTION'
-           ) breakdown ON true
+            ) breakdown ON true
           WHERE settlement.user_id = $1
             AND run.processing_version = (
               SELECT max(latest.processing_version) FROM extraction_runs latest
@@ -1352,18 +1971,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           ORDER BY settlement.payroll_period DESC, settlement.created_at DESC LIMIT 500`,
         [request.authUser!.id],
       );
-      return { data: result.rows.map((row) => ({
-        id: String(row.id), payrollPeriod: String(row.payroll_period), employerName: value(row, "employer_name"),
-        settlementType: String(row.settlement_type), currencyCode: String(row.currency_code),
-        grossAmount: value(row, "gross_amount"), netAmount: value(row, "net_amount"),
-        deductionsAmount: value(row, "deductions_amount"), confidence: value(row, "confidence"),
-        deductionsPercentage: value(row, "deductions_percentage"), deductions: deductionViews(row.deductions),
-        totalsBalance: row.totals_balance === true,
-        deductionsMatchTotal: row.deductions_match_total === true,
-        deductionsDifferenceAmount: value(row, "deductions_difference_amount"),
-        deductionsDifferenceKind: String(row.deductions_difference_kind),
-        documentId: String(row.document_id),
-      })) };
+      return { data: result.rows.map(settlementView) };
     },
   );
 
@@ -1554,7 +2162,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         const amountColumn = settlementAmountColumns.get(fieldPath);
         if (amountColumn) {
           const amount = normalizeDecimal(corrected);
-          if (!amount || amount.startsWith("-")) throw new ApiError(400, "INVALID_AMOUNT", "El monto corregido no es válido.");
+          if (!amount || (amount.startsWith("-") && fieldPath !== "settlement.deductionsAmount")) {
+            throw new ApiError(400, "INVALID_AMOUNT", "El monto corregido no es válido.");
+          }
           const interpreted = row.interpreted_value && typeof row.interpreted_value === "object"
             ? row.interpreted_value as Record<string, unknown>
             : {};

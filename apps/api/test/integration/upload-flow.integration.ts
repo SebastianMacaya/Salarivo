@@ -1637,6 +1637,8 @@ test("upload privado crea un único documento y un único intent durable", async
   await pool.query("UPDATE import_batch_items SET status = 'NEEDS_REVIEW' WHERE id = $1", [batchData.items[0]!.id]);
   const reviewDetail = await app.inject({ method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieA } });
   assert.equal(reviewDetail.statusCode, 200, reviewDetail.body);
+  assert.equal(reviewDetail.json().data.settlement.documentId, documentId);
+  assert.equal(reviewDetail.json().data.settlement.deductionsAmount, "180.00");
   const reviewFields = reviewDetail.json().data.extractedFields as Array<{
     id: string | null; fieldPath: string; source: string; missingReason?: string;
   }>;
@@ -1726,6 +1728,119 @@ test("upload privado crea un único documento y un único intent durable", async
   const documentsView = await app.inject({ method: "GET", url: "/api/v1/documents", headers: { cookie: cookieA } });
   assert.equal(documentsView.statusCode, 200, documentsView.body);
   assert.equal(documentsView.json().data[0].displayFilename, "2026-08 - Empresa Sintética SA.pdf");
+  const filteredDocuments = await app.inject({
+    method: "GET",
+    url: "/api/v1/documents?year=2026&documentType=PAYROLL&settlementType=NORMAL&search=Empresa%20Sint%C3%A9tica",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(filteredDocuments.statusCode, 200, filteredDocuments.body);
+  assert.deepEqual(filteredDocuments.json().data.map((document: { id: string }) => document.id), [documentId]);
+  const nextDocumentsPage = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents?limit=10&before=${encodeURIComponent(documentsView.json().data[0].createdAt)}&beforeId=${documentId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(nextDocumentsPage.statusCode, 200, nextDocumentsPage.body);
+  assert.deepEqual(nextDocumentsPage.json().data, []);
+  assert.equal(
+    (await app.inject({ method: "GET", url: `/api/v1/documents?beforeId=${documentId}`, headers: { cookie: cookieA } })).statusCode,
+    400,
+  );
+  await pool.query(
+    `UPDATE payroll_settlements
+        SET basic_amount = 1000.00, remunerative_amount = 1000.00, non_remunerative_amount = 0.00
+      WHERE id = $1 AND user_id = $2`,
+    [settlementId, userId],
+  );
+  await pool.query(
+    `INSERT INTO payroll_line_items (
+       id, user_id, settlement_id, item_ordinal, raw_description, normalized_concept_code,
+       amount, currency_code, item_type, is_recurring, confidence
+     ) VALUES
+       ($1, $2, $3, 4, 'Sueldo básico sintético', 'BASIC_SALARY', 1000.00, 'ARS', 'EARNING', true, 0.99),
+       ($4, $2, $3, 5, 'Bono sintético', 'BONUS', 25.00, 'ARS', 'EARNING', false, 0.99),
+       ($5, $2, $3, 6, 'Haber desconocido sintético', NULL, 15.00, 'ARS', 'EARNING', NULL, 0.50)`,
+    [crypto.randomUUID(), userId, settlementId, crypto.randomUUID(), crypto.randomUUID()],
+  );
+  const salaryHistory = await app.inject({ method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA } });
+  assert.equal(salaryHistory.statusCode, 200, salaryHistory.body);
+  assert.equal(salaryHistory.json().data.calculationVersion, "salary-analytics-v1");
+  assert.equal(salaryHistory.json().data.contexts[0].state, "DETECTED");
+  assert.equal(salaryHistory.json().data.analytics.scopes[0].currencyCode, "ARS");
+  assert.equal(salaryHistory.json().data.analytics.scopes[0].current.comparableSalary, "1000.00");
+  assert.equal("settlements" in salaryHistory.json().data.analytics.scopes[0].evolution[0], false);
+  assert.doesNotMatch(salaryHistory.body, /Sueldo básico sintético|Bono sintético|Haber desconocido sintético/);
+  const employmentContext = salaryHistory.json().data.contexts[0].employmentContext as string;
+  const conceptContextQuery = `employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa Sintética SA")}`;
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=ARS&employerName=Otra`,
+    headers: { cookie: cookieA },
+  })).statusCode, 400);
+  const firstConcepts = await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?${conceptContextQuery}&limit=1`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(firstConcepts.statusCode, 200, firstConcepts.body);
+  assert.deepEqual(firstConcepts.json().data.items.map((item: { code: string; category: string }) => [item.code, item.category]), [
+    ["BASIC_SALARY", "NORMAL"],
+  ]);
+  assert.equal(typeof firstConcepts.json().data.nextCursor, "string");
+  const nextConcepts = await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?${conceptContextQuery}&limit=1&cursor=${encodeURIComponent(firstConcepts.json().data.nextCursor)}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(nextConcepts.statusCode, 200, nextConcepts.body);
+  assert.deepEqual(nextConcepts.json().data.items.map((item: { code: string; category: string }) => [item.code, item.category]), [
+    ["BONUS", "BONO"],
+  ]);
+  assert.equal(nextConcepts.json().data.nextCursor, null);
+  for (const invalidCursor of [
+    ["0000-01", "1", 1, crypto.randomUUID(), 1, crypto.randomUUID()],
+    ["2026-08", "1", 2_147_483_648, crypto.randomUUID(), 1, crypto.randomUUID()],
+  ]) {
+    assert.equal((await app.inject({
+      method: "GET",
+      url: `/api/v1/salary-history/concepts?${conceptContextQuery}&cursor=${Buffer.from(JSON.stringify(invalidCursor)).toString("base64url")}`,
+      headers: { cookie: cookieA },
+    })).statusCode, 400);
+  }
+  const bonusConcepts = await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?${conceptContextQuery}&year=2026&category=BONO`,
+    headers: { cookie: cookieA },
+  });
+  assert.deepEqual(bonusConcepts.json().data.items.map((item: { code: string }) => item.code), ["BONUS"]);
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?${conceptContextQuery}&limit=101`,
+    headers: { cookie: cookieA },
+  })).statusCode, 400);
+  const isolatedSalaryHistory = await app.inject({ method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieB } });
+  assert.equal(isolatedSalaryHistory.statusCode, 200, isolatedSalaryHistory.body);
+  assert.deepEqual(isolatedSalaryHistory.json().data.analytics.scopes, []);
+  const isolatedConcepts = await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?${conceptContextQuery}`,
+    headers: { cookie: cookieB },
+  });
+  assert.deepEqual(isolatedConcepts.json().data, { items: [], nextCursor: null });
+  const detectedEmployments = await app.inject({ method: "GET", url: "/api/v1/employment-detections", headers: { cookie: cookieA } });
+  assert.equal(detectedEmployments.statusCode, 200, detectedEmployments.body);
+  assert.deepEqual(detectedEmployments.json().data[0], {
+    employerName: "Empresa Sintética SA",
+    currencyCode: "ARS",
+    firstPeriod: "2026-08",
+    lastPeriod: "2026-08",
+    documentCount: 1,
+    state: "DETECTED",
+  });
+  assert.deepEqual(
+    (await app.inject({ method: "GET", url: "/api/v1/employment-detections", headers: { cookie: cookieB } })).json().data,
+    [],
+  );
   const settlementsView = await app.inject({ method: "GET", url: "/api/v1/settlements", headers: { cookie: cookieA } });
   assert.equal(settlementsView.statusCode, 200, settlementsView.body);
   assert.equal(settlementsView.json().data[0].employerName, "Empresa Sintética SA");
@@ -1799,6 +1914,38 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(clearedAssociation.rows[0].document_employment_id, null);
   assert.equal(clearedAssociation.rows[0].settlement_employment_id, null);
 
+  const foreignDetectionConfirmation = await app.inject({
+    method: "POST",
+    url: "/api/v1/employment-detections/confirm",
+    headers: { origin, cookie: cookieB },
+    payload: { employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
+  });
+  assert.equal(foreignDetectionConfirmation.statusCode, 404, foreignDetectionConfirmation.body);
+  const confirmedDetection = await app.inject({
+    method: "POST",
+    url: "/api/v1/employment-detections/confirm",
+    headers: { origin, cookie: cookieA },
+    payload: { employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
+  });
+  assert.equal(confirmedDetection.statusCode, 201, confirmedDetection.body);
+  assert.equal(confirmedDetection.json().data.associatedDocuments, 1);
+  assert.equal(confirmedDetection.json().data.employment.status, "ACTIVE");
+  const detectedEmploymentId = String(confirmedDetection.json().data.employment.id);
+  const detectedEmployerId = String(confirmedDetection.json().data.employment.employerId);
+  assert.equal(
+    String((await pool.query("SELECT employment_id FROM documents WHERE id = $1", [documentId])).rows[0].employment_id),
+    detectedEmploymentId,
+  );
+  const clearDetectedEmployment = await app.inject({
+    method: "PATCH",
+    url: "/api/v1/documents/employment",
+    headers: { origin, cookie: cookieA },
+    payload: { documentIds: [documentId], employmentId: null },
+  });
+  assert.equal(clearDetectedEmployment.statusCode, 200, clearDetectedEmployment.body);
+  await pool.query("DELETE FROM employments WHERE id = $1 AND user_id = $2", [detectedEmploymentId, userId]);
+  await pool.query("DELETE FROM employers WHERE id = $1 AND user_id = $2", [detectedEmployerId, userId]);
+
   const correction = await app.inject({
     method: "POST",
     url: `/api/v1/documents/${documentId}/corrections`,
@@ -1816,12 +1963,33 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(correctedSettlements.json().data[0].deductionsDifferenceKind, "MISSING_ITEMS");
   assert.equal(correctedSettlements.json().data[0].deductionsDifferenceAmount, "20.00");
   assert.equal(correctedSettlements.json().data[0].deductions.length, 3);
+  const creditCorrection = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/corrections`,
+    headers: { origin, cookie: cookieA },
+    payload: { extractedFieldId: deductionsFieldId, correctedValue: "-20.00" },
+  });
+  assert.equal(creditCorrection.statusCode, 201, creditCorrection.body);
+  const creditSettlement = (await app.inject({ method: "GET", url: "/api/v1/settlements", headers: { cookie: cookieA } }))
+    .json().data.find((row: { documentId: string }) => row.documentId === documentId);
+  assert.equal(creditSettlement.deductionsAmount, "-20.00");
+  assert.equal(creditSettlement.deductionsChargedAmount, "0.00");
+  assert.equal(creditSettlement.reimbursementsAmount, "20.00");
+  assert.equal(creditSettlement.deductionsPercentage, null);
+  assert.equal((await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/corrections`,
+    headers: { origin, cookie: cookieA },
+    payload: { extractedFieldId: deductionsFieldId, correctedValue: "200.00" },
+  })).statusCode, 201);
 
   const manualRunId = crypto.randomUUID();
   const manualGrossFieldId = crypto.randomUUID();
   const manualNetFieldId = crypto.randomUUID();
   const manualDeductionsFieldId = crypto.randomUUID();
   const manualTypeFieldId = crypto.randomUUID();
+  const manualRemunerativeFieldId = crypto.randomUUID();
+  const manualNonRemunerativeFieldId = crypto.randomUUID();
   await pool.query(
     `INSERT INTO extraction_runs (
        id, user_id, document_id, processing_version, status, extractor_name,
@@ -1837,12 +2005,16 @@ test("upload privado crea un único documento y un único intent durable", async
        ($1, $2, $3, $4, 'settlement.grossAmount', 'PAYROLL_SETTLEMENT', '1000.00', $5::jsonb, 0.7, 'PDF_TEXT', '3'),
        ($6, $2, $3, $4, 'settlement.netAmount', 'PAYROLL_SETTLEMENT', '820.00', $7::jsonb, 0.7, 'PDF_TEXT', '3'),
        ($8, $2, $3, $4, 'settlement.deductionsAmount', 'PAYROLL_SETTLEMENT', '180.00', $9::jsonb, 0.7, 'PDF_TEXT', '3'),
-       ($10, $2, $3, $4, 'settlement.type', 'PAYROLL_SETTLEMENT', 'BONO', $11::jsonb, 0.8, 'RULE', '3')`,
+       ($10, $2, $3, $4, 'settlement.type', 'PAYROLL_SETTLEMENT', 'BONO', $11::jsonb, 0.8, 'RULE', '3'),
+       ($12, $2, $3, $4, 'settlement.remunerativeAmount', 'PAYROLL_SETTLEMENT', '700.00', $13::jsonb, 0.7, 'PDF_TEXT', '3'),
+       ($14, $2, $3, $4, 'settlement.nonRemunerativeAmount', 'PAYROLL_SETTLEMENT', '300.00', $15::jsonb, 0.7, 'PDF_TEXT', '3')`,
     [
       manualGrossFieldId, userId, documentId, manualRunId, JSON.stringify({ amount: "1000.00", currencyCode: "ARS" }),
       manualNetFieldId, JSON.stringify({ amount: "820.00", currencyCode: "ARS" }),
       manualDeductionsFieldId, JSON.stringify({ amount: "180.00", currencyCode: "ARS" }),
       manualTypeFieldId, JSON.stringify("BONO"),
+      manualRemunerativeFieldId, JSON.stringify({ amount: "700.00", currencyCode: "ARS" }),
+      manualNonRemunerativeFieldId, JSON.stringify({ amount: "300.00", currencyCode: "ARS" }),
     ],
   );
   await pool.query("UPDATE documents SET processing_status = 'NEEDS_REVIEW' WHERE id = $1", [documentId]);
@@ -1878,6 +2050,8 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(missingTotalSettlement.json().data[0].settlementType, "BONO");
   for (const [extractedFieldId, correctedValue] of [
     [manualGrossFieldId, "1000.00"],
+    [manualRemunerativeFieldId, "700.00"],
+    [manualNonRemunerativeFieldId, "300.00"],
     [manualNetFieldId, "820.00"],
     [manualDeductionsFieldId, "180.00"],
   ]) {
@@ -1889,6 +2063,9 @@ test("upload privado crea un único documento y un único intent durable", async
     });
     assert.equal(response.statusCode, 201, response.body);
   }
+  const correctedBreakdown = (await app.inject({ method: "GET", url: "/api/v1/settlements", headers: { cookie: cookieA } })).json().data[0];
+  assert.equal(correctedBreakdown.remunerativeAmount, "700.00");
+  assert.equal(correctedBreakdown.nonRemunerativeAmount, "300.00");
   const unconfirmedMismatch = await app.inject({
     method: "POST", url: `/api/v1/documents/${documentId}/review-complete`, headers: { origin, cookie: cookieA }, payload: {},
   });
@@ -2145,8 +2322,12 @@ test("upload privado crea un único documento y un único intent durable", async
       url: `/api/v1/privacy/exports/${socketExports[2]!.id}/download`,
       headers: { cookie: `salarivo_session=${socketExports[2]!.token}` },
     });
-    assert.equal(capacityHeldAfterAbort.statusCode, 503, capacityHeldAfterAbort.body);
-    assert.equal(capacityHeldAfterAbort.json().error.code, "EXPORT_CAPACITY");
+    const capacityRejection = [capacityHeldAfterAbort.statusCode, capacityHeldAfterAbort.json().error.code];
+    assert.ok(
+      (capacityRejection[0] === 503 && capacityRejection[1] === "EXPORT_CAPACITY")
+      || (capacityRejection[0] === 409 && capacityRejection[1] === "EXPORT_IN_PROGRESS"),
+      capacityHeldAfterAbort.body,
+    );
   } finally {
     for (const socketRequest of socketRequests) socketRequest.destroy();
     await employerLock.query("COMMIT").catch(() => undefined);

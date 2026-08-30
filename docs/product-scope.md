@@ -27,10 +27,11 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - ImportBatch persistente, recuperable al volver a la pantalla, con progreso agregado y por archivo;
 - admisión acotada por lote activo, cantidad, bytes, espacio de cuenta y concurrencia por usuario;
 - validación de seguridad, malware y clasificación temprana;
-- extracción de empresa, período, tipo, básico, bruto, neto, descuentos y conceptos principales;
+- extracción de empresa, período, tipo, básico, bruto, neto, remunerativo, no remunerativo, descuentos, reintegros y conceptos principales;
 - asociación manual individual o masiva de documentos procesados a un empleo propio;
+- detección no persistida de un posible empleo desde documentos sin asociar y creación/asociación sólo después de confirmación explícita;
 - confidence por campo, carga manual de montos ausentes y cierre explícito de revisión;
-- historial básico y evolución de bruto/neto;
+- historial `salary-analytics-v1` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
 - eliminación de original, documento o cuenta;
 - exportación de datos;
 - auditoría de acciones sensibles;
@@ -39,6 +40,10 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 La administración no altera ownership ni concede acceso general al contenido privado. Las listas usan metadata mínima y contacto enmascarado; leer un email completo es una operación separada con permiso, step-up, motivo y auditoría. No se exponen PDFs, filenames, URLs firmadas, object keys, OCR, salarios, conceptos, identificadores fiscales completos, tokens ni secretos. Tampoco están habilitados break-glass, impersonación, reproceso completo, baja administrativa de cuenta, merge global de empleadores, tickets, flags o configuración dinámica. Ver [ADR 0012](adr/0012-granular-admin-console.md).
 
 La identidad del dominio sigue siendo el UUID interno. Google OIDC agrega una cuenta de autenticación identificada sólo por `(provider, sub)` y emite la misma sesión opaca propia: un email coincidente no identifica ni auto-vincula usuarios, y la aplicación no conserva access, refresh ni ID tokens del proveedor. Las cuentas `BLOCKED` o `SUSPENDED` fallan cerradas. El ownership de empleos, imports, documentos, liquidaciones, analytics, exports y operaciones de privacidad no cambia con el método de login.
+
+Analytics usa sólo la última extracción vigente de documentos `COMPLETED`; `NEEDS_REVIEW` se cuenta como cobertura pendiente pero no aporta importes. El salario comparable inicial es el sueldo básico verificado de una liquidación `NORMAL` recurrente: no usa neto ni bruto como fallback y devuelve N/D si falta o el período es ambiguo. Los porcentajes se calculan con decimal exacto mediante `(final / inicial) - 1`, nunca sumando variaciones mensuales ni cruzando contextos laborales o monedas.
+
+Las deducciones individuales siguen minimizadas a etiqueta genérica e importe: no se conserva ni expone obra social, sindicato, descripción original, código normalizado, recurrencia ni campo fuente. Un total de descuentos negativo se presenta como crédito/reintegro, conservando el signo para el cálculo. Toda firma de posible duplicado requiere revisión y confirmación humana.
 
 ### No incluye
 
@@ -59,7 +64,7 @@ La arquitectura puede dejar una salida limpia para esas capacidades, pero no deb
 
 ### V2
 
-IPC, poder adquisitivo, comparaciones, resumen anual, detección de aumentos, períodos de puesto y timeline, templates por empresa, más monedas y mejor importación. También se evaluarán entitlements server-side y un benchmark privado basado en cohortes amplias de usuarios que den consentimiento específico; ver [ADR 0006](adr/0006-entitlements-and-market-benchmarking.md).
+IPC, poder adquisitivo, períodos de puesto y timeline, templates por empresa, más monedas y mejor importación. También se evaluarán entitlements server-side y un benchmark privado basado en cohortes amplias de usuarios que den consentimiento específico; ver [ADR 0006](adr/0006-entitlements-and-market-benchmarking.md).
 
 ### V3
 

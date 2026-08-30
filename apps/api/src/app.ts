@@ -27,6 +27,7 @@ import type { Storage } from "./storage.ts";
 import { registerGoogleAuthRoutes } from "./google-auth-routes.ts";
 import { createGoogleOidc, type GoogleOidcClient } from "./google-oidc.ts";
 import { registerMfaRoutes } from "./mfa-routes.ts";
+import { MAX_COVERAGE_MONTHS } from "./salary-analytics.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 import {
   hasTrustedMutationOrigin,
@@ -211,6 +212,20 @@ const employmentSchema = {
   },
 };
 
+const employmentDetectionSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["employerName", "currencyCode", "firstPeriod", "lastPeriod", "documentCount", "state"],
+  properties: {
+    employerName: { type: "string" },
+    currencyCode: { type: "string", pattern: "^[A-Z]{3}$" },
+    firstPeriod: { type: "string", pattern: "^\\d{4}-\\d{2}$" },
+    lastPeriod: { type: "string", pattern: "^\\d{4}-\\d{2}$" },
+    documentCount: { type: "integer", minimum: 1 },
+    state: { type: "string", const: "DETECTED" },
+  },
+};
+
 const idParamsSchema = {
   type: "object",
   additionalProperties: false,
@@ -358,6 +373,22 @@ function date(value: string): string {
   return value;
 }
 
+export function validateEmploymentDates(
+  startValue: string,
+  endValue: string | null,
+): { startDate: string; endDate: string | null } {
+  const startDate = date(startValue);
+  const endDate = endValue === null ? null : date(endValue);
+  const today = new Date().toISOString().slice(0, 10);
+  const invalidBoundary = startDate < "1900-01-01" || startDate > today
+    || (endDate !== null && (endDate < startDate || endDate > today));
+  const monthIndex = (current: string) => Number(current.slice(0, 4)) * 12 + Number(current.slice(5, 7)) - 1;
+  if (invalidBoundary || monthIndex(endDate ?? today) - monthIndex(startDate) + 1 > MAX_COVERAGE_MONTHS) {
+    throw new ApiError(400, "VALIDATION_ERROR", "El período laboral no es válido.");
+  }
+  return { startDate, endDate };
+}
+
 function isDatabaseError(error: unknown): error is { code: string } {
   return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string";
 }
@@ -375,6 +406,12 @@ type EmploymentBody = {
   currencyCode: string;
 };
 type EmploymentPatch = Partial<EmploymentBody>;
+type EmploymentDetectionBody = {
+  employerName: string;
+  startDate: string;
+  endDate?: string | null;
+  currencyCode: string;
+};
 type IdParams = { id: string };
 type LegalParams = { type: "terms" | "privacy" };
 type LegalQuery = { version?: string };
@@ -937,6 +974,171 @@ export async function buildApp(
       FROM employments e
       JOIN employers employer ON employer.id = e.employer_id AND employer.user_id = e.user_id`;
 
+  const detectedEmploymentDocuments = `
+    WITH latest_runs AS (
+      SELECT DISTINCT ON (run.document_id) run.id, run.document_id, run.user_id
+        FROM extraction_runs run
+       WHERE run.user_id = $1 AND run.status = 'COMPLETED'
+       ORDER BY run.document_id, run.processing_version DESC
+    ), detected AS (
+      SELECT document.id AS document_id,
+             COALESCE(correction.corrected_value #>> '{}', field.interpreted_value #>> '{}') AS employer_name,
+             settlement.payroll_period, settlement.currency_code
+        FROM documents document
+        JOIN latest_runs run
+          ON run.document_id = document.id AND run.user_id = document.user_id
+        JOIN extracted_fields field
+          ON field.extraction_run_id = run.id AND field.user_id = run.user_id
+         AND field.document_id = run.document_id AND field.field_path = 'employer.name'
+        LEFT JOIN LATERAL (
+          SELECT current.corrected_value
+            FROM user_corrections current
+           WHERE current.user_id = field.user_id
+             AND current.extraction_run_id = field.extraction_run_id
+             AND current.field_path = field.field_path
+           ORDER BY current.correction_version DESC LIMIT 1
+        ) correction ON true
+        JOIN payroll_settlements settlement
+          ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
+       WHERE document.user_id = $1 AND document.employment_id IS NULL
+         AND document.deleted_at IS NULL AND document.document_type = 'PAYROLL'
+         AND document.processing_status IN ('COMPLETED', 'NEEDS_REVIEW')
+    )`;
+
+  app.get(
+    "/api/v1/employment-detections",
+    {
+      preHandler: requireAuth,
+      schema: { response: responses(200, { type: "array", items: employmentDetectionSchema }) },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `${detectedEmploymentDocuments}
+         SELECT (array_agg(employer_name ORDER BY payroll_period DESC))[1] AS employer_name,
+                currency_code, to_char(min(payroll_period), 'YYYY-MM') AS first_period,
+                to_char(max(payroll_period), 'YYYY-MM') AS last_period,
+                count(DISTINCT document_id)::integer AS document_count
+           FROM detected
+          WHERE employer_name IS NOT NULL AND btrim(employer_name) <> ''
+          GROUP BY lower(btrim(employer_name)), currency_code
+          ORDER BY max(payroll_period) DESC, lower((array_agg(employer_name ORDER BY payroll_period DESC))[1])`,
+        [request.authUser!.id],
+      );
+      return { data: result.rows.map((row) => ({
+        employerName: String(row.employer_name),
+        currencyCode: String(row.currency_code),
+        firstPeriod: String(row.first_period),
+        lastPeriod: String(row.last_period),
+        documentCount: Number(row.document_count),
+        state: "DETECTED",
+      })) };
+    },
+  );
+
+  app.post<{ Body: EmploymentDetectionBody }>(
+    "/api/v1/employment-detections/confirm",
+    {
+      preHandler: requireAuth,
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["employerName", "startDate", "currencyCode"],
+          properties: {
+            employerName: { type: "string", minLength: 2, maxLength: 160 },
+            startDate: { type: "string", pattern: DATE_PATTERN },
+            endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
+            currencyCode: { type: "string", minLength: 3, maxLength: 3 },
+          },
+        },
+        response: responses(201, {
+          type: "object",
+          additionalProperties: false,
+          required: ["employment", "associatedDocuments"],
+          properties: {
+            employment: employmentSchema,
+            associatedDocuments: { type: "integer", minimum: 1 },
+          },
+        }),
+      },
+    },
+    async (request, reply) => {
+      const employerName = text(request.body.employerName, 160);
+      const { startDate, endDate } = validateEmploymentDates(request.body.startDate, request.body.endDate ?? null);
+      const selectedCurrency = currencyCode(request.body.currencyCode);
+      const result = await withTransaction(async (client) => {
+        await client.query("SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE", [request.authUser!.id]);
+        const detected = await client.query(
+          `${detectedEmploymentDocuments}
+           SELECT DISTINCT document_id
+             FROM detected
+            WHERE lower(btrim(employer_name)) = lower(btrim($2))
+              AND currency_code = $3
+              AND payroll_period >= date_trunc('month', $4::date)::date
+              AND ($5::date IS NULL OR payroll_period <= date_trunc('month', $5::date)::date)
+            ORDER BY document_id`,
+          [request.authUser!.id, employerName, selectedCurrency, startDate, endDate],
+        );
+        if (!detected.rowCount) {
+          throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos recibos sin asociar para esa empresa y período.");
+        }
+        const lockedDocuments = await client.query(
+          `SELECT id FROM documents
+            WHERE user_id = $1 AND employment_id IS NULL AND deleted_at IS NULL
+              AND id = ANY($2::uuid[])
+            ORDER BY id FOR UPDATE`,
+          [request.authUser!.id, detected.rows.map((row) => String(row.document_id))],
+        );
+        if (!lockedDocuments.rowCount) {
+          throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos recibos sin asociar para esa empresa y período.");
+        }
+        let employer = await client.query(
+          `SELECT id FROM employers
+            WHERE user_id = $1 AND lower(btrim(name)) = lower(btrim($2))
+            ORDER BY created_at LIMIT 1 FOR UPDATE`,
+          [request.authUser!.id, employerName],
+        );
+        if (!employer.rowCount) {
+          employer = await client.query(
+            `INSERT INTO employers (id, user_id, name, country_code)
+             VALUES ($1, $2, $3, 'AR') RETURNING id`,
+            [randomUUID(), request.authUser!.id, employerName],
+          );
+        }
+        const employmentId = randomUUID();
+        await client.query(
+          `INSERT INTO employments (
+             id, user_id, employer_id, status, start_date, end_date, country_code, currency_code
+           ) VALUES ($1, $2, $3, $4, $5, $6, 'AR', $7)`,
+          [employmentId, request.authUser!.id, employer.rows[0].id, endDate === null ? "ACTIVE" : "ENDED", startDate, endDate, selectedCurrency],
+        );
+        const documentIds = lockedDocuments.rows.map((row) => String(row.id));
+        await client.query(
+          `UPDATE documents SET employment_id = $1
+            WHERE user_id = $2 AND employment_id IS NULL AND id = ANY($3::uuid[])`,
+          [employmentId, request.authUser!.id, documentIds],
+        );
+        await client.query(
+          `UPDATE payroll_settlements SET employment_id = $1
+            WHERE user_id = $2 AND employment_id IS NULL AND document_id = ANY($3::uuid[])`,
+          [employmentId, request.authUser!.id, documentIds],
+        );
+        await client.query(
+          `INSERT INTO audit_events (
+             id, user_id, actor_user_id, action, resource_type, resource_id, result, metadata_no_sensitive
+           ) VALUES ($1, $2, $2, 'EMPLOYMENT_DETECTION_CONFIRMED', 'EMPLOYMENT', $3, 'SUCCESS', $4::jsonb)`,
+          [randomUUID(), request.authUser!.id, employmentId, JSON.stringify({ documentCount: documentIds.length })],
+        );
+        const selected = await client.query(
+          `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
+          [employmentId, request.authUser!.id],
+        );
+        return { employment: employmentFrom(selected.rows[0]), associatedDocuments: documentIds.length };
+      });
+      return reply.code(201).send({ data: result });
+    },
+  );
+
   app.get(
     "/api/v1/employments",
     {
@@ -980,13 +1182,7 @@ export async function buildApp(
       },
     },
     async (request, reply) => {
-      const startDate = date(request.body.startDate);
-      const endDate = request.body.endDate === undefined || request.body.endDate === null
-        ? null
-        : date(request.body.endDate);
-      if (endDate !== null && endDate < startDate) {
-        throw new ApiError(400, "VALIDATION_ERROR", "La fecha de fin no puede ser anterior al inicio.");
-      }
+      const { startDate, endDate } = validateEmploymentDates(request.body.startDate, request.body.endDate ?? null);
 
       const created = await withTransaction(async (client) => {
         const result = await client.query(
@@ -1098,12 +1294,17 @@ export async function buildApp(
         }
         const updated = await client.query(
           `UPDATE employments SET ${updates.join(", ")}
-            WHERE id = $1 AND user_id = $2 RETURNING id`,
+            WHERE id = $1 AND user_id = $2
+            RETURNING id, start_date::text, end_date::text`,
           values,
         );
         if (updated.rowCount !== 1) {
           throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         }
+        validateEmploymentDates(
+          String(updated.rows[0].start_date),
+          updated.rows[0].end_date === null ? null : String(updated.rows[0].end_date),
+        );
         const selected = await client.query(
           `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
           [request.params.id, userId],

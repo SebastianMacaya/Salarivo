@@ -2,7 +2,16 @@
 
 import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { money, percentage } from './format';
+import {
+  extractionSourceLabel,
+  money,
+  percentage,
+  periodLabel,
+  recentPeriodRange,
+  salaryCategories,
+  settlementTypeLabel,
+  type SalaryCategory,
+} from './format';
 import { mfaQrDataUrl } from './mfa-qr';
 import { uploadFile, type AuthorizedUpload } from './storage-upload';
 
@@ -36,9 +45,20 @@ type Employment = {
   status: 'ACTIVE' | 'ENDED';
   currencyCode: string;
 };
+type EmploymentDetection = {
+  employerName: string;
+  currencyCode: string;
+  firstPeriod: string;
+  lastPeriod: string;
+  documentCount: number;
+  state: 'DETECTED';
+};
 type DocumentItem = {
   id: string;
   employmentId?: string | null;
+  employerName?: string | null;
+  payrollPeriod?: string | null;
+  settlementType?: string | null;
   originalFilename: string;
   displayFilename?: string;
   createdAt: string;
@@ -60,13 +80,20 @@ type ExtractedField = {
 };
 type Settlement = {
   id: string;
+  employmentId?: string | null;
   payrollPeriod: string;
   employerName?: string | null;
   settlementType: string;
+  isRecurring: boolean;
   currencyCode: string;
+  basicAmount?: string | null;
   grossAmount?: string | null;
   netAmount?: string | null;
+  remunerativeAmount?: string | null;
+  nonRemunerativeAmount?: string | null;
   deductionsAmount?: string | null;
+  deductionsChargedAmount?: string | null;
+  reimbursementsAmount?: string | null;
   deductionsPercentage?: string | null;
   totalsBalance?: boolean;
   deductionsMatchTotal?: boolean;
@@ -79,17 +106,126 @@ type Settlement = {
     grossPercentage?: string | null;
     confidence?: string | null;
   }>;
+  earnings?: Array<{
+    normalizedConceptCode?: string | null;
+    rawDescription: string;
+    amount: string;
+    isRecurring?: boolean | null;
+    confidence?: string | null;
+  }>;
   confidence?: string | null;
   documentId?: string | null;
 };
-type Dashboard = {
-  activeEmployments: number;
-  documents: number;
-  pendingReview: number;
-  latestNetAmount?: string | null;
-  currencyCode?: string | null;
-  evolution: Array<{ period: string; gross: string | null; net: string | null }>;
+type SalaryAmounts = {
+  basicAmount: string | null;
+  grossAmount: string | null;
+  netAmount: string | null;
+  deductionsAmount: string | null;
+  remunerativeAmount: string | null;
+  nonRemunerativeAmount: string | null;
 };
+type MoneyChange = { fromAmount: string; toAmount: string; deltaAmount: string; percentage: string | null };
+type SalaryChange = MoneyChange & { fromPeriod: string; toPeriod: string };
+type MonthlyEvolution = {
+  period: string;
+  totals: SalaryAmounts;
+  regular: SalaryAmounts;
+  comparableSalary: string | null;
+};
+type SalaryConcept = {
+  period: string;
+  settlementId: string;
+  settlementType: string;
+  earningIndex: number;
+  category: SalaryCategory;
+  code: string;
+  isRecurring: boolean | null;
+  amount: string;
+};
+type SalaryConceptPage = { items: SalaryConcept[]; nextCursor: string | null };
+type AnnualCategorySummary = { settlementCount: number; documentCount: number; totals: SalaryAmounts };
+type AnnualSalarySummary = {
+  year: string;
+  periodCount: number;
+  settlementCount: number;
+  documentCount: number;
+  totals: SalaryAmounts;
+  averages: SalaryAmounts;
+  byCategory: Record<SalaryCategory, AnnualCategorySummary>;
+  normalizedEarningsByCategory: Record<SalaryCategory, string> | null;
+  comparableChange: SalaryChange | null;
+};
+type SalaryScopeAnalytics = {
+  employmentContext: string | null;
+  currencyCode: string;
+  current: {
+    period: string;
+    amounts: SalaryAmounts;
+    comparableSalary: string | null;
+    settlementCount: number;
+    documentCount: number;
+    changes: { latest: SalaryChange | null; ytd: SalaryChange | null; rolling12: SalaryChange | null; yearOverYear: SalaryChange | null };
+  } | null;
+  evolution: MonthlyEvolution[];
+  annual: AnnualSalarySummary[];
+  increases: SalaryChange[];
+  coverage: {
+    basis: 'CONFIRMED_EMPLOYMENT' | 'OBSERVED' | 'INDETERMINATE_CONTEXT';
+    boundaryContradiction: boolean;
+    employmentStartPeriod: string | null;
+    employmentEndPeriod: string | null;
+    employmentStatus: string | null;
+    rangeStartPeriod: string | null;
+    rangeEndPeriod: string | null;
+    expectedPeriods: string[];
+    availablePeriods: string[];
+    possibleMissingPeriods: string[];
+    byYear: Array<{ year: string; expectedPeriods: string[]; availablePeriods: string[]; possibleMissingPeriods: string[] }>;
+  };
+  events: Array<
+    | { type: 'COMPARABLE_INCREASE'; period: string; category: 'NORMAL'; change: SalaryChange }
+    | { type: 'EXTRAORDINARY'; period: string; category: Exclude<SalaryCategory, 'NORMAL' | 'OTRO'>; amount: string | null; amountBasis: 'NORMALIZED_EARNING' | 'SETTLEMENT_GROSS' | 'UNAVAILABLE'; settlementId: string; documentId: string }
+  >;
+};
+type SalaryContext = {
+  employmentContext: string;
+  employmentId: string | null;
+  employerName: string | null;
+  state: 'CONFIRMED' | 'DETECTED' | 'UNCONFIRMED';
+  currencyCode: string;
+  employmentStatus: string | null;
+  startDate: string | null;
+  endDate: string | null;
+  firstPeriod: string | null;
+  lastPeriod: string | null;
+};
+type SalaryHistory = {
+  calculationVersion: string;
+  contexts: SalaryContext[];
+  coverage: { documents: number; activeEmployments: number; completedDocuments: number; needsReviewDocuments: number; pendingReviewDocuments: number; unassociatedDocuments: number; analyzedSettlements: number };
+  analytics: {
+    settlementCount: number;
+    documentCount: number;
+    employmentContextCount: number;
+    periodCount: number;
+    firstPeriod: string | null;
+    lastPeriod: string | null;
+    scopes: SalaryScopeAnalytics[];
+    possibleDuplicates: Array<{ signature: string; employmentContext: string; currencyCode: string; payrollPeriod: string; settlementIds: string[]; documentIds: string[] }>;
+  };
+};
+type PeriodComparison = {
+  employmentContext: string;
+  currencyCode: string;
+  fromPeriod: string;
+  toPeriod: string;
+  changes: Record<'basicAmount' | 'comparableSalary' | 'grossAmount' | 'netAmount' | 'deductionsAmount' | 'remunerativeAmount' | 'nonRemunerativeAmount', MoneyChange | null>;
+  earnings: Array<{ code: string; change: MoneyChange }> | null;
+  drivers: Array<{ type: 'EXTRAORDINARY_EARNING' | 'DEDUCTIONS'; code: string; category: Exclude<SalaryCategory, 'NORMAL' | 'OTRO'> | 'DEDUCTIONS'; change: MoneyChange }>;
+  driversComplete: boolean;
+  conclusionCode: 'NET_UNAVAILABLE' | 'NET_UNCHANGED' | 'NET_VARIATION_RECONCILED_BY_EXTRAORDINARY' | 'NET_VARIATION_RECONCILED_BY_DEDUCTIONS' | 'NET_VARIATION_RECONCILED_BY_EXTRAORDINARY_AND_DEDUCTIONS' | 'NET_VARIATION_INSUFFICIENT_DATA' | 'NET_VARIATION_UNEXPLAINED';
+};
+type DocumentDetail = DocumentItem & { extractedFields: ExtractedField[]; settlement: Settlement | null };
 type ImportProgress = {
   key: string;
   name: string;
@@ -203,12 +339,49 @@ const deductionLabels: Record<string, string> = {
   INCOME_TAX: 'Ganancias / Ingresos personales',
   UNION_DUES: 'Cuota sindical',
 };
+const categoryLabels: Record<SalaryCategory, string> = {
+  NORMAL: 'Sueldo regular',
+  SAC: 'Aguinaldo',
+  BONO: 'Bonos y premios',
+  RETROACTIVO: 'Retroactivos',
+  VACACIONES: 'Vacaciones',
+  HORAS_EXTRA: 'Horas extra',
+  AJUSTE: 'Ajustes',
+  REINTEGRO: 'Reintegros',
+  COMISION: 'Comisiones',
+  LIQUIDACION_FINAL: 'Liquidación final',
+  INDEMNIZACION: 'Indemnizaciones',
+  OTRO: 'Otros',
+};
+const earningLabels: Record<string, string> = {
+  BASIC_SALARY: 'Sueldo básico',
+  SENIORITY: 'Antigüedad',
+  ATTENDANCE: 'Presentismo',
+  SAC: 'Aguinaldo',
+  RETROACTIVE: 'Retroactivo',
+  VACATION: 'Vacaciones',
+  BONUS: 'Bono o premio',
+  COMMISSION: 'Comisión',
+  OVERTIME: 'Horas extra',
+  REIMBURSEMENT: 'Reintegro',
+};
+const comparisonConclusionLabels: Record<NonNullable<PeriodComparison['conclusionCode']>, string> = {
+  NET_UNAVAILABLE: 'No hay neto suficiente para explicar la variación.',
+  NET_UNCHANGED: 'El neto no cambió entre los períodos elegidos.',
+  NET_VARIATION_RECONCILED_BY_EXTRAORDINARY: 'La variación del neto queda conciliada por cambios en ingresos extraordinarios.',
+  NET_VARIATION_RECONCILED_BY_DEDUCTIONS: 'La variación del neto queda conciliada por cambios en descuentos o créditos.',
+  NET_VARIATION_RECONCILED_BY_EXTRAORDINARY_AND_DEDUCTIONS: 'La variación del neto queda conciliada por cambios extraordinarios y en descuentos o créditos.',
+  NET_VARIATION_INSUFFICIENT_DATA: 'Faltan conceptos normalizados para explicar la variación del neto.',
+  NET_VARIATION_UNEXPLAINED: 'Los datos disponibles no alcanzan para explicar la variación del neto.',
+};
 const reviewFieldLabels: Record<string, string> = {
   'employer.name': 'Empresa detectada',
   'settlement.type': 'Tipo de liquidación',
   'settlement.payrollPeriod': 'Período',
   'settlement.basicAmount': 'Sueldo básico',
   'settlement.grossAmount': 'Bruto',
+  'settlement.remunerativeAmount': 'Remunerativo',
+  'settlement.nonRemunerativeAmount': 'No remunerativo',
   'settlement.deductionsAmount': 'Descuentos',
   'settlement.netAmount': 'Neto',
 };
@@ -218,11 +391,12 @@ const missingReasonMessages: Record<NonNullable<ExtractedField['missingReason']>
 };
 const editableCorrectionPaths = new Set([
   'settlement.type', 'settlement.payrollPeriod', 'settlement.basicAmount',
-  'settlement.grossAmount', 'settlement.deductionsAmount', 'settlement.netAmount',
+  'settlement.grossAmount', 'settlement.remunerativeAmount', 'settlement.nonRemunerativeAmount',
+  'settlement.deductionsAmount', 'settlement.netAmount',
 ]);
 const settlementTypeOptions = [
   'NORMAL', 'SAC', 'VACACIONES', 'BONO', 'RETROACTIVO', 'COMISION', 'HORAS_EXTRA',
-  'LIQUIDACION_FINAL', 'INDEMNIZACION', 'AJUSTE', 'OTRO_LABORAL',
+  'LIQUIDACION_FINAL', 'INDEMNIZACION', 'AJUSTE', 'REINTEGRO', 'OTRO_LABORAL',
 ];
 
 function handleDialogKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
@@ -273,6 +447,28 @@ const associationReadyStatuses = new Set([
   'COMPLETED', 'NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION', 'REJECTED_UNSUPPORTED',
   'QUARANTINED', 'FAILED_PERMANENT', 'CANCELLED',
 ]);
+const processingDocumentPattern = /UPLOADED|VALIDATION|PROCESSING|RETRY|CLASSIFICATION|EXTRACTION|OCR|PARSING|NORMALIZATION/;
+const historyTabs = [
+  ['summary', 'Resumen'],
+  ['evolution', 'Evolución'],
+  ['annual', 'Por año'],
+  ['concepts', 'Conceptos'],
+  ['documents', 'Documentos'],
+] as const;
+const documentFilterStatuses = [
+  ['COMPLETED', 'Listos'],
+  ['NEEDS_REVIEW', 'Requieren revisión'],
+  ['NEEDS_TYPE_CONFIRMATION', 'Requieren confirmar tipo'],
+  ['REJECTED_UNSUPPORTED', 'No soportados'],
+  ['FAILED_PERMANENT', 'Con error'],
+] as const;
+const evolutionRanges = [
+  ['6', '6 meses', 6],
+  ['12', '1 año', 12],
+  ['24', '2 años', 24],
+  ['60', '5 años', 60],
+  ['all', 'Todo', undefined],
+] as const;
 const importErrorLabels: Record<string, string> = {
   DOCUMENT_DUPLICATE: 'Ya estaba cargado; no se volvió a guardar.',
   DOCUMENT_UNSUPPORTED: 'No parece un recibo salarial soportado.',
@@ -866,39 +1062,180 @@ function EmptyState({ title, body, action }: { title: string; body: string; acti
   return <div className="empty-state"><span className="empty-mark" aria-hidden="true">∿</span><h3>{title}</h3><p>{body}</p>{action}</div>;
 }
 
+function salaryMoney(value: string | null | undefined, currency: string) {
+  return value === null || value === undefined ? 'N/D' : money(value, currency);
+}
+
+function salaryPercentage(value: string | null | undefined) {
+  return value === null || value === undefined ? 'N/D' : percentage(value);
+}
+
+function deductionOrCredit(value: string | null | undefined, currency: string) {
+  if (value === null || value === undefined) return 'N/D';
+  return value.startsWith('-') ? `Crédito ${money(value.slice(1), currency)}` : money(value, currency);
+}
+
+function salaryContextName(context: SalaryContext) {
+  return context.employerName || 'Empleo sin confirmar';
+}
+
+function salaryScopeKey(context: SalaryContext) {
+  return JSON.stringify([context.employmentContext, context.currencyCode]);
+}
+
+function retainedSalaryScopeKey(current: string, history: SalaryHistory) {
+  return history.contexts.some((context) => salaryScopeKey(context) === current)
+    ? current
+    : history.contexts[0] ? salaryScopeKey(history.contexts[0]) : '';
+}
+
+function SalaryScopeControl({ history, selectedKey, onChange, id }: {
+  history: SalaryHistory;
+  selectedKey: string;
+  onChange: (key: string) => void;
+  id: string;
+}) {
+  const context = history.contexts.find((item) => salaryScopeKey(item) === selectedKey) ?? history.contexts[0];
+  if (!context) return null;
+  const status = context.state === 'CONFIRMED' ? 'Confirmado' : context.state === 'DETECTED' ? 'Detectado' : 'Sin confirmar';
+  const range = context.firstPeriod && context.lastPeriod
+    ? `${periodLabel(context.firstPeriod)} a ${periodLabel(context.lastPeriod)}`
+    : 'Período no disponible';
+  return <section className="scope-control" aria-label="Contexto salarial">
+    <div><label htmlFor={id}>Empleo y moneda</label>{history.contexts.length > 1
+      ? <select id={id} value={salaryScopeKey(context)} onChange={(event) => onChange(event.target.value)}>{history.contexts.map((item) => <option value={salaryScopeKey(item)} key={salaryScopeKey(item)}>{salaryContextName(item)} · {item.currencyCode}</option>)}</select>
+      : <strong>{salaryContextName(context)} · {context.currencyCode}</strong>}</div>
+    <div className="scope-meta"><span className={`status ${context.state === 'CONFIRMED' ? 'ready' : 'pending'}`}>{status}</span><span>{range}</span></div>
+  </section>;
+}
+
+function SalaryContextNotice({ context }: { context: SalaryContext }) {
+  if (context.state === 'CONFIRMED') return null;
+  return <p className="message warning" role="status">{context.state === 'DETECTED'
+    ? 'Este análisis corresponde a una empresa detectada en recibos todavía sin asociar. Confirmá el empleo para consolidar su historial.'
+    : 'Este análisis contiene recibos sin empresa confirmada. No se compara con otros contextos hasta que los asocies.'}</p>;
+}
+
+function SalaryMetricGrid({ scope, context }: { scope: SalaryScopeAnalytics; context: SalaryContext }) {
+  const current = scope.current;
+  const currentYear = current?.period.slice(0, 4) ?? scope.annual[0]?.year;
+  const annual = scope.annual.find((item) => item.year === currentYear) ?? null;
+  const latest = current?.changes.latest ?? null;
+  const ytd = current?.changes.ytd ?? null;
+  const coverage = scope.coverage;
+  const coverageKnown = coverage && coverage.basis !== 'INDETERMINATE_CONTEXT';
+  return <section className="metric-grid salary-metrics" aria-label="Indicadores salariales">
+    <article className="metric accent"><small>Básico comparable</small><strong>{salaryMoney(current?.comparableSalary, context.currencyCode)}</strong><span>{current ? periodLabel(current.period) : 'Sin período comparable'}</span></article>
+    <article className="metric"><small>Neto actual</small><strong>{salaryMoney(current?.amounts.netAmount, context.currencyCode)}</strong><span>{current ? `${periodLabel(current.period)} · sueldo regular` : 'N/D'}</span></article>
+    <article className="metric"><small>Última variación</small><strong>{salaryPercentage(latest?.percentage)}</strong><span>{latest ? `${periodLabel(latest.fromPeriod)} → ${periodLabel(latest.toPeriod)}` : 'Sin dos períodos comparables'}</span></article>
+    <article className="metric"><small>Variación en el año</small><strong>{salaryPercentage(ytd?.percentage)}</strong><span>{ytd ? `Desde ${periodLabel(ytd.fromPeriod)}` : 'Sin base comparable en el año'}</span></article>
+    <article className="metric"><small>{annual ? `Cobrado en ${annual.year}` : 'Total anual'}</small><strong>{salaryMoney(annual?.totals.netAmount, context.currencyCode)}</strong><span>{annual ? `${annual.periodCount} período${annual.periodCount === 1 ? '' : 's'} · ${annual.settlementCount} ${annual.settlementCount === 1 ? 'liquidación' : 'liquidaciones'}` : 'N/D'}</span></article>
+    <article className="metric"><small>Cobertura</small><strong>{coverageKnown ? `${coverage.availablePeriods.length}/${coverage.expectedPeriods.length}` : 'N/D'}</strong><span>{coverageKnown ? coverage.boundaryContradiction ? 'Límites laborales contradictorios' : coverage.possibleMissingPeriods.length ? `${coverage.possibleMissingPeriods.length} posible${coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : coverage.basis === 'OBSERVED' ? 'Rango basado en períodos observados' : 'Sin faltantes posibles en el rango' : 'No se puede determinar sin un contexto laboral'}</span></article>
+  </section>;
+}
+
+function SalaryEvolution({ scope, year = 'all', limit }: { scope: SalaryScopeAnalytics; year?: string; limit?: number }) {
+  const filtered = year === 'all' ? scope.evolution : scope.evolution.filter((point) => point.period.startsWith(`${year}-`));
+  const points = recentPeriodRange(filtered, limit);
+  if (!points.length) return <EmptyState title="Sin evolución para mostrar" body="Elegí otro año o importá recibos con datos comparables." />;
+  const visualStep = Math.max(1, Math.ceil(points.length / 60));
+  const chartPoints = points.filter((_, index) => index % visualStep === 0 || index === points.length - 1);
+  const visualValues = chartPoints.flatMap((point) => [point.comparableSalary, point.totals.netAmount])
+    .flatMap((value) => value === null ? [] : [Number(value)])
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const visualMaximum = Math.max(1, ...visualValues);
+  const visualHeight = (value: string) => `${Math.max(2, (Number(value) / visualMaximum) * 100)}%`;
+  const currency = scope.currencyCode;
+  const exactTable = <div className="table-wrap salary-evolution-table" role="region" aria-label="Tabla desplazable de evolución salarial" tabIndex={0}><table><caption className="sr-only">Valores exactos de la evolución salarial</caption><thead><tr><th>Período</th><th>Básico comparable</th><th>Bruto total</th><th>Neto total</th><th>Descuentos / créditos</th></tr></thead><tbody>{points.map((point) => <tr key={point.period}><td>{periodLabel(point.period)}</td><td>{salaryMoney(point.comparableSalary, currency)}</td><td>{salaryMoney(point.totals.grossAmount, currency)}</td><td>{salaryMoney(point.totals.netAmount, currency)}</td><td>{deductionOrCredit(point.totals.deductionsAmount, currency)}</td></tr>)}</tbody></table></div>;
+  return <div className="salary-evolution">
+    <div className="legend"><span className="comparable">Básico comparable</span><span className="net">Neto total</span></div>
+    <div className="bar-chart salary-chart" role="img" aria-label="Gráfico de básico comparable y neto por período">{chartPoints.map((point) => <div className="bar-group" key={point.period} title={`${periodLabel(point.period)}: básico comparable ${salaryMoney(point.comparableSalary, currency)}, neto ${salaryMoney(point.totals.netAmount, currency)}`}><div className="bars">{point.comparableSalary !== null && <i className="bar comparable" style={{ height: visualHeight(point.comparableSalary) }} />}{point.totals.netAmount !== null && <i className="bar net" style={{ height: visualHeight(point.totals.netAmount) }} />}</div><small>{periodLabel(point.period)}</small></div>)}</div>
+    {chartPoints.length < points.length && <p className="coverage-note">El gráfico muestra {chartPoints.length} puntos seleccionados; la tabla conserva los {points.length} períodos exactos.</p>}
+    {points.length > 24 ? <details className="evolution-details"><summary>Ver tabla exacta ({points.length} períodos)</summary>{exactTable}</details> : exactTable}
+  </div>;
+}
+
+const comparisonAmountLabels: Array<[keyof PeriodComparison['changes'], string]> = [
+  ['basicAmount', 'Sueldo básico'],
+  ['comparableSalary', 'Básico comparable'],
+  ['grossAmount', 'Bruto'],
+  ['netAmount', 'Neto'],
+  ['deductionsAmount', 'Descuentos / créditos'],
+  ['remunerativeAmount', 'Remunerativo'],
+  ['nonRemunerativeAmount', 'No remunerativo'],
+];
+
+function ComparisonResult({ comparison }: { comparison: PeriodComparison }) {
+  const currency = comparison.currencyCode;
+  return <div className="comparison-result" aria-live="polite">
+    <p className="comparison-conclusion">{comparison.conclusionCode ? comparisonConclusionLabels[comparison.conclusionCode] : 'Comparación calculada con los importes disponibles.'}</p>
+    <div className="table-wrap" role="region" aria-label="Tabla desplazable de comparación de períodos" tabIndex={0}><table><caption className="sr-only">Comparación exacta de períodos</caption><thead><tr><th>Importe</th><th>{periodLabel(comparison.fromPeriod)}</th><th>{periodLabel(comparison.toPeriod)}</th><th>Diferencia</th><th>Variación</th></tr></thead><tbody>{comparisonAmountLabels.map(([key, label]) => {
+      const change = comparison.changes[key];
+      const renderAmount = key === 'deductionsAmount' ? deductionOrCredit : salaryMoney;
+      return <tr key={key}><th scope="row">{label}</th><td>{change ? renderAmount(change.fromAmount, currency) : 'N/D'}</td><td>{change ? renderAmount(change.toAmount, currency) : 'N/D'}</td><td>{change ? salaryMoney(change.deltaAmount, currency) : 'N/D'}</td><td>{salaryPercentage(change?.percentage)}</td></tr>;
+    })}</tbody></table></div>
+    {comparison.drivers && comparison.drivers.length > 0 && <div className="comparison-drivers"><h4>Qué cambió</h4><ul>{comparison.drivers.map((driver) => <li key={`${driver.type}-${driver.code}`}><span>{driver.type === 'DEDUCTIONS' ? 'Descuentos / créditos' : categoryLabels[driver.category as SalaryCategory] ?? earningLabels[driver.code] ?? 'Ingreso extraordinario'}</span><strong>{salaryMoney(driver.change.deltaAmount, currency)}</strong></li>)}</ul></div>}
+    {comparison.driversComplete === false && <p className="coverage-note">Explicación parcial: algún recibo no tiene todos sus conceptos normalizados.</p>}
+    {comparison.earnings && comparison.earnings.length > 0 && <details><summary>Ver conceptos normalizados</summary><div className="table-wrap" role="region" aria-label="Tabla desplazable de conceptos comparados" tabIndex={0}><table><thead><tr><th>Concepto</th><th>Antes</th><th>Después</th><th>Diferencia</th></tr></thead><tbody>{comparison.earnings.map(({ code, change }) => <tr key={code}><td>{earningLabels[code] ?? 'Otro concepto'}</td><td>{salaryMoney(change.fromAmount, currency)}</td><td>{salaryMoney(change.toAmount, currency)}</td><td>{salaryMoney(change.deltaAmount, currency)}</td></tr>)}</tbody></table></div></details>}
+  </div>;
+}
+
+function AnnualHistory({ rows, scope, category }: { rows: AnnualSalarySummary[]; scope: SalaryScopeAnalytics; category: 'all' | SalaryCategory }) {
+  if (!rows.length) return <EmptyState title="Sin datos para ese año" body="Elegí otro año o importá recibos de ese período." />;
+  const categories = category === 'all' ? salaryCategories : [category];
+  return <div className="annual-list">{rows.map((annual) => {
+    const yearCoverage = scope.coverage?.byYear.find((item) => item.year === annual.year);
+    return <details className="panel annual-card" key={annual.year}><summary><span><strong>{annual.year}</strong><small>{annual.periodCount} período{annual.periodCount === 1 ? '' : 's'} · {annual.documentCount} documento{annual.documentCount === 1 ? '' : 's'}</small></span><strong>{salaryMoney(annual.totals.netAmount, scope.currencyCode)}</strong></summary><div className="annual-body">
+      <dl className="annual-kpis"><div><dt>Neto total</dt><dd>{salaryMoney(annual.totals.netAmount, scope.currencyCode)}</dd></div><div><dt>Neto promedio</dt><dd>{salaryMoney(annual.averages.netAmount, scope.currencyCode)}</dd></div><div><dt>Bruto total</dt><dd>{salaryMoney(annual.totals.grossAmount, scope.currencyCode)}</dd></div><div><dt>Cambio comparable</dt><dd>{salaryPercentage(annual.comparableChange?.percentage)}</dd></div></dl>
+      {yearCoverage && <p className="coverage-note">Cobertura {yearCoverage.availablePeriods.length}/{yearCoverage.expectedPeriods.length}{yearCoverage.possibleMissingPeriods.length ? ` · posibles faltantes: ${yearCoverage.possibleMissingPeriods.map(periodLabel).join(', ')}` : ' · sin faltantes posibles'}</p>}
+      <div className="table-wrap" role="region" aria-label={`Tabla desplazable del resumen ${annual.year}`} tabIndex={0}><table><thead><tr><th>Categoría</th><th>Liquidaciones</th><th>Bruto</th><th>Neto</th><th>Conceptos normalizados</th></tr></thead><tbody>{categories.map((item) => {
+        const summary = annual.byCategory[item];
+        return <tr key={item}><td>{categoryLabels[item]}</td><td>{summary.settlementCount}</td><td>{salaryMoney(summary.totals.grossAmount, scope.currencyCode)}</td><td>{salaryMoney(summary.totals.netAmount, scope.currencyCode)}</td><td>{salaryMoney(annual.normalizedEarningsByCategory?.[item], scope.currencyCode)}</td></tr>;
+      })}</tbody></table></div>
+    </div></details>;
+  })}</div>;
+}
+
 function Summary({ user, onNavigate }: { user: User; onNavigate: (section: Section) => void }) {
-  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [history, setHistory] = useState<SalaryHistory | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [selectedScopeKey, setSelectedScopeKey] = useState('');
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
-  useEffect(() => {
-    Promise.all([api<Dashboard>('/dashboard'), api<DocumentItem[]>('/documents?limit=5')])
-      .then(([summary, recent]) => { setDashboard(summary); setDocuments(recent); })
-      .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'No pudimos cargar el resumen.'));
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try {
+      const [salaryHistory, recent] = await Promise.all([
+        api<SalaryHistory>('/salary-history'),
+        api<DocumentItem[]>('/documents?limit=5'),
+      ]);
+      setHistory(salaryHistory); setDocuments(recent);
+      setSelectedScopeKey((current) => retainedSalaryScopeKey(current, salaryHistory));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'No pudimos cargar el resumen.');
+    } finally { setLoading(false); }
   }, []);
+  useEffect(() => { void Promise.resolve().then(load); }, [load]);
 
-  const maxValue = useMemo(() => Math.max(1, ...(dashboard?.evolution.flatMap((point) => [Number(point.gross ?? 0), Number(point.net ?? 0)]) ?? [])), [dashboard]);
+  const selectedScopeIndex = history?.contexts.findIndex((context) => salaryScopeKey(context) === selectedScopeKey) ?? -1;
+  const context = history?.contexts[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
+  const scope = history?.analytics.scopes[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
 
   return (
-    <div className="page">
+    <div className="page" aria-busy={loading}>
       <PageHeader eyebrow="Resumen personal" title={`Hola, ${user.displayName?.split(' ')[0] || 'bienvenido'}`} action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />
-      {error && <p className="message error" role="alert">{error}</p>}
-      <section className="metric-grid" aria-label="Indicadores">
-        <article className="metric"><small>Último neto</small><strong>{money(dashboard?.latestNetAmount, dashboard?.currencyCode ?? 'ARS')}</strong><span>Dato estructurado más reciente</span></article>
-        <article className="metric"><small>Empleos activos</small><strong>{dashboard?.activeEmployments ?? '—'}</strong><span>Relaciones laborales abiertas</span></article>
-        <article className="metric accent"><small>Para revisar</small><strong>{dashboard?.pendingReview ?? '—'}</strong><button onClick={() => onNavigate('history')}>Ver pendientes →</button></article>
-        <article className="metric"><small>Documentos</small><strong>{dashboard?.documents ?? '—'}</strong><span>Recibos en tu espacio</span></article>
-      </section>
-      <div className="dashboard-grid">
-        <section className="panel chart-panel">
-          <div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Bruto y neto por período</h2></div><div className="legend"><span className="gross">Bruto</span><span className="net">Neto</span></div></div>
-          {dashboard?.evolution.length ? <div className="bar-chart" role="img" aria-label="Evolución de salario bruto y neto">{dashboard.evolution.map((point) => <div className="bar-group" key={point.period} title={`${point.period}: bruto ${money(point.gross)}, neto ${money(point.net)}`}><div className="bars"><i className="bar gross" style={{ height: `${(Number(point.gross ?? 0) / maxValue) * 100}%` }} /><i className="bar net" style={{ height: `${(Number(point.net ?? 0) / maxValue) * 100}%` }} /></div><small>{point.period.slice(0, 7)}</small></div>)}</div> : <EmptyState title="Todavía no hay evolución" body="Importá tu primer recibo para empezar a construirla." action={<button className="button secondary" onClick={() => onNavigate('import')}>Importar ahora</button>} />}
-        </section>
-        <section className="panel recent-panel">
-          <div className="panel-heading"><div><p className="eyebrow">Actividad</p><h2>Documentos recientes</h2></div><button className="text-button" onClick={() => onNavigate('history')}>Ver todos</button></div>
-          {documents.length ? <ul className="recent-list">{documents.map((document) => <li key={document.id}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{shortDate(document.createdAt)}</small></span><Status value={document.processingStatus} /></li>)}</ul> : <EmptyState title="Sin documentos" body="Tus recibos importados aparecerán acá." />}
-        </section>
-      </div>
+      {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
+      {loading && !history && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando tu historial salarial…</p></div>}
+      {history && context && scope ? <>
+        <SalaryScopeControl history={history} selectedKey={selectedScopeKey} onChange={setSelectedScopeKey} id="summary-salary-scope" />
+        <SalaryContextNotice context={context} />
+        <SalaryMetricGrid scope={scope} context={context} />
+        <div className="dashboard-grid">
+          <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto reciente</h2></div><button className="text-button" onClick={() => onNavigate('history')}>Analizar historial</button></div><SalaryEvolution scope={scope} limit={12} /></section>
+          <section className="panel recent-panel"><div className="panel-heading"><div><p className="eyebrow">Actividad</p><h2>Documentos recientes</h2></div><button className="text-button" onClick={() => onNavigate('history')}>Ver todos</button></div><p className="coverage-note">{history.coverage.documents} documentos · {history.coverage.pendingReviewDocuments} para revisar · {history.coverage.activeEmployments} empleos activos</p>{documents.length ? <ul className="recent-list">{documents.map((document) => <li key={document.id}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{document.payrollPeriod ? periodLabel(document.payrollPeriod) : shortDate(document.createdAt)}</small></span><Status value={document.processingStatus} /></li>)}</ul> : <EmptyState title="Sin documentos" body="Tus recibos importados aparecerán acá." />}</section>
+        </div>
+      </> : history && !loading && <EmptyState title="Todavía no hay datos salariales" body="Importá un recibo soportado y completá su revisión para construir el historial." action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />}
     </div>
   );
 }
@@ -911,6 +1248,7 @@ function Status({ value }: { value: string }) {
 
 function DeductionBreakdown({ settlement }: { settlement: Settlement }) {
   const items = settlement.deductions ?? [];
+  if (settlement.reimbursementsAmount) return <div className="deduction-cell"><strong>Reintegro {money(settlement.reimbursementsAmount, settlement.currencyCode)}</strong><small>Crédito a favor</small></div>;
   const difference = money(settlement.deductionsDifferenceAmount, settlement.currencyCode);
   const mismatch = settlement.deductionsDifferenceKind === 'TOTAL_MISSING'
     ? `Se detectaron conceptos por ${difference}, pero no el total.`
@@ -919,15 +1257,31 @@ function DeductionBreakdown({ settlement }: { settlement: Settlement }) {
       : settlement.deductionsDifferenceKind === 'ITEMS_EXCEED_TOTAL'
         ? `Los conceptos superan el total por ${difference}.`
         : null;
-  return <div className="deduction-cell"><strong>{money(settlement.deductionsAmount, settlement.currencyCode)}</strong>{settlement.deductionsPercentage && <small>{percentage(settlement.deductionsPercentage)} del bruto</small>}{mismatch && <small className="deduction-warning">{mismatch}</small>}{items.length > 0 && <details><summary>Ver desglose ({items.length})</summary><ul>{items.map((item, index) => <li key={`${item.normalizedConceptCode ?? 'OTHER'}-${index}`}><span>{item.normalizedConceptCode ? deductionLabels[item.normalizedConceptCode] ?? item.rawDescription : item.rawDescription}{item.grossPercentage && <small>{percentage(item.grossPercentage)} del bruto</small>}</span><strong>{money(item.amount, settlement.currencyCode)}</strong></li>)}</ul></details>}</div>;
+  return <div className="deduction-cell"><strong>{money(settlement.deductionsChargedAmount ?? settlement.deductionsAmount, settlement.currencyCode)}</strong>{settlement.deductionsPercentage && <small>{percentage(settlement.deductionsPercentage)} del bruto</small>}{mismatch && <small className="deduction-warning">{mismatch}</small>}{items.length > 0 && <details><summary>Ver desglose ({items.length})</summary><ul>{items.map((item, index) => <li key={`${item.normalizedConceptCode ?? 'OTHER'}-${index}`}><span>{item.normalizedConceptCode ? deductionLabels[item.normalizedConceptCode] ?? item.rawDescription : item.rawDescription}{item.grossPercentage && <small>{percentage(item.grossPercentage)} del bruto</small>}</span><strong>{money(item.amount, settlement.currencyCode)}</strong></li>)}</ul></details>}</div>;
 }
 
 function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSensitive: RunSensitive }) {
   const [items, setItems] = useState<Employment[]>([]);
+  const [detections, setDetections] = useState<EmploymentDetection[]>([]);
   const [editing, setEditing] = useState<Employment | null | 'new'>(null);
   const [error, setError] = useState('');
-  const load = useCallback(() => api<Employment[]>('/employments').then(setItems).catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'No pudimos cargar tus empleos.')), []);
-  useEffect(() => { void load(); }, [load]);
+  const [loading, setLoading] = useState(true);
+  const [confirmation, setConfirmation] = useState<EmploymentDetection | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmationError, setConfirmationError] = useState('');
+  const load = useCallback(async () => {
+    setError(''); setLoading(true);
+    try {
+      const [employments, detected] = await Promise.all([
+        api<Employment[]>('/employments'),
+        api<EmploymentDetection[]>('/employment-detections'),
+      ]);
+      setItems(employments); setDetections(detected);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'No pudimos cargar tus empleos.');
+    } finally { setLoading(false); }
+  }, []);
+  useEffect(() => { void Promise.resolve().then(load); }, [load]);
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError('');
@@ -969,13 +1323,67 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminarlo.'); }
   }
 
+  async function confirmDetection(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!confirmation) return;
+    const detection = confirmation;
+    const form = new FormData(event.currentTarget);
+    setError(''); setConfirmationError(''); setConfirming(true);
+    try {
+      await api('/employment-detections/confirm', {
+        method: 'POST',
+        body: JSON.stringify({
+          employerName: detection.employerName,
+          currencyCode: detection.currencyCode,
+          startDate: form.get('startDate'),
+          endDate: form.get('endDate') || null,
+        }),
+      });
+      setConfirmation(null);
+      await load(); onChanged();
+    } catch (caught) {
+      setConfirmationError(caught instanceof Error ? caught.message : 'No pudimos confirmar el empleo detectado.');
+    } finally { setConfirming(false); }
+  }
+
+  function closeConfirmation() {
+    if (confirming) return;
+    setConfirmation(null); setConfirmationError('');
+  }
+
   return (
-    <div className="page">
+    <div className="page" aria-busy={loading || confirming}>
       <PageHeader eyebrow="Trayectoria" title="Empleos" action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />
       <p className="page-intro">Usalos para agrupar recibos y entender cada etapa de tu carrera.</p>
-      {error && <p className="message error" role="alert">{error}</p>}
-      {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p></div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{shortDate(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{shortDate(item.endDate)}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : <EmptyState title="Sumá tu primer empleo" body="Podés empezar por tu trabajo actual y completar el resto después." action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />}
+      {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Recargando…' : 'Recargar'}</button></p>}
+      <div className="stack-form">
+        {loading && !items.length && !detections.length && <div className="empty-state" role="status" aria-live="polite"><div className="loader" aria-hidden="true" /><p>Cargando empleos…</p></div>}
+        {detections.length > 0 && <section className="panel" aria-labelledby="detected-employments-title">
+          <div className="panel-heading"><div><p className="eyebrow">Pendientes de confirmación</p><h2 id="detected-employments-title">Empleos detectados</h2></div></div>
+          <div className="employment-grid">{detections.map((detection) => {
+            const key = JSON.stringify([detection.employerName, detection.currencyCode]);
+            return <article className="employment-card" key={key}><div className="employer-avatar">{detection.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{detection.employerName}</h2><p>{detection.documentCount} recibo{detection.documentCount === 1 ? '' : 's'} sin asociar</p></div><span className="status pending">Detectado</span><dl><div><dt>Primer recibo</dt><dd>{periodLabel(detection.firstPeriod)}</dd></div><div><dt>Último recibo</dt><dd>{periodLabel(detection.lastPeriod)}</dd></div><div><dt>Moneda</dt><dd>{detection.currencyCode}</dd></div></dl><div className="card-actions"><button type="button" className="button compact" disabled={confirming} onClick={() => { setConfirmationError(''); setConfirmation(detection); }}>Confirmar empleo</button></div></div></article>;
+          })}</div>
+        </section>}
+        <section aria-label="Empleos confirmados">
+          {detections.length > 0 && <div className="panel-heading"><div><p className="eyebrow">Trayectoria confirmada</p><h2>Empleos confirmados</h2></div></div>}
+          {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p></div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{shortDate(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{shortDate(item.endDate)}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />}
+        </section>
+      </div>
       {editing && <div className="modal-layer" role="presentation" onMouseDown={() => setEditing(null)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setEditing(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" onClick={() => setEditing(null)} aria-label="Cerrar">×</button></div><form className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><label>Moneda<select name="currencyCode" defaultValue={editing === 'new' ? 'ARS' : editing.currencyCode}><option value="ARS">ARS — Peso argentino</option><option value="USD">USD — Dólar</option><option value="EUR">EUR — Euro</option></select></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setEditing(null)}>Cancelar</button><button className="button primary">Guardar</button></div></form></section></div>}
+      {confirmation && <div className="modal-layer" role="presentation" onMouseDown={closeConfirmation}>
+        <section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-confirmation-title" aria-describedby="employment-confirmation-description" tabIndex={-1} onKeyDown={(event) => handleDialogKey(event, closeConfirmation)} onMouseDown={(event) => event.stopPropagation()}>
+          <div className="modal-head"><div><p className="eyebrow">Empleo detectado</p><h2 id="employment-confirmation-title">Confirmar empleo</h2></div><button type="button" className="icon-button" disabled={confirming} onClick={closeConfirmation} aria-label="Cerrar">×</button></div>
+          <form className="stack-form" onSubmit={confirmDetection}>
+            <label>Empresa<input value={confirmation.employerName} readOnly /></label>
+            <div className="field-row"><label>Moneda<input value={confirmation.currencyCode} readOnly /></label><label>Documentos detectados<input value={confirmation.documentCount} readOnly /></label></div>
+            <p id="employment-confirmation-description">Detectamos recibos entre {periodLabel(confirmation.firstPeriod)} y {periodLabel(confirmation.lastPeriod)}. El último recibo no implica que el empleo haya finalizado.</p>
+            <div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={`${confirmation.firstPeriod}-01`} required autoFocus /></label><label>Fin (opcional)<input name="endDate" type="date" /></label></div>
+            {confirmationError && <p className="message error" role="alert">{confirmationError}</p>}
+            <div className="modal-actions"><button type="button" className="button secondary" disabled={confirming} onClick={closeConfirmation}>Cancelar</button><button className="button primary" disabled={confirming}>{confirming ? 'Confirmando…' : 'Confirmar empleo'}</button></div>
+          </form>
+        </section>
+      </div>}
     </div>
   );
 }
@@ -1121,52 +1529,142 @@ function Importer({ onDone }: { onDone: () => void }) {
 
 function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
-  const [settlements, setSettlements] = useState<Settlement[]>([]);
+  const [history, setHistory] = useState<SalaryHistory | null>(null);
   const [employments, setEmployments] = useState<Employment[]>([]);
   const [checkedDocumentIds, setCheckedDocumentIds] = useState<string[]>([]);
   const [employmentChoice, setEmploymentChoice] = useState('');
   const [associating, setAssociating] = useState(false);
   const [selected, setSelected] = useState<DocumentItem | null>(null);
-  const [fields, setFields] = useState<ExtractedField[]>([]);
+  const [detail, setDetail] = useState<DocumentDetail | null>(null);
   const [acceptDeductionsMismatch, setAcceptDeductionsMismatch] = useState(false);
-  const [tab, setTab] = useState<'settlements' | 'documents'>('settlements');
+  const [tab, setTab] = useState<'summary' | 'evolution' | 'annual' | 'concepts' | 'documents'>('summary');
+  const [selectedScopeKey, setSelectedScopeKey] = useState('');
+  const [yearFilter, setYearFilter] = useState('all');
+  const [evolutionRange, setEvolutionRange] = useState<(typeof evolutionRanges)[number][0]>('12');
+  const [categoryFilter, setCategoryFilter] = useState<'all' | SalaryCategory>('all');
+  const [fromPeriod, setFromPeriod] = useState('');
+  const [toPeriod, setToPeriod] = useState('');
+  const [comparison, setComparison] = useState<PeriodComparison | null>(null);
+  const [comparisonLoaded, setComparisonLoaded] = useState(false);
+  const [comparisonLoading, setComparisonLoading] = useState(false);
+  const [concepts, setConcepts] = useState<SalaryConcept[]>([]);
+  const [conceptCursor, setConceptCursor] = useState<string | null>(null);
+  const [conceptLoading, setConceptLoading] = useState(false);
+  const [conceptLoadingMore, setConceptLoadingMore] = useState(false);
+  const [conceptError, setConceptError] = useState('');
+  const [conceptReloadKey, setConceptReloadKey] = useState(0);
+  const [documentKind, setDocumentKind] = useState<'PAYROLL' | 'UNSUPPORTED'>('PAYROLL');
+  const [documentSearchDraft, setDocumentSearchDraft] = useState('');
+  const [documentSearch, setDocumentSearch] = useState('');
+  const [documentYearDraft, setDocumentYearDraft] = useState('');
+  const [documentYear, setDocumentYear] = useState('all');
+  const [documentStatus, setDocumentStatus] = useState('all');
+  const [documentSettlementType, setDocumentSettlementType] = useState('all');
+  const [documentsLoading, setDocumentsLoading] = useState(true);
+  const [loadingMoreDocuments, setLoadingMoreDocuments] = useState(false);
+  const [hasMoreDocuments, setHasMoreDocuments] = useState(false);
+  const [documentError, setDocumentError] = useState('');
+  const [detailError, setDetailError] = useState('');
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const selectedId = selected?.id;
   const selectedStatus = selected?.processingStatus;
-  const load = useCallback(() => Promise.all([api<DocumentItem[]>('/documents'), api<Settlement[]>('/settlements'), api<Employment[]>('/employments')]).then(([docs, rows, jobs]) => {
+
+  const applyDocuments = useCallback((docs: DocumentItem[]) => {
     setDocuments(docs);
-    setSettlements(rows);
-    setEmployments(jobs);
     setCheckedDocumentIds((current) => current.filter((id) => docs.some((document) => document.id === id && associationReadyStatuses.has(document.processingStatus))));
     setSelected((current) => current ? docs.find((document) => document.id === current.id) ?? current : null);
-  }).catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'No pudimos cargar el historial.')), []);
-  useEffect(() => { void load(); }, [load]);
+  }, []);
+  const fetchDocumentPage = useCallback((cursor?: DocumentItem, limit = 100) => {
+    const query = new URLSearchParams({ limit: String(limit), documentType: documentKind });
+    if (documentSearch) query.set('search', documentSearch);
+    if (documentYear !== 'all' && documentKind === 'PAYROLL') query.set('year', documentYear);
+    if (documentStatus !== 'all') query.set('processingStatus', documentStatus);
+    if (documentSettlementType !== 'all' && documentKind === 'PAYROLL') query.set('settlementType', documentSettlementType);
+    if (cursor) { query.set('before', cursor.createdAt); query.set('beforeId', cursor.id); }
+    return api<DocumentItem[]>(`/documents?${query}`);
+  }, [documentKind, documentSearch, documentYear, documentStatus, documentSettlementType]);
+  const reloadDocuments = useCallback(async (silent = false) => {
+    if (!silent) setDocumentsLoading(true);
+    setDocumentError('');
+    try {
+      const docs = await fetchDocumentPage();
+      applyDocuments(docs); setHasMoreDocuments(docs.length === 100);
+    } catch (caught) {
+      setDocumentError(caught instanceof Error ? caught.message : 'No pudimos cargar los documentos.');
+    } finally { if (!silent) setDocumentsLoading(false); }
+  }, [applyDocuments, fetchDocumentPage]);
+  const loadSalary = useCallback(async () => {
+    const next = await api<SalaryHistory>('/salary-history');
+    setHistory(next);
+    setSelectedScopeKey((current) => retainedSalaryScopeKey(current, next));
+    setComparison(null); setComparisonLoaded(false);
+    return next;
+  }, []);
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try {
+      const [nextHistory, jobs] = await Promise.all([
+        api<SalaryHistory>('/salary-history'),
+        api<Employment[]>('/employments'),
+      ]);
+      setHistory(nextHistory); setEmployments(jobs);
+      setSelectedScopeKey((current) => retainedSalaryScopeKey(current, nextHistory));
+      setComparison(null); setComparisonLoaded(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'No pudimos cargar el historial.');
+    } finally { setLoading(false); }
+  }, []);
+  useEffect(() => { void Promise.resolve().then(load); }, [load]);
+  useEffect(() => { void Promise.resolve().then(() => reloadDocuments()); }, [reloadDocuments]);
   useEffect(() => {
-    if (!documents.some((document) => /UPLOADED|VALIDATION|PROCESSING|RETRY|CLASSIFICATION|EXTRACTION|OCR|PARSING|NORMALIZATION/.test(document.processingStatus))) return;
-    const timer = window.setInterval(() => void load(), 3_000);
-    return () => window.clearInterval(timer);
-  }, [documents, load]);
+    if (!documents.some((document) => processingDocumentPattern.test(document.processingStatus))) return;
+    const timer = window.setTimeout(async () => {
+      try {
+        const docs: DocumentItem[] = [];
+        const targetCount = Math.max(100, documents.length);
+        let cursor: DocumentItem | undefined;
+        while (docs.length < targetCount) {
+          const pageLimit = Math.min(500, targetCount - docs.length);
+          const page = await fetchDocumentPage(cursor, pageLimit);
+          docs.push(...page);
+          cursor = page.at(-1);
+          if (!cursor || page.length < pageLimit) break;
+        }
+        const refreshedIds = new Set(docs.map(({ id }) => id));
+        const visible = [...docs, ...documents.filter(({ id }) => !refreshedIds.has(id))];
+        applyDocuments(visible);
+        if (!visible.some((document) => processingDocumentPattern.test(document.processingStatus))) await loadSalary();
+      } catch (caught) { setDocumentError(caught instanceof Error ? caught.message : 'No pudimos actualizar el procesamiento.'); }
+    }, 3_000);
+    return () => window.clearTimeout(timer);
+  }, [documents, applyDocuments, fetchDocumentPage, loadSalary]);
+  const loadDetail = useCallback(async (id: string) => {
+    setDetailError('');
+    setDetail(await api<DocumentDetail>(`/documents/${id}`));
+  }, []);
   useEffect(() => {
     if (!selectedId) return;
     let stopped = false;
-    api<{ extractedFields: ExtractedField[] }>(`/documents/${selectedId}`)
-      .then((detail) => { if (!stopped) setFields(detail.extractedFields ?? []); })
-      .catch((caught: unknown) => { if (!stopped) setError(caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.'); });
+    api<DocumentDetail>(`/documents/${selectedId}`)
+      .then((nextDetail) => { if (!stopped) { setDetailError(''); setDetail(nextDetail); } })
+      .catch((caught: unknown) => { if (!stopped) setDetailError(caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.'); });
     return () => { stopped = true; };
   }, [selectedId, selectedStatus]);
 
   function openDocument(document: DocumentItem) {
-    setSelected(document); setFields([]); setAcceptDeductionsMismatch(false); setError('');
+    setSelected(document); setDetail(null); setDetailError(''); setAcceptDeductionsMismatch(false); setError('');
   }
   async function correct(field: ExtractedField, value: string) {
+    if (!selected) return;
+    setDetailError('');
     try {
-      await api(`/documents/${selected?.id}/corrections`, {
+      await api(`/documents/${selected.id}/corrections`, {
         method: 'POST',
         body: JSON.stringify({ ...(field.id ? { extractedFieldId: field.id } : { fieldPath: field.fieldPath }), correctedValue: value }),
       });
-      setFields((current) => current.map((item) => item.fieldPath === field.fieldPath ? { ...item, correctedValue: value } : item));
-      await load();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar la corrección.'); }
+      await Promise.all([loadDetail(selected.id), loadSalary()]);
+    } catch (caught) { setDetailError(caught instanceof Error ? caught.message : 'No pudimos guardar la corrección.'); }
   }
   async function deleteOriginal() {
     if (!selected || !confirm('¿Eliminar el PDF original? Los datos estructurados se conservarán.')) return;
@@ -1187,7 +1685,7 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   }
   async function deleteDocument() {
     if (!selected || !confirm('¿Eliminar el PDF y todos sus datos extraídos? Esta acción no se puede deshacer.')) return;
-    try { await runSensitive(async () => { await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' }); setSelected(null); await load(); }); }
+    try { await runSensitive(async () => { await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' }); setSelected(null); await Promise.all([load(), reloadDocuments()]); }); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminar el documento.'); }
   }
   async function confirmType(documentType: 'PAYROLL' | 'UNSUPPORTED') {
@@ -1197,7 +1695,7 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
         method: 'POST', body: JSON.stringify({ documentType }),
       });
       setSelected({ ...selected, processingStatus: result.processingStatus });
-      await load();
+      await Promise.all([load(), reloadDocuments()]);
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar la confirmación.'); }
   }
   async function completeReview() {
@@ -1208,7 +1706,7 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
         body: JSON.stringify({ acceptDeductionsMismatch }),
       });
       setSelected({ ...selected, processingStatus: result.processingStatus });
-      await load();
+      await Promise.all([load(), reloadDocuments()]);
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos finalizar la revisión.'); }
   }
   async function associateDocuments() {
@@ -1222,25 +1720,182 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
           employmentId: employmentChoice === 'none' ? null : employmentChoice,
         }),
       });
-      setCheckedDocumentIds([]); setEmploymentChoice(''); await load();
+      setCheckedDocumentIds([]); setEmploymentChoice(''); await Promise.all([load(), reloadDocuments()]);
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos asociar los documentos.'); }
     finally { setAssociating(false); }
+  }
+
+  const selectedScopeIndex = history?.contexts.findIndex((item) => salaryScopeKey(item) === selectedScopeKey) ?? -1;
+  const context = history?.contexts[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
+  const scope = history?.analytics.scopes[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
+  const years = scope?.annual.map(({ year }) => year) ?? [];
+  const selectedYear = yearFilter === 'all' || years.includes(yearFilter) ? yearFilter : 'all';
+  const periods = scope?.evolution.map(({ period }) => period) ?? [];
+  const selectedFromPeriod = periods.includes(fromPeriod) ? fromPeriod : periods[0] ?? '';
+  const selectedToPeriod = periods.includes(toPeriod) ? toPeriod : periods.at(-1) ?? '';
+  const annualRows = scope?.annual.filter(({ year }) => selectedYear === 'all' || year === selectedYear) ?? [];
+  const latestEvents = scope?.events?.slice(-6).reverse() ?? [];
+  const possibleDuplicates = context
+    ? history?.analytics.possibleDuplicates.filter((duplicate) => duplicate.employmentContext === context.employmentContext && duplicate.currencyCode === context.currencyCode) ?? []
+    : [];
+  const conceptEmploymentContext = context?.employmentContext ?? '';
+  const conceptCurrency = context?.currencyCode ?? '';
+  const conceptEmployerName = context?.state === 'DETECTED' ? context.employerName ?? '' : '';
+  const buildConceptQuery = useCallback((cursor?: string) => {
+    if (!conceptEmploymentContext || !conceptCurrency || (conceptEmploymentContext.startsWith('detected:') && !conceptEmployerName)) return null;
+    const query = new URLSearchParams({
+      employmentContext: conceptEmploymentContext,
+      currencyCode: conceptCurrency,
+      limit: '100',
+    });
+    if (conceptEmployerName) query.set('employerName', conceptEmployerName);
+    if (selectedYear !== 'all') query.set('year', selectedYear);
+    if (categoryFilter !== 'all') query.set('category', categoryFilter);
+    if (cursor) query.set('cursor', cursor);
+    return `/salary-history/concepts?${query}`;
+  }, [categoryFilter, conceptCurrency, conceptEmployerName, conceptEmploymentContext, selectedYear]);
+  useEffect(() => {
+    const path = tab === 'concepts' ? buildConceptQuery() : null;
+    if (!path) return;
+    let stopped = false;
+    void Promise.resolve().then(async () => {
+      setConceptLoading(true); setConcepts([]); setConceptCursor(null); setConceptError('');
+      try {
+        const page = await api<SalaryConceptPage>(path);
+        if (!stopped) { setConcepts(page.items); setConceptCursor(page.nextCursor); }
+      } catch (caught) {
+        if (!stopped) setConceptError(caught instanceof Error ? caught.message : 'No pudimos cargar los conceptos.');
+      } finally { if (!stopped) setConceptLoading(false); }
+    });
+    return () => { stopped = true; };
+  }, [buildConceptQuery, conceptReloadKey, history, tab]);
+
+  function selectScope(key: string) {
+    setSelectedScopeKey(key); setYearFilter('all'); setCategoryFilter('all');
+    setEvolutionRange('12');
+    setConcepts([]); setConceptCursor(null); setConceptError('');
+    setFromPeriod(''); setToPeriod(''); setComparison(null); setComparisonLoaded(false);
+  }
+
+  function moveHistoryTab(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    const last = historyTabs.length - 1;
+    const nextIndex = event.key === 'ArrowRight' ? (index === last ? 0 : index + 1)
+      : event.key === 'ArrowLeft' ? (index === 0 ? last : index - 1)
+        : event.key === 'Home' ? 0
+          : event.key === 'End' ? last
+            : null;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const next = historyTabs[nextIndex]![0];
+    setTab(next);
+    document.getElementById(`history-tab-${next}`)?.focus();
+  }
+
+  async function loadMoreConcepts() {
+    const path = conceptCursor ? buildConceptQuery(conceptCursor) : null;
+    if (!path || conceptLoadingMore) return;
+    setConceptLoadingMore(true); setConceptError('');
+    try {
+      const page = await api<SalaryConceptPage>(path);
+      setConcepts((current) => [...current, ...page.items]);
+      setConceptCursor(page.nextCursor);
+    } catch (caught) {
+      setConceptError(caught instanceof Error ? caught.message : 'No pudimos cargar más conceptos.');
+    } finally { setConceptLoadingMore(false); }
+  }
+
+  async function comparePeriods() {
+    if (!context || !selectedFromPeriod || !selectedToPeriod || selectedFromPeriod === selectedToPeriod) return;
+    setComparisonLoading(true); setComparisonLoaded(false); setError('');
+    try {
+      const query = new URLSearchParams({
+        employmentContext: context.employmentContext,
+        currencyCode: context.currencyCode,
+        fromPeriod: selectedFromPeriod,
+        toPeriod: selectedToPeriod,
+      });
+      setComparison(await api<PeriodComparison | null>(`/salary-history/comparison?${query}`));
+      setComparisonLoaded(true);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos comparar los períodos.'); }
+    finally { setComparisonLoading(false); }
+  }
+
+  async function loadMoreDocuments() {
+    const cursor = documents.at(-1);
+    if (!cursor || loadingMoreDocuments) return;
+    setLoadingMoreDocuments(true); setDocumentError('');
+    try {
+      const next = await fetchDocumentPage(cursor);
+      setDocuments((current) => [...current, ...next.filter((item) => !current.some(({ id }) => id === item.id))]);
+      setHasMoreDocuments(next.length === 100);
+    } catch (caught) { setDocumentError(caught instanceof Error ? caught.message : 'No pudimos cargar más documentos.'); }
+    finally { setLoadingMoreDocuments(false); }
   }
 
   const assignableDocuments = documents.filter((document) => associationReadyStatuses.has(document.processingStatus));
   const allAssignableSelected = assignableDocuments.length > 0
     && assignableDocuments.every((document) => checkedDocumentIds.includes(document.id));
+  const fields = detail?.extractedFields ?? [];
   const missingReviewFields = fields.filter((field) => field.source === 'MANUAL_REQUIRED' && !field.correctedValue);
-  const selectedSettlement = settlements.find((settlement) => settlement.documentId === selected?.id);
+  const selectedSettlement = detail?.settlement ?? null;
+  const documentGroups = useMemo(() => {
+    const grouped = new Map<string, DocumentItem[]>();
+    for (const document of documents) {
+      const year = document.payrollPeriod?.slice(0, 4) || document.createdAt.slice(0, 4) || 'Sin año';
+      grouped.set(year, [...(grouped.get(year) ?? []), document]);
+    }
+    return [...grouped].sort(([left], [right]) => left === 'Sin año' ? 1 : right === 'Sin año' ? -1 : right.localeCompare(left));
+  }, [documents]);
+
+  function documentRow(document: DocumentItem) {
+    const assignable = documentKind === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus);
+    return <div className={`document-entry${documentKind === 'PAYROLL' ? '' : ' no-check'}`} key={document.id}>{documentKind === 'PAYROLL' && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${documentName(document)}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={() => openDocument(document)}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{document.employerName || 'Sin empresa asociada'} · {document.payrollPeriod ? periodLabel(document.payrollPeriod) : shortDate(document.createdAt)}{document.settlementType ? ` · ${settlementTypeLabel(document.settlementType)}` : ''}{document.errorCode ? ` · ${importErrorLabels[document.errorCode] ?? 'No procesado'}` : ''}</small></span><Status value={document.processingStatus} /><span aria-hidden="true">›</span></button></div>;
+  }
 
   return (
-    <div className="page">
+    <div className="page" aria-busy={loading || documentsLoading || comparisonLoading || conceptLoading || conceptLoadingMore}>
       <PageHeader eyebrow="Datos estructurados" title="Historial salarial" />
-      <div className="tabs" role="tablist"><button role="tab" aria-selected={tab === 'settlements'} className={tab === 'settlements' ? 'active' : ''} onClick={() => setTab('settlements')}>Liquidaciones</button><button role="tab" aria-selected={tab === 'documents'} className={tab === 'documents' ? 'active' : ''} onClick={() => setTab('documents')}>Documentos</button></div>
-      {error && <p className="message error" role="alert">{error}</p>}
-      {tab === 'documents' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}<option value="none">Quitar asociación</option></select><button className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={associateDocuments}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
-      {tab === 'settlements' ? (settlements.length ? <div className="table-wrap"><table><thead><tr><th>Período</th><th>Empresa</th><th>Tipo</th><th>Bruto</th><th>Descuentos</th><th>Neto</th></tr></thead><tbody>{settlements.map((row) => <tr key={row.id}><td>{row.payrollPeriod.slice(0, 7)}</td><td>{row.employerName || 'Sin asociar'}</td><td>{row.settlementType}</td><td>{money(row.grossAmount, row.currencyCode)}</td><td><DeductionBreakdown settlement={row} /></td><td><strong>{money(row.netAmount, row.currencyCode)}</strong></td></tr>)}</tbody></table></div> : <EmptyState title="Todavía no hay liquidaciones" body="Cuando el worker termine de analizar tus recibos, aparecerán acá." />) : (documents.length ? <div className="document-list">{documents.map((document) => { const assignable = associationReadyStatuses.has(document.processingStatus); return <div className="document-entry" key={document.id}><label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${documentName(document)}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label><button className="document-row" onClick={() => openDocument(document)}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{shortDate(document.createdAt)} · {document.documentType || 'Clasificando'}{document.errorCode ? ` · ${importErrorLabels[document.errorCode] ?? document.errorCode}` : ''}</small></span><Status value={document.processingStatus} /><span aria-hidden="true">›</span></button></div>; })}</div> : <EmptyState title="No hay documentos" body="Importá PDFs para ver su estado y revisar los campos extraídos." />)}
-      {selected && <div className="modal-layer" role="presentation" onMouseDown={() => setSelected(null)}><section className="modal wide" role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setSelected(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Revisión humana</p><h2 id="review-title">{documentName(selected)}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Cerrar">×</button></div><div className="review-summary"><Status value={selected.processingStatus} /><span>{selected.errorCode ? importErrorLabels[selected.errorCode] ?? selected.errorCode : missingReviewFields.length ? `Falta completar: ${missingReviewFields.map((field) => reviewFieldLabels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : selectedSettlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto; corregí uno de los importes.' : selectedSettlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total; revisá los valores y confirmá la diferencia.' : 'Tus correcciones quedan guardadas en esta extracción.'}</span></div>{selected.processingStatus === 'NEEDS_TYPE_CONFIRMATION' ? <div className="type-confirmation"><h3>¿Este PDF es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente. Confirmalo para continuar con la extracción.</p><div><button className="button primary" onClick={() => confirmType('PAYROLL')}>Sí, es un recibo</button><button className="button secondary" onClick={() => confirmType('UNSUPPORTED')}>No corresponde</button></div></div> : fields.length ? <div className="field-list">{fields.map((field) => <FieldEditor key={field.fieldPath} field={field} onSave={(value) => correct(field, value)} />)}</div> : <EmptyState title="Sin campos disponibles" body="El documento todavía está procesándose o no produjo datos utilizables." />}{selected.processingStatus === 'NEEDS_REVIEW' && selectedSettlement?.deductionsMatchTotal === false && <label className="review-acceptance"><input type="checkbox" checked={acceptDeductionsMismatch} onChange={(event) => setAcceptDeductionsMismatch(event.target.checked)} />Revisé los conceptos y acepto esta diferencia.</label>}<div className="modal-actions">{selected.processingStatus === 'NEEDS_REVIEW' && <button className="button primary" disabled={missingReviewFields.length > 0 || selectedSettlement?.totalsBalance === false || (selectedSettlement?.deductionsMatchTotal === false && !acceptDeductionsMismatch)} onClick={completeReview}>Finalizar revisión</button>}<button className="button secondary" disabled={selected.originalAvailable === false} onClick={downloadOriginal}>Descargar PDF</button><button className="button danger-button" disabled={selected.originalAvailable === false || !associationReadyStatuses.has(selected.processingStatus)} onClick={deleteOriginal}>{selected.originalAvailable === false ? 'Original eliminado' : 'Eliminar sólo el PDF'}</button><button className="button danger-button" onClick={deleteDocument}>Eliminar PDF y datos</button><button className="button secondary" onClick={() => setSelected(null)}>Cerrar</button></div></section></div>}
+      <div className="tabs history-tabs" role="tablist" aria-label="Secciones del historial">{historyTabs.map(([value, label], index) => <button type="button" id={`history-tab-${value}`} role="tab" aria-controls={`history-panel-${value}`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className={tab === value ? 'active' : ''} onKeyDown={(event) => moveHistoryTab(event, index)} onClick={() => setTab(value)} key={value}>{label}</button>)}</div>
+      {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
+      {loading && !history && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando el historial salarial…</p></div>}
+
+      {tab !== 'documents' && history && context && scope && <>
+        <SalaryScopeControl history={history} selectedKey={selectedScopeKey} onChange={selectScope} id="history-salary-scope" />
+        <SalaryContextNotice context={context} />
+        {(tab === 'evolution' || tab === 'annual' || tab === 'concepts') && <div className="history-filters">{tab === 'evolution' ? <label>Rango<select value={evolutionRange} onChange={(event) => setEvolutionRange(event.target.value as (typeof evolutionRanges)[number][0])}>{evolutionRanges.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label> : <><label>Año<select value={selectedYear} onChange={(event) => setYearFilter(event.target.value)}><option value="all">Todos</option>{years.map((year) => <option value={year} key={year}>{year}</option>)}</select></label><label>Categoría<select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value as 'all' | SalaryCategory)}><option value="all">Todas</option>{salaryCategories.map((item) => <option value={item} key={item}>{categoryLabels[item]}</option>)}</select></label></>}</div>}
+      </>}
+
+      {tab === 'summary' && <section id="history-panel-summary" role="tabpanel" aria-labelledby="history-tab-summary" tabIndex={0}>{history && context && scope ? <>
+        <SalaryMetricGrid scope={scope} context={context} />
+        <div className="history-summary-grid">
+          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Últimos cambios</p><h2>Eventos informados</h2></div></div>{latestEvents.length ? <ul className="event-list">{latestEvents.map((event) => <li key={`${event.type}-${event.period}-${event.type === 'EXTRAORDINARY' ? event.settlementId : event.change.toPeriod}`}><span><strong>{event.type === 'COMPARABLE_INCREASE' ? 'Aumento comparable' : categoryLabels[event.category]}</strong><small>{periodLabel(event.period)}</small></span><strong>{event.type === 'COMPARABLE_INCREASE' ? salaryPercentage(event.change.percentage) : salaryMoney(event.amount, scope.currencyCode)}</strong></li>)}</ul> : <EmptyState title="Sin cambios informados" body="Hacen falta más períodos comparables o liquidaciones extraordinarias." />}</section>
+          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Calidad del historial</p><h2>Cobertura</h2></div></div>{scope.coverage && scope.coverage.basis !== 'INDETERMINATE_CONTEXT' ? <><p className="coverage-total"><strong>{scope.coverage.availablePeriods.length}/{scope.coverage.expectedPeriods.length}</strong> períodos disponibles</p><p>{scope.coverage.possibleMissingPeriods.length ? `Posibles faltantes: ${scope.coverage.possibleMissingPeriods.map(periodLabel).join(', ')}.` : scope.coverage.basis === 'OBSERVED' ? 'Sin faltantes dentro del rango observado; no implica una relación laboral completa.' : 'No se detectaron posibles faltantes dentro del rango laboral.'}</p>{scope.coverage.boundaryContradiction && <p className="message warning" role="status">Las fechas del empleo contradicen períodos observados; se amplió el rango para no ocultarlos.</p>}</> : <p>N/D: sin contexto laboral suficiente para determinar períodos esperados.</p>}{possibleDuplicates.length > 0 && <p className="message warning" role="status">Hay {possibleDuplicates.length} período{possibleDuplicates.length === 1 ? '' : 's'} con posibles recibos duplicados para revisar.</p>}</section>
+        </div>
+        <section className="panel comparison-panel"><div className="panel-heading"><div><p className="eyebrow">Comparación exacta</p><h2>Dos períodos</h2></div></div>{periods.length > 1 ? <><div className="comparison-controls"><label>Desde<select value={selectedFromPeriod} onChange={(event) => { setFromPeriod(event.target.value); setComparisonLoaded(false); }} >{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><label>Hasta<select value={selectedToPeriod} onChange={(event) => { setToPeriod(event.target.value); setComparisonLoaded(false); }}>{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><button type="button" className="button primary" disabled={comparisonLoading || selectedFromPeriod === selectedToPeriod} onClick={() => void comparePeriods()}>{comparisonLoading ? 'Comparando…' : 'Comparar'}</button></div>{comparison && <ComparisonResult comparison={comparison} />}{comparisonLoaded && !comparison && <EmptyState title="No se pueden comparar" body="No hay datos suficientes en uno de los períodos elegidos." />}</> : <EmptyState title="Falta otro período" body="La comparación necesita al menos dos períodos del mismo empleo y moneda." />}</section>
+      </> : history && !loading ? <EmptyState title="Todavía no hay datos salariales" body="Importá recibos soportados y completá su revisión para construir el historial." /> : null}</section>}
+
+      {tab === 'evolution' && <section id="history-panel-evolution" role="tabpanel" aria-labelledby="history-tab-evolution" tabIndex={0}>{scope ? <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto</h2></div></div><SalaryEvolution scope={scope} limit={evolutionRanges.find(([value]) => value === evolutionRange)?.[2]} /></section> : history && !loading ? <EmptyState title="Sin evolución" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
+
+      {tab === 'annual' && <section id="history-panel-annual" role="tabpanel" aria-labelledby="history-tab-annual" tabIndex={0}>{scope ? <AnnualHistory rows={annualRows} scope={scope} category={categoryFilter} /> : history && !loading ? <EmptyState title="Sin resumen anual" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
+
+      {tab === 'concepts' && <section id="history-panel-concepts" role="tabpanel" aria-labelledby="history-tab-concepts" tabIndex={0} aria-busy={conceptLoading || conceptLoadingMore}>
+        {conceptError && <p className="message error" role="alert">{conceptError} <button type="button" className="text-button" disabled={conceptLoading} onClick={() => setConceptReloadKey((current) => current + 1)}>Reintentar</button></p>}
+        {conceptLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando conceptos…</p></div> : scope && concepts.length ? <><div className="table-wrap" role="region" aria-label="Tabla desplazable de conceptos salariales" tabIndex={0}><table><caption className="sr-only">Conceptos normalizados paginados por el servidor</caption><thead><tr><th>Período</th><th>Liquidación</th><th>Categoría</th><th>Concepto</th><th>Recurrencia</th><th>Importe</th></tr></thead><tbody>{concepts.map((row) => <tr key={`${row.settlementId}-${row.earningIndex}`}><td>{periodLabel(row.period)}</td><td>{settlementTypeLabel(row.settlementType)}</td><td>{categoryLabels[row.category]}</td><td>{earningLabels[row.code] ?? 'Otro concepto'}</td><td>{row.isRecurring === true ? 'Recurrente' : row.isRecurring === false ? 'No recurrente' : 'N/D'}</td><td>{salaryMoney(row.amount, scope.currencyCode)}</td></tr>)}</tbody></table></div>{conceptCursor && <div className="load-more"><button type="button" className="button secondary" disabled={conceptLoadingMore} onClick={() => void loadMoreConcepts()}>{conceptLoadingMore ? 'Cargando…' : 'Cargar más'}</button></div>}</> : scope ? <EmptyState title="Sin conceptos para esos filtros" body="Sólo se muestran conceptos ya normalizados por el servidor." /> : history && !loading ? <EmptyState title="Sin conceptos" body="Todavía no hay liquidaciones analizadas." /> : null}
+      </section>}
+
+      {tab === 'documents' && <section id="history-panel-documents" role="tabpanel" aria-labelledby="history-tab-documents" tabIndex={0}>
+        <div className="document-kind" role="group" aria-label="Clase de documento"><button type="button" className={documentKind === 'PAYROLL' ? 'active' : ''} aria-pressed={documentKind === 'PAYROLL'} onClick={() => { setDocumentKind('PAYROLL'); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentSettlementType('all'); setCheckedDocumentIds([]); setSelected(null); }}>Recibos salariales</button><button type="button" className={documentKind === 'UNSUPPORTED' ? 'active' : ''} aria-pressed={documentKind === 'UNSUPPORTED'} onClick={() => { setDocumentKind('UNSUPPORTED'); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentSettlementType('all'); setCheckedDocumentIds([]); setSelected(null); }}>No soportados / descartados</button></div>
+        <form className="document-filters" role="search" onSubmit={(event) => { event.preventDefault(); setDocumentSearch(documentSearchDraft.trim()); setDocumentYear(documentYearDraft || 'all'); }}><label>Buscar<input type="search" value={documentSearchDraft} maxLength={100} placeholder="Archivo o empresa" onChange={(event) => setDocumentSearchDraft(event.target.value)} /></label>{documentKind === 'PAYROLL' && <label>Año<input type="text" inputMode="numeric" pattern="20[0-9]{2}" maxLength={4} value={documentYearDraft} placeholder="Todos" title="Ingresá un año entre 2000 y 2099" onChange={(event) => setDocumentYearDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label>}<label>Estado<select value={documentStatus} onChange={(event) => setDocumentStatus(event.target.value)}><option value="all">Todos</option>{documentFilterStatuses.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>{documentKind === 'PAYROLL' && <label>Tipo de liquidación<select value={documentSettlementType} onChange={(event) => setDocumentSettlementType(event.target.value)}><option value="all">Todos</option>{settlementTypeOptions.map((value) => <option value={value} key={value}>{settlementTypeLabel(value)}</option>)}</select></label>}<button type="submit" className="button secondary compact">Buscar</button>{(documentSearch || documentYear !== 'all' || documentStatus !== 'all' || documentSettlementType !== 'all') && <button type="button" className="text-button" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentStatus('all'); setDocumentSettlementType('all'); }}>Limpiar filtros</button>}</form>
+        {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void reloadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
+        {documentKind === 'PAYROLL' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}<option value="none">Quitar asociación</option></select><button type="button" className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={() => void associateDocuments()}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
+        {documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-groups">{documentGroups.map(([year, items]) => <details className="document-year" key={year}><summary><strong>{year}</strong><span>{items.length} documento{items.length === 1 ? '' : 's'} cargado{items.length === 1 ? '' : 's'}</span></summary><div className="document-list">{items.map(documentRow)}</div></details>)}</div>{hasMoreDocuments && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title={documentKind === 'PAYROLL' ? 'No hay recibos para estos filtros' : 'No hay documentos no soportados'} body={documentKind === 'PAYROLL' ? 'Importá PDFs o limpiá los filtros para ver su estado.' : 'Los PDFs descartados o confirmados como no salariales aparecen separados acá.'} />}
+      </section>}
+
+      {selected && <div className="modal-layer" role="presentation" onMouseDown={() => setSelected(null)}><section className="modal wide" role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setSelected(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Documento y extracción</p><h2 id="review-title">{documentName(selected)}</h2></div><button type="button" className="icon-button" onClick={() => setSelected(null)} aria-label="Cerrar">×</button></div><div className="review-summary"><Status value={selected.processingStatus} /><span>{selected.errorCode ? importErrorLabels[selected.errorCode] ?? 'El documento no pudo procesarse.' : missingReviewFields.length ? `Falta completar: ${missingReviewFields.map((field) => reviewFieldLabels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : selectedSettlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto; corregí uno de los importes.' : selectedSettlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total; revisá los valores y confirmá la diferencia.' : 'Tus correcciones quedan guardadas en esta extracción.'}</span></div>
+        {detailError && <p className="message error" role="alert">{detailError}</p>}
+        {selectedSettlement && <section className="settlement-detail" aria-labelledby="settlement-detail-title"><h3 id="settlement-detail-title">Liquidación extraída</h3><dl className="settlement-overview"><div><dt>Período</dt><dd>{periodLabel(selectedSettlement.payrollPeriod)}</dd></div><div><dt>Tipo</dt><dd>{settlementTypeLabel(selectedSettlement.settlementType)}</dd></div><div><dt>Básico</dt><dd>{salaryMoney(selectedSettlement.basicAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Bruto</dt><dd>{salaryMoney(selectedSettlement.grossAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Remunerativo</dt><dd>{salaryMoney(selectedSettlement.remunerativeAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>No remunerativo</dt><dd>{salaryMoney(selectedSettlement.nonRemunerativeAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Neto</dt><dd>{salaryMoney(selectedSettlement.netAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Descuentos / créditos</dt><dd><DeductionBreakdown settlement={selectedSettlement} /></dd></div></dl>{selectedSettlement.earnings && selectedSettlement.earnings.length > 0 && <details><summary>Ver ingresos detectados ({selectedSettlement.earnings.length})</summary><ul className="detail-earnings">{selectedSettlement.earnings.map((earning, index) => <li key={`${earning.normalizedConceptCode ?? 'OTHER'}-${index}`}><span>{earning.normalizedConceptCode ? earningLabels[earning.normalizedConceptCode] ?? earning.rawDescription : earning.rawDescription}</span><strong>{money(earning.amount, selectedSettlement.currencyCode)}</strong></li>)}</ul></details>}</section>}
+        {selected.processingStatus === 'NEEDS_TYPE_CONFIRMATION' ? <div className="type-confirmation"><h3>¿Este PDF es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente. Confirmalo para continuar con la extracción.</p><div><button type="button" className="button primary" onClick={() => void confirmType('PAYROLL')}>Sí, es un recibo</button><button type="button" className="button secondary" onClick={() => void confirmType('UNSUPPORTED')}>No corresponde</button></div></div> : !detail ? !detailError && <p role="status">Cargando detalle…</p> : fields.length ? <div className="field-list">{fields.map((field) => <FieldEditor key={field.fieldPath} field={field} onSave={(value) => correct(field, value)} />)}</div> : <EmptyState title="Sin campos disponibles" body="El documento todavía está procesándose o no produjo datos utilizables." />}
+        {selected.processingStatus === 'NEEDS_REVIEW' && selectedSettlement?.deductionsMatchTotal === false && <label className="review-acceptance"><input type="checkbox" checked={acceptDeductionsMismatch} onChange={(event) => setAcceptDeductionsMismatch(event.target.checked)} />Revisé los conceptos y acepto esta diferencia.</label>}<div className="modal-actions">{selected.processingStatus === 'NEEDS_REVIEW' && <button type="button" className="button primary" disabled={missingReviewFields.length > 0 || selectedSettlement?.totalsBalance === false || (selectedSettlement?.deductionsMatchTotal === false && !acceptDeductionsMismatch)} onClick={() => void completeReview()}>Finalizar revisión</button>}<button type="button" className="button secondary" disabled={selected.originalAvailable === false} onClick={() => void downloadOriginal()}>Descargar PDF</button><button type="button" className="button danger-button" disabled={selected.originalAvailable === false || !associationReadyStatuses.has(selected.processingStatus)} onClick={() => void deleteOriginal()}>{selected.originalAvailable === false ? 'Original eliminado' : 'Eliminar sólo el PDF'}</button><button type="button" className="button danger-button" onClick={() => void deleteDocument()}>Eliminar PDF y datos</button><button type="button" className="button secondary" onClick={() => setSelected(null)}>Cerrar</button></div></section></div>}
     </div>
   );
 }
@@ -1252,9 +1907,9 @@ function FieldEditor({ field, onSave }: { field: ExtractedField; onSave: (value:
   const editable = editableCorrectionPaths.has(field.fieldPath);
   const missingReasonMessage = field.missingReason ? missingReasonMessages[field.missingReason] : null;
   const editor = field.fieldPath === 'settlement.type'
-    ? <select value={value} onChange={(event) => setValue(event.target.value)}>{settlementTypeOptions.map((type) => <option key={type}>{type}</option>)}</select>
+    ? <select value={value} onChange={(event) => setValue(event.target.value)}>{settlementTypeOptions.map((type) => <option key={type} value={type}>{settlementTypeLabel(type)}</option>)}</select>
     : <input disabled={!editable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={field.fieldPath.includes('Amount') ? 'decimal' : undefined} value={value} onChange={(event) => setValue(event.target.value)} />;
-  return <div className="field-editor"><label><span>{reviewFieldLabels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label><span className={`confidence ${confidence < 70 ? 'low' : ''}`}>{field.source === 'MANUAL_REQUIRED' ? field.correctedValue ? 'Manual' : 'Falta' : Number.isFinite(confidence) ? `${confidence}%` : '—'}</span><small>{field.correctedValue ? 'Corregido por vos' : missingReasonMessage ?? (!editable ? 'Sólo lectura' : field.source === 'MANUAL_REQUIRED' ? 'Completalo manualmente' : field.source)}</small>{editable && <button className="button compact" disabled={busy || !value.trim() || value === (field.correctedValue ?? field.interpretedValue ?? '')} onClick={async () => { setBusy(true); await onSave(value); setBusy(false); }}>Guardar</button>}</div>;
+  return <div className="field-editor"><label><span>{reviewFieldLabels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label><span className={`confidence ${confidence < 70 ? 'low' : ''}`}>{field.source === 'MANUAL_REQUIRED' ? field.correctedValue ? 'Manual' : 'Falta' : Number.isFinite(confidence) ? `${confidence}%` : '—'}</span><small>{field.correctedValue ? 'Corregido por vos' : missingReasonMessage ?? (!editable ? 'Sólo lectura' : field.source === 'MANUAL_REQUIRED' ? 'Completalo manualmente' : extractionSourceLabel(field.source))}</small>{editable && <button className="button compact" disabled={busy || !value.trim() || value === (field.correctedValue ?? field.interpretedValue ?? '')} onClick={async () => { setBusy(true); await onSave(value); setBusy(false); }}>Guardar</button>}</div>;
 }
 
 function MfaSettings({ onUserChanged, runSensitive }: { onUserChanged: (user: User) => void; runSensitive: RunSensitive }) {

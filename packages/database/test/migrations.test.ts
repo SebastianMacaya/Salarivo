@@ -22,11 +22,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 15);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 15 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 16);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 16 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 15, name: "granular_admin_console" },
+    { version: 16, name: "reimbursement_settlement_type" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -120,4 +120,17 @@ test("granular admin migration keeps roles fixed and audit append-only", async (
   assert.match(migration.sql, /BEFORE UPDATE OR DELETE ON admin_audit_events/);
   assert.match(migration.sql, /BEFORE TRUNCATE ON admin_audit_events/);
   assert.doesNotMatch(migration.sql, /original_filename|object_key|gross_amount|net_amount|raw_value|corrected_value/);
+});
+
+test("reimbursement migration extends the settlement vocabulary without rewriting amounts", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 16);
+  assert.ok(migration);
+  assert.equal(migration.name, "reimbursement_settlement_type");
+  assert.match(migration.sql, /ADD CONSTRAINT payroll_settlements_settlement_type_check_v2/);
+  assert.match(migration.sql, /DROP CONSTRAINT payroll_settlements_settlement_type_check/);
+  assert.match(migration.sql, /'REINTEGRO'/);
+  assert.match(migration.sql, /NOT VALID/);
+  assert.match(migration.sql, /VALIDATE CONSTRAINT payroll_settlements_settlement_type_check_v2/);
+  assert.match(migration.sql, /RENAME CONSTRAINT payroll_settlements_settlement_type_check_v2/);
+  assert.doesNotMatch(migration.sql, /UPDATE payroll_settlements|basic_amount|gross_amount|net_amount/);
 });

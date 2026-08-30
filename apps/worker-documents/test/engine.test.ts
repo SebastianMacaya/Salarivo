@@ -162,18 +162,36 @@ Contribución Jubilación                                  $ 120.000,00
   const result = extractArgentinePayroll(tableReceipt, 'PDF_TEXT');
 
   assert.equal(result.grossAmount, '1250000.00');
+  assert.equal(result.remunerativeAmount, '1200000.00');
+  assert.equal(result.nonRemunerativeAmount, '50000.00');
   assert.equal(result.deductionsAmount, '250000.00');
   assert.equal(result.netAmount, '1000000.00');
   assert.equal(result.needsReview, true);
   assert.equal(result.fields.find(({ fieldPath }) => fieldPath === 'settlement.grossAmount')?.source, 'RULE');
+  assert.deepEqual(
+    result.fields.find(({ fieldPath }) => fieldPath === 'settlement.remunerativeAmount'),
+    { confidence: 0.84, fieldPath: 'settlement.remunerativeAmount', interpretedValue: { amount: '1200000.00', currencyCode: 'ARS' }, rawValue: '1.200.000,00', source: 'PDF_TEXT' },
+  );
+  assert.deepEqual(
+    result.fields.find(({ fieldPath }) => fieldPath === 'settlement.nonRemunerativeAmount'),
+    { confidence: 0.84, fieldPath: 'settlement.nonRemunerativeAmount', interpretedValue: { amount: '50000.00', currencyCode: 'ARS' }, rawValue: '50.000,00', source: 'PDF_TEXT' },
+  );
   assert.equal(result.lineItems.some(({ normalizedConceptCode }) => normalizedConceptCode === 'RETIREMENT'), false);
 
   const unknownTable = extractArgentinePayroll(`RECIBO DE SUELDO\nPeríodo: 07/2026\nTotales 1.200.000,00 50.000,00 250.000,00 400.000,00\nNeto a cobrar $ 1.000.000,00`, 'PDF_TEXT');
   assert.equal(unknownTable.grossAmount, null);
+  assert.equal(unknownTable.remunerativeAmount, null);
+  assert.equal(unknownTable.nonRemunerativeAmount, null);
+  assert.equal(
+    unknownTable.fields.find(({ fieldPath }) => fieldPath === 'settlement.remunerativeAmount')?.signals?.missingReason,
+    'LABEL_OR_LAYOUT_NOT_RECOGNIZED',
+  );
   assert.equal(unknownTable.needsReview, true);
 
   const threeColumns = extractArgentinePayroll(`RECIBO DE HABERES\nPeríodo: 07/2026\nRemunerativos  No remunerativos  Retenciones\nTotal 1.200.000,00 50.000,00 250.000,00\nNeto a pagar $ 1.000.000,00`, 'PDF_TEXT');
   assert.equal(threeColumns.grossAmount, '1250000.00');
+  assert.equal(threeColumns.remunerativeAmount, '1200000.00');
+  assert.equal(threeColumns.nonRemunerativeAmount, '50000.00');
   assert.equal(threeColumns.deductionsAmount, '250000.00');
 
   const pageNumber = extractArgentinePayroll(`RECIBO DE HABERES\nPeríodo: 07/2026\nTotal bruto $ 1.000.000,00\nNeto a cobrar\nPágina 1`, 'PDF_TEXT');
@@ -304,6 +322,97 @@ test('separa descuentos del empleado de contribuciones y minimiza cada deducció
   );
 });
 
+test('preserva haberes desconocidos y normaliza extraordinarios sin cambiar una liquidación normal', () => {
+  const row = (description: string, remunerative = '', nonRemunerative = '', deduction = '') =>
+    `${description.padEnd(38)}${remunerative.padEnd(20)}${nonRemunerative.padEnd(20)}${deduction}`;
+  const receipt = [
+    'RECIBO DE HABERES',
+    'Período: 08/2026',
+    row('Concepto', 'Remunerativos', 'No remunerativos', 'Descuentos'),
+    row('9000 Adicional\u0000 sintético', '100.000,00'),
+    row('9001 Aguinaldo', '', '20.000,00'),
+    row('9002 Retroactivo', '10.000,00'),
+    row('9003 Vacaciones', '10.000,00'),
+    row('9004 Premio', '10.000,00'),
+    row('9005 Comisión', '10.000,00'),
+    row('9006 Horas extra', '10.000,00'),
+    row('9007 Reintegro', '', '10.000,00'),
+    row('9008 Ajuste sintético', '-5.000,00'),
+    row('9100 Obra social Plan Sintético', '', '', '10.000,00'),
+    row('Totales', '145.000,00', '30.000,00', '10.000,00'),
+    'Neto a cobrar $ 165.000,00',
+  ].join('\n');
+  const result = extractArgentinePayroll(receipt, 'PDF_TEXT');
+  const unknown = result.lineItems.find(({ rawDescription }) => rawDescription === '9000 Adicional sintético');
+
+  assert.equal(result.settlementType, 'NORMAL');
+  assert.deepEqual(unknown, {
+    amount: '100000.00',
+    confidence: 0.86,
+    isRecurring: null,
+    itemType: 'EARNING',
+    normalizedConceptCode: null,
+    rawDescription: '9000 Adicional sintético',
+  });
+  assert.equal(result.lineItems.find(({ rawDescription }) => rawDescription === '9008 Ajuste sintético')?.amount, '-5000.00');
+  assert.deepEqual(
+    result.lineItems.filter(({ itemType, normalizedConceptCode }) => itemType === 'EARNING' && normalizedConceptCode)
+      .map(({ normalizedConceptCode, isRecurring }) => [normalizedConceptCode, isRecurring]),
+    [
+      ['SAC', false],
+      ['RETROACTIVE', false],
+      ['VACATION', false],
+      ['BONUS', false],
+      ['COMMISSION', false],
+      ['OVERTIME', false],
+      ['REIMBURSEMENT', false],
+    ],
+  );
+  assert.deepEqual(result.lineItems.find(({ itemType }) => itemType === 'DEDUCTION'), {
+    amount: '10000.00',
+    confidence: 0.86,
+    isRecurring: null,
+    itemType: 'DEDUCTION',
+    normalizedConceptCode: null,
+    rawDescription: 'Deducción',
+  });
+  assert.equal(/obra social|plan sintetico/i.test(JSON.stringify(result.lineItems)), false);
+  assert.equal(extractArgentinePayroll(`${receipt}\nTipo de liquidación: REINTEGRO`, 'PDF_TEXT').settlementType, 'REINTEGRO');
+  assert.equal(extractArgentinePayroll(`${receipt}\nTipo de liquidación: AJUSTE A FAVOR`, 'PDF_TEXT').settlementType, 'REINTEGRO');
+  assert.equal(extractArgentinePayroll(`${receipt}\nTipo de liquidación: DEVOLUCIÓN`, 'PDF_TEXT').settlementType, 'REINTEGRO');
+  assert.equal(extractArgentinePayroll(`${receipt}\nTipo de liquidación: CRÉDITO`, 'PDF_TEXT').settlementType, 'REINTEGRO');
+
+  const collisions = extractArgentinePayroll([
+    'RECIBO DE HABERES',
+    'Período: 08/2026',
+    row('Concepto', 'Remunerativos', 'No remunerativos', 'Descuentos'),
+    row('SAC sueldo básico', '10.000,00'),
+    row('Retroactivo sueldo básico', '10.000,00'),
+    row('Premio presentismo', '10.000,00'),
+    row('Antigüedad s/ sueldo básico', '2.000,00'),
+    row('Presentismo s/ sueldo básico', '3.000,00'),
+    row('1000 Sueldo básico', '20.000,00'),
+    row('Crédito devolución', '', '', '-5.000,00'),
+    row('Totales', '55.000,00', '0,00', '-5.000,00'),
+    'Neto a cobrar $ 60.000,00',
+  ].join('\n'), 'PDF_TEXT');
+  assert.deepEqual(
+    collisions.lineItems.map(({ normalizedConceptCode, isRecurring, itemType, amount, rawDescription }) =>
+      ({ normalizedConceptCode, isRecurring, itemType, amount, rawDescription })),
+    [
+      { normalizedConceptCode: 'SAC', isRecurring: false, itemType: 'EARNING', amount: '10000.00', rawDescription: 'SAC sueldo básico' },
+      { normalizedConceptCode: 'RETROACTIVE', isRecurring: false, itemType: 'EARNING', amount: '10000.00', rawDescription: 'Retroactivo sueldo básico' },
+      { normalizedConceptCode: 'BONUS', isRecurring: false, itemType: 'EARNING', amount: '10000.00', rawDescription: 'Premio presentismo' },
+      { normalizedConceptCode: 'SENIORITY', isRecurring: true, itemType: 'EARNING', amount: '2000.00', rawDescription: 'Antigüedad s/ sueldo básico' },
+      { normalizedConceptCode: 'ATTENDANCE', isRecurring: true, itemType: 'EARNING', amount: '3000.00', rawDescription: 'Presentismo s/ sueldo básico' },
+      { normalizedConceptCode: 'BASIC_SALARY', isRecurring: true, itemType: 'EARNING', amount: '20000.00', rawDescription: '1000 Sueldo básico' },
+      { normalizedConceptCode: null, isRecurring: null, itemType: 'DEDUCTION', amount: '-5000.00', rawDescription: 'Deducción' },
+    ],
+  );
+  assert.equal(collisions.basicAmount, '20000.00');
+  assert.equal(collisions.needsReview, false);
+});
+
 test('minimiza afiliación sindical, salud y cualquier deducción tabular', () => {
   const result = extractArgentinePayroll(`
 RECIBO DE SUELDO
@@ -320,6 +429,12 @@ Neto a cobrar $ 70.000,00
     { normalizedConceptCode: null, rawDescription: 'Deducción' },
   ]);
   assert.equal(JSON.stringify(deductions).match(/sindicat|obra social|health_insurance|union_dues/gi), null);
+
+  const ambiguous = extractArgentinePayroll('RECIBO DE SUELDO\nPeríodo: 08/2026\nPremio obra social $ 10.000,00\nTotal bruto $ 100.000,00\nTotal descuentos $ 10.000,00\nNeto a cobrar $ 90.000,00', 'PDF_TEXT');
+  assert.deepEqual(ambiguous.lineItems[0], {
+    amount: '10000.00', confidence: 0.84, isRecurring: null, itemType: 'DEDUCTION',
+    normalizedConceptCode: null, rawDescription: 'Deducción',
+  });
 
   const row = (description: string, deduction = '') => `${description.padEnd(50)}${''.padEnd(20)}${''.padEnd(20)}${deduction}`;
   const table = extractArgentinePayroll([

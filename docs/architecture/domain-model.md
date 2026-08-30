@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–015. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–016. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -33,7 +33,6 @@ erDiagram
     EXTRACTION_RUN ||--o{ EXTRACTED_FIELD : records
     EMPLOYMENT o|--o{ PAYROLL_SETTLEMENT : receives
     PAYROLL_SETTLEMENT ||--o{ PAYROLL_LINE_ITEM : contains
-    NORMALIZED_CONCEPT o|--o{ PAYROLL_LINE_ITEM : classifies
     USER ||--o{ USER_CORRECTION : makes
     EXTRACTION_RUN ||--o{ USER_CORRECTION : contextualizes
     EXTRACTED_FIELD o|--o{ USER_CORRECTION : corrects
@@ -69,6 +68,8 @@ Campos esenciales de Employment:
 - status y metadata mínima.
 
 El puesto actual vive todavía en Employment. Una futura PositionPeriod conservará cambios de puesto/categoría con vigencia sin sobrescribir historia; no está implementada.
+
+Los recibos sin asociación pueden producir una proyección `DETECTED` agrupada por nombre efectivo del empleador y moneda. Esa detección no crea ni modifica Employment: sólo una confirmación explícita crea o reutiliza Employer, crea Employment y asocia los documentos propios coincidentes.
 
 ### ImportBatch
 
@@ -129,19 +130,20 @@ Tipos iniciales:
 - LIQUIDACION_FINAL;
 - INDEMNIZACION;
 - AJUSTE;
+- REINTEGRO;
 - OTRO_LABORAL.
 
-Además del tipo se registra si el ingreso es recurrente o extraordinario. Montos: básico, bruto, neto, remunerativo, no remunerativo y descuentos, todos decimales y con currencyCode.
+Además del tipo se registra si el ingreso es recurrente o extraordinario. Montos: básico, bruto, neto, remunerativo, no remunerativo y descuentos, todos decimales y con currencyCode. Remunerativo y no remunerativo se extraen y persisten sólo cuando la tabla aporta columnas reconocibles; de lo contrario permanecen N/D. `REINTEGRO` y el concepto normalizado `REIMBURSEMENT` representan créditos no recurrentes; un total de descuentos negativo se expone como reintegro/crédito y conserva internamente su signo.
 
-### PayrollLineItem y NormalizedConcept
+### PayrollLineItem y conceptos normalizados
 
-PayrollLineItem conserva rawDescription y el concepto normalizado opcional. Un concepto desconocido no se descarta ni se fuerza a una categoría incorrecta.
+PayrollLineItem conserva rawDescription y el código normalizado opcional para haberes. Un haber desconocido no se descarta ni se fuerza a una categoría incorrecta. Todas las deducciones individuales se minimizan de forma irreversible a `Deducción` e importe: nunca conservan obra social, sindicato, descripción original, código normalizado, recurrencia ni campo fuente.
 
 Campos:
 
 - rawDescription;
-- normalizedConceptId opcional;
-- exactAmount y currencyCode;
+- normalizedConceptCode opcional sólo para haberes;
+- amount decimal y currencyCode;
 - EARNING, DEDUCTION o INFORMATIONAL;
 - confidence, sourcePage y sourceField;
 - recurrencia cuando sea inferible.
@@ -271,4 +273,8 @@ Los detalles están en [Retención](../privacy/data-retention.md).
 
 ## Analytics
 
-Analytics sólo consume proyecciones estructuradas y verificadas. No abre PDFs ni texto OCR. Sus cálculos guardan fuente y versión cuando dependen de índices económicos futuros.
+Analytics sólo consume la última ExtractionRun `COMPLETED` de documentos PAYROLL cuyo estado también es `COMPLETED`; no abre PDFs ni texto OCR. Los documentos `NEEDS_REVIEW` aparecen en cobertura pendiente, pero sus importes quedan fuera de la proyección.
+
+La proyección derivada declara `calculationVersion = salary-analytics-v1` y no persiste agregados. Segmenta estrictamente por contexto laboral y currencyCode. `comparableSalary` usa exclusivamente basicAmount cuando el período tiene una liquidación `NORMAL` recurrente verificada y un básico único; falta o ambigüedad producen N/D, sin fallback a bruto o neto. Las operaciones monetarias usan BigInt sobre centavos y los porcentajes se obtienen por variación compuesta `(final / inicial) - 1`, nunca sumando porcentajes; cada resultado conserva período inicial y final.
+
+La proyección conserva múltiples liquidaciones de un mes, calcula situación actual, YTD, ventana móvil de doce meses, interanual exacto, evolución, totales/promedios anuales y separación `NORMAL`, `SAC`, `BONO`, `RETROACTIVO`, `VACACIONES`, `HORAS_EXTRA`, `AJUSTE`, `REINTEGRO` y otros. Los haberes normalizados permiten separar extraordinarios incluidos dentro de una liquidación normal. Una firma estructural sólo marca un posible duplicado entre documentos distintos; requiere confirmación humana y nunca elimina datos.

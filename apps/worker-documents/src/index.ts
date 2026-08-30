@@ -38,7 +38,7 @@ import {
 } from './storage.ts';
 
 const QUEUE_NAME = 'salarivo:processing-jobs:documents';
-const WORKER_VERSION = '4';
+const WORKER_VERSION = '5';
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
 
 type WorkerConfig = {
@@ -1187,10 +1187,11 @@ async function persistExtraction(
           `INSERT INTO payroll_settlements (
              id, user_id, document_id, extraction_run_id, employment_id, settlement_ordinal,
              payroll_period, settlement_type, is_recurring, currency_code,
-             basic_amount, gross_amount, net_amount, deductions_amount
+             basic_amount, gross_amount, net_amount, remunerative_amount,
+             non_remunerative_amount, deductions_amount
            ) VALUES ($1, $2, $3, $4,
              (SELECT employment_id FROM documents WHERE id = $3 AND user_id = $2),
-             1, $5, $6, $7, $8, $9, $10, $11, $12)
+             1, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
            RETURNING id`,
           [
             randomUUID(),
@@ -1204,6 +1205,8 @@ async function persistExtraction(
             extraction.basicAmount,
             extraction.grossAmount,
             extraction.netAmount,
+            extraction.remunerativeAmount,
+            extraction.nonRemunerativeAmount,
             extraction.deductionsAmount,
           ],
         );

@@ -3,7 +3,7 @@ import test from "node:test";
 
 test("Fastify registers every local route and rejects untrusted mutations", async (context) => {
   process.env.DATABASE_URL ??= "postgresql://unused:unused@127.0.0.1:1/unused";
-  const [{ buildApp, validateRegistrationLegalDocuments }, { loadConfig }, { derivedDocumentFilename }] = await Promise.all([
+  const [{ buildApp, validateEmploymentDates, validateRegistrationLegalDocuments }, { loadConfig }, { derivedDocumentFilename }] = await Promise.all([
     import("../src/app.ts"),
     import("../src/config.ts"),
     import("../src/data-routes.ts"),
@@ -21,6 +21,11 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
     (error: unknown) => typeof error === "object" && error !== null && "code" in error
       && error.code === "LEGAL_REVIEW_REQUIRED",
   );
+  const currentYear = new Date().getUTCFullYear();
+  assert.doesNotThrow(() => validateEmploymentDates(`${currentYear - 1}-01-01`, null));
+  assert.throws(() => validateEmploymentDates("0001-01-01", null));
+  assert.throws(() => validateEmploymentDates("1900-01-01", "2000-01-01"));
+  assert.throws(() => validateEmploymentDates(`${currentYear + 1}-01-01`, null));
   const app = await buildApp(loadConfig({ APP_ENV: "test", LOG_LEVEL: "silent" }), {
     provisionStorage: false,
   });

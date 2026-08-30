@@ -37,7 +37,9 @@ export type PayrollExtraction = {
   lineItems: PayrollLineItem[];
   needsReview: boolean;
   netAmount: string | null;
+  nonRemunerativeAmount: string | null;
   payrollPeriod: string | null;
+  remunerativeAmount: string | null;
   settlementType:
     | 'NORMAL'
     | 'SAC'
@@ -48,7 +50,8 @@ export type PayrollExtraction = {
     | 'HORAS_EXTRA'
     | 'LIQUIDACION_FINAL'
     | 'INDEMNIZACION'
-    | 'AJUSTE';
+    | 'AJUSTE'
+    | 'REINTEGRO';
 };
 
 const fold = (value: string) =>
@@ -287,7 +290,10 @@ function extractEmployer(lines: string[]): EmployerCandidate | null {
   return null;
 }
 
-const basicAmountLabels = [/\b(?:sueldo|salario|haber|remuneracion)\s+basic[oa]\b/, /^\s*basico\b/];
+const basicAmountLabels = [
+  /^\s*(?:\d{1,8}\s+)?(?:sueldo|salario|haber|remuneracion)\s+basic[oa]\b/,
+  /^\s*(?:\d{1,8}\s+)?basic[oa]\b/,
+];
 const grossAmountLabels = [/\b(?:total\s+(?:de\s+)?(?:haberes|remuneraciones)|haberes\s+totales|total\s+bruto|sueldo\s+bruto|remuneracion\s+bruta|importe\s+bruto)\b/];
 const netAmountLabels = [/\b(?:neto|liquido)\s+(?:a\s+)?(?:cobrar|pagar|percibir)\b/, /\b(?:total|importe|haber)\s+neto\b/, /\b(?:neto|liquido)\s+a\s*$/, /^\s*(?:neto|liquido)\s*$/];
 const deductionAmountLabels = [/\b(?:total\s+(?:de\s+)?(?:descuentos|deducciones|retenciones)|(?:descuentos|deducciones|retenciones)\s+totales)\b/];
@@ -387,7 +393,12 @@ function findPayrollTable(lines: string[]): PayrollTable | null {
   return null;
 }
 
-function extractTotalsTable(table: PayrollTable | null): { deductions: Amount; gross: Amount } | null {
+function extractTotalsTable(table: PayrollTable | null): {
+  deductions: Amount;
+  gross: Amount;
+  nonRemunerative: Amount;
+  remunerative: Amount;
+} | null {
   if (!table) return null;
   const [remunerative, nonRemunerative, deductions] = table.totals;
   if (!remunerative || !nonRemunerative || !deductions) return null;
@@ -401,6 +412,8 @@ function extractTotalsTable(table: PayrollTable | null): { deductions: Amount; g
       source: 'RULE',
       value: gross,
     },
+    nonRemunerative: { ...nonRemunerative, confidence: 0.84 },
+    remunerative: { ...remunerative, confidence: 0.84 },
   };
 }
 
@@ -408,16 +421,17 @@ function settlementType(text: string): PayrollExtraction['settlementType'] {
   const descriptors = text.split(/\r?\n/)
     .map((line) => fold(line).trim())
     .filter((line) => /^(?:tipo\s+(?:de\s+)?liquidacion|liquidacion|recibo\s+de)\b/.test(line)
-      || /^(?:sac|aguinaldo|vacaciones|bono|retroactiv[oa]|comision(?:es)?|horas?\s+extra|indemnizacion|ajuste)$/.test(line))
+      || /^(?:sac|aguinaldo|vacaciones|bono|premio|retroactiv[oa]|comision(?:es)?|horas?\s+extra|indemnizacion|ajuste(?:\s+a\s+favor)?|reintegro|devolucion|credito)$/.test(line))
     .join('\n');
   if (/\bliquidacion\s+final\b/.test(descriptors)) return 'LIQUIDACION_FINAL';
   if (/\bindemnizacion\b/.test(descriptors)) return 'INDEMNIZACION';
   if (/\b(?:sac|aguinaldo)\b/.test(descriptors)) return 'SAC';
   if (/\bvacaciones\b/.test(descriptors)) return 'VACACIONES';
-  if (/\bbono\b/.test(descriptors)) return 'BONO';
+  if (/\b(?:bono|premio)\b/.test(descriptors)) return 'BONO';
   if (/\bretroactiv[oa]\b/.test(descriptors)) return 'RETROACTIVO';
   if (/\bcomision(?:es)?\b/.test(descriptors)) return 'COMISION';
   if (/\bhoras?\s+extra\b/.test(descriptors)) return 'HORAS_EXTRA';
+  if (/\b(?:reintegro|devolucion|credito|ajuste\s+a\s+favor)\b/.test(descriptors)) return 'REINTEGRO';
   if (/\bajuste\b/.test(descriptors)) return 'AJUSTE';
   return 'NORMAL';
 }
@@ -428,20 +442,25 @@ const concepts: Array<{
   recurring: boolean;
   type: PayrollLineItem['itemType'];
 }> = [
-  { code: 'BASIC_SALARY', pattern: /sueldo\s+basico/, recurring: true, type: 'EARNING' },
-  { code: 'SENIORITY', pattern: /antiguedad/, recurring: true, type: 'EARNING' },
-  { code: 'ATTENDANCE', pattern: /presentismo/, recurring: true, type: 'EARNING' },
-  { code: 'OVERTIME', pattern: /horas?\s+extra/, recurring: false, type: 'EARNING' },
-  { code: 'BONUS', pattern: /\bbono\b/, recurring: false, type: 'EARNING' },
   { code: 'RETIREMENT', pattern: /jubilacion/, recurring: true, type: 'DEDUCTION' },
   { code: 'HEALTH_INSURANCE', pattern: /obra\s+social/, recurring: true, type: 'DEDUCTION' },
   { code: 'PAMI', pattern: /(?:ley\s*19\.?032|pami)/, recurring: true, type: 'DEDUCTION' },
   { code: 'INCOME_TAX', pattern: /(?:ganancias|impuesto\s+a\s+las\s+ganancias|(?:imp\.?|impuesto)\s+a\s+los\s+ingresos\s+personales)/, recurring: true, type: 'DEDUCTION' },
   { code: 'UNION_DUES', pattern: /(?:sindicato|cuota\s+sindical)/, recurring: true, type: 'DEDUCTION' },
+  { code: 'SAC', pattern: /\b(?:sac|aguinaldo)\b/, recurring: false, type: 'EARNING' },
+  { code: 'RETROACTIVE', pattern: /\bretroactiv[oa]s?\b/, recurring: false, type: 'EARNING' },
+  { code: 'VACATION', pattern: /\bvacacion(?:es)?\b/, recurring: false, type: 'EARNING' },
+  { code: 'BONUS', pattern: /\b(?:bonos?|premios?)\b/, recurring: false, type: 'EARNING' },
+  { code: 'COMMISSION', pattern: /\bcomision(?:es)?\b/, recurring: false, type: 'EARNING' },
+  { code: 'OVERTIME', pattern: /horas?\s+extra/, recurring: false, type: 'EARNING' },
+  { code: 'REIMBURSEMENT', pattern: /\b(?:reintegros?|devoluciones?|creditos?|ajustes?\s+a\s+favor)\b/, recurring: false, type: 'EARNING' },
+  { code: 'SENIORITY', pattern: /antiguedad/, recurring: true, type: 'EARNING' },
+  { code: 'ATTENDANCE', pattern: /presentismo/, recurring: true, type: 'EARNING' },
+  { code: 'BASIC_SALARY', pattern: /sueldo\s+basico/, recurring: true, type: 'EARNING' },
 ];
 
 function lineDescription(line: string, end: number): string | null {
-  const description = line.slice(0, Math.max(1, end)).trim().slice(0, 240);
+  const description = line.slice(0, Math.max(1, end)).replace(/[\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240);
   return /\p{L}/u.test(description) ? description : null;
 }
 
@@ -468,15 +487,15 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
         });
         continue;
       }
-      if (concept?.type !== 'EARNING') continue;
+      if (concept?.type === 'DEDUCTION') continue;
       const earning = mapped[0] ?? mapped[1];
-      if (!earning || earning.value.startsWith('-')) continue;
+      if (!earning) continue;
       items.push({
         amount: earning.value,
         confidence: 0.86,
-        isRecurring: concept.recurring,
+        isRecurring: concept?.recurring ?? null,
         itemType: 'EARNING',
-        normalizedConceptCode: concept.code,
+        normalizedConceptCode: concept?.code ?? null,
         rawDescription,
       });
     }
@@ -492,14 +511,14 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
     const amount = rawAmount ? parseArgentineAmount(rawAmount) : null;
     if (!concept || !amount) continue;
     items.push({
-      amount: amount.startsWith('-') ? amount.slice(1) : amount,
+      amount,
       confidence: 0.84,
       isRecurring: concept.type === 'DEDUCTION' ? null : concept.recurring,
       itemType: concept.type,
       normalizedConceptCode: concept.type === 'DEDUCTION' ? null : concept.code,
       rawDescription: concept.type === 'DEDUCTION'
         ? 'Deducción'
-        : line.slice(0, Math.max(1, line.length - (rawAmount?.length ?? 0))).trim().slice(0, 240),
+        : lineDescription(line, line.length - (rawAmount?.length ?? 0)) ?? 'Concepto salarial',
     });
   }
   return items;
@@ -543,6 +562,8 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
   const table = extractTotalsTable(payrollTable);
   const basic = extractAmount(lines, basicAmountLabels);
   const gross = table?.gross ?? extractAmount(lines, grossAmountLabels) ?? null;
+  const remunerative = table?.remunerative ?? null;
+  const nonRemunerative = table?.nonRemunerative ?? null;
   const deductions = table?.deductions ?? extractAmount(lines, deductionAmountLabels) ?? null;
   const netLabelFound = hasAmountLabel(lines, netAmountLabels);
   const derivedNet = table && netLabelFound ? subtractAmounts(table.gross.value, table.deductions.value) : null;
@@ -571,6 +592,8 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
     ['settlement.basicAmount', basic, hasAmountLabel(lines, basicAmountLabels)],
     ['settlement.grossAmount', gross, Boolean(payrollTable) || hasAmountLabel(lines, grossAmountLabels)],
     ['settlement.netAmount', net, netLabelFound],
+    ['settlement.remunerativeAmount', remunerative, Boolean(payrollTable)],
+    ['settlement.nonRemunerativeAmount', nonRemunerative, Boolean(payrollTable)],
     ['settlement.deductionsAmount', deductions, Boolean(payrollTable) || hasAmountLabel(lines, deductionAmountLabels)],
   ] as const) {
     if (amount) {
@@ -599,7 +622,9 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
     needsReview: !period || !gross || !net || !deductions || !totalsBalance(gross, deductions, net)
       || !deductionsMatchTotal(lineItems, deductions),
     netAmount: net?.value ?? null,
+    nonRemunerativeAmount: nonRemunerative?.value ?? null,
     payrollPeriod: period?.value ?? null,
+    remunerativeAmount: remunerative?.value ?? null,
     settlementType: type,
   };
 }
