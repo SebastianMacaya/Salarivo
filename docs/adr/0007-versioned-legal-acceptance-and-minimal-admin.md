@@ -21,8 +21,8 @@ Las nuevas versiones se incorporan por migración revisada. No se agrega todaví
 - La eliminación de cuenta borra sus acknowledgements personales; las versiones publicadas permanecen.
 - Revocar un rol en DB quita acceso en el siguiente request.
 - Promover administradores es una acción explícita de operador, fuera de endpoints públicos.
-- La versión 1.1 tiene aprobación operativa del titular sólo para acceso privado individual. Abrir cuentas a terceros requiere texto nuevo, identificación completa y revisión legal. La administración exige MFA según el ADR 0008.
+- La versión inicial 1.0 tiene aprobación operativa del titular sólo para acceso privado individual. Abrir cuentas a terceros requiere texto nuevo, identificación completa y revisión legal. La administración exige MFA según el ADR 0008.
 
 ## Evidencia
 
-Las migraciones `004_legal_acceptance_and_admin.sql` y `005_legal_policy_integrity.sql` crean y protegen las versiones iniciales; `012_publish_approved_legal_documents.sql` agrega la 1.1 sin mutar la 1.0. Las pruebas rechazan registro sin aceptación, con versión obsoleta, documentos no aprobados o escalamiento de rol; la integración acepta la 1.1 aprobada y verifica tipo, versión y timestamp de ambas evidencias; también niega el panel a `USER`, refleja promoción/revocación en la sesión existente y comprueba el shape sanitizado de la respuesta administrativa.
+Las migraciones `004_legal_acceptance_and_admin.sql` y `005_legal_policy_integrity.sql` crean el modelo y su protección. Antes del primer despliegue, `013_google_identity_foundation.sql` consolida las revisiones pre-lanzamiento sólo si la instancia no tiene usuarios ni aceptaciones y deja los textos aprobados como primera versión 1.0; luego restaura el trigger append-only. Las pruebas rechazan registro sin aceptación, con versión obsoleta, documentos no aprobados o escalamiento de rol; la integración acepta la 1.0 aprobada y verifica tipo, versión y timestamp de ambas evidencias; también niega el panel a `USER`, refleja promoción/revocación en la sesión existente y comprueba el shape sanitizado de la respuesta administrativa.

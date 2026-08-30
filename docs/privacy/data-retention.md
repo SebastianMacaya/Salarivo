@@ -106,6 +106,6 @@ Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se 
 - semántica exacta de borrado de ExtractionRun;
 - proveedor y lifecycle de backups;
 - plazos y comunicación del borrado diferido en producción;
-- verificación operativa de la retención de evidencia de aceptación y del mapping de identidad externa antes de producción; la versión legal 1.2 ya fue aprobada para la instancia privada.
+- verificación operativa de la retención de evidencia de aceptación y del mapping de identidad externa antes de producción; la versión legal inicial 1.0 ya fue aprobada para la instancia privada.
 
 Estas decisiones requieren producto, seguridad y asesoramiento legal aplicable; no deben inventarse en código.

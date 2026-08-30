@@ -267,41 +267,27 @@ test("upload privado crea un único documento y un único intent durable", async
   const suffix = crypto.randomUUID();
   const publicTerms = await app.inject({ method: "GET", url: "/api/v1/legal/terms" });
   assert.equal(publicTerms.statusCode, 200, publicTerms.body);
-  assert.equal(publicTerms.json().data.version, "1.2");
+  assert.equal(publicTerms.json().data.version, "1.0");
   assert.doesNotMatch(publicTerms.json().data.content, /(?:^|\n)(?:BORRADOR|TODO)\b|revisión legal antes de producción/i);
   const publicPrivacy = await app.inject({ method: "GET", url: "/api/v1/legal/privacy" });
   assert.equal(publicPrivacy.statusCode, 200, publicPrivacy.body);
-  assert.equal(publicPrivacy.json().data.version, "1.2");
-  const historicalTerms = await app.inject({ method: "GET", url: "/api/v1/legal/terms?version=1.0" });
-  assert.equal(historicalTerms.statusCode, 200, historicalTerms.body);
+  assert.equal(publicPrivacy.json().data.version, "1.0");
+  const versionedTerms = await app.inject({ method: "GET", url: "/api/v1/legal/terms?version=1.0" });
+  assert.equal(versionedTerms.statusCode, 200, versionedTerms.body);
   await assert.rejects(
     () => pool.query("UPDATE legal_document_versions SET title = title WHERE document_type = 'TERMS' AND version = '1.0'"),
     /append-only/,
   );
   const approvedDocuments = await pool.query(
-    `SELECT document_type, approved_for_production
+    `SELECT document_type, version, approved_for_production
        FROM legal_document_versions
-      WHERE version = '1.1'
       ORDER BY document_type`,
   );
   assert.deepEqual(
     approvedDocuments.rows,
     [
-      { document_type: "PRIVACY_NOTICE", approved_for_production: true },
-      { document_type: "TERMS", approved_for_production: true },
-    ],
-  );
-  const currentDocuments = await pool.query(
-    `SELECT document_type, approved_for_production
-       FROM legal_document_versions
-      WHERE version = '1.2'
-      ORDER BY document_type`,
-  );
-  assert.deepEqual(
-    currentDocuments.rows,
-    [
-      { document_type: "PRIVACY_NOTICE", approved_for_production: true },
-      { document_type: "TERMS", approved_for_production: true },
+      { document_type: "PRIVACY_NOTICE", version: "1.0", approved_for_production: true },
+      { document_type: "TERMS", version: "1.0", approved_for_production: true },
     ],
   );
   const productionApp = await buildApp(
@@ -322,8 +308,8 @@ test("upload privado crea un único documento y un único intent durable", async
         password: "frase local segura 2026",
         acceptedTerms: true,
         acknowledgedPrivacy: true,
-        termsVersion: "1.2",
-        privacyVersion: "1.2",
+        termsVersion: "1.0",
+        privacyVersion: "1.0",
       },
     });
     assert.equal(productionRegistration.statusCode, 403, productionRegistration.body);
@@ -363,8 +349,8 @@ test("upload privado crea un único documento y un único intent durable", async
       payload: {
         acceptedTerms: true,
         acknowledgedPrivacy: true,
-        termsVersion: "1.2",
-        privacyVersion: "1.2",
+        termsVersion: "1.0",
+        privacyVersion: "1.0",
       },
     });
     assert.equal(productionGoogleRegistration.statusCode, 201, productionGoogleRegistration.body);
@@ -401,8 +387,8 @@ test("upload privado crea un único documento y un único intent durable", async
       password: "frase local segura 2026",
       acceptedTerms: true,
       acknowledgedPrivacy: true,
-      termsVersion: "1.2",
-      privacyVersion: "1.2",
+      termsVersion: "1.0",
+      privacyVersion: "1.0",
     },
   });
   assert.equal(disabledPasswordRegistration.statusCode, 403, disabledPasswordRegistration.body);
@@ -474,8 +460,8 @@ test("upload privado crea un único documento y un único intent durable", async
     payload: {
       acceptedTerms: true,
       acknowledgedPrivacy: true,
-      termsVersion: "1.2",
-      privacyVersion: "1.2",
+      termsVersion: "1.0",
+      privacyVersion: "1.0",
     },
   });
   assert.equal(googleRegistration.statusCode, 201, googleRegistration.body);
@@ -502,7 +488,7 @@ test("upload privado crea un único documento y un único intent durable", async
       `SELECT count(*)::integer AS count
          FROM legal_acknowledgements acknowledgement
          JOIN legal_document_versions version ON version.id = acknowledgement.document_version_id
-        WHERE acknowledgement.user_id = $1 AND version.version = '1.2'`,
+        WHERE acknowledgement.user_id = $1 AND version.version = '1.0'`,
       [googleUserId],
     )).rows[0].count,
     2,
@@ -684,8 +670,8 @@ test("upload privado crea un único documento y un único intent durable", async
     payload: {
       acceptedTerms: true,
       acknowledgedPrivacy: true,
-      termsVersion: "1.2",
-      privacyVersion: "1.2",
+      termsVersion: "1.0",
+      privacyVersion: "1.0",
     },
   })));
   assert.deepEqual(
@@ -892,7 +878,7 @@ test("upload privado crea un único documento y un único intent durable", async
   );
   assert.deepEqual(
     legalAcknowledgements.rows.map((row) => [row.document_type, row.version]),
-    [["PRIVACY_NOTICE", "1.2"], ["TERMS", "1.2"]],
+    [["PRIVACY_NOTICE", "1.0"], ["TERMS", "1.0"]],
   );
   assert.ok(legalAcknowledgements.rows.every((row) => row.accepted_at instanceof Date));
   const deniedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieB } });

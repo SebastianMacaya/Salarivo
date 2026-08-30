@@ -9,8 +9,8 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
     import("../src/data-routes.ts"),
   ]);
   const approvedLegalDocuments = [
-    { id: "terms", document_type: "TERMS", version: "1.1", requires_acceptance: true, approved_for_production: true },
-    { id: "privacy", document_type: "PRIVACY_NOTICE", version: "1.1", requires_acceptance: false, approved_for_production: true },
+    { id: "terms", document_type: "TERMS", version: "1.0", requires_acceptance: true, approved_for_production: true },
+    { id: "privacy", document_type: "PRIVACY_NOTICE", version: "1.0", requires_acceptance: false, approved_for_production: true },
   ];
   assert.doesNotThrow(() => validateRegistrationLegalDocuments("production", approvedLegalDocuments));
   assert.throws(

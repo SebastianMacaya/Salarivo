@@ -116,7 +116,7 @@ Las alertas sólo incluyen IDs internos y códigos.
 ## Riesgos abiertos
 
 - Proceso operativo de alta, recuperación y revocación para administradores.
-- Validación operativa de Google OIDC y rotación del client secret antes de producción; la versión legal 1.2 ya fue aprobada para la instancia privada.
+- Validación operativa de Google OIDC y rotación del client secret antes de producción; la versión legal inicial 1.0 ya fue aprobada para la instancia privada.
 - Rate limit compartido y configuración probada de proxy/IP antes de escalar la API a múltiples réplicas.
 - Auditoría durable y alertas sanitizadas para intentos MFA denegados o bloqueados.
 - Alerta y procedimiento verificado para recuperar un `execution_owner` huérfano sin borrar temporales de un proceso vivo.

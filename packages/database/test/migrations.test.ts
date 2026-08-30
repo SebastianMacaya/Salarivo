@@ -82,7 +82,12 @@ test("Google identity migration keeps provider identity separate and transient O
   assert.match(sql, /CREATE INDEX oauth_attempts_step_up_idx/);
   assert.doesNotMatch(`${accounts}\n${attempts}`, /^\s*(?:access_token|refresh_token|id_token)\s/im);
 
-  assert.equal(sql.match(/\n    '1\.2',/g)?.length, 2);
+  assert.match(sql, /IF EXISTS \(SELECT 1 FROM users\)/);
+  assert.match(sql, /OR EXISTS \(SELECT 1 FROM legal_acknowledgements\)/);
+  assert.match(sql, /prelaunch legal reset requires an unused instance/);
+  assert.match(sql, /DROP TRIGGER legal_document_versions_append_only/);
+  assert.match(sql, /DELETE FROM legal_document_versions/);
+  assert.equal(sql.match(/\n    '1\.0',/g)?.length, 2);
   assert.doesNotMatch(sql, /contraseñas?/i);
   assert.match(sql, /alcances openid, email y profile/);
   assert.match(sql, /no persiste access tokens, refresh tokens ni ID tokens/);

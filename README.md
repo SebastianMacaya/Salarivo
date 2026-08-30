@@ -60,7 +60,7 @@ El rol `ADMIN` nunca se acepta desde registro ni desde la web. En una instalaci�
 docker compose exec postgres psql -U salarivo -d salarivo -c "UPDATE users SET role = 'ADMIN', updated_at = now() WHERE email = 'tu-email@example.com';"
 ~~~
 
-Las versiones legales 1.1 y 1.2 están cerradas y aprobadas por el titular para esta vista privada de uso individual; 1.2 es la vigente para el alta exclusiva con Google. Ninguna equivale a una revisión profesional ni habilita acceso de terceros; esa ampliación requiere una versión nueva con identidad, domicilio, canal y operación legal acordes al servicio real.
+La versión legal 1.0 está cerrada y aprobada por el titular para esta vista privada de uso individual y es la primera vigente para el alta exclusiva con Google. Ninguna aprobación equivale a una revisión profesional ni habilita acceso de terceros; esa ampliación requiere una versión nueva con identidad, domicilio, canal y operación legal acordes al servicio real.
 
 Para detener todo sin borrar los volúmenes:
 

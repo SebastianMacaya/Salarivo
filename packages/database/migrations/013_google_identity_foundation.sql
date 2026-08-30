@@ -89,6 +89,18 @@ CREATE INDEX oauth_attempts_step_up_idx
     ON oauth_attempts (user_id, session_id, created_at DESC)
     WHERE purpose = 'STEP_UP';
 
+DO $prelaunch_legal_reset$
+BEGIN
+    IF EXISTS (SELECT 1 FROM users)
+       OR EXISTS (SELECT 1 FROM legal_acknowledgements) THEN
+        RAISE EXCEPTION 'prelaunch legal reset requires an unused instance';
+    END IF;
+END;
+$prelaunch_legal_reset$;
+
+DROP TRIGGER legal_document_versions_append_only ON legal_document_versions;
+DELETE FROM legal_document_versions;
+
 INSERT INTO legal_document_versions (
     id, document_type, version, locale, title, content,
     published_at, effective_at, requires_acceptance, approved_for_production
@@ -96,7 +108,7 @@ INSERT INTO legal_document_versions (
 (
     '00000000-0000-4000-8000-000000000131',
     'TERMS',
-    '1.2',
+    '1.0',
     'es-AR',
     'Términos de uso de Salarivo — acceso privado individual',
     $terms$1. Alcance y aceptación
@@ -154,7 +166,7 @@ Cada versión se conserva de forma inmutable con su fecha de vigencia. Una versi
 (
     '00000000-0000-4000-8000-000000000132',
     'PRIVACY_NOTICE',
-    '1.2',
+    '1.0',
     'es-AR',
     'Aviso de privacidad de Salarivo — acceso privado individual',
     $privacy$1. Alcance y responsable
@@ -213,3 +225,7 @@ Cada versión del Aviso se conserva de forma inmutable con su fecha de vigencia 
     false,
     true
 );
+
+CREATE TRIGGER legal_document_versions_append_only
+    BEFORE UPDATE OR DELETE ON legal_document_versions
+    FOR EACH ROW EXECUTE FUNCTION reject_legal_document_version_mutation();

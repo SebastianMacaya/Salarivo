@@ -1,14 +1,14 @@
 # Políticas legales del MVP
 
-> Estado: versiones 1.1 y 1.2 aprobadas por el titular exclusivamente para acceso privado individual. La revisión 1.2 es la vigente para producción. Ninguna constituye certificación jurídica ni autorización para abrir cuentas a terceros.
+> Estado: versión inicial 1.0 aprobada por el titular exclusivamente para acceso privado individual. Es la vigente para producción. No constituye certificación jurídica ni autorización para abrir cuentas a terceros.
 
-Las versiones que muestra el producto viven en `legal_document_versions` y se crean únicamente mediante migraciones revisadas. Un trigger las hace append-only: corregir o cambiar un texto requiere una versión nueva, no editar la ya aceptada. Cada versión indica además si fue aprobada para producción; el alta productiva falla cerrada cuando los Términos o el Aviso vigentes no lo están. La ruta pública puede resolver la versión vigente o una versión histórica exacta. La 1.0 permanece como antecedente, la 1.1 conserva sus aceptaciones históricas y la 1.2 es la versión vigente y aprobada para la vista privada.
+Las versiones que muestra el producto viven en `legal_document_versions` y se crean únicamente mediante migraciones revisadas. Un trigger las hace append-only: corregir o cambiar un texto requiere una versión nueva, no editar la ya aceptada. Cada versión indica además si fue aprobada para producción; el alta productiva falla cerrada cuando los Términos o el Aviso vigentes no lo están. La ruta pública puede resolver la versión vigente o una versión histórica exacta. Como excepción anterior al primer despliegue, la migración de Google consolida las revisiones pre-lanzamiento sólo cuando no existen usuarios ni aceptaciones y publica los textos aprobados como 1.0; después restaura la protección append-only.
 
 Al registrar una cuenta, la API resuelve del lado servidor los Términos y el Aviso vigentes para `es-AR`. El alta local por email y contraseña está deshabilitada. En Google, el callback verifica la identidad y deja un intento de registro breve ligado al navegador, pero no crea una cuenta activa: el segundo paso crea usuario, aceptación/confirmación, relación `(provider, sub)`, sesión y auditoría en una sola transacción, con onboarding todavía pendiente. No se confía en un ID/version enviado por el navegador.
 
-Google actúa sólo como proveedor de autenticación. Salarivo mantiene un UUID y una sesión propios, no usa el email para identificar ni auto-vincular cuentas y no persiste access, refresh ni ID tokens. La revisión 1.2 describe este destinatario y flujo mínimo de datos y fue aprobada expresamente para la instancia privada; esa aprobación no autoriza abrir cuentas al público.
+Google actúa sólo como proveedor de autenticación. Salarivo mantiene un UUID y una sesión propios, no usa el email para identificar ni auto-vincular cuentas y no persiste access, refresh ni ID tokens. La versión 1.0 describe este destinatario y flujo mínimo de datos y fue aprobada expresamente para la instancia privada; esa aprobación no autoriza abrir cuentas al público.
 
-La versión 1.1 limita expresamente su alcance al titular y distingue tres usos:
+La versión 1.0 limita expresamente su alcance al titular y distingue tres usos:
 
 - prestar las funciones solicitadas con los datos privados de la cuenta;
 - mejorar seguridad, fallos y rendimiento sólo con telemetría minimizada que no lleve PDFs, OCR, salarios reales ni PII completa;

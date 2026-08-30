@@ -13,7 +13,7 @@ const effectiveAt = '2026-08-30T12:30:00.000Z';
 export const publishedLegalDocuments: Record<'terms' | 'privacy', PublishedLegalDocument> = {
   terms: {
     documentType: 'TERMS',
-    version: '1.2',
+    version: '1.0',
     locale: 'es-AR',
     title: 'Términos de uso de Salarivo — acceso privado individual',
     effectiveAt,
@@ -68,7 +68,7 @@ Cada versión se conserva de forma inmutable con su fecha de vigencia. Una versi
   },
   privacy: {
     documentType: 'PRIVACY_NOTICE',
-    version: '1.2',
+    version: '1.0',
     locale: 'es-AR',
     title: 'Aviso de privacidad de Salarivo — acceso privado individual',
     effectiveAt,

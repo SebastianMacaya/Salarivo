@@ -20,7 +20,7 @@ El alta conserva además la regla del ADR 0007: no existe una cuenta activa ante
 - Una cuenta Google-only completa step-up mediante otra autorización con `max_age=0`, ligada a la sesión y al propósito originales. Al completarse rota la sesión. Revocar otras sesiones conserva sólo la actual.
 - El método de autenticación no cambia ningún guard ni consulta de ownership: documentos, empleos, imports, liquidaciones, analytics, exports, storage, OCR y privacidad siguen autorizados exclusivamente por el UUID de la sesión.
 - La configuración se limita a `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` y `GOOGLE_OAUTH_REDIRECT_URI`.
-- La versión legal 1.2 fue aprobada expresamente para la instancia privada. El alta local por email y contraseña queda deshabilitada y las cuentas nuevas usan Google; el login local se conserva sólo para cuentas existentes. Esta integración no levanta el NO-GO para un backend público ni para datos reales.
+- La versión legal inicial 1.0 fue aprobada expresamente para la instancia privada. El alta local por email y contraseña queda deshabilitada y las cuentas nuevas usan Google; el login local se conserva sólo para cuentas existentes. Esta integración no levanta el NO-GO para un backend público ni para datos reales.
 
 ## Alternativas descartadas
 
