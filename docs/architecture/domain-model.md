@@ -172,6 +172,8 @@ Evidencia por campo dentro de una ExtractionRun. Puede materializarse como filas
 
 Empresa, período, básico, bruto, neto y total de descuentos pasan por esta representación. Los conceptos se conservan directamente como PayrollLineItem trazable dentro de la misma ExtractionRun. No alcanza con un confidence global de la corrida.
 
+Un campo esperado ausente puede conservarse como evidencia trazable con `interpretedValue` en `null` y un `signals.missingReason` sanitizado. Esa evidencia explica la ausencia; nunca autoriza a inventar un valor.
+
 ### UserCorrection
 
 Corrección append-only que conserva documentId, extractionRunId, fieldPath, extractedValue, correctedValue y timestamp. Puede referenciar un ExtractedField o completar un monto ausente sin fingir que fue extraído. La proyección actual elige la corrección vigente dentro de la ExtractionRun seleccionada; la precedencia entre corridas aún no está implementada.

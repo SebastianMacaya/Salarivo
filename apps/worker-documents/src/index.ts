@@ -38,7 +38,7 @@ import {
 } from './storage.ts';
 
 const QUEUE_NAME = 'salarivo:processing-jobs:documents';
-const WORKER_VERSION = '3';
+const WORKER_VERSION = '4';
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
 
 type WorkerConfig = {
@@ -1164,7 +1164,7 @@ async function persistExtraction(
           `INSERT INTO extracted_fields (
              id, user_id, document_id, extraction_run_id, field_path, entity_type,
              raw_value, interpreted_value, confidence, source, extractor_version, signals
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, '{}'::jsonb)`,
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb)`,
           [
             randomUUID(),
             job.user_id,
@@ -1177,6 +1177,7 @@ async function persistExtraction(
             field.confidence,
             field.source,
             WORKER_VERSION,
+            JSON.stringify(field.signals ?? {}),
           ],
         );
       }

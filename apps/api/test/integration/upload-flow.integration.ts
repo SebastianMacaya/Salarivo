@@ -1452,14 +1452,19 @@ test("upload privado crea un único documento y un único intent durable", async
   await pool.query(
     `INSERT INTO extracted_fields (
        id, user_id, document_id, extraction_run_id, field_path, entity_type,
-       raw_value, interpreted_value, confidence, source, extractor_version
+       raw_value, interpreted_value, confidence, source, extractor_version, signals
      ) VALUES
-       ($1, $2, $3, $4, 'employer.name', 'EMPLOYER', 'Empresa Sintética SA', $5::jsonb, 0.9, 'PDF_TEXT', '3'),
-       ($6, $2, $3, $4, 'settlement.payrollPeriod', 'PAYROLL_SETTLEMENT', '08/2026', $7::jsonb, 0.9, 'PDF_TEXT', '3'),
-       ($8, $2, $3, $4, 'settlement.deductionsAmount', 'PAYROLL_SETTLEMENT', '180.00', $9::jsonb, 0.9, 'RULE', '3')`,
+       ($1, $2, $3, $4, 'employer.name', 'EMPLOYER', 'Empresa Sintética SA', $5::jsonb, 0.9, 'PDF_TEXT', '3', '{}'::jsonb),
+       ($6, $2, $3, $4, 'settlement.payrollPeriod', 'PAYROLL_SETTLEMENT', '08/2026', $7::jsonb, 0.9, 'PDF_TEXT', '3', '{}'::jsonb),
+       ($8, $2, $3, $4, 'settlement.grossAmount', 'PAYROLL_SETTLEMENT', '', 'null'::jsonb, 0, 'RULE', '3', $9::jsonb),
+       ($10, $2, $3, $4, 'settlement.netAmount', 'PAYROLL_SETTLEMENT', '', 'null'::jsonb, 0, 'RULE', '3', $11::jsonb),
+       ($12, $2, $3, $4, 'settlement.deductionsAmount', 'PAYROLL_SETTLEMENT', '180.00', $13::jsonb, 0.9, 'RULE', '3', '{}'::jsonb)`,
     [
       crypto.randomUUID(), userId, documentId, runId, JSON.stringify("Empresa Sintética SA"),
-      crypto.randomUUID(), JSON.stringify("2026-08"), deductionsFieldId,
+      crypto.randomUUID(), JSON.stringify("2026-08"),
+      crypto.randomUUID(), JSON.stringify({ missingReason: "LABEL_OR_LAYOUT_NOT_RECOGNIZED" }),
+      crypto.randomUUID(), JSON.stringify({ missingReason: "VALUE_NOT_INTERPRETABLE" }),
+      deductionsFieldId,
       JSON.stringify({ amount: "180.00", currencyCode: "ARS" }),
     ],
   );
@@ -1468,7 +1473,7 @@ test("upload privado crea un único documento y un único intent durable", async
        id, user_id, document_id, extraction_run_id, settlement_ordinal,
        payroll_period, settlement_type, is_recurring, currency_code,
        gross_amount, net_amount, deductions_amount
-     ) VALUES ($1, $2, $3, $4, 1, '2026-08-01', 'NORMAL', true, 'ARS', 1000.00, 820.00, 180.00)`,
+     ) VALUES ($1, $2, $3, $4, 1, '2026-08-01', 'NORMAL', true, 'ARS', NULL, NULL, 180.00)`,
     [settlementId, userId, documentId, runId],
   );
   await pool.query(
@@ -1486,20 +1491,51 @@ test("upload privado crea un único documento y un único intent durable", async
   await pool.query("UPDATE import_batch_items SET status = 'NEEDS_REVIEW' WHERE id = $1", [batchData.items[0]!.id]);
   const reviewDetail = await app.inject({ method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieA } });
   assert.equal(reviewDetail.statusCode, 200, reviewDetail.body);
-  const reviewFields = reviewDetail.json().data.extractedFields as Array<{ id: string | null; fieldPath: string; source: string }>;
+  const reviewFields = reviewDetail.json().data.extractedFields as Array<{
+    id: string | null; fieldPath: string; source: string; missingReason?: string;
+  }>;
   assert.deepEqual(
     reviewFields.filter(({ source }) => source === "MANUAL_REQUIRED").map(({ fieldPath }) => fieldPath).sort(),
     ["settlement.grossAmount", "settlement.netAmount"],
   );
-  for (const [fieldPath, correctedValue] of [["settlement.grossAmount", "1000.00"], ["settlement.netAmount", "820.00"]]) {
+  assert.deepEqual(
+    Object.fromEntries(reviewFields.filter(({ missingReason }) => missingReason).map(({ fieldPath, missingReason }) => [fieldPath, missingReason])),
+    {
+      "settlement.grossAmount": "LABEL_OR_LAYOUT_NOT_RECOGNIZED",
+      "settlement.netAmount": "VALUE_NOT_INTERPRETABLE",
+    },
+  );
+  for (const [fieldPath, correctedValue] of [["settlement.grossAmount", "1100.00"], ["settlement.netAmount", "820.00"]]) {
+    const target = reviewFields.find((field) => field.fieldPath === fieldPath);
+    assert.ok(target?.id);
     const manualCorrection = await app.inject({
       method: "POST",
       url: `/api/v1/documents/${documentId}/corrections`,
       headers: { origin, cookie: cookieA },
-      payload: { fieldPath, correctedValue },
+      payload: { extractedFieldId: target.id, correctedValue },
     });
     assert.equal(manualCorrection.statusCode, 201, manualCorrection.body);
   }
+  const mismatchedSettlement = (await app.inject({ method: "GET", url: "/api/v1/settlements", headers: { cookie: cookieA } }))
+    .json().data.find((row: { documentId: string }) => row.documentId === documentId);
+  assert.equal(mismatchedSettlement.totalsBalance, false);
+  const blockedTotalsReview = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/review-complete`,
+    headers: { origin, cookie: cookieA },
+    payload: {},
+  });
+  assert.equal(blockedTotalsReview.statusCode, 409, blockedTotalsReview.body);
+  assert.equal(blockedTotalsReview.json().error.code, "TOTALS_MISMATCH_REQUIRES_CORRECTION");
+  const grossField = reviewFields.find((field) => field.fieldPath === "settlement.grossAmount");
+  assert.ok(grossField?.id);
+  const correctedGross = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/corrections`,
+    headers: { origin, cookie: cookieA },
+    payload: { extractedFieldId: grossField.id, correctedValue: "1000.00" },
+  });
+  assert.equal(correctedGross.statusCode, 201, correctedGross.body);
   await pool.query("UPDATE documents SET retention_policy = 'DELETE_AFTER_PROCESSING' WHERE id = $1", [documentId]);
   const completedReview = await app.inject({
     method: "POST",

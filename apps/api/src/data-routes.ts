@@ -62,6 +62,8 @@ const requiredPayrollReviewPaths = [
   "settlement.netAmount",
   "settlement.deductionsAmount",
 ];
+const missingFieldReasons = ["LABEL_OR_LAYOUT_NOT_RECOGNIZED", "VALUE_NOT_INTERPRETABLE"] as const;
+type MissingFieldReason = (typeof missingFieldReasons)[number];
 const exportSections = [
   ["authAccounts", `SELECT provider, provider_account_id, created_at, updated_at, last_login_at
       FROM auth_accounts WHERE user_id = $1 ORDER BY provider`],
@@ -305,6 +307,12 @@ function displayExtracted(input: unknown): string | null {
   if (typeof input === "string" || typeof input === "number" || typeof input === "boolean") return String(input);
   if (typeof input === "object" && "amount" in input && typeof input.amount === "string") return input.amount;
   return JSON.stringify(input);
+}
+
+function readMissingFieldReason(signals: unknown): MissingFieldReason | undefined {
+  if (!signals || typeof signals !== "object") return undefined;
+  const value = (signals as { missingReason?: unknown }).missingReason;
+  return missingFieldReasons.find((reason) => reason === value);
 }
 
 function normalizeDecimal(input: string): string | null {
@@ -1131,7 +1139,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       );
       const extractionRunId = latestRun.rowCount ? String(latestRun.rows[0].id) : null;
       const fields = extractionRunId ? await pool.query(
-        `SELECT field.id, field.field_path, field.interpreted_value, field.confidence, field.source,
+        `SELECT field.id, field.field_path, field.interpreted_value, field.confidence, field.source, field.signals,
                 correction.corrected_value
            FROM extracted_fields field
            LEFT JOIN LATERAL (
@@ -1175,12 +1183,17 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         correctedValue: string | null;
         confidence: string;
         source: string;
-      }> = fields.rows.map((field) => ({
-        id: String(field.id), fieldPath: String(field.field_path),
-        interpretedValue: displayExtracted(field.interpreted_value),
-        correctedValue: displayExtracted(field.corrected_value),
-        confidence: String(field.confidence), source: String(field.source),
-      }));
+        missingReason?: MissingFieldReason;
+      }> = fields.rows.map((field) => {
+        const missingReason = readMissingFieldReason(field.signals);
+        return {
+          id: String(field.id), fieldPath: String(field.field_path),
+          interpretedValue: displayExtracted(field.interpreted_value),
+          correctedValue: displayExtracted(field.corrected_value),
+          confidence: String(field.confidence), source: String(field.source),
+          ...(missingReason ? { missingReason } : {}),
+        };
+      });
       if (document.rows[0].document_type === "PAYROLL") {
         const existingPaths = new Set(extractedFields.map(({ fieldPath }) => fieldPath));
         for (const fieldPath of requiredPayrollReviewPaths) {
@@ -1275,6 +1288,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 settlement.settlement_type,
                 settlement.currency_code, settlement.gross_amount, settlement.net_amount,
                 settlement.deductions_amount, run.confidence, settlement.document_id,
+                settlement.gross_amount IS NOT NULL AND settlement.net_amount IS NOT NULL
+                  AND settlement.deductions_amount IS NOT NULL
+                  AND settlement.gross_amount - settlement.deductions_amount = settlement.net_amount AS totals_balance,
                 CASE WHEN settlement.gross_amount > 0 AND settlement.deductions_amount IS NOT NULL
                   THEN round(settlement.deductions_amount * 100 / settlement.gross_amount, 2)::text
                   ELSE NULL END AS deductions_percentage,
@@ -1342,6 +1358,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         grossAmount: value(row, "gross_amount"), netAmount: value(row, "net_amount"),
         deductionsAmount: value(row, "deductions_amount"), confidence: value(row, "confidence"),
         deductionsPercentage: value(row, "deductions_percentage"), deductions: deductionViews(row.deductions),
+        totalsBalance: row.totals_balance === true,
         deductionsMatchTotal: row.deductions_match_total === true,
         deductionsDifferenceAmount: value(row, "deductions_difference_amount"),
         deductionsDifferenceKind: String(row.deductions_difference_kind),
@@ -1650,6 +1667,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         const settlement = await client.query(
           `SELECT settlement.id, settlement.extraction_run_id, settlement.payroll_period,
                   settlement.gross_amount, settlement.net_amount, settlement.deductions_amount,
+                  settlement.gross_amount IS NOT NULL AND settlement.net_amount IS NOT NULL
+                    AND settlement.deductions_amount IS NOT NULL
+                    AND settlement.gross_amount - settlement.deductions_amount = settlement.net_amount AS totals_balance,
                   settlement.deductions_amount IS NOT NULL
                     AND COALESCE(breakdown.total_amount, 0) = settlement.deductions_amount AS deductions_match_total
              FROM payroll_settlements settlement
@@ -1680,6 +1700,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         );
         if (Number(reviewed.rows[0].count) !== requiredPayrollReviewPaths.length) {
           throw new ApiError(409, "REVIEW_INCOMPLETE", "Revisá todos los campos obligatorios antes de finalizar.");
+        }
+        if (settlement.rows[0].totals_balance !== true) {
+          throw new ApiError(409, "TOTALS_MISMATCH_REQUIRES_CORRECTION", "Corregí bruto, descuentos o neto para que los totales coincidan.");
         }
         const acceptedDeductionsMismatch = settlement.rows[0].deductions_match_total !== true;
         if (acceptedDeductionsMismatch && request.body?.acceptDeductionsMismatch !== true) {

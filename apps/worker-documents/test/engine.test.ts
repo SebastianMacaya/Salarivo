@@ -181,6 +181,15 @@ Contribución Jubilación                                  $ 120.000,00
 
   const malformedTotal = extractArgentinePayroll(`RECIBO DE HABERES\nPeríodo: 07/2026\nTotal bruto 1.2.34\nNeto a cobrar $ 1.000,00`, 'PDF_TEXT');
   assert.equal(malformedTotal.grossAmount, null);
+  assert.equal(
+    malformedTotal.fields.find(({ fieldPath }) => fieldPath === 'settlement.grossAmount')?.signals?.missingReason,
+    'VALUE_NOT_INTERPRETABLE',
+  );
+  assert.equal(malformedTotal.fields.find(({ fieldPath }) => fieldPath === 'settlement.basicAmount')?.signals?.missingReason, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED');
+  assert.equal(malformedTotal.fields.find(({ fieldPath }) => fieldPath === 'employer.name')?.signals?.missingReason, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED');
+
+  const malformedPeriod = extractArgentinePayroll('RECIBO DE HABERES\nPeríodo: desconocido', 'PDF_TEXT');
+  assert.equal(malformedPeriod.fields.find(({ fieldPath }) => fieldPath === 'settlement.payrollPeriod')?.signals?.missingReason, 'VALUE_NOT_INTERPRETABLE');
 
   const adjacentLabel = extractArgentinePayroll(`RECIBO DE HABERES\nPeríodo: 07/2026\nTotal bruto\nTotal descuentos $ 250.000,00\nNeto a cobrar $ 1.000.000,00`, 'PDF_TEXT');
   assert.equal(adjacentLabel.grossAmount, null);
@@ -200,6 +209,53 @@ Contribución Jubilación                                  $ 120.000,00
 
   const shifted = extractArgentinePayroll(`RECIBO DE HABERES\nPeríodo: 07/2026\nRemunerativos  No remunerativos  Retenciones\nTotal                                              1.000,00 200,00 100,00\nNeto a pagar $ 1.100,00`, 'PDF_TEXT');
   assert.equal(shifted.grossAmount, null);
+  assert.equal(
+    shifted.fields.find(({ fieldPath }) => fieldPath === 'settlement.grossAmount')?.signals?.missingReason,
+    'LABEL_OR_LAYOUT_NOT_RECOGNIZED',
+  );
+
+  const ambiguous = extractArgentinePayroll(`RECIBO DE HABERES\nPeríodo: 07/2026\nTotal bruto $ 1.000.000,00 $ 100.000,00 $ 200.000,00\nNeto a cobrar $ 800.000,00`, 'PDF_TEXT');
+  assert.equal(ambiguous.grossAmount, null);
+  assert.equal(ambiguous.needsReview, true);
+});
+
+test('lee tablas alineadas a derecha y deriva el neto sólo con evidencia suficiente', () => {
+  const header = `${' '.repeat(10)}Haberes con${' '.repeat(41)}Haberes sin`;
+  const deductionHeader = `${' '.repeat(75)}Descuentos`;
+  const totals = `${'Totales'.padEnd(48)}1.200.000,00  50.000,00 250.000,00`;
+  const deduction = `${'Jubilación'.padEnd(72)}250.000,00`;
+  const receipt = [
+    'RECIBO DE HABERES',
+    'Período: 08/2026',
+    header,
+    deductionHeader,
+    deduction,
+    totals,
+    'SON PESOS UN MILLÓN NETO A',
+  ].join('\n');
+  const result = extractArgentinePayroll(receipt, 'PDF_TEXT');
+
+  assert.equal(result.grossAmount, '1250000.00');
+  assert.equal(result.deductionsAmount, '250000.00');
+  assert.equal(result.netAmount, '1000000.00');
+  assert.equal(result.needsReview, false);
+  assert.equal(result.fields.find(({ fieldPath }) => fieldPath === 'settlement.netAmount')?.source, 'RULE');
+
+  const withoutNetEvidence = extractArgentinePayroll(receipt.replace('\nSON PESOS UN MILLÓN NETO A', ''), 'PDF_TEXT');
+  assert.equal(withoutNetEvidence.netAmount, null);
+  assert.equal(withoutNetEvidence.needsReview, true);
+  assert.equal(
+    withoutNetEvidence.fields.find(({ fieldPath }) => fieldPath === 'settlement.netAmount')?.signals?.missingReason,
+    'LABEL_OR_LAYOUT_NOT_RECOGNIZED',
+  );
+
+  const signed = extractArgentinePayroll(
+    receipt.replace('  50.000,00', ' -50.000,00').replace('UN MILLÓN', 'NOVECIENTOS MIL'),
+    'PDF_TEXT',
+  );
+  assert.equal(signed.grossAmount, '1150000.00');
+  assert.equal(signed.netAmount, '900000.00');
+  assert.equal(signed.needsReview, false);
 });
 
 test('separa descuentos del empleado de contribuciones y minimiza cada deducción', () => {
@@ -282,4 +338,12 @@ Neto a cobrar $ 70.000,00
 
 test('rechaza texto comercial sin señales salariales', () => {
   assert.equal(classifyPayrollText('FACTURA A\nIVA responsable inscripto\nTotal $ 100,00').decision, 'UNSUPPORTED');
+  assert.equal(
+    classifyPayrollText('Liquidación de impuesto a las ganancias\nRemuneración bruta\nDescuentos\nEmpleador').decision,
+    'UNSUPPORTED',
+  );
+  assert.equal(
+    classifyPayrollText('RECIBO DE HABERES\nSueldo básico\nDescuentos\nNeto\nLiquidación de impuesto a las ganancias').decision,
+    'SUPPORTED',
+  );
 });

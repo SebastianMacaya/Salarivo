@@ -122,6 +122,8 @@ Cada transición usa compare-and-set o transacción equivalente. Estados termina
 | 11 | IA futura | fallback mínimo, redactado y presupuestado |
 | 12 | validación | COMPLETED o NEEDS_REVIEW; el usuario puede completar montos ausentes y cerrar la revisión |
 
+El parser no inventa montos. El neto sólo puede derivarse de los totales de una tabla salarial reconocida cuando además existe una etiqueta explícita de neto, siempre con aritmética decimal exacta. Un valor ausente queda como evidencia trazable; si bruto, descuentos y neto no balancean, los valores extraídos se conservan pero el documento pasa a NEEDS_REVIEW y no puede cerrarse hasta corregirlos.
+
 Confirmar manualmente el tipo nunca salta malware, límites ni parse seguro.
 
 ## Clasificación por costo

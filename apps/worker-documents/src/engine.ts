@@ -1,5 +1,7 @@
 export type FieldSource = 'PDF_TEXT' | 'OCR' | 'RULE';
 
+export type MissingFieldReason = 'VALUE_NOT_INTERPRETABLE' | 'LABEL_OR_LAYOUT_NOT_RECOGNIZED';
+
 export type Classification = {
   confidence: number;
   decision: 'SUPPORTED' | 'NEEDS_CONFIRMATION' | 'UNSUPPORTED';
@@ -12,6 +14,7 @@ export type ExtractedField = {
   fieldPath: string;
   interpretedValue: unknown;
   rawValue: string;
+  signals?: { missingReason: MissingFieldReason };
   source: FieldSource;
 };
 
@@ -71,6 +74,7 @@ type PositionedAmount = Amount & { index: number };
 
 type PayrollTable = {
   columns: number[];
+  descriptionEnd: number;
   headerIndex: number;
   totalIndex: number;
   totals: PositionedAmount[];
@@ -220,6 +224,11 @@ export function classifyPayrollText(text: string, lowThreshold = 0.2, highThresh
     signals.push('documento_comercial');
     confidence -= 0.45;
   }
+  const hasPayrollTitle = signals.includes('recibo_sueldo') || signals.includes('liquidacion_haberes');
+  if (!hasPayrollTitle && /\bliquidacion\s+de\s+(?:impuesto\s+a\s+las\s+)?ganancias\b/.test(normalized)) {
+    signals.push('documento_fiscal');
+    confidence -= 0.45;
+  }
   confidence = Math.max(0, Math.min(1, Number(confidence.toFixed(2))));
   const decision = confidence >= highThreshold
     ? 'SUPPORTED'
@@ -280,7 +289,7 @@ function extractEmployer(lines: string[]): EmployerCandidate | null {
 
 const basicAmountLabels = [/\b(?:sueldo|salario|haber|remuneracion)\s+basic[oa]\b/, /^\s*basico\b/];
 const grossAmountLabels = [/\b(?:total\s+(?:de\s+)?(?:haberes|remuneraciones)|haberes\s+totales|total\s+bruto|sueldo\s+bruto|remuneracion\s+bruta|importe\s+bruto)\b/];
-const netAmountLabels = [/\b(?:neto|liquido)\s+(?:a\s+)?(?:cobrar|pagar|percibir)\b/, /\b(?:total|importe|haber)\s+neto\b/, /^\s*(?:neto|liquido)\s*$/];
+const netAmountLabels = [/\b(?:neto|liquido)\s+(?:a\s+)?(?:cobrar|pagar|percibir)\b/, /\b(?:total|importe|haber)\s+neto\b/, /\b(?:neto|liquido)\s+a\s*$/, /^\s*(?:neto|liquido)\s*$/];
 const deductionAmountLabels = [/\b(?:total\s+(?:de\s+)?(?:descuentos|deducciones|retenciones)|(?:descuentos|deducciones|retenciones)\s+totales)\b/];
 const settlementAmountLabels = [...basicAmountLabels, ...grossAmountLabels, ...netAmountLabels, ...deductionAmountLabels];
 
@@ -292,8 +301,11 @@ function extractAmount(lines: string[], labels: RegExp[]): Amount | null {
       const match = label.exec(normalized);
       if (!match) continue;
       const inlineNumber = /\d/.test(line.slice(match.index + match[0].length));
-      for (const [offset, candidate] of [line, lines[index + 1] ?? ''].entries()) {
-        if (offset && (inlineNumber || settlementAmountLabels.some((candidateLabel) => candidateLabel.test(fold(candidate))))) continue;
+      for (const [offset, candidate] of [line, lines[index + 1] ?? '', lines[index + 2] ?? ''].entries()) {
+        if (offset && (inlineNumber || settlementAmountLabels.some((candidateLabel) => candidateLabel.test(fold(candidate))))) break;
+        const formattedAmounts = amountsInLine(candidate).filter(({ raw }) =>
+          raw.includes('$') || /[.,]/.test(raw) || /\d[ \u00a0]\d{3}/.test(raw));
+        if (formattedAmounts.length > 1) break;
         const raw = amountAtEnd.exec(candidate)?.[0]?.trim();
         const value = raw ? parseArgentineAmount(raw) : null;
         const formatted = raw && (raw.includes('$') || /[.,]/.test(raw) || /\d[ \u00a0]\d{3}/.test(raw));
@@ -313,6 +325,10 @@ function addAmounts(left: string, right: string): string | null {
     : null;
 }
 
+function subtractAmounts(left: string, right: string): string | null {
+  return addAmounts(left, right.startsWith('-') ? right.slice(1) : `-${right}`);
+}
+
 function headerColumn(lines: string[], patterns: RegExp[]): number | null {
   for (const line of lines) {
     const normalized = fold(line);
@@ -327,13 +343,14 @@ function headerColumn(lines: string[], patterns: RegExp[]): number | null {
 function mapAmountsToColumns(amounts: PositionedAmount[], columns: number[]): Array<PositionedAmount | null> {
   const mapped: Array<PositionedAmount | null> = columns.map(() => null);
   for (const amount of amounts) {
+    const amountEnd = amount.index + amount.raw.length;
     let nearest = 0;
     for (let position = 1; position < columns.length; position += 1) {
-      if (Math.abs(amount.index - columns[position]!) < Math.abs(amount.index - columns[nearest]!)) nearest = position;
+      if (Math.abs(amountEnd - columns[position]!) < Math.abs(amountEnd - columns[nearest]!)) nearest = position;
     }
-    if (Math.abs(amount.index - columns[nearest]!) > 32) continue;
+    if (Math.abs(amountEnd - columns[nearest]!) > 32) continue;
     const current = mapped[nearest];
-    if (!current || Math.abs(amount.index - columns[nearest]!) < Math.abs(current.index - columns[nearest]!)) {
+    if (!current || Math.abs(amountEnd - columns[nearest]!) < Math.abs(current.index + current.raw.length - columns[nearest]!)) {
       mapped[nearest] = amount;
     }
   }
@@ -357,9 +374,14 @@ function findPayrollTable(lines: string[]): PayrollTable | null {
       if (!/\btotal(?:es)?\b/.test(fold(lines[row] ?? ''))) continue;
       const amounts = amountsInLine(lines[row] ?? '');
       if (amounts.length !== columns.length) continue;
-      const mapped = mapAmountsToColumns(amounts, columns);
-      if (mapped.some((amount) => amount === null)) continue;
-      return { columns, headerIndex: index, totalIndex: row, totals: mapped as PositionedAmount[] };
+      if (amounts.some((amount, position) => Math.abs(amount.index - columns[position]!) > (position ? 32 : 64))) continue;
+      return {
+        columns: amounts.map((amount) => amount.index + amount.raw.length),
+        descriptionEnd: requiredColumns[0]!,
+        headerIndex: index,
+        totalIndex: row,
+        totals: amounts,
+      };
     }
   }
   return null;
@@ -368,9 +390,9 @@ function findPayrollTable(lines: string[]): PayrollTable | null {
 function extractTotalsTable(table: PayrollTable | null): { deductions: Amount; gross: Amount } | null {
   if (!table) return null;
   const [remunerative, nonRemunerative, deductions] = table.totals;
-  if (!remunerative || !nonRemunerative || !deductions || [remunerative, nonRemunerative, deductions].some(({ value }) => value.startsWith('-'))) return null;
+  if (!remunerative || !nonRemunerative || !deductions) return null;
   const gross = addAmounts(remunerative.value, nonRemunerative.value);
-  if (!gross) return null;
+  if (!gross || gross.startsWith('-')) return null;
   return {
     deductions: { ...deductions, confidence: 0.84 },
     gross: {
@@ -431,11 +453,11 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
       const normalized = fold(line);
       const amounts = amountsInLine(line);
       const mapped = mapAmountsToColumns(amounts, table.columns);
-      const rawDescription = lineDescription(line, table.columns[0]!);
+      const rawDescription = lineDescription(line, table.descriptionEnd);
       if (!rawDescription) continue;
       const concept = concepts.find(({ pattern }) => pattern.test(normalized));
       const deduction = mapped[2];
-      if (deduction && !deduction.value.startsWith('-')) {
+      if (deduction) {
         items.push({
           amount: deduction.value,
           confidence: 0.86,
@@ -495,6 +517,25 @@ function deductionsMatchTotal(lineItems: PayrollLineItem[], deductions: Amount |
   return total === deductions.value;
 }
 
+function totalsBalance(gross: Amount | null, deductions: Amount | null, net: Amount | null): boolean {
+  return Boolean(gross && deductions && net && subtractAmounts(gross.value, deductions.value) === net.value);
+}
+
+function hasAmountLabel(lines: string[], labels: RegExp[]): boolean {
+  return lines.some((line) => labels.some((label) => label.test(fold(line))));
+}
+
+function missingField(fieldPath: string, fieldRecognized: boolean): ExtractedField {
+  return {
+    confidence: 0,
+    fieldPath,
+    interpretedValue: null,
+    rawValue: '',
+    signals: { missingReason: fieldRecognized ? 'VALUE_NOT_INTERPRETABLE' : 'LABEL_OR_LAYOUT_NOT_RECOGNIZED' },
+    source: 'RULE',
+  };
+}
+
 export function extractArgentinePayroll(text: string, source: Exclude<FieldSource, 'RULE'>): PayrollExtraction {
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
   const period = extractPeriod(text);
@@ -502,8 +543,15 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
   const table = extractTotalsTable(payrollTable);
   const basic = extractAmount(lines, basicAmountLabels);
   const gross = table?.gross ?? extractAmount(lines, grossAmountLabels) ?? null;
-  const net = extractAmount(lines, netAmountLabels);
   const deductions = table?.deductions ?? extractAmount(lines, deductionAmountLabels) ?? null;
+  const netLabelFound = hasAmountLabel(lines, netAmountLabels);
+  const derivedNet = table && netLabelFound ? subtractAmounts(table.gross.value, table.deductions.value) : null;
+  const net = extractAmount(lines, netAmountLabels) ?? (derivedNet ? {
+    confidence: 0.8,
+    raw: `${table!.gross.raw} - ${table!.deductions.raw}`,
+    source: 'RULE' as const,
+    value: derivedNet,
+  } : null);
   const employer = extractEmployer(lines);
   const employerName = employer?.value ?? null;
   const type = settlementType(text);
@@ -516,20 +564,26 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
   }];
 
   if (period) fields.push({ confidence: 0.92, fieldPath: 'settlement.payrollPeriod', interpretedValue: period.value, rawValue: period.raw, source });
+  else fields.push(missingField('settlement.payrollPeriod', /\b(?:periodo(?:\s+de\s+liquidacion)?|mes)\b/.test(fold(text))));
   if (employer) fields.push({ confidence: employer.confidence, fieldPath: 'employer.name', interpretedValue: employer.value, rawValue: employer.raw, source });
-  for (const [fieldPath, amount] of [
-    ['settlement.basicAmount', basic],
-    ['settlement.grossAmount', gross],
-    ['settlement.netAmount', net],
-    ['settlement.deductionsAmount', deductions],
+  else fields.push(missingField('employer.name', lines.some((line) => /^\s*(?:empleador|razon\s+social|empresa)\s*[:\-]/.test(fold(line)))));
+  for (const [fieldPath, amount, labelFound] of [
+    ['settlement.basicAmount', basic, hasAmountLabel(lines, basicAmountLabels)],
+    ['settlement.grossAmount', gross, Boolean(payrollTable) || hasAmountLabel(lines, grossAmountLabels)],
+    ['settlement.netAmount', net, netLabelFound],
+    ['settlement.deductionsAmount', deductions, Boolean(payrollTable) || hasAmountLabel(lines, deductionAmountLabels)],
   ] as const) {
-    if (amount) fields.push({
-      confidence: amount.confidence ?? 0.88,
-      fieldPath,
-      interpretedValue: { amount: amount.value, currencyCode: 'ARS' },
-      rawValue: amount.raw,
-      source: amount.source ?? source,
-    });
+    if (amount) {
+      fields.push({
+        confidence: amount.confidence ?? 0.88,
+        fieldPath,
+        interpretedValue: { amount: amount.value, currencyCode: 'ARS' },
+        rawValue: amount.raw,
+        source: amount.source ?? source,
+      });
+    } else {
+      fields.push(missingField(fieldPath, labelFound));
+    }
   }
 
   const lineItems = extractLineItems(lines, payrollTable);
@@ -542,7 +596,8 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
     fields,
     grossAmount: gross?.value ?? null,
     lineItems,
-    needsReview: !period || !gross || !net || !deductionsMatchTotal(lineItems, deductions),
+    needsReview: !period || !gross || !net || !deductions || !totalsBalance(gross, deductions, net)
+      || !deductionsMatchTotal(lineItems, deductions),
     netAmount: net?.value ?? null,
     payrollPeriod: period?.value ?? null,
     settlementType: type,
