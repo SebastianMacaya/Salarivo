@@ -119,7 +119,7 @@ Las alertas sólo incluyen IDs internos y códigos.
 
 - Proceso operativo de alta, recuperación y revocación para administradores.
 - Validación operativa de Google OIDC y rotación del client secret antes de producción; la versión legal inicial 1.0 ya fue aprobada para la instancia privada.
-- Rate limit compartido y configuración probada de proxy/IP antes de escalar la API a múltiples réplicas.
+- Store distribuido de rate limiting antes de escalar la API a múltiples réplicas; el proxy productivo normaliza la IP cliente antes de que la API la use como clave local.
 - Auditoría durable y alertas sanitizadas para intentos MFA denegados o bloqueados.
 - Alerta y procedimiento verificado para recuperar un `execution_owner` huérfano sin borrar temporales de un proceso vivo.
 - Evidencia operativa de R2, ubicación efectiva, contrato/subencargados y respuesta ante drift o indisponibilidad de su API de configuración; el cifrado queda bajo claves administradas por Cloudflare, no KMS propio.

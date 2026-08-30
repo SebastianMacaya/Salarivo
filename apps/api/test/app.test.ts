@@ -62,4 +62,22 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
   );
   assert.equal(derivedDocumentFilename("CON.pdf"), "document-CON.pdf");
   assert.ok(derivedDocumentFilename("document.pdf", "2026-07", "A".repeat(400)).length <= 250);
+
+  const proxyApp = await buildApp({
+    ...loadConfig({ APP_ENV: "test", LOG_LEVEL: "silent" }),
+    appEnv: "production",
+  }, { provisionStorage: false });
+  context.after(() => proxyApp.close());
+  proxyApp.get("/test/client-rate-limit", {
+    config: { rateLimit: { max: 1, timeWindow: "1 minute" } },
+  }, async (request) => ({ ip: request.headers["cf-connecting-ip"] }));
+  await proxyApp.ready();
+  const hitLimit = (clientIp: string) => proxyApp.inject({
+    method: "GET", url: "/test/client-rate-limit", headers: { "cf-connecting-ip": clientIp },
+  });
+  assert.equal((await hitLimit("198.51.100.10")).statusCode, 200);
+  assert.equal((await hitLimit("198.51.100.10")).statusCode, 429);
+  assert.equal((await hitLimit("198.51.100.11")).statusCode, 200);
+  assert.equal((await hitLimit("not-an-ip")).statusCode, 200);
+  assert.equal((await hitLimit("still-not-an-ip")).statusCode, 429);
 });

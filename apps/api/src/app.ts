@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
+import rateLimit, { normalizeIP } from "@fastify/rate-limit";
 import { pool, withTransaction } from "@salarivo/database";
 import Fastify, {
   LogController,
@@ -388,6 +389,10 @@ export async function buildApp(
   app.decorateRequest("authSessionHash", null);
   app.decorateRequest("authStepUp", false);
   const googleOidc = options.googleOidc ?? createGoogleOidc(config.googleOAuth);
+  const clientRateKey = (request: FastifyRequest) => {
+    const forwarded = config.appEnv === "production" ? request.headers["cf-connecting-ip"] : undefined;
+    return normalizeIP(typeof forwarded === "string" && isIP(forwarded) ? forwarded : request.ip);
+  };
 
   await app.register(cookie);
   await app.register(cors, {
@@ -397,7 +402,12 @@ export async function buildApp(
   });
   await app.register(helmet);
   // ponytail: local in-memory limit; move counters to Redis when the API runs in more than one process.
-  await app.register(rateLimit, { global: true, max: 300, timeWindow: "1 minute" });
+  await app.register(rateLimit, {
+    global: true,
+    max: 300,
+    timeWindow: "1 minute",
+    keyGenerator: clientRateKey,
+  });
 
   app.addHook("onRequest", async (request) => {
     if (
