@@ -3,9 +3,22 @@
 import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { money, percentage } from './format';
 
-const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001/api/v1';
+const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
+  ?? (process.env.NODE_ENV === 'production' ? '/api/v1' : 'http://localhost:3001/api/v1');
 
-type User = { id: string; email: string; displayName: string | null; role: 'USER' | 'ADMIN' };
+type User = {
+  id: string;
+  email: string;
+  displayName: string | null;
+  role: 'USER' | 'ADMIN';
+  authState: 'AUTHENTICATED' | 'MFA_REQUIRED' | 'MFA_SETUP_REQUIRED';
+  mfaEnabled: boolean;
+};
+type MfaStatus = { enabled: boolean; pendingEnrollment: boolean; recoveryCodesRemaining: number };
+type MfaEnrollmentResult = { secret: string; otpauthUri: string; expiresAt: string };
+type DeletionReceipt = { id: string; status: 'PENDING' | 'COMPLETED'; requestedAt: string; completedAt: string | null };
+type DeletionReceiptEntry = { token: string; source: 'accepted' | 'ambiguous' | 'lookup' };
+type RunSensitive = (action: () => Promise<void>) => Promise<void>;
 type Employment = {
   id: string;
   employerId: string;
@@ -110,7 +123,7 @@ type AdminOverview = {
 type LegalSummary = { version: string };
 
 class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly code: string) {
     super(message);
   }
 }
@@ -127,15 +140,30 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (response.status === 204) return undefined as T;
   const body = (await response.json().catch(() => ({}))) as {
     data?: T;
-    error?: { message?: string } | string;
+    error?: { code?: string; message?: string } | string;
   };
   if (!response.ok) {
     const message = typeof body.error === 'string'
       ? body.error
       : body.error?.message ?? 'No pudimos completar la operación.';
-    throw new ApiError(message, response.status);
+    const code = typeof body.error === 'string' ? 'REQUEST_FAILED' : body.error?.code ?? 'REQUEST_FAILED';
+    throw new ApiError(message, response.status, code);
   }
   return (Object.prototype.hasOwnProperty.call(body, 'data') ? body.data : body) as T;
+}
+
+async function downloadApiFile(path: string, filename: string) {
+  const response = await fetch(apiUrl(path), { credentials: 'include' });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { error?: { code?: string; message?: string } };
+    throw new ApiError(body.error?.message ?? 'No pudimos descargar la exportación.', response.status, body.error?.code ?? 'REQUEST_FAILED');
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 function shortDate(value?: string | null) {
@@ -147,6 +175,11 @@ function shortDate(value?: string | null) {
 
 function apiUrl(path: string) {
   return path.startsWith('/api/v1/') ? `${API_ROOT}${path.slice('/api/v1'.length)}` : path;
+}
+
+function browserOpaqueToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 }
 
 function documentName(document: DocumentItem) {
@@ -162,12 +195,21 @@ const deductionLabels: Record<string, string> = {
 };
 const reviewFieldLabels: Record<string, string> = {
   'employer.name': 'Empresa detectada',
+  'settlement.type': 'Tipo de liquidación',
   'settlement.payrollPeriod': 'Período',
   'settlement.basicAmount': 'Sueldo básico',
   'settlement.grossAmount': 'Bruto',
   'settlement.deductionsAmount': 'Descuentos',
   'settlement.netAmount': 'Neto',
 };
+const editableCorrectionPaths = new Set([
+  'settlement.type', 'settlement.payrollPeriod', 'settlement.basicAmount',
+  'settlement.grossAmount', 'settlement.deductionsAmount', 'settlement.netAmount',
+]);
+const settlementTypeOptions = [
+  'NORMAL', 'SAC', 'VACACIONES', 'BONO', 'RETROACTIVO', 'COMISION', 'HORAS_EXTRA',
+  'LIQUIDACION_FINAL', 'INDEMNIZACION', 'AJUSTE', 'OTRO_LABORAL',
+];
 
 function handleDialogKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
   if (event.key === 'Escape') {
@@ -250,6 +292,7 @@ function importProgressItem(server: ImportBatchItem, current?: ImportProgress): 
 
 export function SalarivoApp() {
   const [user, setUser] = useState<User | null | undefined>(undefined);
+  const [deletionReceiptEntry, setDeletionReceiptEntry] = useState<DeletionReceiptEntry | null>(null);
 
   useEffect(() => {
     api<User>('/auth/me')
@@ -265,8 +308,22 @@ export function SalarivoApp() {
       </main>
     );
   }
-  if (!user) return <AccessScreen onAuthenticated={setUser} />;
-  return <PrivateApp user={user} onLogout={() => setUser(null)} />;
+  if (deletionReceiptEntry) {
+    return <DeletionReceiptScreen entry={deletionReceiptEntry} onDone={() => setDeletionReceiptEntry(null)} />;
+  }
+  if (!user) return <AccessScreen
+    onAuthenticated={setUser}
+    onReceiptToken={(token) => setDeletionReceiptEntry({ token, source: 'lookup' })}
+  />;
+  if (user.authState === 'MFA_REQUIRED' || user.authState === 'MFA_SETUP_REQUIRED') {
+    return <MfaAccessGate user={user} onAuthenticated={setUser} onLogout={() => setUser(null)} />;
+  }
+  return <PrivateApp
+    user={user}
+    onUserChanged={setUser}
+    onLogout={() => setUser(null)}
+    onDeletionRequested={(token, source) => { setDeletionReceiptEntry({ token, source }); setUser(null); }}
+  />;
 }
 
 function Brand() {
@@ -278,8 +335,176 @@ function Brand() {
   );
 }
 
-function AccessScreen({ onAuthenticated }: { onAuthenticated: (user: User) => void }) {
-  const [mode, setMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
+function DeletionReceiptScreen({ entry, onDone }: { entry: DeletionReceiptEntry; onDone: () => void }) {
+  const [receipt, setReceipt] = useState<DeletionReceipt | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(true);
+  const { token } = entry;
+
+  const refresh = useCallback(async () => {
+    setBusy(true); setError('');
+    try {
+      setReceipt(await api<DeletionReceipt>('/privacy/account-deletion/status', {
+        method: 'POST', body: JSON.stringify({ token }),
+      }));
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos consultar el comprobante.'); }
+    finally { setBusy(false); }
+  }, [token]);
+
+  useEffect(() => {
+    let stopped = false;
+    api<DeletionReceipt>('/privacy/account-deletion/status', {
+      method: 'POST', body: JSON.stringify({ token }),
+    }).then(
+      (result) => { if (!stopped) setReceipt(result); },
+      (caught: unknown) => { if (!stopped) setError(caught instanceof Error ? caught.message : 'No pudimos consultar el comprobante.'); },
+    ).finally(() => { if (!stopped) setBusy(false); });
+    return () => { stopped = true; };
+  }, [token]);
+
+  const confirmed = receipt !== null;
+  const heading = confirmed
+    ? receipt.status === 'COMPLETED' ? 'La eliminación fue completada.' : 'La solicitud fue recibida.'
+    : entry.source === 'accepted' ? 'La solicitud fue recibida.' : 'Todavía no pudimos confirmar la solicitud.';
+  const lead = confirmed
+    ? 'El worker elimina los objetos privados y después purga los datos de la cuenta.'
+    : entry.source === 'accepted'
+      ? 'Tu cuenta quedó cerrada para nuevos accesos mientras se completa el borrado.'
+      : 'La respuesta pudo interrumpirse antes o después de registrar el pedido. Conservá el token y verificá su estado.';
+
+  return (
+    <main className="access-layout">
+      <section className="access-story"><Brand /><div><p className="eyebrow">{confirmed ? 'Comprobante verificado' : 'Comprobante sin confirmar'}</p><h1>{heading}</h1><p className="lead">{lead}</p></div></section>
+      <section className="access-panel" aria-labelledby="deletion-receipt-title"><div className="access-card stack-form">
+        <h2 id="deletion-receipt-title">Comprobante de eliminación</h2>
+        <p>Guardá este token hasta que el estado figure como completado. Se muestra una sola vez.</p>
+        <code>{token}</code>
+        <p className={receipt?.status === 'COMPLETED' ? 'message success' : 'message'}>Estado: <strong>{receipt ? receipt.status === 'COMPLETED' ? 'Completado' : 'Pendiente' : 'Sin confirmar'}</strong>{receipt?.completedAt ? ` · ${shortDate(receipt.completedAt)}` : ''}</p>
+        {error && <p className="message error" role="alert">{error}</p>}
+        {!receipt && entry.source !== 'accepted' && <p>Si el token sigue sin aparecer, el pedido puede no haber llegado. Volvé al ingreso y solicitá la baja nuevamente.</p>}
+        <button className="button primary" disabled={busy} onClick={refresh}>{busy ? 'Consultando…' : 'Actualizar estado'}</button>
+        <button className="button secondary" onClick={onDone}>Ir al ingreso</button>
+      </div></section>
+    </main>
+  );
+}
+
+function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => Promise<void> | void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  return (
+    <div className="stack-form" aria-live="polite">
+      <p className="message success">Guardá estos códigos ahora. Cada uno sirve una sola vez y no volveremos a mostrarlos.</p>
+      <ul aria-label="Códigos de recuperación">
+        {codes.map((code) => <li key={code}><code>{code}</code></li>)}
+      </ul>
+      {error && <p className="message error" role="alert">{error}</p>}
+      <button className="button primary" disabled={busy} onClick={async () => { setError(''); setBusy(true); try { await onDone(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos continuar.'); } finally { setBusy(false); } }}>
+        {busy ? 'Continuando…' : 'Ya los guardé'}
+      </button>
+    </div>
+  );
+}
+
+function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onComplete: () => Promise<void> | void }) {
+  const [enrollment, setEnrollment] = useState<MfaEnrollmentResult | null>(null);
+  const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function start(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(''); setBusy(true);
+    const form = new FormData(event.currentTarget);
+    try {
+      setEnrollment(await api<MfaEnrollmentResult>('/auth/mfa/enrollment', {
+        method: 'POST', body: JSON.stringify({ password: form.get('password') }),
+      }));
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la configuración.'); }
+    finally { setBusy(false); }
+  }
+
+  async function confirmEnrollment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(''); setBusy(true);
+    const form = new FormData(event.currentTarget);
+    try {
+      const result = await api<{ recoveryCodes: string[] }>('/auth/mfa/enrollment/confirm', {
+        method: 'POST', body: JSON.stringify({ code: form.get('code') }),
+      });
+      setRecoveryCodes(result.recoveryCodes);
+      setEnrollment(null);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos confirmar el código.'); }
+    finally { setBusy(false); }
+  }
+
+  if (recoveryCodes) return <RecoveryCodes codes={recoveryCodes} onDone={onComplete} />;
+  if (enrollment) {
+    return (
+      <div className="stack-form">
+        <p>Agregá esta clave en tu aplicación autenticadora:</p>
+        <p><code>{enrollment.secret}</code></p>
+        <p><small>La configuración vence el {new Intl.DateTimeFormat('es-AR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(enrollment.expiresAt))}.</small></p>
+        <form className="stack-form" onSubmit={confirmEnrollment}>
+          <label>Código de 6 dígitos<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required autoFocus /></label>
+          {error && <p className="message error" role="alert">{error}</p>}
+          <button className="button primary" disabled={busy}>{busy ? 'Verificando…' : 'Confirmar y activar'}</button>
+        </form>
+      </div>
+    );
+  }
+  return (
+    <form className="stack-form" onSubmit={start}>
+      {pending && <p className="message error">Hay una configuración incompleta. Iniciá una nueva para reemplazarla.</p>}
+      <label>Contraseña actual<input name="password" type="password" autoComplete="current-password" minLength={12} required /></label>
+      {error && <p className="message error" role="alert">{error}</p>}
+      <button className="button primary" disabled={busy}>{busy ? 'Preparando…' : 'Configurar segundo factor'}</button>
+    </form>
+  );
+}
+
+function MfaAccessGate({ user, onAuthenticated, onLogout }: { user: User; onAuthenticated: (user: User) => void; onLogout: () => void }) {
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function logout() {
+    await api('/auth/logout', { method: 'POST', body: '{}' }).catch(() => undefined);
+    onLogout();
+  }
+
+  async function verify(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(''); setBusy(true);
+    const form = new FormData(event.currentTarget);
+    try {
+      onAuthenticated(await api<User>('/auth/mfa/verify', {
+        method: 'POST', body: JSON.stringify({ code: form.get('code') }),
+      }));
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos verificar el código.'); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <main className="access-layout">
+      <section className="access-story"><Brand /><div><p className="eyebrow">Acceso protegido</p><h1>Confirmá que sos vos.</h1><p className="lead">Tu historial salarial queda bloqueado hasta completar este paso.</p></div></section>
+      <section className="access-panel" aria-labelledby="mfa-access-title"><div className="access-card">
+        <p className="eyebrow">{user.email}</p>
+        <h2 id="mfa-access-title">{user.authState === 'MFA_SETUP_REQUIRED' ? 'Activá el segundo factor' : 'Ingresá tu segundo factor'}</h2>
+        {user.authState === 'MFA_SETUP_REQUIRED'
+          ? <MfaEnrollment onComplete={async () => onAuthenticated(await api<User>('/auth/me'))} />
+          : <form className="stack-form" onSubmit={verify}>
+              <label>Código de la app o de recuperación<input name="code" autoComplete="one-time-code" maxLength={39} required autoFocus /></label>
+              {error && <p className="message error" role="alert">{error}</p>}
+              <button className="button primary" disabled={busy}>{busy ? 'Verificando…' : 'Continuar'}</button>
+            </form>}
+        <div className="access-actions"><button className="text-button" onClick={logout}>Cerrar sesión</button></div>
+      </div></section>
+    </main>
+  );
+}
+
+function AccessScreen({ onAuthenticated, onReceiptToken }: {
+  onAuthenticated: (user: User) => void;
+  onReceiptToken: (token: string) => void;
+}) {
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot' | 'reset' | 'deletion'>('login');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
@@ -292,7 +517,7 @@ function AccessScreen({ onAuthenticated }: { onAuthenticated: (user: User) => vo
       .catch(() => setLegalError('No pudimos cargar los documentos legales vigentes.'));
   }, []);
 
-  function changeMode(next: 'login' | 'register' | 'forgot' | 'reset') {
+  function changeMode(next: 'login' | 'register' | 'forgot' | 'reset' | 'deletion') {
     setError('');
     setNotice('');
     setMode(next);
@@ -306,7 +531,9 @@ function AccessScreen({ onAuthenticated }: { onAuthenticated: (user: User) => vo
     setBusy(true);
     const form = new FormData(formElement);
     try {
-      if (mode === 'forgot') {
+      if (mode === 'deletion') {
+        onReceiptToken(String(form.get('token')));
+      } else if (mode === 'forgot') {
         const result = await api<{ resetToken?: string }>('/auth/forgot-password', {
           method: 'POST',
           body: JSON.stringify({ email: form.get('email') }),
@@ -375,12 +602,13 @@ function AccessScreen({ onAuthenticated }: { onAuthenticated: (user: User) => vo
       <section className="access-panel" aria-labelledby="access-title">
         <div className="access-card">
           <p className="eyebrow">Espacio privado</p>
-          <h2 id="access-title">{mode === 'register' ? 'Creá tu cuenta' : mode === 'forgot' ? 'Recuperá el acceso' : mode === 'reset' ? 'Elegí una nueva clave' : 'Ingresá a Salarivo'}</h2>
+          <h2 id="access-title">{mode === 'register' ? 'Creá tu cuenta' : mode === 'forgot' ? 'Recuperá el acceso' : mode === 'reset' ? 'Elegí una nueva clave' : mode === 'deletion' ? 'Consultá una eliminación' : 'Ingresá a Salarivo'}</h2>
           <form onSubmit={submit} className="stack-form">
             {mode === 'register' && <label>Nombre<input name="displayName" autoComplete="name" minLength={2} maxLength={80} required /></label>}
             {(mode === 'login' || mode === 'register' || mode === 'forgot') && <label>Email<input name="email" type="email" autoComplete="email" required /></label>}
             {mode === 'reset' && <label>Código de recuperación<input name="token" autoComplete="one-time-code" required /></label>}
-            {mode !== 'forgot' && <label>Contraseña<input name="password" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} required /></label>}
+            {mode === 'deletion' && <label>Token del comprobante<input name="token" autoComplete="off" pattern="[A-Za-z0-9_-]{43}" minLength={43} maxLength={43} required autoFocus /></label>}
+            {mode !== 'forgot' && mode !== 'deletion' && <label>Contraseña<input name="password" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} required /></label>}
             {mode === 'register' && <div className="legal-checks">
               <div className="legal-check"><input id="accepted-terms" name="acceptedTerms" type="checkbox" required /><span><label htmlFor="accepted-terms">Acepto los Términos de uso{legalVersions ? ` v${legalVersions.terms}` : ''}.</label> <a href={legalVersions ? `/terms?version=${encodeURIComponent(legalVersions.terms)}` : '/terms'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
               <div className="legal-check"><input id="acknowledged-privacy" name="acknowledgedPrivacy" type="checkbox" required /><span><label htmlFor="acknowledged-privacy">Confirmo que leí el Aviso de privacidad{legalVersions ? ` v${legalVersions.privacy}` : ''}.</label> <a href={legalVersions ? `/privacy?version=${encodeURIComponent(legalVersions.privacy)}` : '/privacy'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
@@ -388,10 +616,10 @@ function AccessScreen({ onAuthenticated }: { onAuthenticated: (user: User) => vo
             {mode === 'register' && legalError && <p className="message error" role="alert">{legalError}</p>}
             {error && <p className="message error" role="alert">{error}</p>}
             {notice && <p className="message success" aria-live="polite">{notice}</p>}
-            <button className="button primary" disabled={busy || (mode === 'register' && !legalVersions)}>{busy ? 'Procesando…' : mode === 'register' ? 'Crear cuenta' : mode === 'forgot' ? 'Solicitar código' : mode === 'reset' ? 'Cambiar contraseña' : 'Ingresar'}</button>
+            <button className="button primary" disabled={busy || (mode === 'register' && !legalVersions)}>{busy ? 'Procesando…' : mode === 'register' ? 'Crear cuenta' : mode === 'forgot' ? 'Solicitar código' : mode === 'reset' ? 'Cambiar contraseña' : mode === 'deletion' ? 'Consultar estado' : 'Ingresar'}</button>
           </form>
           <div className="access-actions">
-            {mode === 'login' ? <><button className="text-button" onClick={() => changeMode('forgot')}>Olvidé mi contraseña</button><button className="text-button" onClick={() => changeMode('register')}>Crear una cuenta</button></> : <button className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
+            {mode === 'login' ? <><button className="text-button" onClick={() => changeMode('forgot')}>Olvidé mi contraseña</button><button className="text-button" onClick={() => changeMode('register')}>Crear una cuenta</button><button className="text-button" onClick={() => changeMode('deletion')}>Consultar una eliminación</button></> : <button className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
           </div>
         </div>
       </section>
@@ -408,13 +636,30 @@ const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'privacy', label: 'Privacidad', icon: '◇' },
 ];
 
-function PrivateApp({ user, onLogout }: { user: User; onLogout: () => void }) {
+function PrivateApp({ user, onUserChanged, onLogout, onDeletionRequested }: {
+  user: User;
+  onUserChanged: (user: User) => void;
+  onLogout: () => void;
+  onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
+}) {
   const [section, setSection] = useState<Section>('summary');
   const [menuOpen, setMenuOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [pendingSensitiveAction, setPendingSensitiveAction] = useState<(() => Promise<void>) | null>(null);
   const visibleSections = user.role === 'ADMIN'
     ? [...sections, { id: 'admin' as const, label: 'Administración', icon: '⚙' }]
     : sections;
+
+  const runSensitive = useCallback<RunSensitive>(async (action) => {
+    try { await action(); }
+    catch (caught) {
+      if (caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
+        setPendingSensitiveAction(() => action);
+        return;
+      }
+      throw caught;
+    }
+  }, []);
 
   async function logout() {
     await api('/auth/logout', { method: 'POST', body: '{}' }).catch(() => undefined);
@@ -438,12 +683,45 @@ function PrivateApp({ user, onLogout }: { user: User; onLogout: () => void }) {
       <main className="content">
         <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú">☰</button><Brand /></header>
         {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={setSection} />}
-        {section === 'jobs' && <Employments key={refreshKey} onChanged={() => setRefreshKey((n) => n + 1)} />}
+        {section === 'jobs' && <Employments key={refreshKey} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={runSensitive} />}
         {section === 'import' && <Importer onDone={() => setRefreshKey((n) => n + 1)} />}
-        {section === 'history' && <History key={refreshKey} />}
-        {section === 'privacy' && <Privacy />}
+        {section === 'history' && <History key={refreshKey} runSensitive={runSensitive} />}
+        {section === 'privacy' && <Privacy user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
         {section === 'admin' && user.role === 'ADMIN' && <Admin />}
       </main>
+      {pendingSensitiveAction && <StepUpDialog mfaEnabled={Boolean(user.mfaEnabled)} action={pendingSensitiveAction} onClose={() => setPendingSensitiveAction(null)} />}
+    </div>
+  );
+}
+
+function StepUpDialog({ mfaEnabled, action, onClose }: { mfaEnabled: boolean; action: () => Promise<void>; onClose: () => void }) {
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(''); setBusy(true);
+    const form = new FormData(event.currentTarget);
+    const value = form.get('credential');
+    try {
+      await api('/auth/step-up', {
+        method: 'POST', body: JSON.stringify(mfaEnabled ? { code: value } : { password: value }),
+      });
+      await action();
+      onClose();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos confirmar tu identidad.'); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="modal-layer" role="presentation" onMouseDown={onClose}>
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="step-up-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, onClose)} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head"><div><p className="eyebrow">Acción sensible</p><h2 id="step-up-title">Confirmá tu identidad</h2></div><button className="icon-button" onClick={onClose} aria-label="Cerrar">×</button></div>
+        <form className="stack-form" onSubmit={submit}>
+          <label>{mfaEnabled ? 'Código de la app o de recuperación' : 'Contraseña actual'}<input name="credential" type={mfaEnabled ? 'text' : 'password'} autoComplete={mfaEnabled ? 'one-time-code' : 'current-password'} maxLength={mfaEnabled ? 39 : undefined} required autoFocus /></label>
+          {error && <p className="message error" role="alert">{error}</p>}
+          <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancelar</button><button className="button primary" disabled={busy}>{busy ? 'Confirmando…' : 'Continuar'}</button></div>
+        </form>
+      </section>
     </div>
   );
 }
@@ -512,7 +790,7 @@ function DeductionBreakdown({ settlement }: { settlement: Settlement }) {
   return <div className="deduction-cell"><strong>{money(settlement.deductionsAmount, settlement.currencyCode)}</strong>{settlement.deductionsPercentage && <small>{percentage(settlement.deductionsPercentage)} del bruto</small>}{mismatch && <small className="deduction-warning">{mismatch}</small>}{items.length > 0 && <details><summary>Ver desglose ({items.length})</summary><ul>{items.map((item, index) => <li key={`${item.normalizedConceptCode ?? 'OTHER'}-${index}`}><span>{item.normalizedConceptCode ? deductionLabels[item.normalizedConceptCode] ?? item.rawDescription : item.rawDescription}{item.grossPercentage && <small>{percentage(item.grossPercentage)} del bruto</small>}</span><strong>{money(item.amount, settlement.currencyCode)}</strong></li>)}</ul></details>}</div>;
 }
 
-function Employments({ onChanged }: { onChanged: () => void }) {
+function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSensitive: RunSensitive }) {
   const [items, setItems] = useState<Employment[]>([]);
   const [editing, setEditing] = useState<Employment | null | 'new'>(null);
   const [error, setError] = useState('');
@@ -550,9 +828,11 @@ function Employments({ onChanged }: { onChanged: () => void }) {
   async function remove(item: Employment) {
     if (!confirm(`¿Eliminar el empleo en ${item.employerName}? Las liquidaciones no se borrarán.`)) return;
     try {
-      await api(`/employments/${item.id}`, { method: 'DELETE', body: '{}' });
-      await api(`/employers/${item.employerId}`, { method: 'DELETE', body: '{}' }).catch(() => undefined);
-      await load(); onChanged();
+      await runSensitive(async () => {
+        await api(`/employments/${item.id}`, { method: 'DELETE', body: '{}' });
+        await api(`/employers/${item.employerId}`, { method: 'DELETE', body: '{}' }).catch(() => undefined);
+        await load(); onChanged();
+      });
     }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminarlo.'); }
   }
@@ -710,7 +990,7 @@ function Importer({ onDone }: { onDone: () => void }) {
   );
 }
 
-function History() {
+function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [employments, setEmployments] = useState<Employment[]>([]);
@@ -761,12 +1041,24 @@ function History() {
   }
   async function deleteOriginal() {
     if (!selected || !confirm('¿Eliminar el PDF original? Los datos estructurados se conservarán.')) return;
-    try { await api(`/documents/${selected.id}/original`, { method: 'DELETE', body: '{}' }); setSelected({ ...selected, originalAvailable: false }); await load(); }
+    try { await runSensitive(async () => { await api(`/documents/${selected.id}/original`, { method: 'DELETE', body: '{}' }); setSelected({ ...selected, originalAvailable: false }); await load(); }); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminar el original.'); }
+  }
+  async function downloadOriginal() {
+    if (!selected) return;
+    try {
+      await runSensitive(async () => {
+        const download = await api<{ url: string }>(`/documents/${selected.id}/original`);
+        const anchor = document.createElement('a');
+        anchor.href = download.url;
+        anchor.rel = 'noreferrer';
+        anchor.click();
+      });
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos descargar el original.'); }
   }
   async function deleteDocument() {
     if (!selected || !confirm('¿Eliminar el PDF y todos sus datos extraídos? Esta acción no se puede deshacer.')) return;
-    try { await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' }); setSelected(null); await load(); }
+    try { await runSensitive(async () => { await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' }); setSelected(null); await load(); }); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminar el documento.'); }
   }
   async function confirmType(documentType: 'PAYROLL' | 'UNSUPPORTED') {
@@ -819,7 +1111,7 @@ function History() {
       {error && <p className="message error" role="alert">{error}</p>}
       {tab === 'documents' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}<option value="none">Quitar asociación</option></select><button className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={associateDocuments}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
       {tab === 'settlements' ? (settlements.length ? <div className="table-wrap"><table><thead><tr><th>Período</th><th>Empresa</th><th>Tipo</th><th>Bruto</th><th>Descuentos</th><th>Neto</th></tr></thead><tbody>{settlements.map((row) => <tr key={row.id}><td>{row.payrollPeriod.slice(0, 7)}</td><td>{row.employerName || 'Sin asociar'}</td><td>{row.settlementType}</td><td>{money(row.grossAmount, row.currencyCode)}</td><td><DeductionBreakdown settlement={row} /></td><td><strong>{money(row.netAmount, row.currencyCode)}</strong></td></tr>)}</tbody></table></div> : <EmptyState title="Todavía no hay liquidaciones" body="Cuando el worker termine de analizar tus recibos, aparecerán acá." />) : (documents.length ? <div className="document-list">{documents.map((document) => { const assignable = associationReadyStatuses.has(document.processingStatus); return <div className="document-entry" key={document.id}><label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${documentName(document)}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label><button className="document-row" onClick={() => openDocument(document)}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{shortDate(document.createdAt)} · {document.documentType || 'Clasificando'}{document.errorCode ? ` · ${importErrorLabels[document.errorCode] ?? document.errorCode}` : ''}</small></span><Status value={document.processingStatus} /><span aria-hidden="true">›</span></button></div>; })}</div> : <EmptyState title="No hay documentos" body="Importá PDFs para ver su estado y revisar los campos extraídos." />)}
-      {selected && <div className="modal-layer" role="presentation" onMouseDown={() => setSelected(null)}><section className="modal wide" role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setSelected(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Revisión humana</p><h2 id="review-title">{documentName(selected)}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Cerrar">×</button></div><div className="review-summary"><Status value={selected.processingStatus} /><span>{selected.errorCode ? importErrorLabels[selected.errorCode] ?? selected.errorCode : missingReviewFields.length ? `Falta completar: ${missingReviewFields.map((field) => reviewFieldLabels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : selectedSettlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total; revisá los valores y confirmá la diferencia.' : 'Tus correcciones quedan guardadas en esta extracción.'}</span></div>{selected.processingStatus === 'NEEDS_TYPE_CONFIRMATION' ? <div className="type-confirmation"><h3>¿Este PDF es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente. Confirmalo para continuar con la extracción.</p><div><button className="button primary" onClick={() => confirmType('PAYROLL')}>Sí, es un recibo</button><button className="button secondary" onClick={() => confirmType('UNSUPPORTED')}>No corresponde</button></div></div> : fields.length ? <div className="field-list">{fields.map((field) => <FieldEditor key={field.fieldPath} field={field} onSave={(value) => correct(field, value)} />)}</div> : <EmptyState title="Sin campos disponibles" body="El documento todavía está procesándose o no produjo datos utilizables." />}{selected.processingStatus === 'NEEDS_REVIEW' && selectedSettlement?.deductionsMatchTotal === false && <label className="review-acceptance"><input type="checkbox" checked={acceptDeductionsMismatch} onChange={(event) => setAcceptDeductionsMismatch(event.target.checked)} />Revisé los conceptos y acepto esta diferencia.</label>}<div className="modal-actions">{selected.processingStatus === 'NEEDS_REVIEW' && <button className="button primary" disabled={missingReviewFields.length > 0 || (selectedSettlement?.deductionsMatchTotal === false && !acceptDeductionsMismatch)} onClick={completeReview}>Finalizar revisión</button>}<button className="button danger-button" disabled={selected.originalAvailable === false || !associationReadyStatuses.has(selected.processingStatus)} onClick={deleteOriginal}>{selected.originalAvailable === false ? 'Original eliminado' : 'Eliminar sólo el PDF'}</button><button className="button danger-button" onClick={deleteDocument}>Eliminar PDF y datos</button><button className="button secondary" onClick={() => setSelected(null)}>Cerrar</button></div></section></div>}
+      {selected && <div className="modal-layer" role="presentation" onMouseDown={() => setSelected(null)}><section className="modal wide" role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setSelected(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Revisión humana</p><h2 id="review-title">{documentName(selected)}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Cerrar">×</button></div><div className="review-summary"><Status value={selected.processingStatus} /><span>{selected.errorCode ? importErrorLabels[selected.errorCode] ?? selected.errorCode : missingReviewFields.length ? `Falta completar: ${missingReviewFields.map((field) => reviewFieldLabels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : selectedSettlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total; revisá los valores y confirmá la diferencia.' : 'Tus correcciones quedan guardadas en esta extracción.'}</span></div>{selected.processingStatus === 'NEEDS_TYPE_CONFIRMATION' ? <div className="type-confirmation"><h3>¿Este PDF es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente. Confirmalo para continuar con la extracción.</p><div><button className="button primary" onClick={() => confirmType('PAYROLL')}>Sí, es un recibo</button><button className="button secondary" onClick={() => confirmType('UNSUPPORTED')}>No corresponde</button></div></div> : fields.length ? <div className="field-list">{fields.map((field) => <FieldEditor key={field.fieldPath} field={field} onSave={(value) => correct(field, value)} />)}</div> : <EmptyState title="Sin campos disponibles" body="El documento todavía está procesándose o no produjo datos utilizables." />}{selected.processingStatus === 'NEEDS_REVIEW' && selectedSettlement?.deductionsMatchTotal === false && <label className="review-acceptance"><input type="checkbox" checked={acceptDeductionsMismatch} onChange={(event) => setAcceptDeductionsMismatch(event.target.checked)} />Revisé los conceptos y acepto esta diferencia.</label>}<div className="modal-actions">{selected.processingStatus === 'NEEDS_REVIEW' && <button className="button primary" disabled={missingReviewFields.length > 0 || (selectedSettlement?.deductionsMatchTotal === false && !acceptDeductionsMismatch)} onClick={completeReview}>Finalizar revisión</button>}<button className="button secondary" disabled={selected.originalAvailable === false} onClick={downloadOriginal}>Descargar PDF</button><button className="button danger-button" disabled={selected.originalAvailable === false || !associationReadyStatuses.has(selected.processingStatus)} onClick={deleteOriginal}>{selected.originalAvailable === false ? 'Original eliminado' : 'Eliminar sólo el PDF'}</button><button className="button danger-button" onClick={deleteDocument}>Eliminar PDF y datos</button><button className="button secondary" onClick={() => setSelected(null)}>Cerrar</button></div></section></div>}
     </div>
   );
 }
@@ -828,10 +1120,73 @@ function FieldEditor({ field, onSave }: { field: ExtractedField; onSave: (value:
   const [value, setValue] = useState(field.correctedValue ?? field.interpretedValue ?? '');
   const [busy, setBusy] = useState(false);
   const confidence = Math.round(Number(field.confidence) * 100);
-  return <div className="field-editor"><label><span>{reviewFieldLabels[field.fieldPath] ?? field.fieldPath}</span><input type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={field.fieldPath.includes('Amount') ? 'decimal' : undefined} value={value} onChange={(event) => setValue(event.target.value)} /></label><span className={`confidence ${confidence < 70 ? 'low' : ''}`}>{field.source === 'MANUAL_REQUIRED' ? field.correctedValue ? 'Manual' : 'Falta' : Number.isFinite(confidence) ? `${confidence}%` : '—'}</span><small>{field.correctedValue ? 'Corregido por vos' : field.source === 'MANUAL_REQUIRED' ? 'Completalo manualmente' : field.source}</small><button className="button compact" disabled={busy || !value.trim() || value === (field.correctedValue ?? field.interpretedValue ?? '')} onClick={async () => { setBusy(true); await onSave(value); setBusy(false); }}>Guardar</button></div>;
+  const editable = editableCorrectionPaths.has(field.fieldPath);
+  const editor = field.fieldPath === 'settlement.type'
+    ? <select value={value} onChange={(event) => setValue(event.target.value)}>{settlementTypeOptions.map((type) => <option key={type}>{type}</option>)}</select>
+    : <input disabled={!editable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={field.fieldPath.includes('Amount') ? 'decimal' : undefined} value={value} onChange={(event) => setValue(event.target.value)} />;
+  return <div className="field-editor"><label><span>{reviewFieldLabels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label><span className={`confidence ${confidence < 70 ? 'low' : ''}`}>{field.source === 'MANUAL_REQUIRED' ? field.correctedValue ? 'Manual' : 'Falta' : Number.isFinite(confidence) ? `${confidence}%` : '—'}</span><small>{!editable ? 'Sólo lectura' : field.correctedValue ? 'Corregido por vos' : field.source === 'MANUAL_REQUIRED' ? 'Completalo manualmente' : field.source}</small>{editable && <button className="button compact" disabled={busy || !value.trim() || value === (field.correctedValue ?? field.interpretedValue ?? '')} onClick={async () => { setBusy(true); await onSave(value); setBusy(false); }}>Guardar</button>}</div>;
 }
 
-function Privacy() {
+function MfaSettings({ onUserChanged, runSensitive }: { onUserChanged: (user: User) => void; runSensitive: RunSensitive }) {
+  const [status, setStatus] = useState<MfaStatus | null>(null);
+  const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+
+  const refresh = useCallback(async () => {
+    const [nextStatus, nextUser] = await Promise.all([api<MfaStatus>('/auth/mfa'), api<User>('/auth/me')]);
+    setStatus(nextStatus);
+    onUserChanged(nextUser);
+  }, [onUserChanged]);
+
+  useEffect(() => {
+    api<MfaStatus>('/auth/mfa').then(setStatus).catch((caught) => setError(caught instanceof Error ? caught.message : 'No pudimos consultar el segundo factor.'));
+  }, []);
+
+  async function regenerateRecoveryCodes() {
+    setError(''); setMessage('');
+    try {
+      await runSensitive(async () => {
+        const result = await api<{ recoveryCodes: string[] }>('/auth/mfa/recovery-codes', { method: 'POST', body: '{}' });
+        setRecoveryCodes(result.recoveryCodes);
+        setStatus((current) => current ? { ...current, recoveryCodesRemaining: result.recoveryCodes.length } : current);
+      });
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos renovar los códigos.'); }
+  }
+
+  async function disable() {
+    if (!confirm('¿Desactivar el segundo factor? Tu cuenta quedará protegida sólo por la contraseña.')) return;
+    setError(''); setMessage('');
+    try {
+      await runSensitive(async () => {
+        await api('/auth/mfa', { method: 'DELETE' });
+        setRecoveryCodes(null);
+        await refresh();
+        setMessage('Segundo factor desactivado.');
+      });
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos desactivar el segundo factor.'); }
+  }
+
+  return (
+    <section className="settings-card"><div className="setting-icon">2</div><div><h2>Segundo factor</h2>
+      {!status && !error && <p>Cargando estado…</p>}
+      {error && <p className="message error" role="alert">{error}</p>}
+      {message && <p className="message success" aria-live="polite">{message}</p>}
+      {recoveryCodes ? <RecoveryCodes codes={recoveryCodes} onDone={() => setRecoveryCodes(null)} /> : status?.enabled ? <>
+        <p>Activo. Además de tu contraseña, Salarivo pedirá un código para ingresar y proteger acciones sensibles.</p>
+        <p>Te quedan <strong>{status.recoveryCodesRemaining}</strong> códigos de recuperación.</p>
+        <div className="setting-actions"><button className="button secondary" onClick={regenerateRecoveryCodes}>Generar códigos nuevos</button><button className="button danger-button" onClick={disable}>Desactivar</button></div>
+      </> : status ? <><p>Usá una app autenticadora compatible con códigos TOTP.</p><MfaEnrollment pending={status.pendingEnrollment} onComplete={refresh} /></> : null}
+    </div></section>
+  );
+}
+
+function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
+  user: User;
+  onUserChanged: (user: User) => void;
+  runSensitive: RunSensitive;
+  onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
+}) {
   const [exportJob, setExportJob] = useState<{ id: string; status: string; downloadUrl?: string | null } | null>(null);
   const [confirmation, setConfirmation] = useState('');
   const [password, setPassword] = useState('');
@@ -839,7 +1194,7 @@ function Privacy() {
   const [error, setError] = useState('');
   async function requestExport() {
     setError('');
-    try { setExportJob(await api('/privacy/exports', { method: 'POST', body: '{}' })); setMessage('Preparamos tu exportación en segundo plano.'); }
+    try { await runSensitive(async () => { setExportJob(await api('/privacy/exports', { method: 'POST', body: '{}' })); setMessage('Tu exportación quedó lista para descargar.'); }); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la exportación.'); }
   }
   async function refreshExport() {
@@ -850,15 +1205,36 @@ function Privacy() {
   async function deleteAccount() {
     if (confirmation !== 'ELIMINAR' || !password) return;
     setError('');
-    try { await api('/privacy/account', { method: 'DELETE', body: JSON.stringify({ confirmation, password }) }); window.location.reload(); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la eliminación.'); }
+    const receiptToken = browserOpaqueToken();
+    try {
+      await runSensitive(async () => {
+        try {
+          await api('/privacy/account', {
+            method: 'DELETE', body: JSON.stringify({ confirmation, password, receiptToken }),
+          });
+          onDeletionRequested(receiptToken, 'accepted');
+        } catch (caught) {
+          if (!(caught instanceof ApiError) || caught.status >= 500) onDeletionRequested(receiptToken, 'ambiguous');
+          else throw caught;
+        }
+      });
+    }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos solicitar la baja.'); }
+  }
+
+  async function downloadExport() {
+    if (!exportJob?.downloadUrl) return;
+    setError('');
+    try { await runSensitive(() => downloadApiFile(exportJob.downloadUrl!, 'salarivo-export.json')); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos descargar la exportación.'); }
   }
 
   return (
     <div className="page narrow-page">
-      <PageHeader eyebrow="Tus datos" title="Privacidad y control" />
+      <PageHeader eyebrow="Tus datos" title="Privacidad y seguridad" />
       {error && <p className="message error" role="alert">{error}</p>}{message && <p className="message success" aria-live="polite">{message}</p>}
-      <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un archivo JSON con empleos, liquidaciones, campos y correcciones. Los PDFs no se incluyen.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <a className="button primary" href={apiUrl(exportJob.downloadUrl)}>Descargar</a> : exportJob ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
+      <MfaSettings key={String(user.mfaEnabled)} onUserChanged={onUserChanged} runSensitive={runSensitive} />
+      <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un JSON con tu cuenta, empleos, importaciones, documentos, extracciones, liquidaciones, correcciones y constancias de privacidad. Los PDFs y secretos no se incluyen.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <button className="button primary" onClick={downloadExport}>Descargar</button> : exportJob ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
       <section className="settings-card"><div className="setting-icon">◇</div><div><h2>Originales y datos estructurados</h2><p>Desde Historial podés borrar un PDF y conservar la liquidación revisada. Cada lifecycle es independiente.</p></div></section>
       <section className="settings-card"><div className="setting-icon">§</div><div><h2>Documentos legales</h2><p>Consultá la versión vigente de los <a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> y el <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a>.</p></div></section>
       <section className="settings-card danger-zone"><div className="setting-icon">!</div><div><h2>Eliminar mi cuenta</h2><p>Inicia el borrado irreversible de documentos, datos estructurados, sesiones y exportaciones.</p><label>Contraseña actual<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><label>Escribí <strong>ELIMINAR</strong> para confirmar<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label></div><div className="setting-actions"><button className="button danger-button" disabled={confirmation !== 'ELIMINAR' || !password} onClick={deleteAccount}>Eliminar cuenta</button></div></section>

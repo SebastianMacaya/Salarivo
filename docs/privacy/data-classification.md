@@ -6,7 +6,7 @@
 
 | Clase | Ejemplos | Manejo |
 | --- | --- | --- |
-| Restricted | PDFs, OCR, salarios, futura contribución/mapping de benchmark, DNI/CUIL, banco, correcciones, exports, tokens, URLs firmadas, claves | cifrado, acceso mínimo, no logs, no fixtures reales, sharing explícito |
+| Restricted | PDFs, OCR, salarios, salud/obra social, afiliación sindical, futura contribución/mapping de benchmark, DNI/CUIL, banco, correcciones, exports, tokens, URLs firmadas, claves | cifrado, acceso mínimo, no logs, no fixtures reales, sharing explícito |
 | Confidential | userId interno, documentId, rol admin, aceptación legal, employment metadata, audit events sanitizados, configuración no secreta | acceso por rol/servicio, logs limitados, retención definida |
 | Internal | métricas agregadas sin cardinalidad sensible, health, versiones, error codes | uso operativo, sin vínculo innecesario a persona |
 | Public | documentación pública aprobada y contenido de marketing | sin datos derivados de usuarios |
@@ -22,7 +22,7 @@ Antes de persistir un campo:
 3. clasificarlo;
 4. demostrar que no basta una versión menos precisa o redactada.
 
-No se guarda una dirección, banco, familiar u otro dato sólo porque aparece en el PDF.
+No se guarda una dirección, banco, familiar u otro dato sólo porque aparece en el PDF. Toda línea individual de tipo deducción se materializa únicamente con su importe y la etiqueta genérica `Deducción`: no conserva descripción, código, recurrencia ni campo de origen. El PDF original continúa siendo Restricted y puede contener señales de salud, afiliación sindical u otros datos incidentales.
 
 ## Reglas por sistema
 

@@ -98,7 +98,9 @@ test('clasifica y extrae un recibo completamente sintético', () => {
     { confidence: 0.8, fieldPath: 'settlement.type', interpretedValue: 'NORMAL', rawValue: 'NORMAL', source: 'RULE' },
   );
   assert.equal(result.lineItems.length, 4);
-  assert.equal(result.lineItems.find((item) => item.normalizedConceptCode === 'RETIREMENT')?.itemType, 'DEDUCTION');
+  assert.equal(result.lineItems.find((item) => item.amount === '135802.47')?.itemType, 'DEDUCTION');
+  assert.equal(result.lineItems.some((item) => item.normalizedConceptCode === 'HEALTH_INSURANCE'), false);
+  assert.equal(result.lineItems.find((item) => item.amount === '37037.04')?.rawDescription, 'Deducción');
   assert.equal(extractArgentinePayroll(`${syntheticReceipt}\nBono productividad $ 10.000,00`, 'PDF_TEXT').settlementType, 'NORMAL');
   assert.equal(extractArgentinePayroll(`${syntheticReceipt}\nTipo de liquidación: BONO`, 'PDF_TEXT').settlementType, 'BONO');
 
@@ -199,7 +201,7 @@ Contribución Jubilación                                  $ 120.000,00
   assert.equal(shifted.grossAmount, null);
 });
 
-test('separa descuentos del empleado de contribuciones y conserva conceptos desconocidos', () => {
+test('separa descuentos del empleado de contribuciones y minimiza cada deducción', () => {
   const row = (description: string, remunerative = '', nonRemunerative = '', deduction = '', contribution = '') =>
     `${description.padEnd(50)}${remunerative.padEnd(20)}${nonRemunerative.padEnd(20)}${deduction.padEnd(20)}${contribution}`;
   const receipt = [
@@ -225,11 +227,8 @@ test('separa descuentos del empleado de contribuciones y conserva conceptos desc
   assert.equal(result.grossAmount, '1250000.00');
   assert.equal(result.deductionsAmount, '250000.00');
   assert.equal(deductions.length, 5);
-  assert.equal(deductions.find(({ normalizedConceptCode }) => normalizedConceptCode === 'RETIREMENT')?.amount, '110000.00');
-  assert.equal(deductions.find(({ normalizedConceptCode }) => normalizedConceptCode === 'PAMI')?.amount, '30000.00');
-  assert.equal(deductions.find(({ normalizedConceptCode }) => normalizedConceptCode === 'HEALTH_INSURANCE')?.amount, '40000.00');
-  assert.equal(deductions.find(({ normalizedConceptCode }) => normalizedConceptCode === 'INCOME_TAX')?.amount, '50000.00');
-  assert.equal(deductions.find(({ normalizedConceptCode }) => normalizedConceptCode === null)?.amount, '20000.00');
+  assert.ok(deductions.every(({ normalizedConceptCode, rawDescription, isRecurring }) =>
+    normalizedConceptCode === null && rawDescription === 'Deducción' && isRecurring === null));
   assert.equal(deductions.some(({ amount }) => amount === '180000.00'), false);
 
   const narrowRow = (description: string, remunerative = '', nonRemunerative = '', deduction = '') =>
@@ -242,7 +241,42 @@ test('separa descuentos del empleado de contribuciones y conserva conceptos desc
     narrowRow('Totales', '1.000.000,00', '0,00', '110.000,00'),
     'Neto a cobrar $ 890.000,00',
   ].join('\n'), 'PDF_TEXT');
-  assert.equal(narrow.lineItems.find(({ normalizedConceptCode }) => normalizedConceptCode === 'RETIREMENT')?.amount, '110000.00');
+  assert.deepEqual(
+    narrow.lineItems.find(({ itemType }) => itemType === 'DEDUCTION'),
+    { amount: '110000.00', confidence: 0.86, isRecurring: null, itemType: 'DEDUCTION', normalizedConceptCode: null, rawDescription: 'Deducción' },
+  );
+});
+
+test('minimiza afiliación sindical, salud y cualquier deducción tabular', () => {
+  const result = extractArgentinePayroll(`
+RECIBO DE SUELDO
+Período: 08/2026
+Cuota sindical Sindicato Sintético $ 10.000,00
+Obra social Plan Sintético $ 20.000,00
+Total bruto $ 100.000,00
+Total descuentos $ 30.000,00
+Neto a cobrar $ 70.000,00
+`, 'PDF_TEXT');
+  const deductions = result.lineItems.filter(({ itemType }) => itemType === 'DEDUCTION');
+  assert.deepEqual(deductions.map(({ normalizedConceptCode, rawDescription }) => ({ normalizedConceptCode, rawDescription })), [
+    { normalizedConceptCode: null, rawDescription: 'Deducción' },
+    { normalizedConceptCode: null, rawDescription: 'Deducción' },
+  ]);
+  assert.equal(JSON.stringify(deductions).match(/sindicat|obra social|health_insurance|union_dues/gi), null);
+
+  const row = (description: string, deduction = '') => `${description.padEnd(50)}${''.padEnd(20)}${''.padEnd(20)}${deduction}`;
+  const table = extractArgentinePayroll([
+    'RECIBO DE SUELDO',
+    'Período: 08/2026',
+    row('Concepto') + 'Descuentos',
+    row('OSDE Plan 999', '20.000,00'),
+    row('UPCN cuota solidaria', '10.000,00'),
+    row('Totales', '30.000,00'),
+    'Neto a cobrar $ 70.000,00',
+  ].join('\n'), 'PDF_TEXT');
+  assert.ok(table.lineItems.filter(({ itemType }) => itemType === 'DEDUCTION').every((item) =>
+    item.rawDescription === 'Deducción' && item.normalizedConceptCode === null));
+  assert.equal(/OSDE|UPCN|solidaria/i.test(JSON.stringify(table.lineItems)), false);
 });
 
 test('rechaza texto comercial sin señales salariales', () => {

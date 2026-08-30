@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el esquema base, las correcciones manuales y la aceptación legal/admin mínima existen en las migraciones 001–005. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–011. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -35,6 +35,8 @@ erDiagram
     USER ||--o{ USER_CORRECTION : makes
     EXTRACTION_RUN ||--o{ USER_CORRECTION : contextualizes
     EXTRACTED_FIELD o|--o{ USER_CORRECTION : corrects
+    USER ||--o{ MFA_FACTOR : protects
+    MFA_FACTOR ||--o{ MFA_RECOVERY_CODE : issues
     USER ||--o{ AUDIT_EVENT : scopes
 ~~~
 
@@ -183,6 +185,12 @@ LegalDocumentVersion conserva una versión append-only de Términos o Aviso de P
 
 User tiene sólo `USER` o `ADMIN`. `ADMIN` habilita rutas explícitas de métricas sanitizadas y no altera ownership ni concede acceso a recursos de otra cuenta. El rol se relee desde DB en cada request privilegiado.
 
+### MFAFactor, sesión y constancias de privacidad
+
+MFAFactor conserva un secreto TOTP cifrado y versionado, estado pendiente/activo, contador anti-replay y lock temporal. Los recovery codes se guardan sólo como hashes. `mfaVerifiedAt` y `stepUpExpiresAt` pertenecen a la sesión exacta; elevar garantía rota su token.
+
+StorageDeletionTombstone sobrevive a cascades y conserva únicamente las dos keys opacas necesarias para reconciliar un borrado físico. AccountDeletionReceipt conserva el hash de una constancia opaca y el estado de la baja sin email, nombre, userId ni FK personal después de completarse.
+
 ## Dinero
 
 - PostgreSQL NUMERIC/DECIMAL; nunca FLOAT.
@@ -237,7 +245,7 @@ Original y estructura tienen lifecycle separado:
 
 - borrar original elimina object storage y derivados, pero puede conservar settlements;
 - borrar documento elimina o anonimiza toda relación según elección/política;
-- borrar cuenta coordina DB, storage, cache, cola, shares, temporales e índices.
+- borrar cuenta coordina hoy DB, storage, cola, exports y temporales; cualquier cache externa, share o índice futuro deberá sumarse a esa orquestación antes de habilitarse.
 
 Los detalles están en [Retención](../privacy/data-retention.md).
 

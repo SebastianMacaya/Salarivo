@@ -11,7 +11,7 @@ Web, API, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, ob
 - PDFs y derivados;
 - salarios, conceptos y timeline;
 - PII e identificadores fiscales;
-- sesiones, credenciales y MFA futuro;
+- sesiones, credenciales, secretos MFA y recovery codes;
 - claves de cifrado y credenciales de proveedores;
 - exports y autorizaciones firmadas;
 - correcciones humanas y audit trail;
@@ -62,10 +62,10 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 | Path traversal | object key generada por servidor, filename sólo metadata, paths temporales internos | filenames con rutas no escapan del sandbox |
 | SSRF | worker sin red por defecto, destinos externos allowlisted, no seguir URLs del documento | URLs embebidas nunca se solicitan |
 | URL firmada filtrada/reutilizada | TTL breve, método/key/tamaño limitados, autorización previa, no loguear URL | expiración, método incorrecto y otra key fallan |
-| Robo de sesión | cookies HttpOnly/Secure/SameSite, CSRF según auth, rotación/revocación, reauth sensible | sesión revocada y CSRF |
-| Credential stuffing | rate limit por identidad/IP, respuestas uniformes, alertas, MFA futura | tests de rate limit y enumeración |
+| Robo de sesión | cookies HttpOnly/Secure/SameSite, validación de Origin, rotación/revocación, MFA de sesión y step-up sensible | sesión revocada, cookie rotada y acción sin step-up |
+| Credential stuffing | rate limit local por identidad/IP, respuestas uniformes, MFA obligatorio para admin y opcional para usuario | tests de rate limit y enumeración; store distribuido antes de múltiples réplicas |
 | XSS desde documento/OCR | nunca renderizar HTML; output como texto escapado; CSP | payload OCR no ejecuta código |
-| DoS de CPU/RAM/storage | límites tempranos, streaming, lote activo único, cuotas de documentos/bytes, timeout y backpressure | lote/archivo excesivo se rechaza antes de emitir uploads y la concurrencia por usuario no bloquea a otro |
+| DoS de CPU/RAM/storage/DB | límites tempranos, streaming, lote activo único, cuotas, timeout, backpressure y máximo local de dos exports | lote/archivo excesivo se rechaza antes de emitir uploads y la concurrencia por usuario no agota workers ni pool DB |
 | Ataque económico OCR/LLM | clasificación barata, budget por documento/user/batch, LLM último | batch inválido no dispara OCR/LLM masivo |
 | Monopolio de workers | concurrencia global y por usuario, fairness | usuario grande no bloquea uno pequeño |
 | Mensajes duplicados/retries | idempotency keys, constraints y state transitions transaccionales | delivery duplicado produce un resultado |
@@ -75,7 +75,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 | Escalamiento a admin | rol sólo en DB, nunca desde body/cookie; guard server-side en cada ruta; respuestas agregadas sin PII ni salarios | registro con `role` falla, USER recibe 403 y revocación aplica al siguiente request |
 | Reidentificación en benchmark futuro | feature apagada; antes de habilitar: cohortes amplias predefinidas, k mínimo, redondeo, demora, anti-differencing, query budget, mitigación Sybil/poisoning y opt-in separado | ataques de membership inference y consultas diferenciales no recuperan aportes individuales |
 | Supply chain | lockfile, versiones evaluadas, SCA/SAST, imágenes/versiones reproducibles | scans bloqueantes y actualización controlada |
-| Borrado incompleto | orquestación idempotente sobre DB/storage/cache/cola/temporales/backups | prueba de account deletion y reconciliación |
+| Borrado incompleto | orquestación idempotente sobre DB/storage/cache/cola/temporales/backups; marcador de ejecución hasta limpiar temporales | prueba de account deletion, job activo y reconciliación |
 | Prompt injection / exfiltración IA | documentos como datos, prompts fijos, tool allowlist, minimización/redacción, sin secretos | fixture con órdenes no cambia flujo ni herramientas |
 
 ## Riesgos de privacidad específicos
@@ -98,14 +98,17 @@ Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle de
 - OCR/proveedor degradado;
 - cuota o storage cerca del límite;
 - fallos de eliminación;
+- marcadores de ejecución huérfanos que bloquean una baja;
 - errores de sanitizer o secret scan.
 
 Las alertas sólo incluyen IDs internos y códigos.
 
 ## Riesgos abiertos
 
-- Proveedor de auth y política MFA.
-- MFA/step-up y proceso operativo de alta/revocación para administradores antes de producción.
+- Proveedor definitivo de identidad y proceso operativo de alta/recuperación/revocación para administradores.
+- Rate limit compartido y configuración probada de proxy/IP antes de escalar la API a múltiples réplicas.
+- Auditoría durable y alertas sanitizadas para intentos MFA denegados o bloqueados.
+- Alerta y procedimiento verificado para recuperar un `execution_owner` huérfano sin borrar temporales de un proceso vivo.
 - Proveedor cloud, región y KMS.
 - Parser PDF y perfil exacto de sandbox.
 - SLA, budgets y límites numéricos.

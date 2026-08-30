@@ -1,3 +1,5 @@
+import type { MfaKeyring } from "./mfa.ts";
+
 export type AppEnvironment = "development" | "test" | "production";
 
 export type ApiConfig = Readonly<{
@@ -8,6 +10,7 @@ export type ApiConfig = Readonly<{
   logLevel: "silent" | "fatal" | "error" | "warn" | "info" | "debug" | "trace";
   sessionTtlSeconds: number;
   passwordResetTtlSeconds: number;
+  mfaKeyring: MfaKeyring;
   maxFileBytes: number;
   maxFilesPerBatch: number;
   maxBatchBytes: number;
@@ -19,6 +22,7 @@ export type ApiConfig = Readonly<{
   storageSecretKey: string;
   storageBucket: string;
   storageInternalEndpoint: string;
+  storageKmsKeyId: string | null;
   storagePublicEndpoint: string;
   storageRegion: string;
 }>;
@@ -77,12 +81,76 @@ function required(value: string | undefined, name: string): string {
   return value;
 }
 
+function endpoint(value: string, name: string, production: boolean): string {
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { throw new Error(`${name} must be an absolute HTTP(S) origin`); }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.origin !== value) {
+    throw new Error(`${name} must contain only an absolute HTTP(S) origin`);
+  }
+  if (production && parsed.protocol !== "https:") throw new Error(`${name} must use HTTPS in production`);
+  return parsed.origin;
+}
+
+function encryptionKey(value: string, name: string): Buffer {
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.length !== 32 || decoded.toString("base64") !== value) {
+    throw new Error(`${name} must be canonical base64 for exactly 32 bytes`);
+  }
+  return decoded;
+}
+
+function mfaKeyring(env: NodeJS.ProcessEnv, production: boolean): MfaKeyring {
+  const activeVersion = integer(
+    env.MFA_ENCRYPTION_KEY_VERSION,
+    "MFA_ENCRYPTION_KEY_VERSION",
+    production ? undefined : 1,
+    1,
+    2_147_483_647,
+  );
+  const activeKey = production
+    ? required(env.MFA_ENCRYPTION_KEY_BASE64, "MFA_ENCRYPTION_KEY_BASE64")
+    : (env.MFA_ENCRYPTION_KEY_BASE64 ?? "bG9jYWwtbWZhLWtleS1vbmx5LWZvci10ZXN0cyEhISE=");
+  const keys = new Map<number, Buffer>([[
+    activeVersion,
+    encryptionKey(activeKey, "MFA_ENCRYPTION_KEY_BASE64"),
+  ]]);
+  if (env.MFA_ENCRYPTION_PREVIOUS_KEYS_JSON) {
+    let previous: unknown;
+    try {
+      previous = JSON.parse(env.MFA_ENCRYPTION_PREVIOUS_KEYS_JSON);
+    } catch {
+      throw new Error("MFA_ENCRYPTION_PREVIOUS_KEYS_JSON must be valid JSON");
+    }
+    if (!previous || typeof previous !== "object" || Array.isArray(previous)) {
+      throw new Error("MFA_ENCRYPTION_PREVIOUS_KEYS_JSON must be a version-to-key object");
+    }
+    for (const [rawVersion, rawKey] of Object.entries(previous)) {
+      if (!/^[1-9]\d*$/.test(rawVersion) || typeof rawKey !== "string") {
+        throw new Error("MFA_ENCRYPTION_PREVIOUS_KEYS_JSON contains an invalid entry");
+      }
+      const version = Number(rawVersion);
+      if (!Number.isSafeInteger(version) || version === activeVersion) {
+        throw new Error("MFA_ENCRYPTION_PREVIOUS_KEYS_JSON contains an invalid version");
+      }
+      keys.set(version, encryptionKey(rawKey, `MFA previous key ${version}`));
+    }
+  }
+  return Object.freeze({ activeVersion, keys });
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
-  const appEnv = env.APP_ENV ?? "development";
+  const configuredAppEnv = env.APP_ENV?.trim();
+  if (env.NODE_ENV === "production" && configuredAppEnv && configuredAppEnv !== "production") {
+    throw new Error("APP_ENV cannot override NODE_ENV=production");
+  }
+  const appEnv = env.NODE_ENV === "production" ? "production" : (configuredAppEnv || "development");
   if (!["development", "test", "production"].includes(appEnv)) {
     throw new Error("APP_ENV must be development, test or production");
   }
   const production = appEnv === "production";
+  if (production && env.NODE_TLS_REJECT_UNAUTHORIZED?.trim() === "0") {
+    throw new Error("NODE_TLS_REJECT_UNAUTHORIZED=0 is forbidden in production");
+  }
   const publicOrigin = origin(
     production ? required(env.PUBLIC_ORIGIN, "PUBLIC_ORIGIN") : (env.PUBLIC_ORIGIN ?? "http://localhost:3000"),
   );
@@ -118,6 +186,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
       300,
       86_400,
     ),
+    mfaKeyring: mfaKeyring(env, production),
     maxFileBytes: integer(env.MAX_FILE_BYTES, "MAX_FILE_BYTES", production ? undefined : 20 * 1024 * 1024, 1_024, 100 * 1024 * 1024),
     maxFilesPerBatch: integer(env.MAX_FILES_PER_BATCH, "MAX_FILES_PER_BATCH", production ? undefined : 200, 1, 1_000),
     maxBatchBytes: integer(env.MAX_BATCH_BYTES, "MAX_BATCH_BYTES", production ? undefined : 512 * 1024 * 1024, 1_024, 10 * 1024 * 1024 * 1024),
@@ -134,12 +203,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     storageBucket: production
       ? required(env.OBJECT_STORAGE_BUCKET, "OBJECT_STORAGE_BUCKET")
       : (env.OBJECT_STORAGE_BUCKET ?? "salarivo-documents-local"),
-    storageInternalEndpoint: production
-      ? required(env.OBJECT_STORAGE_INTERNAL_ENDPOINT, "OBJECT_STORAGE_INTERNAL_ENDPOINT")
-      : (env.OBJECT_STORAGE_INTERNAL_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`),
-    storagePublicEndpoint: production
-      ? required(env.OBJECT_STORAGE_PUBLIC_ENDPOINT, "OBJECT_STORAGE_PUBLIC_ENDPOINT")
-      : (env.OBJECT_STORAGE_PUBLIC_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`),
+    storageInternalEndpoint: endpoint(
+      production
+        ? required(env.OBJECT_STORAGE_INTERNAL_ENDPOINT, "OBJECT_STORAGE_INTERNAL_ENDPOINT")
+        : (env.OBJECT_STORAGE_INTERNAL_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`),
+      "OBJECT_STORAGE_INTERNAL_ENDPOINT",
+      production,
+    ),
+    storageKmsKeyId: production
+      ? required(env.OBJECT_STORAGE_KMS_KEY_ID, "OBJECT_STORAGE_KMS_KEY_ID")
+      : (env.OBJECT_STORAGE_KMS_KEY_ID ?? null),
+    storagePublicEndpoint: endpoint(
+      production
+        ? required(env.OBJECT_STORAGE_PUBLIC_ENDPOINT, "OBJECT_STORAGE_PUBLIC_ENDPOINT")
+        : (env.OBJECT_STORAGE_PUBLIC_ENDPOINT ?? `http://127.0.0.1:${env.MINIO_API_PORT ?? "9000"}`),
+      "OBJECT_STORAGE_PUBLIC_ENDPOINT",
+      production,
+    ),
     storageRegion: env.OBJECT_STORAGE_REGION ?? "us-east-1",
   });
 }

@@ -1,6 +1,6 @@
 FROM node:24.15-bookworm-slim
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production APP_ENV=production
 WORKDIR /app
 
 COPY package.json package-lock.json ./

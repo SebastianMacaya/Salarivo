@@ -58,14 +58,14 @@ Configuración validada:
 - MAX_PARSE_TIME_MS;
 - MAX_OCR_TIME_MS;
 - MAX_RENDER_PIXELS;
-- MAX_WORKER_MEMORY_BYTES;
-- JOB_MAX_RETRIES.
 
 Ausencia o valor inválido debe impedir el arranque en producción. El worker termina de forma segura cuando supera un budget y registra un código sanitizado.
 
+El límite de memoria es hoy el `mem_limit` global del contenedor y los intentos máximos pertenecen al job persistido. Un límite de memoria por job requiere el sandbox productivo pendiente.
+
 ## Aislamiento del parser
 
-El proceso que inspecciona/renderiza:
+Objetivo productivo para el proceso que inspecciona/renderiza:
 
 - no es root;
 - usa filesystem temporal por job;
@@ -76,6 +76,8 @@ El proceso que inspecciona/renderiza:
 - borra temporales al finalizar o por reconciliación.
 
 Nunca se abre el PDF en un navegador privilegiado del backend ni se ejecuta contenido activo.
+
+El corte local ejecuta herramientas como usuario no-root dentro del mismo contenedor del worker, con entorno mínimo, directorio temporal por job y límites de tiempo y output; Compose agrega filesystem read-only y memoria global. Todavía comparte UID y red del worker, no impone CPU/RAM por job y no tiene reconciliador de filesystem. Si el cleanup del temporal falla, `execution_owner` queda bloqueado en vez de afirmar una baja completa. Egress restringido y sandbox por job son P0 antes de datos reales.
 
 ## Malware
 
@@ -107,7 +109,9 @@ El usuario puede indicar “sí es un recibo” sólo después de seguridad. Esa
 
 ## Cleanup
 
-Uploads incompletos expiran. Su item se cancela cuando ya no existe una sesión vigente y los items que nunca iniciaron upload se cancelan tras `UPLOAD_TTL_SECONDS + UPLOAD_CLEANUP_GRACE_MS` sin actividad del lote, permitiendo completarlo sin cortar una carga secuencial activa. La key `incoming/` de una sesión confirmada se conserva y reborra hasta terminar esa misma ventana; recién entonces la referencia pasa a la key canónica. Rechazados, cancelados y temporales se eliminan por una tarea idempotente y reconciliable. El estado DELETED sólo se confirma después de borrar/revocar recursos activos o registrar explícitamente qué queda sujeto a backup.
+Uploads incompletos expiran. Su item se cancela cuando ya no existe una sesión vigente y los items que nunca iniciaron upload se cancelan tras `UPLOAD_TTL_SECONDS + UPLOAD_CLEANUP_GRACE_MS` sin actividad del lote, permitiendo completarlo sin cortar una carga secuencial activa. La key `incoming/` de una sesión confirmada se conserva y reborra hasta terminar esa misma ventana; recién entonces la referencia pasa a la key canónica. Rechazados, cancelados y temporales se eliminan por una tarea idempotente y reconciliable.
+
+Un borrado explícito registra antes un tombstone durable con las keys `incoming/` y canónica, bloquea la descarga e intenta el delete inmediato. El worker conserva el tombstone hasta que venza la autorización de upload, reintenta ambas keys y sólo entonces lo elimina. Antes de producción debe comprobarse que la duración máxima de una carga no supera esa ventana; si el proveedor no ofrece esa garantía, el worker deberá inventariar y reborrar después antes de cerrar la baja. Producción falla al arrancar si el bucket tuvo versioning, no usa la clave KMS configurada o permite acceso público. `DELETE_AFTER_PROCESSING`, cuando ya está persistido en el documento, usa el mismo mecanismo al terminar sin revisión, al completar una revisión, al rechazar un tipo no soportado o al agotar un fallo permanente.
 
 ## Checklist de implementación
 

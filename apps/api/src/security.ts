@@ -65,6 +65,10 @@ export function tokenHash(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
+export function sessionCookieName(appEnv: string): string {
+  return appEnv === "production" ? "__Host-salarivo_session" : "salarivo_session";
+}
+
 export function hasTrustedMutationOrigin(
   method: string,
   requestOrigin: string | undefined,

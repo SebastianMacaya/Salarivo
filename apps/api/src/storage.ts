@@ -2,6 +2,10 @@ import {
   CopyObjectCommand,
   CreateBucketCommand,
   DeleteObjectCommand,
+  GetBucketEncryptionCommand,
+  GetBucketVersioningCommand,
+  GetObjectCommand,
+  GetPublicAccessBlockCommand,
   HeadBucketCommand,
   HeadObjectCommand,
   PutBucketCorsCommand,
@@ -9,10 +13,12 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash } from "node:crypto";
 import type { ApiConfig } from "./config.ts";
 
 export type Storage = ReturnType<typeof createStorage>;
+const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
 
 export function createStorage(config: ApiConfig) {
   const common = {
@@ -25,15 +31,35 @@ export function createStorage(config: ApiConfig) {
   };
   const internal = new S3Client({ ...common, endpoint: config.storageInternalEndpoint });
   const publicSigner = new S3Client({ ...common, endpoint: config.storagePublicEndpoint });
+  const requestOptions = () => ({ abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) });
 
   return {
     async ensureBucket() {
       try {
-        await internal.send(new HeadBucketCommand({ Bucket: config.storageBucket }));
+        await internal.send(new HeadBucketCommand({ Bucket: config.storageBucket }), requestOptions());
       } catch (error) {
         const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
         if (status !== 404) throw error;
-        await internal.send(new CreateBucketCommand({ Bucket: config.storageBucket }));
+        if (config.appEnv === "production") throw new Error("OBJECT_STORAGE_BUCKET must be provisioned before production startup");
+        await internal.send(new CreateBucketCommand({ Bucket: config.storageBucket }), requestOptions());
+      }
+      if (config.appEnv === "production") {
+        const [versioning, encryption, access] = await Promise.all([
+          internal.send(new GetBucketVersioningCommand({ Bucket: config.storageBucket }), requestOptions()),
+          internal.send(new GetBucketEncryptionCommand({ Bucket: config.storageBucket }), requestOptions()),
+          internal.send(new GetPublicAccessBlockCommand({ Bucket: config.storageBucket }), requestOptions()),
+        ]);
+        if (versioning.Status !== undefined) {
+          throw new Error("OBJECT_STORAGE_BUCKET must never have versioning enabled");
+        }
+        const kms = encryption.ServerSideEncryptionConfiguration?.Rules?.some((rule) =>
+          rule.ApplyServerSideEncryptionByDefault?.SSEAlgorithm === "aws:kms"
+          && rule.ApplyServerSideEncryptionByDefault.KMSMasterKeyID === config.storageKmsKeyId);
+        if (!kms) throw new Error("OBJECT_STORAGE_BUCKET must use the configured KMS key");
+        const block = access.PublicAccessBlockConfiguration;
+        if (!block?.BlockPublicAcls || !block.IgnorePublicAcls || !block.BlockPublicPolicy || !block.RestrictPublicBuckets) {
+          throw new Error("OBJECT_STORAGE_BUCKET must block all public access");
+        }
       }
       try {
         await internal.send(new PutBucketCorsCommand({
@@ -47,7 +73,7 @@ export function createStorage(config: ApiConfig) {
               MaxAgeSeconds: config.uploadTtlSeconds,
             }],
           },
-        }));
+        }), requestOptions());
       } catch (error) {
         const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
         // MinIO configura CORS a nivel servidor y responde 501 a PutBucketCors.
@@ -64,24 +90,47 @@ export function createStorage(config: ApiConfig) {
             AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
           }],
         },
-      }));
+      }), requestOptions());
     },
 
     async authorizeUpload(sessionId: string, objectKey: string, expectedSize: number) {
+      const encryptionFields = config.storageKmsKeyId ? {
+        "x-amz-server-side-encryption": "aws:kms",
+        "x-amz-server-side-encryption-aws-kms-key-id": config.storageKmsKeyId,
+      } : {};
       return createPresignedPost(publicSigner, {
         Bucket: config.storageBucket,
         Key: objectKey,
-        Conditions: [["content-length-range", expectedSize, expectedSize]],
+        Conditions: [
+          ["content-length-range", expectedSize, expectedSize],
+          ...Object.entries(encryptionFields).map(([key, value]) => ({ [key]: value })),
+        ],
         Fields: {
           "Content-Type": "application/pdf",
           "x-amz-meta-upload-session": sessionId,
+          ...encryptionFields,
         },
         Expires: config.uploadTtlSeconds,
       });
     },
 
+    async authorizeDownload(objectKey: string) {
+      const expiresIn = 120;
+      const url = await getSignedUrl(publicSigner, new GetObjectCommand({
+        Bucket: config.storageBucket,
+        Key: objectKey,
+        ResponseCacheControl: "no-store, private, max-age=0",
+        ResponseContentDisposition: 'attachment; filename="salarivo-document.pdf"',
+        ResponseContentType: "application/pdf",
+      }), { expiresIn });
+      return { url, expiresAt: new Date(Date.now() + expiresIn * 1000).toISOString() };
+    },
+
     async inspectUpload(sessionId: string, objectKey: string, expectedSize: number) {
-      const head = await internal.send(new HeadObjectCommand({ Bucket: config.storageBucket, Key: objectKey }));
+      const head = await internal.send(
+        new HeadObjectCommand({ Bucket: config.storageBucket, Key: objectKey }),
+        requestOptions(),
+      );
       if (
         head.ContentLength !== expectedSize ||
         head.ContentType !== "application/pdf" ||
@@ -104,11 +153,18 @@ export function createStorage(config: ApiConfig) {
         CopySourceIfMatch: sourceEtag,
         Key: targetKey,
         MetadataDirective: "COPY",
-      }));
+        ...(config.storageKmsKeyId ? {
+          ServerSideEncryption: "aws:kms" as const,
+          SSEKMSKeyId: config.storageKmsKeyId,
+        } : {}),
+      }), requestOptions());
     },
 
     async deleteObject(objectKey: string) {
-      await internal.send(new DeleteObjectCommand({ Bucket: config.storageBucket, Key: objectKey }));
+      await internal.send(
+        new DeleteObjectCommand({ Bucket: config.storageBucket, Key: objectKey }),
+        requestOptions(),
+      );
     },
 
     destroy() {

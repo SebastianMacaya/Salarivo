@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 
-const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001/api/v1';
+const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
+  ?? (process.env.NODE_ENV === 'production' ? '/api/v1' : 'http://localhost:3001/api/v1');
 
 type LegalDocument = {
   documentType: 'TERMS' | 'PRIVACY_NOTICE';

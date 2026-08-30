@@ -9,7 +9,7 @@ Los ADR registran decisiones arquitectónicas materiales, no tareas ni preferenc
 - Superseded: reemplazada por otro ADR.
 - Rejected: evaluada y descartada.
 
-Los ADR 0001, 0002 y 0007 están Accepted y respaldados por el corte vertical. Los ADR 0003, 0004, 0005 y 0006 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
+Los ADR 0001, 0002, 0007, 0008 y 0009 están Accepted y respaldados por el corte vertical. Los ADR 0003, 0004, 0005 y 0006 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
 
 ## Índice
 
@@ -20,6 +20,8 @@ Los ADR 0001, 0002 y 0007 están Accepted y respaldados por el corte vertical. L
 - [0005 — Historial laboral y documentos de evidencia](0005-employment-history-and-evidence.md)
 - [0006 — Entitlements y benchmark salarial de mercado](0006-entitlements-and-market-benchmarking.md)
 - [0007 — Aceptación legal versionada y administración mínima](0007-versioned-legal-acceptance-and-minimal-admin.md)
+- [0008 — Garantía de sesión y MFA TOTP](0008-session-assurance-and-totp-mfa.md)
+- [0009 — Borrado durable y constancias de privacidad](0009-durable-deletion-and-privacy-receipts.md)
 
 ## Formato
 

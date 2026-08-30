@@ -439,10 +439,10 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
         items.push({
           amount: deduction.value,
           confidence: 0.86,
-          isRecurring: concept?.type === 'DEDUCTION' ? concept.recurring : null,
+          isRecurring: null,
           itemType: 'DEDUCTION',
-          normalizedConceptCode: concept?.type === 'DEDUCTION' ? concept.code : null,
-          rawDescription,
+          normalizedConceptCode: null,
+          rawDescription: 'Deducción',
         });
         continue;
       }
@@ -472,10 +472,12 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
     items.push({
       amount: amount.startsWith('-') ? amount.slice(1) : amount,
       confidence: 0.84,
-      isRecurring: concept.recurring,
+      isRecurring: concept.type === 'DEDUCTION' ? null : concept.recurring,
       itemType: concept.type,
-      normalizedConceptCode: concept.code,
-      rawDescription: line.slice(0, Math.max(1, line.length - (rawAmount?.length ?? 0))).trim().slice(0, 240),
+      normalizedConceptCode: concept.type === 'DEDUCTION' ? null : concept.code,
+      rawDescription: concept.type === 'DEDUCTION'
+        ? 'Deducción'
+        : line.slice(0, Math.max(1, line.length - (rawAmount?.length ?? 0))).trim().slice(0, 240),
     });
   }
   return items;

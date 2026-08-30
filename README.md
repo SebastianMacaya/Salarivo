@@ -2,7 +2,7 @@
 
 Aplicación privada para convertir recibos de sueldo en un historial salarial y laboral estructurado, verificable y controlado por su dueño.
 
-> Estado: MVP local implementado. El repositorio incluye web, API, PostgreSQL, storage privado, cola durable, worker de PDFs, revisión humana y controles de privacidad. No está desplegado.
+> Estado: MVP local implementado. Existe una vista previa `owner-only` del frontend en Sites; no existe todavía un backend de producción apto para datos reales ni debe usarse esa vista con datos reales.
 
 ## Qué funciona
 
@@ -14,7 +14,8 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - extracción determinística de recibos argentinos, campos trazables, liquidación y conceptos;
 - confirmación de tipo, correcciones humanas e historial bruto/neto;
 - borrado separado de original o documento completo;
-- exportación JSON y eliminación durable de cuenta con reautenticación;
+- MFA TOTP, recovery codes y step-up de acciones sensibles; MFA obligatorio para administración;
+- exportación JSON completa y eliminación durable de cuenta con constancia consultable;
 - páginas públicas de Términos/Privacidad y panel admin de métricas sanitizadas;
 - reglas para agentes y mejora supervisada en [AGENTS.md](AGENTS.md).
 
@@ -41,7 +42,7 @@ docker compose --profile processing ps
 
 La API y el worker aplican la migración automáticamente. ClamAV puede tardar en quedar listo la primera vez mientras descarga firmas.
 
-La web se ejecuta aparte cuando quieras usar la interfaz; no se publica en Internet:
+Para desarrollo local, la web se ejecuta aparte:
 
 ~~~powershell
 npm run dev:web
@@ -89,6 +90,7 @@ npm run test:integration
 - [Pipeline de ingestión](docs/architecture/ingestion-pipeline.md)
 - [Modelo de dominio](docs/architecture/domain-model.md)
 - [Threat model](docs/security/threat-model.md)
+- [Auditoría de privacidad y seguridad 2026-08-30](docs/security/privacy-security-audit-2026-08-30.md)
 - [Seguridad de upload](docs/security/file-upload.md)
 - [Clasificación de datos](docs/privacy/data-classification.md)
 - [Retención](docs/privacy/data-retention.md)

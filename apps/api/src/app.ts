@@ -5,16 +5,20 @@ import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import { pool, withTransaction } from "@salarivo/database";
 import Fastify, {
+  LogController,
   type FastifyInstance,
   type FastifyReply,
   type FastifyRequest,
 } from "fastify";
 import type { ApiConfig } from "./config.ts";
 import { registerDataRoutes } from "./data-routes.ts";
+import { registerMfaRoutes } from "./mfa-routes.ts";
+import { lockValidStepUpSession } from "./session-assurance.ts";
 import {
   hashPassword,
   hasTrustedMutationOrigin,
   opaqueToken,
+  sessionCookieName,
   tokenHash,
   verifyPassword,
 } from "./security.ts";
@@ -25,12 +29,15 @@ type AuthUser = {
   displayName: string | null;
   role: "USER" | "ADMIN";
   createdAt: string;
+  authState: "AUTHENTICATED" | "MFA_REQUIRED" | "MFA_SETUP_REQUIRED";
+  mfaEnabled: boolean;
 };
 
 declare module "fastify" {
   interface FastifyRequest {
     authUser: AuthUser | null;
     authSessionHash: string | null;
+    authStepUp: boolean;
   }
 }
 
@@ -77,13 +84,15 @@ const errorSchema = {
 const userSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["id", "email", "displayName", "role", "createdAt"],
+  required: ["id", "email", "displayName", "role", "createdAt", "authState", "mfaEnabled"],
   properties: {
     id: { type: "string", pattern: UUID_PATTERN },
     email: { type: "string" },
     displayName: nullableText(100),
     role: { type: "string", enum: ["USER", "ADMIN"] },
     createdAt: { type: "string" },
+    authState: { type: "string", enum: ["AUTHENTICATED", "MFA_REQUIRED", "MFA_SETUP_REQUIRED"] },
+    mfaEnabled: { type: "boolean" },
   },
 };
 
@@ -187,12 +196,21 @@ function timestamp(value: Date | string): string {
 }
 
 function userFrom(row: Record<string, unknown>): AuthUser {
+  const role = row.role === "ADMIN" ? "ADMIN" : "USER";
+  const mfaEnabled = Boolean(row.mfa_enabled);
+  const authState = role === "ADMIN" && !mfaEnabled
+    ? "MFA_SETUP_REQUIRED"
+    : mfaEnabled && !row.mfa_verified_at
+      ? "MFA_REQUIRED"
+      : "AUTHENTICATED";
   return {
     id: String(row.id),
     email: String(row.email),
     displayName: row.display_name === null ? null : String(row.display_name),
-    role: row.role === "ADMIN" ? "ADMIN" : "USER",
+    role,
     createdAt: timestamp(row.created_at as Date | string),
+    authState,
+    mfaEnabled,
   };
 }
 
@@ -331,6 +349,7 @@ export async function buildApp(
 ): Promise<FastifyInstance> {
   const app = Fastify({
     bodyLimit: 256 * 1024,
+    logController: new LogController({ disableRequestLogging: true }),
     ajv: { customOptions: { removeAdditional: false } },
     logger:
       config.logLevel === "silent"
@@ -349,6 +368,7 @@ export async function buildApp(
   });
   app.decorateRequest("authUser", null);
   app.decorateRequest("authSessionHash", null);
+  app.decorateRequest("authStepUp", false);
 
   await app.register(cookie);
   await app.register(cors, {
@@ -367,6 +387,13 @@ export async function buildApp(
     ) {
       throw new ApiError(403, "UNTRUSTED_ORIGIN", "Origen no autorizado.");
     }
+  });
+
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (request.url.startsWith("/api/v1/") && !request.url.startsWith("/api/v1/legal/")) {
+      reply.header("Cache-Control", "no-store");
+    }
+    return payload;
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -428,7 +455,8 @@ export async function buildApp(
     });
   });
 
-  const sessionCookie = "salarivo_session";
+  const legacySessionCookie = "salarivo_session";
+  const sessionCookie = sessionCookieName(config.appEnv);
   const cookieOptions = {
     httpOnly: true,
     secure: config.appEnv === "production",
@@ -436,7 +464,7 @@ export async function buildApp(
     path: "/",
   };
 
-  async function requireAuth(request: FastifyRequest): Promise<void> {
+  async function requirePrimaryAuth(request: FastifyRequest): Promise<void> {
     const rawToken = request.cookies[sessionCookie];
     if (!rawToken || !new RegExp(TOKEN_PATTERN).test(rawToken)) {
       throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
@@ -444,7 +472,12 @@ export async function buildApp(
 
     const digest = tokenHash(rawToken);
     const result = await pool.query(
-      `SELECT u.id, u.email, u.display_name, u.role, u.created_at
+      `SELECT u.id, u.email, u.display_name, u.role, u.created_at,
+              s.mfa_verified_at, s.step_up_expires_at,
+              EXISTS (
+                SELECT 1 FROM mfa_factors factor
+                 WHERE factor.user_id = u.id AND factor.status = 'ACTIVE'
+              ) AS mfa_enabled
          FROM sessions s
          JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = $1
@@ -459,6 +492,25 @@ export async function buildApp(
     }
     request.authUser = userFrom(result.rows[0]);
     request.authSessionHash = digest;
+    request.authStepUp = result.rows[0].step_up_expires_at !== null
+      && new Date(result.rows[0].step_up_expires_at) > new Date();
+  }
+
+  async function requireAuth(request: FastifyRequest): Promise<void> {
+    await requirePrimaryAuth(request);
+    if (request.authUser!.authState === "MFA_REQUIRED") {
+      throw new ApiError(403, "MFA_REQUIRED", "Ingresá el código de tu segundo factor para continuar.");
+    }
+    if (request.authUser!.authState === "MFA_SETUP_REQUIRED") {
+      throw new ApiError(403, "MFA_SETUP_REQUIRED", "Configurá el segundo factor para continuar.");
+    }
+  }
+
+  async function requireStepUp(request: FastifyRequest): Promise<void> {
+    await requireAuth(request);
+    if (!request.authStepUp) {
+      throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+    }
   }
 
   async function requireAdmin(request: FastifyRequest): Promise<void> {
@@ -469,10 +521,16 @@ export async function buildApp(
   }
 
   function setSession(reply: FastifyReply, token: string): void {
+    if (sessionCookie !== legacySessionCookie) reply.clearCookie(legacySessionCookie, cookieOptions);
     reply.setCookie(sessionCookie, token, {
       ...cookieOptions,
       maxAge: config.sessionTtlSeconds,
     });
+  }
+
+  function clearSession(reply: FastifyReply): void {
+    reply.clearCookie(sessionCookie, cookieOptions);
+    if (sessionCookie !== legacySessionCookie) reply.clearCookie(legacySessionCookie, cookieOptions);
   }
 
   app.get(
@@ -645,7 +703,11 @@ export async function buildApp(
     async (request, reply) => {
       const email = normalizeEmail(request.body.email);
       const result = await pool.query(
-        `SELECT id, email, password_hash, display_name, role, created_at
+        `SELECT id, email, password_hash, display_name, role, created_at,
+                EXISTS (
+                  SELECT 1 FROM mfa_factors factor
+                   WHERE factor.user_id = users.id AND factor.status = 'ACTIVE'
+                ) AS mfa_enabled
            FROM users
           WHERE email = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
         [email],
@@ -660,16 +722,30 @@ export async function buildApp(
       }
 
       const token = opaqueToken();
-      await pool.query(
-        `INSERT INTO sessions (id, user_id, token_hash, expires_at)
-         VALUES ($1, $2, $3, $4)`,
-        [
-          randomUUID(),
-          row.id,
-          tokenHash(token),
-          new Date(Date.now() + config.sessionTtlSeconds * 1000),
-        ],
-      );
+      const verifiedHash = String(row.password_hash);
+      const sessionCreated = await withTransaction(async (client) => {
+        const current = await client.query(
+          `SELECT password_hash FROM users
+            WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL
+            FOR UPDATE`,
+          [row.id],
+        );
+        if (!current.rowCount || String(current.rows[0].password_hash) !== verifiedHash) return false;
+        await client.query(
+          `INSERT INTO sessions (id, user_id, token_hash, expires_at)
+           VALUES ($1, $2, $3, $4)`,
+          [
+            randomUUID(),
+            row.id,
+            tokenHash(token),
+            new Date(Date.now() + config.sessionTtlSeconds * 1000),
+          ],
+        );
+        return true;
+      });
+      if (!sessionCreated) {
+        throw new ApiError(401, "INVALID_CREDENTIALS", "Email o contraseña incorrectos.");
+      }
       setSession(reply, token);
       return { data: userFrom(row) };
     },
@@ -689,7 +765,7 @@ export async function buildApp(
           [tokenHash(rawToken)],
         );
       }
-      reply.clearCookie(sessionCookie, cookieOptions);
+      clearSession(reply);
       return { data: null };
     },
   );
@@ -697,11 +773,21 @@ export async function buildApp(
   app.get(
     "/api/v1/auth/me",
     {
-      preHandler: requireAuth,
+      preHandler: requirePrimaryAuth,
       schema: { response: responses(200, userSchema) },
     },
     async (request) => ({ data: request.authUser }),
   );
+
+  await registerMfaRoutes(app, {
+    config,
+    ApiError,
+    requirePrimaryAuth,
+    requireAuth,
+    requireStepUp,
+    setSession,
+    userSchema,
+  });
 
   app.get(
     "/api/v1/admin/overview",
@@ -914,7 +1000,7 @@ export async function buildApp(
         throw new ApiError(400, "INVALID_RESET_TOKEN", "El enlace de recuperación no es válido o venció.");
       }
 
-      reply.clearCookie(sessionCookie, cookieOptions);
+      clearSession(reply);
       return { data: { reset: true } };
     },
   );
@@ -975,7 +1061,7 @@ export async function buildApp(
   app.get<{ Params: IdParams }>(
     "/api/v1/employers/:id",
     {
-      preHandler: requireAuth,
+      preHandler: requireStepUp,
       schema: { params: idParamsSchema, response: responses(200, employerSchema) },
     },
     async (request) => {
@@ -1039,6 +1125,9 @@ export async function buildApp(
     },
     async (request) => {
       const outcome = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
         const employer = await client.query(
           `SELECT id FROM employers WHERE id = $1 AND user_id = $2 FOR UPDATE`,
           [request.params.id, request.authUser!.id],
@@ -1161,7 +1250,7 @@ export async function buildApp(
   app.get<{ Params: IdParams }>(
     "/api/v1/employments/:id",
     {
-      preHandler: requireAuth,
+      preHandler: requireStepUp,
       schema: { params: idParamsSchema, response: responses(200, employmentSchema) },
     },
     async (request) => {
@@ -1254,10 +1343,15 @@ export async function buildApp(
       schema: { params: idParamsSchema, response: responses(200, { type: "null" }) },
     },
     async (request) => {
-      const result = await pool.query(
-        `DELETE FROM employments WHERE id = $1 AND user_id = $2 RETURNING id`,
-        [request.params.id, request.authUser!.id],
-      );
+      const result = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
+        return client.query(
+          `DELETE FROM employments WHERE id = $1 AND user_id = $2 RETURNING id`,
+          [request.params.id, request.authUser!.id],
+        );
+      });
       if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
       return { data: null };
     },
@@ -1266,6 +1360,7 @@ export async function buildApp(
   await registerDataRoutes(app, {
     config,
     requireAuth,
+    requireStepUp,
     ApiError,
     provisionStorage: options.provisionStorage ?? config.appEnv !== "test",
   });

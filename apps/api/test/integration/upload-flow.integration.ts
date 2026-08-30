@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { request as httpRequest } from "node:http";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { createClient } from "redis";
 
 const origin = "http://localhost:3000";
@@ -41,10 +47,11 @@ function syntheticPayrollPdf(): Uint8Array<ArrayBuffer> {
 }
 
 test("upload privado crea un único documento y un único intent durable", async (context) => {
-  const [{ buildApp }, { loadConfig }, { pool }] = await Promise.all([
+  const [{ buildApp }, { loadConfig }, { pool }, { generateTotpCode }] = await Promise.all([
     import("../../src/app.ts"),
     import("../../src/config.ts"),
     import("@salarivo/database"),
+    import("../../src/mfa.ts"),
   ]);
   const config = loadConfig({
     ...process.env,
@@ -53,14 +60,75 @@ test("upload privado crea un único documento y un único intent durable", async
     PUBLIC_ORIGIN: origin,
   });
   const app = await buildApp(config, { provisionStorage: true });
+  const s3 = new S3Client({
+    credentials: { accessKeyId: config.storageAccessKey, secretAccessKey: config.storageSecretKey },
+    endpoint: config.storageInternalEndpoint,
+    forcePathStyle: true,
+    region: config.storageRegion,
+  });
   const redis = createClient({ url: process.env.QUEUE_URL ?? "redis://127.0.0.1:6379" });
   await redis.connect();
   context.after(async () => {
     await app.close();
     await redis.quit();
+    s3.destroy();
     await pool.end();
   });
   await app.ready();
+  const apiOrigin = await app.listen({ host: "127.0.0.1", port: 0 });
+
+  async function runWorkerUntil(event: string): Promise<void> {
+    const worker = spawn(process.execPath, [fileURLToPath(new URL("../../../worker-documents/src/index.ts", import.meta.url))], {
+      env: { ...process.env, APP_ENV: "test", UPLOAD_CLEANUP_GRACE_MS: "60000" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    let matched = false;
+    const reached = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`WORKER_EVENT_TIMEOUT:${event}:${output.slice(-500)}`)), 20_000);
+      timer.unref();
+      worker.stdout.on("data", (chunk) => {
+        output += String(chunk);
+        if (output.includes(`"event":"${event}"`)) {
+          matched = true;
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      worker.once("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      worker.once("exit", (code) => {
+        if (!matched) {
+          clearTimeout(timer);
+          reject(new Error(`WORKER_EXITED:${String(code)}:${output.slice(-500)}`));
+        }
+      });
+    });
+    try {
+      await reached;
+    } finally {
+      if (worker.exitCode === null) {
+        const exited = once(worker, "exit");
+        worker.kill("SIGTERM");
+        await exited.catch(() => undefined);
+      }
+    }
+  }
+
+  async function objectExists(key: string): Promise<boolean> {
+    try {
+      await s3.send(new HeadObjectCommand({ Bucket: config.storageBucket, Key: key }));
+      return true;
+    } catch (error) {
+      const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+      if (status === 404) return false;
+      throw error;
+    }
+  }
+
+  const deletionReceiptToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
   async function register(email: string) {
     const response = await app.inject({
@@ -81,6 +149,22 @@ test("upload privado crea un único documento y un único intent durable", async
     const cookie = response.headers["set-cookie"];
     assert.ok(cookie);
     return String(Array.isArray(cookie) ? cookie[0] : cookie).split(";", 1)[0]!;
+  }
+
+  function rotatedCookie(response: { headers: Record<string, string | string[] | number | undefined> }, current: string): string {
+    const value = response.headers["set-cookie"];
+    return value ? String(Array.isArray(value) ? value[0] : value).split(";", 1)[0]! : current;
+  }
+
+  async function login(email: string): Promise<string> {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/login",
+      headers: { origin },
+      payload: { email, password: "frase local segura 2026" },
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    return rotatedCookie(response, "");
   }
 
   const suffix = crypto.randomUUID();
@@ -147,12 +231,98 @@ test("upload privado crea un único documento y un único intent durable", async
     },
   });
   assert.equal(staleLegalVersion.statusCode, 409, staleLegalVersion.body);
-  const cookieA = await register(`a-${suffix}@example.test`);
-  const cookieB = await register(`b-${suffix}@example.test`);
+  const emailA = `a-${suffix}@example.test`;
+  const emailB = `b-${suffix}@example.test`;
+  let cookieA = await register(emailA);
+  let cookieB = await register(emailB);
+  const secondaryCookieA = await login(emailA);
   const meA = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: cookieA } });
   assert.equal(meA.statusCode, 200, meA.body);
   assert.equal(meA.json().data.role, "USER");
   const userIdA = String(meA.json().data.id);
+  const meB = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: cookieB } });
+  assert.equal(meB.statusCode, 200, meB.body);
+  const userIdB = String(meB.json().data.id);
+
+  const racingResetRequest = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/forgot-password",
+    headers: { origin },
+    payload: { email: emailB },
+  });
+  assert.equal(racingResetRequest.statusCode, 202, racingResetRequest.body);
+  const [racingLogin, racingReset] = await Promise.all([
+    app.inject({
+      method: "POST",
+      url: "/api/v1/auth/login",
+      headers: { origin },
+      payload: { email: emailB, password: "frase local segura 2026" },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/v1/auth/reset-password",
+      headers: { origin },
+      payload: { token: racingResetRequest.json().data.resetToken, password: "otra frase local segura 2026" },
+    }),
+  ]);
+  assert.equal(racingReset.statusCode, 200, racingReset.body);
+  if (racingLogin.statusCode === 200) {
+    const racedCookie = rotatedCookie(racingLogin, "");
+    const revokedRaceSession = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: racedCookie } });
+    assert.equal(revokedRaceSession.statusCode, 401, revokedRaceSession.body);
+  } else {
+    assert.equal(racingLogin.statusCode, 401, racingLogin.body);
+  }
+  const restoreResetRequest = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/forgot-password",
+    headers: { origin },
+    payload: { email: emailB },
+  });
+  const restoredPassword = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/reset-password",
+    headers: { origin },
+    payload: { token: restoreResetRequest.json().data.resetToken, password: "frase local segura 2026" },
+  });
+  assert.equal(restoredPassword.statusCode, 200, restoredPassword.body);
+  cookieB = await login(emailB);
+  await pool.query(
+    `INSERT INTO storage_deletion_tombstones (
+       id, user_id, canonical_object_key, incoming_object_key,
+       upload_expires_at, available_at, created_at
+     )
+     SELECT gen_random_uuid(), $1,
+            'documents/fairness-a-' || lpad(series::text, 3, '0') || '.pdf',
+            'incoming/fairness-a-' || lpad(series::text, 3, '0') || '.pdf',
+            now() - interval '2 minutes', now() - interval '3 minutes', now() - interval '3 minutes'
+       FROM generate_series(1, 101) AS series`,
+    [userIdA],
+  );
+  await pool.query(
+    `INSERT INTO storage_deletion_tombstones (
+       id, user_id, canonical_object_key, incoming_object_key,
+       upload_expires_at, available_at, created_at
+     ) VALUES ($1, $2, 'documents/fairness-b-single.pdf', 'incoming/fairness-b-single.pdf',
+       now() - interval '2 minutes', now() - interval '2 minutes', now() - interval '2 minutes')`,
+    [crypto.randomUUID(), userIdB],
+  );
+  await runWorkerUntil("storage_deletions_completed");
+  assert.equal(
+    (await pool.query(
+      "SELECT count(*)::integer AS count FROM storage_deletion_tombstones WHERE user_id = $1",
+      [userIdB],
+    )).rows[0].count,
+    0,
+  );
+  assert.equal(
+    (await pool.query(
+      "SELECT count(*)::integer AS count FROM storage_deletion_tombstones WHERE user_id = $1",
+      [userIdA],
+    )).rows[0].count,
+    2,
+  );
+  await pool.query("DELETE FROM storage_deletion_tombstones WHERE user_id = $1", [userIdA]);
   const legalAcknowledgements = await pool.query(
     `SELECT version.document_type, version.version, acknowledgement.accepted_at
        FROM legal_acknowledgements acknowledgement
@@ -169,6 +339,37 @@ test("upload privado crea un único documento y un único intent durable", async
   const deniedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieB } });
   assert.equal(deniedAdmin.statusCode, 403, deniedAdmin.body);
   await pool.query("UPDATE users SET role = 'ADMIN', updated_at = now() WHERE id = $1", [userIdA]);
+  const blockedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
+  assert.equal(blockedAdmin.statusCode, 403, blockedAdmin.body);
+  assert.equal(blockedAdmin.json().error.code, "MFA_SETUP_REQUIRED");
+  const enrollment = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/mfa/enrollment",
+    headers: { origin, cookie: cookieA },
+    payload: { password: "frase local segura 2026" },
+  });
+  assert.equal(enrollment.statusCode, 200, enrollment.body);
+  const enrollmentCode = generateTotpCode(String(enrollment.json().data.secret));
+  const wrongSessionConfirmation = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/mfa/enrollment/confirm",
+    headers: { origin, cookie: secondaryCookieA },
+    payload: { code: enrollmentCode },
+  });
+  assert.equal(wrongSessionConfirmation.statusCode, 409, wrongSessionConfirmation.body);
+  assert.equal(wrongSessionConfirmation.json().error.code, "MFA_ENROLLMENT_NOT_FOUND");
+  const confirmedMfa = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/mfa/enrollment/confirm",
+    headers: { origin, cookie: cookieA },
+    payload: { code: enrollmentCode },
+  });
+  assert.equal(confirmedMfa.statusCode, 200, confirmedMfa.body);
+  const recoveryCodes = confirmedMfa.json().data.recoveryCodes as string[];
+  assert.equal(recoveryCodes.length, 10);
+  cookieA = rotatedCookie(confirmedMfa, cookieA);
+  const revokedSecondarySession = await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { cookie: secondaryCookieA } });
+  assert.equal(revokedSecondarySession.statusCode, 401, revokedSecondarySession.body);
   const adminOverview = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
   assert.equal(adminOverview.statusCode, 200, adminOverview.body);
   assert.equal(adminOverview.headers["cache-control"], "no-store");
@@ -329,12 +530,15 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(denied.statusCode, 404, denied.body);
 
-  const pdf = new Blob([pdfBytes], { type: "application/pdf" });
-  assert.equal(pdf.size, item.expectedSizeBytes);
-  const form = new FormData();
-  for (const [name, value] of Object.entries(session.fields)) form.append(name, value);
-  form.append("file", pdf, "recibo-sintetico.pdf");
-  const upload = await fetch(session.url, { method: "POST", body: form });
+  async function uploadWithSignedPost() {
+    const pdf = new Blob([pdfBytes], { type: "application/pdf" });
+    assert.equal(pdf.size, item.expectedSizeBytes);
+    const form = new FormData();
+    for (const [name, value] of Object.entries(session.fields)) form.append(name, value);
+    form.append("file", pdf, "recibo-sintetico.pdf");
+    return fetch(session.url, { method: "POST", body: form });
+  }
+  const upload = await uploadWithSignedPost();
   assert.equal(upload.status, 204, await upload.text());
 
   const complete = () => app.inject({
@@ -350,7 +554,8 @@ test("upload privado crea un único documento y un único intent durable", async
     "SELECT object_key FROM upload_sessions WHERE id = $1",
     [session.id],
   );
-  assert.match(String(uploadReference.rows[0].object_key), /^incoming\/[0-9a-f-]+\.pdf$/);
+  const incomingObjectKey = String(uploadReference.rows[0].object_key);
+  assert.match(incomingObjectKey, /^incoming\/[0-9a-f-]+\.pdf$/);
 
   const counts = await pool.query(
     `SELECT
@@ -367,6 +572,7 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(await redis.lLen("salarivo:processing-jobs:documents"), 0);
 
   const documentId = confirmations[0]!.json().data.id as string;
+  const canonicalObjectKey = String((await pool.query("SELECT object_key FROM documents WHERE id = $1", [documentId])).rows[0].object_key);
   const processingAssociation = await app.inject({
     method: "PATCH",
     url: "/api/v1/documents/employment",
@@ -382,7 +588,7 @@ test("upload privado crea un único documento y un único intent durable", async
   );
   await pool.query(
     `UPDATE documents
-        SET processing_status = 'NEEDS_TYPE_CONFIRMATION', classification_status = 'NEEDS_CONFIRMATION'
+        SET security_status = 'CLEAN', processing_status = 'NEEDS_TYPE_CONFIRMATION', classification_status = 'NEEDS_CONFIRMATION'
       WHERE id = $1`,
     [documentId],
   );
@@ -489,9 +695,9 @@ test("upload privado crea un único documento y un único intent durable", async
        id, user_id, settlement_id, item_ordinal, raw_description,
        normalized_concept_code, amount, currency_code, item_type, confidence
      ) VALUES
-       ($1, $2, $3, 1, 'Jubilación sintética', 'RETIREMENT', 110.00, 'ARS', 'DEDUCTION', 0.9),
-       ($4, $2, $3, 2, 'Ingresos personales sintético', 'INCOME_TAX', 50.00, 'ARS', 'DEDUCTION', 0.9),
-       ($5, $2, $3, 3, 'Seguro sintético', NULL, 20.00, 'ARS', 'DEDUCTION', 0.8)`,
+       ($1, $2, $3, 1, 'Deducción', NULL, 110.00, 'ARS', 'DEDUCTION', 0.9),
+       ($4, $2, $3, 2, 'Deducción', NULL, 50.00, 'ARS', 'DEDUCTION', 0.9),
+       ($5, $2, $3, 3, 'Deducción', NULL, 20.00, 'ARS', 'DEDUCTION', 0.8)`,
     [crypto.randomUUID(), userId, settlementId, crypto.randomUUID(), crypto.randomUUID()],
   );
 
@@ -513,6 +719,7 @@ test("upload privado crea un único documento y un único intent durable", async
     });
     assert.equal(manualCorrection.statusCode, 201, manualCorrection.body);
   }
+  await pool.query("UPDATE documents SET retention_policy = 'DELETE_AFTER_PROCESSING' WHERE id = $1", [documentId]);
   const completedReview = await app.inject({
     method: "POST",
     url: `/api/v1/documents/${documentId}/review-complete`,
@@ -521,6 +728,34 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(completedReview.statusCode, 200, completedReview.body);
   assert.equal(completedReview.json().data.processingStatus, "COMPLETED");
+  assert.equal(
+    (await pool.query(
+      `SELECT document.original_deleted_at IS NOT NULL AS blocked,
+              EXISTS (SELECT 1 FROM storage_deletion_tombstones tombstone
+                       WHERE tombstone.canonical_object_key = document.object_key) AS scheduled
+         FROM documents AS document WHERE document.id = $1`,
+      [documentId],
+    )).rows[0].blocked,
+    true,
+  );
+  assert.equal(
+    (await pool.query(
+      `SELECT EXISTS (SELECT 1 FROM storage_deletion_tombstones tombstone
+                       JOIN documents document ON document.object_key = tombstone.canonical_object_key
+                      WHERE document.id = $1) AS scheduled`,
+      [documentId],
+    )).rows[0].scheduled,
+    true,
+  );
+  await pool.query(
+    `DELETE FROM storage_deletion_tombstones
+      WHERE canonical_object_key = (SELECT object_key FROM documents WHERE id = $1)`,
+    [documentId],
+  );
+  await pool.query(
+    "UPDATE documents SET retention_policy = 'KEEP_ORIGINAL', original_deleted_at = NULL WHERE id = $1",
+    [documentId],
+  );
   const completedBatch = await app.inject({ method: "GET", url: `/api/v1/imports/${batchData.id}`, headers: { cookie: cookieA } });
   assert.deepEqual(completedBatch.json().data.progress, { total: 1, resolved: 1, percentage: 100 });
   assert.equal((await app.inject({ method: "GET", url: "/api/v1/imports/active", headers: { cookie: cookieA } })).json().data, null);
@@ -740,6 +975,31 @@ test("upload privado crea un único documento y un único intent durable", async
     })).statusCode,
     200,
   );
+  const correctedType = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/corrections`,
+    headers: { origin, cookie: cookieA },
+    payload: { extractedFieldId: manualTypeFieldId, correctedValue: "AJUSTE" },
+  });
+  assert.equal(correctedType.statusCode, 201, correctedType.body);
+  const typeView = await app.inject({ method: "GET", url: "/api/v1/settlements", headers: { cookie: cookieA } });
+  assert.equal(typeView.json().data[0].settlementType, "AJUSTE");
+  assert.equal(
+    (await app.inject({
+      method: "POST",
+      url: `/api/v1/documents/${documentId}/review-complete`,
+      headers: { origin, cookie: cookieA },
+      payload: { acceptDeductionsMismatch: true },
+    })).statusCode,
+    200,
+  );
+  const unsupportedCorrection = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/corrections`,
+    headers: { origin, cookie: cookieA },
+    payload: { extractedFieldId: manualTypeFieldId, correctedValue: "NO_EXISTE" },
+  });
+  assert.equal(unsupportedCorrection.statusCode, 400, unsupportedCorrection.body);
 
   await assert.rejects(
     pool.query(
@@ -755,6 +1015,23 @@ test("upload privado crea un único documento y un único intent durable", async
   const isolatedView = await app.inject({ method: "GET", url: "/api/v1/settlements", headers: { cookie: cookieB } });
   assert.deepEqual(isolatedView.json().data, []);
 
+  await pool.query("UPDATE sessions SET step_up_expires_at = NULL WHERE user_id = $1", [userIdA]);
+  const blockedExport = await app.inject({
+    method: "POST",
+    url: "/api/v1/privacy/exports",
+    headers: { origin, cookie: cookieA },
+    payload: {},
+  });
+  assert.equal(blockedExport.statusCode, 403, blockedExport.body);
+  assert.equal(blockedExport.json().error.code, "STEP_UP_REQUIRED");
+  const steppedUp = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/step-up",
+    headers: { origin, cookie: cookieA },
+    payload: { code: recoveryCodes[0] },
+  });
+  assert.equal(steppedUp.statusCode, 200, steppedUp.body);
+  cookieA = rotatedCookie(steppedUp, cookieA);
   const firstExport = await app.inject({
     method: "POST",
     url: "/api/v1/privacy/exports",
@@ -778,28 +1055,355 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   const downloads = await Promise.all([download(), download()]);
   assert.deepEqual(downloads.map((response) => response.statusCode).sort(), [200, 409]);
+  const exported = downloads.find(({ statusCode }) => statusCode === 200)!.json();
+  assert.equal(exported.format, "salarivo-export-v2");
+  assert.ok(exported.extractionRuns.some((run: { id: string }) => run.id === manualRunId));
+  assert.ok(exported.corrections.every((correction: { extraction_run_id: string }) =>
+    exported.extractionRuns.some((run: { id: string }) => run.id === correction.extraction_run_id)));
+  assert.equal(/encrypted_secret|token_hash|password_hash|HEALTH_INSURANCE|UNION_DUES/i.test(JSON.stringify(exported)), false);
+
+  const revocableToken = deletionReceiptToken();
+  const revocableSessionHash = createHash("sha256").update(revocableToken).digest("hex");
+  const revocableExportId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO sessions (id, user_id, token_hash, expires_at, mfa_verified_at, step_up_expires_at)
+     VALUES ($1, $2, $3, now() + interval '1 hour', now(), now() + interval '10 minutes')`,
+    [crypto.randomUUID(), userIdA, revocableSessionHash],
+  );
+  await pool.query(
+    `INSERT INTO privacy_operations (
+       id, user_id, operation_type, idempotency_key, status, output_expires_at
+     ) VALUES ($1, $2, 'DATA_EXPORT', $3, 'READY', now() + interval '10 minutes')`,
+    [revocableExportId, userIdA, `revocable-export:${revocableExportId}`],
+  );
+  await pool.query(
+    `INSERT INTO audit_events (id, user_id, actor_user_id, action, resource_type, result)
+     SELECT gen_random_uuid(), $1, $1, 'SYNTHETIC_EXPORT_PAGE', 'TEST', 'SUCCESS'
+       FROM generate_series(1, 1001)`,
+    [userIdA],
+  );
+  const auditLock = await pool.connect();
+  await auditLock.query("BEGIN");
+  await auditLock.query("LOCK TABLE audit_events IN ACCESS EXCLUSIVE MODE");
+  const revokedDownload = app.inject({
+    method: "GET",
+    url: `/api/v1/privacy/exports/${revocableExportId}/download`,
+    headers: { cookie: `salarivo_session=${revocableToken}` },
+  });
+  try {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const status = await pool.query("SELECT status FROM privacy_operations WHERE id = $1", [revocableExportId]);
+      if (status.rows[0]?.status === "RUNNING") break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await pool.query("UPDATE sessions SET revoked_at = now() WHERE token_hash = $1", [revocableSessionHash]);
+  } finally {
+    await auditLock.query("COMMIT").catch(() => undefined);
+    auditLock.release();
+  }
+  await revokedDownload.catch(() => undefined);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const status = await pool.query("SELECT status FROM privacy_operations WHERE id = $1", [revocableExportId]);
+    if (status.rows[0]?.status === "READY") break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(
+    (await pool.query("SELECT status FROM privacy_operations WHERE id = $1", [revocableExportId])).rows[0].status,
+    "READY",
+  );
+
+  const socketExports: Array<{ id: string; token: string; userId: string }> = [
+    { id: crypto.randomUUID(), token: deletionReceiptToken(), userId: userIdA },
+    { id: crypto.randomUUID(), token: deletionReceiptToken(), userId: userIdB },
+    { id: crypto.randomUUID(), token: deletionReceiptToken(), userId: userIdA },
+  ];
+  for (const item of socketExports) {
+    await pool.query(
+      `INSERT INTO sessions (id, user_id, token_hash, expires_at, mfa_verified_at, step_up_expires_at)
+       VALUES ($1, $2, $3, now() + interval '1 hour', now(), now() + interval '10 minutes')`,
+      [crypto.randomUUID(), item.userId, createHash("sha256").update(item.token).digest("hex")],
+    );
+    await pool.query(
+      `INSERT INTO privacy_operations (
+         id, user_id, operation_type, idempotency_key, status, output_expires_at
+       ) VALUES ($1, $2, 'DATA_EXPORT', $3, 'READY', now() + interval '10 minutes')`,
+      [item.id, item.userId, `socket-export:${item.id}`],
+    );
+  }
+  const employerLock = await pool.connect();
+  const socketRequests: ReturnType<typeof httpRequest>[] = [];
+  const socketStarts: Promise<void>[] = [];
+  await employerLock.query("BEGIN");
+  await employerLock.query("LOCK TABLE employers IN ACCESS EXCLUSIVE MODE");
+  try {
+    for (const item of socketExports.slice(0, 2)) {
+      let socketRequest!: ReturnType<typeof httpRequest>;
+      const started = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("EXPORT_SOCKET_START_TIMEOUT")), 5_000);
+        timer.unref();
+        const fail = (error: Error) => { clearTimeout(timer); reject(error); };
+        socketRequest = httpRequest(
+          new URL(`/api/v1/privacy/exports/${item.id}/download`, apiOrigin),
+          { headers: { cookie: `salarivo_session=${item.token}` } },
+          (response) => {
+            response.once("data", () => { clearTimeout(timer); resolve(); });
+            response.once("error", fail);
+          },
+        );
+        socketRequest.once("error", fail);
+      });
+      socketRequest.end();
+      socketRequests.push(socketRequest);
+      socketStarts.push(started);
+    }
+    await Promise.all(socketStarts);
+    let activeStatuses: string[] = [];
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const active = await pool.query<{ id: string; status: string }>(
+        "SELECT id, status FROM privacy_operations WHERE id = ANY($1::uuid[]) ORDER BY id",
+        [socketExports.slice(0, 2).map(({ id }) => id)],
+      );
+      activeStatuses = active.rows.map(({ status }) => status);
+      if (activeStatuses.length === 2 && activeStatuses.every((status) => status === "RUNNING")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(activeStatuses, ["RUNNING", "RUNNING"]);
+    for (const socketRequest of socketRequests) socketRequest.destroy();
+    const capacityHeldAfterAbort = await app.inject({
+      method: "GET",
+      url: `/api/v1/privacy/exports/${socketExports[2]!.id}/download`,
+      headers: { cookie: `salarivo_session=${socketExports[2]!.token}` },
+    });
+    assert.equal(capacityHeldAfterAbort.statusCode, 503, capacityHeldAfterAbort.body);
+    assert.equal(capacityHeldAfterAbort.json().error.code, "EXPORT_CAPACITY");
+  } finally {
+    for (const socketRequest of socketRequests) socketRequest.destroy();
+    await employerLock.query("COMMIT").catch(() => undefined);
+    employerLock.release();
+  }
+  let releasedStatuses: string[] = [];
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const released = await pool.query<{ status: string }>(
+      "SELECT status FROM privacy_operations WHERE id = ANY($1::uuid[]) ORDER BY id",
+      [socketExports.slice(0, 2).map(({ id }) => id)],
+    );
+    releasedStatuses = released.rows.map(({ status }) => status);
+    if (releasedStatuses.length === 2 && releasedStatuses.every((status) => status === "READY")) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(releasedStatuses, ["READY", "READY"]);
+
+  const signedOriginal = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/original`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(signedOriginal.statusCode, 200, signedOriginal.body);
+  const signedOriginalUrl = new URL(String(signedOriginal.json().data.url));
+  assert.match(signedOriginalUrl.search, /X-Amz-(?:Algorithm|Signature)=/i);
+  assert.equal(signedOriginalUrl.searchParams.get("response-cache-control"), "no-store, private, max-age=0");
+
+  const blockedWrongPassword = await app.inject({
+    method: "DELETE",
+    url: "/api/v1/privacy/account",
+    headers: { origin, cookie: cookieB },
+    payload: { confirmation: "ELIMINAR", password: "contraseña deliberadamente incorrecta", receiptToken: deletionReceiptToken() },
+  });
+  assert.equal(blockedWrongPassword.statusCode, 403, blockedWrongPassword.body);
+  assert.equal(blockedWrongPassword.json().error.code, "STEP_UP_REQUIRED");
+  const blockedEmploymentDeletion = await app.inject({
+    method: "DELETE",
+    url: `/api/v1/employments/${employmentB}`,
+    headers: { origin, cookie: cookieB },
+  });
+  assert.equal(blockedEmploymentDeletion.statusCode, 403, blockedEmploymentDeletion.body);
+  assert.equal(
+    (await pool.query("SELECT 1 FROM employments WHERE id = $1 AND user_id = $2", [employmentB, userIdB])).rowCount,
+    1,
+  );
+  const stepUpB = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/step-up",
+    headers: { origin, cookie: cookieB },
+    payload: { password: "frase local segura 2026" },
+  });
+  assert.equal(stepUpB.statusCode, 200, stepUpB.body);
+  cookieB = rotatedCookie(stepUpB, cookieB);
+  const foreignOriginal = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/original`,
+    headers: { cookie: cookieB },
+  });
+  assert.equal(foreignOriginal.statusCode, 404, foreignOriginal.body);
+
+  const originalDeletion = await app.inject({
+    method: "DELETE",
+    url: `/api/v1/documents/${documentId}/original`,
+    headers: { origin, cookie: cookieA },
+    payload: {},
+  });
+  assert.equal(originalDeletion.statusCode, 202, originalDeletion.body);
+  assert.equal(
+    (await pool.query("SELECT original_deleted_at IS NOT NULL AS deleted FROM documents WHERE id = $1", [documentId])).rows[0].deleted,
+    true,
+  );
+  assert.ok((await pool.query("SELECT 1 FROM payroll_settlements WHERE document_id = $1", [documentId])).rowCount);
+  const deletedOriginalDownload = await app.inject({
+    method: "GET", url: `/api/v1/documents/${documentId}/original`, headers: { cookie: cookieA },
+  });
+  assert.equal(deletedOriginalDownload.statusCode, 404, deletedOriginalDownload.body);
+
+  const documentDeletion = await app.inject({
+    method: "DELETE",
+    url: `/api/v1/documents/${documentId}`,
+    headers: { origin, cookie: cookieA },
+    payload: {},
+  });
+  assert.equal(documentDeletion.statusCode, 202, documentDeletion.body);
+  assert.equal((await pool.query("SELECT 1 FROM documents WHERE id = $1", [documentId])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM import_batch_items WHERE id = $1", [batchData.items[0]!.id])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM upload_sessions WHERE item_id = $1", [batchData.items[0]!.id])).rowCount, 0);
+  assert.equal(
+    (await pool.query("SELECT count(*)::integer AS count FROM storage_deletion_tombstones WHERE user_id = $1", [userIdA])).rows[0].count,
+    1,
+  );
 
   const wrongPassword = await app.inject({
     method: "DELETE",
     url: "/api/v1/privacy/account",
     headers: { origin, cookie: cookieB },
-    payload: { confirmation: "ELIMINAR", password: "contraseña deliberadamente incorrecta" },
+    payload: { confirmation: "ELIMINAR", password: "contraseña deliberadamente incorrecta", receiptToken: deletionReceiptToken() },
   });
   assert.equal(wrongPassword.statusCode, 401, wrongPassword.body);
+  const activeDocumentB = crypto.randomUUID();
+  const activeJobB = crypto.randomUUID();
+  const activeWorkerB = `synthetic-worker-${crypto.randomUUID()}`;
+  await pool.query(
+    `INSERT INTO documents (
+       id, user_id, import_batch_id, import_batch_item_id, upload_session_id, employment_id,
+       object_key, original_filename, declared_mime_type, size_bytes, processing_status, retention_policy
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'recibo-activo-sintetico.pdf',
+       'application/pdf', $8, 'SECURITY_VALIDATION', 'KEEP_ORIGINAL')`,
+    [
+      activeDocumentB,
+      userIdB,
+      associatedAtImport.json().data.id,
+      associatedAtImport.json().data.items[0].id,
+      cancelledUploadSession.json().data.id,
+      employmentB,
+      `documents/${createHash("sha256").update(activeDocumentB).digest("hex")}.pdf`,
+      pdfBytes.byteLength,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO processing_jobs (
+       id, user_id, document_id, stage, processing_version, idempotency_key,
+       state, attempt, lease_owner, lease_expires_at, started_at, execution_owner
+     ) VALUES ($1, $2, $3, 'SECURITY_VALIDATION', 1, $4,
+       'RUNNING', 1, $5, now() + interval '1 hour', now(), $5)`,
+    [activeJobB, userIdB, activeDocumentB, `synthetic-active-job:${activeJobB}`, activeWorkerB],
+  );
+  const receiptTokenB = deletionReceiptToken();
   const deleteB = await app.inject({
     method: "DELETE",
     url: "/api/v1/privacy/account",
     headers: { origin, cookie: cookieB },
-    payload: { confirmation: "ELIMINAR", password: "frase local segura 2026" },
+    payload: { confirmation: "ELIMINAR", password: "frase local segura 2026", receiptToken: receiptTokenB },
   });
   assert.equal(deleteB.statusCode, 202, deleteB.body);
+  const receiptB = deleteB.json().data as { receiptToken: string };
+  assert.equal(receiptB.receiptToken, receiptTokenB);
+  assert.match(receiptB.receiptToken, /^[A-Za-z0-9_-]{43}$/);
+  const receiptStatusB = await app.inject({
+    method: "POST",
+    url: "/api/v1/privacy/account-deletion/status",
+    headers: { origin },
+    payload: { token: receiptB.receiptToken },
+  });
+  assert.equal(receiptStatusB.statusCode, 200, receiptStatusB.body);
+  assert.equal(receiptStatusB.json().data.status, "PENDING");
+  assert.equal(
+    (await pool.query(
+      "SELECT state, execution_owner FROM processing_jobs WHERE id = $1",
+      [activeJobB],
+    )).rows[0].state,
+    "RUNNING",
+  );
 
   if (process.env.KEEP_INTEGRATION_DATA === "1") return;
+  const receiptTokenA = deletionReceiptToken();
   const deleteA = await app.inject({
     method: "DELETE",
     url: "/api/v1/privacy/account",
     headers: { origin, cookie: cookieA },
-    payload: { confirmation: "ELIMINAR", password: "frase local segura 2026" },
+    payload: { confirmation: "ELIMINAR", password: "frase local segura 2026", receiptToken: receiptTokenA },
   });
   assert.equal(deleteA.statusCode, 202, deleteA.body);
+  assert.equal(deleteA.json().data.receiptToken, receiptTokenA);
+
+  const replay = await uploadWithSignedPost();
+  assert.equal(replay.status, 204, await replay.text());
+  assert.equal(await objectExists(incomingObjectKey), true);
+
+  await runWorkerUntil("worker_started");
+  const pendingReceiptA = await app.inject({
+    method: "POST",
+    url: "/api/v1/privacy/account-deletion/status",
+    headers: { origin },
+    payload: { token: receiptTokenA },
+  });
+  assert.equal(pendingReceiptA.statusCode, 200, pendingReceiptA.body);
+  assert.equal(pendingReceiptA.json().data.status, "PENDING");
+  assert.equal((await pool.query("SELECT 1 FROM users WHERE id = $1", [userIdA])).rowCount, 1);
+
+  await pool.query(
+    `UPDATE storage_deletion_tombstones
+        SET upload_expires_at = now() - interval '2 minutes', available_at = now() - interval '2 minutes'
+      WHERE user_id = $1`,
+    [userIdA],
+  );
+  await runWorkerUntil("accounts_deleted");
+
+  const completedReceiptA = await app.inject({
+    method: "POST",
+    url: "/api/v1/privacy/account-deletion/status",
+    headers: { origin },
+    payload: { token: receiptTokenA },
+  });
+  assert.equal(completedReceiptA.statusCode, 200, completedReceiptA.body);
+  assert.equal(completedReceiptA.json().data.status, "COMPLETED");
+  assert.equal((await pool.query("SELECT 1 FROM users WHERE id = $1", [userIdA])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM storage_deletion_tombstones WHERE user_id = $1", [userIdA])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM users WHERE id = $1", [userIdB])).rowCount, 1);
+  await pool.query(
+    `UPDATE processing_jobs
+        SET state = 'CANCELLED', completed_at = now(), lease_owner = NULL,
+            lease_expires_at = NULL, execution_owner = NULL, error_code = 'ACCOUNT_DELETION'
+      WHERE id = $1`,
+    [activeJobB],
+  );
+  await pool.query(
+    `UPDATE upload_sessions
+        SET created_at = now() - interval '3 minutes', expires_at = now() - interval '2 minutes'
+      WHERE user_id = $1`,
+    [userIdB],
+  );
+  await pool.query(
+    `UPDATE storage_deletion_tombstones
+        SET upload_expires_at = now() - interval '2 minutes', available_at = now() - interval '2 minutes'
+      WHERE user_id = $1`,
+    [userIdB],
+  );
+  await runWorkerUntil("accounts_deleted");
+  const completedReceiptB = await app.inject({
+    method: "POST",
+    url: "/api/v1/privacy/account-deletion/status",
+    headers: { origin },
+    payload: { token: receiptTokenB },
+  });
+  assert.equal(completedReceiptB.statusCode, 200, completedReceiptB.body);
+  assert.equal(completedReceiptB.json().data.status, "COMPLETED");
+  assert.equal((await pool.query("SELECT 1 FROM users WHERE id = $1", [userIdB])).rowCount, 0);
+  assert.equal(await objectExists(incomingObjectKey), false);
+  assert.equal(await objectExists(canonicalObjectKey), false);
 });

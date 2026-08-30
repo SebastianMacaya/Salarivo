@@ -1,14 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import { pool, withTransaction, type PoolClient } from "@salarivo/database";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
-import { verifyPassword } from "./security.ts";
+import { sessionCookieName, tokenHash, verifyPassword } from "./security.ts";
+import { lockValidStepUpSession } from "./session-assurance.ts";
 import { createStorage } from "./storage.ts";
 
 type ErrorConstructor = new (statusCode: number, code: string, message: string) => Error;
 type RegisterOptions = {
   config: ApiConfig;
   requireAuth: (request: FastifyRequest) => Promise<void>;
+  requireStepUp: (request: FastifyRequest) => Promise<void>;
   ApiError: ErrorConstructor;
   provisionStorage: boolean;
 };
@@ -27,7 +30,11 @@ type ReviewCompleteBody = { acceptDeductionsMismatch?: boolean };
 type DocumentEmploymentBody = { documentIds: string[]; employmentId: string | null };
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
-const EXPORT_ROW_LIMIT = 20_000;
+const TOKEN_PATTERN = "^[A-Za-z0-9_-]{43}$";
+const EXPORT_PAGE_SIZE = 500;
+const EXPORT_STREAM_TTL_MS = 10 * 60_000;
+const EXPORT_QUERY_TTL_MS = 30_000;
+const MAX_ACTIVE_EXPORT_STREAMS = 2;
 const uuid = new RegExp(UUID_PATTERN);
 const associationReadyStatuses = new Set([
   "COMPLETED", "NEEDS_REVIEW", "NEEDS_TYPE_CONFIRMATION", "REJECTED_UNSUPPORTED",
@@ -40,13 +47,74 @@ const settlementAmountColumns = new Map([
   ["settlement.netAmount", "net_amount"],
   ["settlement.deductionsAmount", "deductions_amount"],
 ]);
-const manualCorrectionPaths = new Set(["settlement.payrollPeriod", ...settlementAmountColumns.keys()]);
+const settlementTypes = new Set([
+  "NORMAL", "SAC", "VACACIONES", "BONO", "RETROACTIVO", "COMISION",
+  "HORAS_EXTRA", "LIQUIDACION_FINAL", "INDEMNIZACION", "AJUSTE", "OTRO_LABORAL",
+]);
+const manualCorrectionPaths = new Set([
+  "settlement.type", "settlement.payrollPeriod", ...settlementAmountColumns.keys(),
+]);
 const requiredPayrollReviewPaths = [
   "settlement.payrollPeriod",
   "settlement.grossAmount",
   "settlement.netAmount",
   "settlement.deductionsAmount",
 ];
+const exportSections = [
+  ["employers", `SELECT id, name, country_code, tax_identifier_type,
+      (tax_identifier_ciphertext IS NOT NULL) AS tax_identifier_stored, created_at, updated_at
+      FROM employers WHERE user_id = $1 ORDER BY id`],
+  ["employments", `SELECT id, employer_id, status, start_date, end_date, role, category,
+      modality, country_code, currency_code, created_at, updated_at
+      FROM employments WHERE user_id = $1 ORDER BY id`],
+  ["importBatches", `SELECT id, status, created_at, updated_at, completed_at
+      FROM import_batches WHERE user_id = $1 ORDER BY id`],
+  ["importItems", `SELECT id, batch_id, employment_id, client_item_key, ordinal, original_filename,
+      declared_mime_type, expected_size_bytes, status, error_code, created_at, updated_at
+      FROM import_batch_items WHERE user_id = $1 ORDER BY id`],
+  ["uploadSessions", `SELECT id, batch_id, item_id, expected_size_bytes, expected_mime_type,
+      status, expires_at, confirmed_at, created_at
+      FROM upload_sessions WHERE user_id = $1 ORDER BY id`],
+  ["documents", `SELECT id, employment_id, original_filename, declared_mime_type, detected_mime_type,
+      size_bytes, page_count, sha256, security_status, classification_status, document_type,
+      classification_confidence, processing_status, retention_policy, created_at, processed_at,
+      original_deleted_at FROM documents WHERE user_id = $1 AND deleted_at IS NULL ORDER BY id`],
+  ["extractionRuns", `SELECT id, document_id, processing_version, status, classifier_name,
+      classifier_version, extractor_name, extractor_version, parser_version, normalizer_version,
+      ocr_provider, ocr_version, started_at, finished_at, confidence, error_code, compute_ms
+      FROM extraction_runs WHERE user_id = $1 ORDER BY id`],
+  ["extractedFields", `SELECT id, document_id, extraction_run_id, field_path, entity_type, raw_value,
+      interpreted_value, confidence, source, page_number, extractor_version, created_at
+      FROM extracted_fields WHERE user_id = $1 ORDER BY id`],
+  ["settlements", `SELECT id, document_id, extraction_run_id, employment_id, settlement_ordinal,
+      payroll_period, payment_date, issue_date, settlement_type, is_recurring, currency_code,
+      basic_amount, gross_amount, net_amount, remunerative_amount, non_remunerative_amount,
+      deductions_amount, created_at FROM payroll_settlements WHERE user_id = $1 ORDER BY id`],
+  ["lineItems", `SELECT id, settlement_id, item_ordinal, raw_description, normalized_concept_code,
+      amount, currency_code, item_type, is_recurring, confidence, source_page, source_field, created_at
+      FROM payroll_line_items WHERE user_id = $1 ORDER BY id`],
+  ["corrections", `SELECT id, extracted_field_id, document_id, extraction_run_id, field_path,
+      correction_version, extracted_value, corrected_value, created_at
+      FROM user_corrections WHERE user_id = $1 ORDER BY id`],
+  ["legalAcknowledgements", `SELECT version.document_type, version.version, version.locale,
+      acknowledgement.accepted_at
+      FROM legal_acknowledgements acknowledgement
+      JOIN legal_document_versions version ON version.id = acknowledgement.document_version_id
+      WHERE acknowledgement.user_id = $1 ORDER BY version.document_type, version.version`],
+  ["sessions", `SELECT id, expires_at, revoked_at, created_at, mfa_verified_at, step_up_expires_at
+      FROM sessions WHERE user_id = $1 ORDER BY id`],
+  ["mfa", `SELECT factor.id, factor.status, factor.enabled_at, factor.created_at,
+      count(code.id) FILTER (WHERE code.used_at IS NULL)::integer AS recovery_codes_remaining
+      FROM mfa_factors factor
+      LEFT JOIN mfa_recovery_codes code ON code.factor_id = factor.id AND code.user_id = factor.user_id
+      WHERE factor.user_id = $1
+      GROUP BY factor.id ORDER BY factor.id`],
+  ["privacyOperations", `SELECT id, operation_type, status, output_expires_at, error_code,
+      created_at, updated_at, started_at, completed_at
+      FROM privacy_operations WHERE user_id = $1 ORDER BY id`],
+  ["auditEvents", `SELECT id, action, resource_type, resource_id, result,
+      metadata_no_sensitive, created_at FROM audit_events WHERE user_id = $1 ORDER BY id`],
+] as const;
 const idParamsSchema = {
   type: "object",
   additionalProperties: false,
@@ -243,10 +311,158 @@ function normalizeDecimal(input: string): string | null {
   return /^-?\d{1,18}(?:\.\d{1,2})?$/.test(normalized) ? normalized : null;
 }
 
+function authenticatedRateKey(request: FastifyRequest, cookieName: string): string {
+  const token = request.cookies[cookieName];
+  return token && new RegExp(TOKEN_PATTERN).test(token) ? tokenHash(token) : request.ip;
+}
+
+function privacyExportStream(
+  operationId: string,
+  userId: string,
+  sessionHash: string,
+  signal: AbortSignal,
+  onStarted: () => void,
+  onFailure: () => void,
+  onFinished: (completed: boolean) => void,
+): Readable {
+  return Readable.from((async function* () {
+    onStarted();
+    let client: PoolClient | undefined;
+    let completed = false;
+    try {
+      client = await pool.connect();
+      const keepAuthorized = async () => {
+        if (signal.aborted) throw new Error("EXPORT_ABORTED");
+        const active = await pool.query(
+          `UPDATE privacy_operations AS operation SET updated_at = now()
+            WHERE operation.id = $1 AND operation.user_id = $2
+              AND operation.operation_type = 'DATA_EXPORT' AND operation.status = 'RUNNING'
+              AND EXISTS (SELECT 1 FROM users WHERE id = $2 AND status = 'ACTIVE')
+              AND EXISTS (
+                SELECT 1 FROM sessions
+                 WHERE token_hash = $3 AND user_id = $2 AND revoked_at IS NULL
+                   AND expires_at > now() AND step_up_expires_at > now()
+              )
+            RETURNING operation.id`,
+          [operationId, userId, sessionHash],
+        );
+        if (active.rowCount !== 1) throw new Error("EXPORT_REVOKED");
+      };
+      await keepAuthorized();
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      await client.query(
+        "SELECT set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', $2, true)",
+        [String(EXPORT_QUERY_TTL_MS), String(EXPORT_STREAM_TTL_MS)],
+      );
+      const account = await client.query(
+        `SELECT id, email, display_name, role, status, default_retention_policy, created_at, updated_at
+           FROM users WHERE id = $1 AND status = 'ACTIVE'`,
+        [userId],
+      );
+      if (account.rowCount !== 1) throw new Error("EXPORT_ACCOUNT_NOT_FOUND");
+      const row = account.rows[0];
+      yield JSON.stringify({
+        format: "salarivo-export-v2",
+        exportedAt: new Date().toISOString(),
+        account: {
+          id: row.id,
+          email: row.email,
+          displayName: row.display_name,
+          role: row.role,
+          status: row.status,
+          defaultRetentionPolicy: row.default_retention_policy,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        },
+      }).slice(0, -1);
+
+      for (const [name, sql] of exportSections) {
+        yield `,"${name}":[`;
+        let first = true;
+        for (let offset = 0; ; offset += EXPORT_PAGE_SIZE) {
+          // ponytail: OFFSET keeps this dependency-free; switch to per-table keyset cursors only if export latency proves it necessary.
+          await keepAuthorized();
+          const page = await client.query(`${sql} LIMIT $2 OFFSET $3`, [userId, EXPORT_PAGE_SIZE, offset]);
+          for (const item of page.rows) {
+            yield `${first ? "" : ","}${JSON.stringify(item)}`;
+            first = false;
+          }
+          if (page.rows.length < EXPORT_PAGE_SIZE) break;
+        }
+        yield "]";
+      }
+      yield "}\n";
+      await client.query("COMMIT");
+      completed = true;
+    } catch (error) {
+      onFailure();
+      throw error;
+    } finally {
+      if (client && !completed) {
+        try { await client.query("ROLLBACK"); } catch { /* Preserve the stream error. */ }
+      }
+      client?.release();
+      onFinished(completed);
+    }
+  })(), { signal });
+}
+
 export async function registerDataRoutes(app: FastifyInstance, options: RegisterOptions) {
-  const { config, requireAuth, ApiError } = options;
+  const { config, requireAuth, requireStepUp, ApiError } = options;
+  const sessionCookie = sessionCookieName(config.appEnv);
+  const rateKey = (request: FastifyRequest) => authenticatedRateKey(request, sessionCookie);
   const storage = createStorage(config);
   const claimedExports = new WeakSet<FastifyRequest>();
+  const failedExports = new WeakSet<FastifyRequest>();
+  const exportReservations = new WeakSet<FastifyRequest>();
+  const settledExports = new WeakSet<FastifyRequest>();
+  const startedExportStreams = new WeakSet<FastifyRequest>();
+  const successfulExportStreams = new WeakSet<FastifyRequest>();
+  const activeExportStreams = new Map<string, AbortController>();
+  const exportStreams = new WeakMap<FastifyRequest, { controller: AbortController; timer: NodeJS.Timeout }>();
+  // ponytail: this per-process ceiling protects the local pool; use a distributed lease only when replicas are introduced.
+  let activeExportCount = 0;
+  const releaseExportResources = (request: FastifyRequest) => {
+    if (exportReservations.has(request)) {
+      exportReservations.delete(request);
+      activeExportCount = Math.max(0, activeExportCount - 1);
+    }
+    const stream = exportStreams.get(request);
+    if (stream) {
+      clearTimeout(stream.timer);
+      if (request.authUser && activeExportStreams.get(request.authUser.id) === stream.controller) {
+        activeExportStreams.delete(request.authUser.id);
+      }
+      exportStreams.delete(request);
+    }
+  };
+  const settleExport = async (request: FastifyRequest, succeeded: boolean) => {
+    if (!claimedExports.has(request) || settledExports.has(request) || !request.authUser) return;
+    settledExports.add(request);
+    releaseExportResources(request);
+    try {
+      if (succeeded) {
+        await pool.query(
+          `UPDATE privacy_operations
+              SET status = 'COMPLETED', completed_at = now(), updated_at = now()
+            WHERE id = $1 AND user_id = $2 AND status = 'RUNNING'`,
+          [(request.params as IdParams).id, request.authUser.id],
+        );
+      } else {
+        await pool.query(
+          `UPDATE privacy_operations
+              SET status = CASE WHEN output_expires_at > now() THEN 'READY' ELSE 'EXPIRED' END,
+                  completed_at = CASE WHEN output_expires_at > now() THEN NULL ELSE now() END,
+                  updated_at = now()
+            WHERE id = $1 AND user_id = $2 AND status = 'RUNNING'`,
+          [(request.params as IdParams).id, request.authUser.id],
+        );
+      }
+    } catch {
+      settledExports.delete(request);
+      request.log.error({ requestId: request.id, errorCode: "EXPORT_RELEASE_FAILED" }, "export release failed");
+    }
+  };
   if (options.provisionStorage) await storage.ensureBucket();
   app.addHook("onClose", async () => storage.destroy());
 
@@ -1002,9 +1218,14 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     async (request, reply) => {
       const result = await withTransaction(async (client) => {
         const document = await client.query(
-          `SELECT id, import_batch_id, import_batch_item_id, processing_status, original_deleted_at
-             FROM documents
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE`,
+          `SELECT document.id, document.import_batch_id, document.import_batch_item_id,
+                  document.processing_status, document.original_deleted_at, document.object_key,
+                  document.retention_policy, session.object_key AS incoming_object_key, session.expires_at
+             FROM documents AS document
+             JOIN upload_sessions AS session
+               ON session.id = document.upload_session_id AND session.user_id = document.user_id
+            WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL
+            FOR UPDATE OF document, session`,
           [request.params.id, request.authUser!.id],
         );
         if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
@@ -1026,6 +1247,21 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
               WHERE id = $1 AND user_id = $2`,
             [row.import_batch_item_id, request.authUser!.id],
           );
+          if (row.retention_policy === "DELETE_AFTER_PROCESSING" && row.original_deleted_at === null) {
+            await client.query(
+              `INSERT INTO storage_deletion_tombstones (
+                 id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+               ) VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (canonical_object_key) DO NOTHING`,
+              [randomUUID(), request.authUser!.id, row.object_key, row.incoming_object_key, row.expires_at],
+            );
+            await client.query(
+              `UPDATE documents SET original_deleted_at = now()
+                WHERE id = $1 AND user_id = $2
+                  AND EXISTS (SELECT 1 FROM storage_deletion_tombstones WHERE canonical_object_key = $3)`,
+              [request.params.id, request.authUser!.id, row.object_key],
+            );
+          }
           await completeDocumentBatch(client, request.authUser!.id, request.params.id);
           await audit(client, request.authUser!.id, "DOCUMENT_TYPE_REJECTED", "DOCUMENT", request.params.id);
           return { processingStatus: "REJECTED_UNSUPPORTED", job: null };
@@ -1145,7 +1381,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (!field.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         const row = field.rows[0];
         const fieldPath = String(row.field_path);
-        if (!row.id && !manualCorrectionPaths.has(fieldPath)) {
+        if (!manualCorrectionPaths.has(fieldPath)) {
           throw new ApiError(400, "INVALID_FIELD_PATH", "Ese campo no admite carga manual.");
         }
         let correctedJson: unknown = corrected;
@@ -1160,6 +1396,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         }
         if (fieldPath === "settlement.payrollPeriod" && !/^20\d{2}-(0[1-9]|1[0-2])$/.test(corrected)) {
           throw new ApiError(400, "INVALID_PERIOD", "El período corregido no es válido.");
+        }
+        if (fieldPath === "settlement.type") {
+          const normalizedType = corrected.toUpperCase();
+          if (!settlementTypes.has(normalizedType)) {
+            throw new ApiError(400, "INVALID_SETTLEMENT_TYPE", "El tipo de liquidación no es válido.");
+          }
+          correctedJson = normalizedType;
         }
         if (!row.currency_code && amountColumn) {
           throw new ApiError(409, "PAYROLL_PERIOD_REQUIRED", "Completá primero el período del recibo.");
@@ -1183,6 +1426,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             `UPDATE payroll_settlements SET ${amountColumn} = $1
               WHERE extraction_run_id = $2 AND user_id = $3 AND settlement_ordinal = 1`,
             [(correctedJson as { amount: string }).amount, row.extraction_run_id, request.authUser!.id],
+          );
+        } else if (fieldPath === "settlement.type") {
+          await client.query(
+            `UPDATE payroll_settlements
+                SET settlement_type = $1, is_recurring = ($1 = 'NORMAL')
+              WHERE extraction_run_id = $2 AND user_id = $3 AND settlement_ordinal = 1`,
+            [correctedJson, row.extraction_run_id, request.authUser!.id],
           );
         } else if (fieldPath === "settlement.payrollPeriod") {
           await client.query(
@@ -1294,9 +1544,36 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           "UPDATE import_batch_items SET status = 'COMPLETED', error_code = NULL, updated_at = now() WHERE id = $1 AND user_id = $2",
           [document.rows[0].import_batch_item_id, request.authUser!.id],
         );
+        await client.query(
+          `INSERT INTO storage_deletion_tombstones (
+             id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+           )
+           SELECT $3, document.user_id, document.object_key, session.object_key, session.expires_at
+             FROM documents AS document
+             JOIN upload_sessions AS session
+               ON session.id = document.upload_session_id AND session.user_id = document.user_id
+            WHERE document.id = $1 AND document.user_id = $2
+              AND document.retention_policy = 'DELETE_AFTER_PROCESSING'
+              AND document.original_deleted_at IS NULL
+           ON CONFLICT (canonical_object_key) DO NOTHING`,
+          [request.params.id, request.authUser!.id, randomUUID()],
+        );
+        const retentionDeletion = await client.query(
+          `UPDATE documents AS document SET original_deleted_at = now()
+            WHERE document.id = $1 AND document.user_id = $2
+              AND document.retention_policy = 'DELETE_AFTER_PROCESSING'
+              AND document.original_deleted_at IS NULL
+              AND EXISTS (
+                SELECT 1 FROM storage_deletion_tombstones AS tombstone
+                 WHERE tombstone.canonical_object_key = document.object_key
+              )
+            RETURNING document.id`,
+          [request.params.id, request.authUser!.id],
+        );
         await completeDocumentBatch(client, request.authUser!.id, request.params.id);
         await audit(client, request.authUser!.id, "DOCUMENT_REVIEW_COMPLETED", "DOCUMENT", request.params.id, {
           acceptedDeductionsMismatch,
+          originalDeletionScheduled: retentionDeletion.rowCount === 1,
         });
         return { processingStatus: "COMPLETED" };
       });
@@ -1306,50 +1583,127 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
 
   app.delete<{ Params: IdParams }>(
     "/api/v1/documents/:id/original",
-    { preHandler: requireAuth, schema: { params: idParamsSchema } },
-    async (request) => {
-      const found = await pool.query(
-        `SELECT object_key, original_deleted_at, processing_status FROM documents
-          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-        [request.params.id, request.authUser!.id],
-      );
-      if (!found.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      if (![
-        "COMPLETED", "NEEDS_REVIEW", "NEEDS_TYPE_CONFIRMATION", "REJECTED_UNSUPPORTED",
-        "QUARANTINED", "FAILED_PERMANENT", "CANCELLED",
-      ].includes(String(found.rows[0].processing_status))) {
-        throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine o eliminá el documento completo.");
-      }
-      if (found.rows[0].original_deleted_at === null) {
-        try { await storage.deleteObject(String(found.rows[0].object_key)); }
-        catch { throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente."); }
-        await withTransaction(async (client) => {
-          await client.query(
-            "UPDATE documents SET original_deleted_at = now() WHERE id = $1 AND user_id = $2",
-            [request.params.id, request.authUser!.id],
-          );
-          await audit(client, request.authUser!.id, "DOCUMENT_ORIGINAL_DELETED", "DOCUMENT", request.params.id);
-        });
+    { preHandler: requireStepUp, schema: { params: idParamsSchema } },
+    async (request, reply) => {
+      const keys = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
+        const found = await client.query(
+          `SELECT document.object_key, document.original_deleted_at, document.processing_status,
+                  session.object_key AS incoming_object_key, session.expires_at
+             FROM documents AS document
+             JOIN upload_sessions AS session
+               ON session.id = document.upload_session_id AND session.user_id = document.user_id
+            WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL
+            FOR UPDATE OF document, session`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (!found.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        if (![
+          "COMPLETED", "NEEDS_REVIEW", "NEEDS_TYPE_CONFIRMATION", "REJECTED_UNSUPPORTED",
+          "QUARANTINED", "FAILED_PERMANENT", "CANCELLED",
+        ].includes(String(found.rows[0].processing_status))) {
+          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine o eliminá el documento completo.");
+        }
+        if (found.rows[0].original_deleted_at !== null) return null;
+        await client.query(
+          `INSERT INTO storage_deletion_tombstones (
+             id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+           ) VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT DO NOTHING`,
+          [randomUUID(), request.authUser!.id, found.rows[0].object_key, found.rows[0].incoming_object_key, found.rows[0].expires_at],
+        );
+        const updated = await client.query(
+          `UPDATE documents SET original_deleted_at = now()
+            WHERE id = $1 AND user_id = $2
+              AND EXISTS (
+                SELECT 1 FROM storage_deletion_tombstones
+                 WHERE canonical_object_key = $3 AND user_id = $2
+              )`,
+          [request.params.id, request.authUser!.id, found.rows[0].object_key],
+        );
+        if (updated.rowCount !== 1) throw new Error("DELETION_TOMBSTONE_NOT_CREATED");
+        await audit(client, request.authUser!.id, "DOCUMENT_ORIGINAL_DELETION_SCHEDULED", "DOCUMENT", request.params.id);
+        return [String(found.rows[0].object_key), String(found.rows[0].incoming_object_key)];
+      });
+      if (keys) {
+        const results = await Promise.allSettled([...new Set(keys)].map((key) => storage.deleteObject(key)));
+        if (results.some(({ status }) => status === "rejected")) {
+          request.log.warn({ requestId: request.id, errorCode: "STORAGE_DELETION_DEFERRED" }, "storage deletion deferred");
+        }
+        return reply.code(202).send({ data: null });
       }
       return { data: null };
     },
   );
 
+  app.get<{ Params: IdParams }>(
+    "/api/v1/documents/:id/original",
+    { preHandler: requireStepUp, schema: { params: idParamsSchema } },
+    async (request) => {
+      const objectKey = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
+        const document = await client.query(
+          `SELECT object_key FROM documents
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+              AND original_deleted_at IS NULL AND security_status = 'CLEAN'
+            FOR UPDATE`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (document.rowCount !== 1) throw new ApiError(404, "ORIGINAL_NOT_FOUND", "El original no está disponible.");
+        return String(document.rows[0].object_key);
+      });
+      try {
+        return { data: await storage.authorizeDownload(objectKey) };
+      } catch {
+        throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente.");
+      }
+    },
+  );
+
   app.delete<{ Params: IdParams }>(
     "/api/v1/documents/:id",
-    { preHandler: requireAuth, schema: { params: idParamsSchema } },
-    async (request) => {
-      const found = await pool.query(
-        `SELECT object_key, original_deleted_at, import_batch_item_id FROM documents
-          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-        [request.params.id, request.authUser!.id],
-      );
-      if (!found.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      if (found.rows[0].original_deleted_at === null) {
-        try { await storage.deleteObject(String(found.rows[0].object_key)); }
-        catch { throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente."); }
-      }
-      await withTransaction(async (client) => {
+    { preHandler: requireStepUp, schema: { params: idParamsSchema } },
+    async (request, reply) => {
+      const keys = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
+        const found = await client.query(
+          `SELECT document.object_key, document.import_batch_id, document.import_batch_item_id,
+                  session.object_key AS incoming_object_key, session.expires_at
+             FROM documents AS document
+             JOIN upload_sessions AS session
+               ON session.id = document.upload_session_id AND session.user_id = document.user_id
+            WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL
+            FOR UPDATE OF document, session`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (!found.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        const activeExecution = await client.query(
+          `SELECT 1 FROM processing_jobs
+            WHERE document_id = $1 AND user_id = $2 AND execution_owner IS NOT NULL`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (activeExecution.rowCount) {
+          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento para eliminar el documento.");
+        }
+        await client.query(
+          `INSERT INTO storage_deletion_tombstones (
+             id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+           ) VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT DO NOTHING`,
+          [randomUUID(), request.authUser!.id, found.rows[0].object_key, found.rows[0].incoming_object_key, found.rows[0].expires_at],
+        );
+        const tombstone = await client.query(
+          `SELECT 1 FROM storage_deletion_tombstones
+            WHERE canonical_object_key = $1 AND user_id = $2`,
+          [found.rows[0].object_key, request.authUser!.id],
+        );
+        if (!tombstone.rowCount) throw new Error("DELETION_TOMBSTONE_NOT_CREATED");
         await client.query(
           `UPDATE processing_jobs
               SET state = 'CANCELLED', completed_at = now(), lease_owner = NULL,
@@ -1358,28 +1712,52 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
               AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')`,
           [request.params.id, request.authUser!.id],
         );
+        await audit(client, request.authUser!.id, "DOCUMENT_DELETION_SCHEDULED", "DOCUMENT", request.params.id);
         await client.query(
-          `UPDATE import_batch_items SET status = 'CANCELLED',
-                  error_code = 'DOCUMENT_DELETED', updated_at = now()
-            WHERE id = $1 AND user_id = $2`,
+          `DELETE FROM import_batch_items WHERE id = $1 AND user_id = $2`,
           [found.rows[0].import_batch_item_id, request.authUser!.id],
         );
-        await completeDocumentBatch(client, request.authUser!.id, request.params.id);
-        await audit(client, request.authUser!.id, "DOCUMENT_DELETED", "DOCUMENT", request.params.id);
-        await client.query("DELETE FROM documents WHERE id = $1 AND user_id = $2", [request.params.id, request.authUser!.id]);
+        const deletedBatch = await client.query(
+          `DELETE FROM import_batches AS batch
+            WHERE batch.id = $1 AND batch.user_id = $2
+              AND NOT EXISTS (SELECT 1 FROM import_batch_items item WHERE item.batch_id = batch.id)
+            RETURNING id`,
+          [found.rows[0].import_batch_id, request.authUser!.id],
+        );
+        if (!deletedBatch.rowCount) {
+          await client.query(
+            `UPDATE import_batches
+                SET idempotency_key = $3, request_fingerprint = $4, updated_at = now()
+              WHERE id = $1 AND user_id = $2`,
+            [
+              found.rows[0].import_batch_id,
+              request.authUser!.id,
+              randomUUID(),
+              createHash("sha256").update(randomUUID()).digest("hex"),
+            ],
+          );
+        }
+        return [String(found.rows[0].object_key), String(found.rows[0].incoming_object_key)];
       });
-      return { data: null };
+      const results = await Promise.allSettled([...new Set(keys)].map((key) => storage.deleteObject(key)));
+      if (results.some(({ status }) => status === "rejected")) {
+        request.log.warn({ requestId: request.id, errorCode: "STORAGE_DELETION_DEFERRED" }, "storage deletion deferred");
+      }
+      return reply.code(202).send({ data: null });
     },
   );
 
   app.post(
     "/api/v1/privacy/exports",
     {
-      preHandler: requireAuth,
-      config: { rateLimit: { max: 2, timeWindow: "15 minutes" } },
+      preHandler: requireStepUp,
+      config: { rateLimit: { max: 3, timeWindow: "15 minutes", keyGenerator: rateKey } },
     },
     async (request, reply) => {
       const result = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
         const activeUser = await client.query(
           "SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE",
           [request.authUser!.id],
@@ -1398,7 +1776,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         await client.query(
           `UPDATE privacy_operations SET status = 'READY', updated_at = now()
             WHERE user_id = $1 AND operation_type = 'DATA_EXPORT' AND status = 'RUNNING'
-              AND updated_at < now() - interval '5 minutes' AND output_expires_at > now()`,
+              AND updated_at < now() - interval '15 minutes' AND output_expires_at > now()`,
           [request.authUser!.id],
         );
         await client.query(
@@ -1436,9 +1814,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
         await client.query(
           `INSERT INTO privacy_operations (
-             id, user_id, operation_type, idempotency_key, status, object_key, output_expires_at
-           ) VALUES ($1, $2, 'DATA_EXPORT', $3, 'READY', $4, $5)`,
-          [id, request.authUser!.id, `export:${id}`, `exports/${id}.json`, expiresAt],
+             id, user_id, operation_type, idempotency_key, status, output_expires_at
+           ) VALUES ($1, $2, 'DATA_EXPORT', $3, 'READY', $4)`,
+          [id, request.authUser!.id, `export:${id}`, expiresAt],
         );
         await audit(client, request.authUser!.id, "DATA_EXPORT_CREATED", "PRIVACY_OPERATION", id);
         return { created: true, id, status: "READY", expiresAt: expiresAt.toISOString() };
@@ -1463,13 +1841,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       let status = String(result.rows[0].status);
       if (
         status === "RUNNING" &&
-        new Date(result.rows[0].updated_at).valueOf() < Date.now() - 5 * 60 * 1000 &&
+        new Date(result.rows[0].updated_at).valueOf() < Date.now() - 15 * 60 * 1000 &&
         new Date(result.rows[0].output_expires_at).valueOf() > Date.now()
       ) {
         const recovered = await pool.query(
           `UPDATE privacy_operations SET status = 'READY', updated_at = now()
             WHERE id = $1 AND user_id = $2 AND status = 'RUNNING'
-              AND updated_at < now() - interval '5 minutes'
+              AND updated_at < now() - interval '15 minutes'
             RETURNING status`,
           [request.params.id, request.authUser!.id],
         );
@@ -1489,169 +1867,164 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   app.get<{ Params: IdParams }>(
     "/api/v1/privacy/exports/:id/download",
     {
-      preHandler: requireAuth,
-      config: { rateLimit: { max: 2, timeWindow: "15 minutes" } },
+      preHandler: requireStepUp,
+      config: { rateLimit: { max: 2, timeWindow: "15 minutes", keyGenerator: rateKey } },
       onResponse: async (request, reply) => {
-        if (!claimedExports.has(request)) return;
-        try {
-          if (reply.statusCode >= 200 && reply.statusCode < 300) {
-            await pool.query(
-              `UPDATE privacy_operations
-                  SET status = 'COMPLETED', completed_at = now(), updated_at = now()
-                WHERE id = $1 AND user_id = $2 AND status = 'RUNNING'`,
-              [request.params.id, request.authUser!.id],
-            );
-          } else {
-            await pool.query(
-              `UPDATE privacy_operations
-                  SET status = CASE WHEN output_expires_at > now() THEN 'READY' ELSE 'EXPIRED' END,
-                      completed_at = CASE WHEN output_expires_at > now() THEN NULL ELSE now() END,
-                      updated_at = now()
-                WHERE id = $1 AND user_id = $2 AND status = 'RUNNING'`,
-              [request.params.id, request.authUser!.id],
-            );
-          }
-        } catch {
-          request.log.error({ requestId: request.id, errorCode: "EXPORT_RELEASE_FAILED" }, "export release failed");
-        }
+        await settleExport(
+          request,
+          successfulExportStreams.has(request) && !failedExports.has(request)
+            && reply.statusCode >= 200 && reply.statusCode < 300,
+        );
       },
       schema: { params: idParamsSchema },
     },
     async (request, reply) => {
-      await withTransaction(async (client) => {
-        const activeUser = await client.query(
-          "SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE",
-          [request.authUser!.id],
-        );
-        if (!activeUser.rowCount) {
-          throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
-        }
-        const busy = await client.query(
-          `SELECT 1 FROM privacy_operations
-            WHERE user_id = $1 AND operation_type = 'DATA_EXPORT'
-              AND status = 'RUNNING' AND id <> $2`,
-          [request.authUser!.id, request.params.id],
-        );
-        if (busy.rowCount) {
-          throw new ApiError(409, "EXPORT_IN_PROGRESS", "Ya hay otra exportación descargándose.");
-        }
-        const operation = await client.query(
-          `SELECT operation.id
-             FROM privacy_operations AS operation
-            WHERE operation.id = $1 AND operation.user_id = $2
-              AND operation.operation_type = 'DATA_EXPORT'
-              AND operation.status = 'READY' AND operation.output_expires_at > now()
-            FOR UPDATE OF operation`,
-          [request.params.id, request.authUser!.id],
-        );
-        if (!operation.rowCount) {
-          throw new ApiError(409, "EXPORT_NOT_READY", "La exportación no existe, venció o está siendo descargada.");
-        }
-        await client.query(
-          `UPDATE privacy_operations SET status = 'RUNNING', started_at = COALESCE(started_at, now()),
-                  updated_at = now()
-            WHERE id = $1 AND user_id = $2 AND status = 'READY'`,
-          [request.params.id, request.authUser!.id],
-        );
-      });
-      claimedExports.add(request);
-      const userId = request.authUser!.id;
-      const payload = await withTransaction(async (client) => {
-        await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
-        const size = await client.query(
-          `SELECT (
-             (SELECT count(*) FROM employers WHERE user_id = $1)
-             + (SELECT count(*) FROM employments WHERE user_id = $1)
-             + (SELECT count(*) FROM documents WHERE user_id = $1 AND deleted_at IS NULL)
-             + (SELECT count(*) FROM extracted_fields WHERE user_id = $1)
-             + (SELECT count(*) FROM payroll_settlements WHERE user_id = $1)
-             + (SELECT count(*) FROM payroll_line_items WHERE user_id = $1)
-             + (SELECT count(*) FROM user_corrections WHERE user_id = $1)
-             + (SELECT count(*) FROM legal_acknowledgements WHERE user_id = $1)
-             + (SELECT count(*) FROM audit_events WHERE user_id = $1)
-           )::integer AS rows`,
-          [userId],
-        );
-        // ponytail: el MVP acota la exportación en memoria; pasar a streaming cuando una cuenta alcance este techo.
-        if (Number(size.rows[0].rows) > EXPORT_ROW_LIMIT) return null;
-
-        const account = await client.query(
-          "SELECT id, email, display_name, role FROM users WHERE id = $1",
-          [userId],
-        );
-        if (!account.rowCount) {
-          throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
-        }
-        const employers = await client.query("SELECT id, name, country_code, created_at, updated_at FROM employers WHERE user_id = $1 ORDER BY created_at", [userId]);
-        const employments = await client.query("SELECT * FROM employments WHERE user_id = $1 ORDER BY start_date", [userId]);
-        const documents = await client.query("SELECT id, employment_id, original_filename, declared_mime_type, detected_mime_type, size_bytes, page_count, sha256, security_status, classification_status, document_type, classification_confidence, processing_status, retention_policy, created_at, processed_at, original_deleted_at FROM documents WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at", [userId]);
-        const fields = await client.query("SELECT id, document_id, field_path, entity_type, raw_value, interpreted_value, confidence, source, page_number, created_at FROM extracted_fields WHERE user_id = $1 ORDER BY created_at", [userId]);
-        const settlements = await client.query("SELECT * FROM payroll_settlements WHERE user_id = $1 ORDER BY payroll_period", [userId]);
-        const lineItems = await client.query("SELECT item.* FROM payroll_line_items item JOIN payroll_settlements settlement ON settlement.id = item.settlement_id WHERE item.user_id = $1 ORDER BY settlement.payroll_period, item.item_ordinal", [userId]);
-        const corrections = await client.query("SELECT correction.* FROM user_corrections correction WHERE correction.user_id = $1 ORDER BY created_at", [userId]);
-        const legalAcknowledgements = await client.query(
-          `SELECT version.document_type, version.version, version.locale, acknowledgement.accepted_at
-             FROM legal_acknowledgements acknowledgement
-             JOIN legal_document_versions version ON version.id = acknowledgement.document_version_id
-            WHERE acknowledgement.user_id = $1
-            ORDER BY acknowledgement.accepted_at`,
-          [userId],
-        );
-        const auditEvents = await client.query("SELECT action, resource_type, resource_id, result, metadata_no_sensitive, created_at FROM audit_events WHERE user_id = $1 ORDER BY created_at", [userId]);
-
-        return {
-          format: "salarivo-export-v1",
-          exportedAt: new Date().toISOString(),
-          account: {
-            id: account.rows[0].id,
-            email: account.rows[0].email,
-            displayName: account.rows[0].display_name,
-            role: account.rows[0].role,
-          },
-          employers: employers.rows,
-          employments: employments.rows,
-          documents: documents.rows,
-          extractedFields: fields.rows,
-          settlements: settlements.rows,
-          lineItems: lineItems.rows,
-          corrections: corrections.rows,
-          legalAcknowledgements: legalAcknowledgements.rows,
-          auditEvents: auditEvents.rows,
-        };
-      });
-      if (!payload) {
-        await pool.query(
-          `UPDATE privacy_operations
-              SET status = 'FAILED', completed_at = now(), error_code = 'EXPORT_TOO_LARGE', updated_at = now()
-            WHERE id = $1 AND user_id = $2 AND status = 'RUNNING'`,
-          [request.params.id, userId],
-        );
-        throw new ApiError(413, "EXPORT_TOO_LARGE", "La exportación supera el límite seguro del MVP.");
+      if (activeExportCount >= MAX_ACTIVE_EXPORT_STREAMS) {
+        throw new ApiError(503, "EXPORT_CAPACITY", "La exportación está ocupada. Reintentá en unos minutos.");
       }
+      activeExportCount += 1;
+      exportReservations.add(request);
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        controller.abort();
+        if (!startedExportStreams.has(request)) void settleExport(request, false);
+      }, EXPORT_STREAM_TTL_MS);
+      timer.unref();
+      exportStreams.set(request, { controller, timer });
+      request.raw.once("aborted", () => {
+        controller.abort();
+        if (!startedExportStreams.has(request)) void settleExport(request, false);
+      });
+      reply.raw.once("close", () => {
+        if (!reply.raw.writableFinished) controller.abort();
+        if (!startedExportStreams.has(request)) void settleExport(request, false);
+        else if (reply.raw.writableFinished && successfulExportStreams.has(request)) void settleExport(request, true);
+      });
+      try {
+        await withTransaction(async (client) => {
+          if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+            throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+          }
+          const activeUser = await client.query(
+            "SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE",
+            [request.authUser!.id],
+          );
+          if (!activeUser.rowCount) {
+            throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
+          }
+          const busy = await client.query(
+            `SELECT 1 FROM privacy_operations
+              WHERE user_id = $1 AND operation_type = 'DATA_EXPORT'
+                AND status = 'RUNNING' AND id <> $2`,
+            [request.authUser!.id, request.params.id],
+          );
+          if (busy.rowCount) {
+            throw new ApiError(409, "EXPORT_IN_PROGRESS", "Ya hay otra exportación descargándose.");
+          }
+          const operation = await client.query(
+            `SELECT operation.id
+               FROM privacy_operations AS operation
+              WHERE operation.id = $1 AND operation.user_id = $2
+                AND operation.operation_type = 'DATA_EXPORT'
+                AND operation.status = 'READY' AND operation.output_expires_at > now()
+              FOR UPDATE OF operation`,
+            [request.params.id, request.authUser!.id],
+          );
+          if (!operation.rowCount) {
+            throw new ApiError(409, "EXPORT_NOT_READY", "La exportación no existe, venció o está siendo descargada.");
+          }
+          await client.query(
+            `UPDATE privacy_operations SET status = 'RUNNING', started_at = COALESCE(started_at, now()),
+                    updated_at = now()
+              WHERE id = $1 AND user_id = $2 AND status = 'READY'`,
+            [request.params.id, request.authUser!.id],
+          );
+        });
+      } catch (error) {
+        releaseExportResources(request);
+        throw error;
+      }
+      claimedExports.add(request);
+      if (controller.signal.aborted) {
+        failedExports.add(request);
+        await settleExport(request, false);
+        throw new ApiError(409, "EXPORT_ABORTED", "La descarga se interrumpió. Podés reintentarlo.");
+      }
+      const userId = request.authUser!.id;
+      activeExportStreams.set(userId, controller);
       reply.header("Cache-Control", "no-store");
       reply.header("Content-Disposition", `attachment; filename="salarivo-export-${new Date().toISOString().slice(0, 10)}.json"`);
       reply.type("application/json; charset=utf-8");
-      return JSON.stringify(payload, null, 2);
+      return reply.send(privacyExportStream(
+        request.params.id,
+        userId,
+        request.authSessionHash!,
+        controller.signal,
+        () => startedExportStreams.add(request),
+        () => failedExports.add(request),
+        (completed) => {
+          if (completed) {
+            successfulExportStreams.add(request);
+            releaseExportResources(request);
+          }
+          else void settleExport(request, false);
+        },
+      ));
     },
   );
 
-  app.delete<{ Body: { confirmation: string; password: string } }>(
-    "/api/v1/privacy/account",
+  app.post<{ Body: { token: string } }>(
+    "/api/v1/privacy/account-deletion/status",
     {
-      preHandler: requireAuth,
-      config: { rateLimit: { max: 3, timeWindow: "15 minutes" } },
+      config: { rateLimit: { max: 10, timeWindow: "15 minutes" } },
       schema: {
         body: {
-          type: "object", additionalProperties: false, required: ["confirmation", "password"],
+          type: "object",
+          additionalProperties: false,
+          required: ["token"],
+          properties: { token: { type: "string", pattern: TOKEN_PATTERN } },
+        },
+      },
+    },
+    async (request) => {
+      const receipt = await pool.query(
+        `SELECT operation_id, status, requested_at, completed_at
+           FROM account_deletion_receipts WHERE token_hash = $1`,
+        [tokenHash(request.body.token)],
+      );
+      if (receipt.rowCount !== 1) {
+        throw new ApiError(404, "DELETION_RECEIPT_NOT_FOUND", "El comprobante no existe.");
+      }
+      return {
+        data: {
+          id: String(receipt.rows[0].operation_id),
+          status: String(receipt.rows[0].status),
+          requestedAt: timestamp(receipt.rows[0].requested_at),
+          completedAt: receipt.rows[0].completed_at === null ? null : timestamp(receipt.rows[0].completed_at),
+        },
+      };
+    },
+  );
+
+  app.delete<{ Body: { confirmation: string; password: string; receiptToken: string } }>(
+    "/api/v1/privacy/account",
+    {
+      preHandler: requireStepUp,
+      config: { rateLimit: { max: 3, timeWindow: "15 minutes", keyGenerator: rateKey } },
+      schema: {
+        body: {
+          type: "object", additionalProperties: false, required: ["confirmation", "password", "receiptToken"],
           properties: {
             confirmation: { type: "string", const: "ELIMINAR" },
             password: { type: "string", minLength: 1, maxLength: 128 },
+            receiptToken: { type: "string", pattern: TOKEN_PATTERN },
           },
         },
       },
     },
     async (request, reply) => {
       const operationId = randomUUID();
+      const receiptToken = request.body.receiptToken;
       const account = await pool.query(
         `SELECT password_hash FROM users
           WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL`,
@@ -1662,6 +2035,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       }
       const verifiedHash = String(account.rows[0].password_hash);
       await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
         const current = await client.query(
           `SELECT password_hash FROM users
             WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE`,
@@ -1676,12 +2052,42 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
            ) VALUES ($1, $2, 'ACCOUNT_DELETION', $3, 'PENDING')`,
           [operationId, request.authUser!.id, `account-deletion:${operationId}`],
         );
+        await client.query(
+          `INSERT INTO account_deletion_receipts (id, operation_id, token_hash)
+           VALUES ($1, $2, $3)`,
+          [randomUUID(), operationId, tokenHash(receiptToken)],
+        );
         await audit(client, request.authUser!.id, "ACCOUNT_DELETION_REQUESTED", "PRIVACY_OPERATION", operationId);
+        await client.query(
+          `INSERT INTO storage_deletion_tombstones (
+             id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+           )
+           SELECT gen_random_uuid(), document.user_id, document.object_key,
+                  session.object_key, session.expires_at
+             FROM documents AS document
+             JOIN upload_sessions AS session
+               ON session.id = document.upload_session_id AND session.user_id = document.user_id
+            WHERE document.user_id = $1
+           ON CONFLICT DO NOTHING`,
+          [request.authUser!.id],
+        );
+        await client.query(
+          `INSERT INTO storage_deletion_tombstones (
+             id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+           )
+           SELECT gen_random_uuid(), session.user_id,
+                  'documents/' || encode(sha256(convert_to(session.id::text, 'UTF8')), 'hex') || '.pdf',
+                  session.object_key, session.expires_at
+             FROM upload_sessions AS session
+            WHERE session.user_id = $1
+           ON CONFLICT DO NOTHING`,
+          [request.authUser!.id],
+        );
         await client.query(
           `UPDATE processing_jobs
               SET state = 'CANCELLED', completed_at = now(), lease_owner = NULL,
                   lease_expires_at = NULL, error_code = 'ACCOUNT_DELETION', updated_at = now()
-            WHERE user_id = $1 AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')`,
+            WHERE user_id = $1 AND state IN ('PENDING', 'PUBLISHED', 'RETRYABLE')`,
           [request.authUser!.id],
         );
         await client.query(
@@ -1703,6 +2109,12 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [request.authUser!.id],
         );
         await client.query(
+          `UPDATE privacy_operations SET status = 'CANCELLED', completed_at = now(), updated_at = now()
+            WHERE user_id = $1 AND operation_type = 'DATA_EXPORT'
+              AND status IN ('PENDING', 'READY')`,
+          [request.authUser!.id],
+        );
+        await client.query(
           `UPDATE sessions SET revoked_at = COALESCE(revoked_at, now()) WHERE user_id = $1`,
           [request.authUser!.id],
         );
@@ -1711,10 +2123,16 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [request.authUser!.id],
         );
       });
-      reply.clearCookie("salarivo_session", {
+      activeExportStreams.get(request.authUser!.id)?.abort();
+      reply.clearCookie(sessionCookie, {
         httpOnly: true, secure: config.appEnv === "production", sameSite: "lax", path: "/",
       });
-      return reply.code(202).send({ data: { id: operationId, status: "PENDING" } });
+      if (sessionCookie !== "salarivo_session") {
+        reply.clearCookie("salarivo_session", {
+          httpOnly: true, secure: true, sameSite: "lax", path: "/",
+        });
+      }
+      return reply.code(202).send({ data: { id: operationId, status: "PENDING", receiptToken } });
     },
   );
 }

@@ -4,6 +4,7 @@ import {
   hashPassword,
   hasTrustedMutationOrigin,
   opaqueToken,
+  sessionCookieName,
   tokenHash,
   verifyPassword,
 } from "../src/security.ts";
@@ -32,4 +33,9 @@ test("cookie-backed mutations require the configured browser origin", () => {
   assert.equal(hasTrustedMutationOrigin("POST", expected, expected), true);
   assert.equal(hasTrustedMutationOrigin("POST", undefined, expected), false);
   assert.equal(hasTrustedMutationOrigin("DELETE", "https://attacker.test", expected), false);
+});
+
+test("production sessions use a host-only cookie prefix", () => {
+  assert.equal(sessionCookieName("production"), "__Host-salarivo_session");
+  assert.equal(sessionCookieName("test"), "salarivo_session");
 });

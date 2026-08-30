@@ -59,9 +59,12 @@ services:
       dockerfile: apps/api/Dockerfile
     environment:
       APP_ENV: development
+      NODE_ENV: development
       API_HOST: 0.0.0.0
       API_PORT: 3001
       LOG_LEVEL: info
+      MFA_ENCRYPTION_KEY_VERSION: ${MFA_ENCRYPTION_KEY_VERSION:-1}
+      MFA_ENCRYPTION_KEY_BASE64: ${MFA_ENCRYPTION_KEY_BASE64:-bG9jYWwtbWZhLWtleS1vbmx5LWZvci10ZXN0cyEhISE=}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3000}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       OBJECT_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER}
@@ -93,6 +96,7 @@ services:
       dockerfile: apps/worker-documents/Dockerfile
     environment:
       APP_ENV: development
+      NODE_ENV: development
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       QUEUE_URL: redis://redis:6379
       OBJECT_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER}

@@ -1,4 +1,11 @@
-import { DeleteObjectCommand, GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import {
+  DeleteObjectCommand,
+  GetBucketEncryptionCommand,
+  GetBucketVersioningCommand,
+  GetObjectCommand,
+  GetPublicAccessBlockCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
 import { migrate, pool, withTransaction } from '@salarivo/database';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -25,11 +32,14 @@ import {
   type FieldSource,
   type PayrollExtraction,
 } from './engine.ts';
+import { runtimeEnvironment, type RuntimeEnvironment } from './environment.ts';
 
 const QUEUE_NAME = 'salarivo:processing-jobs:documents';
 const WORKER_VERSION = '3';
+const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
 
 type WorkerConfig = {
+  appEnv: RuntimeEnvironment;
   clamavHost: string;
   clamavPort: number;
   classificationHighThreshold: number;
@@ -49,6 +59,7 @@ type WorkerConfig = {
   storageAccessKey: string;
   storageBucket: string;
   storageEndpoint: string;
+  storageKmsKeyId: string | null;
   storageRegion: string;
   storageSecretKey: string;
   uploadCleanupGraceMs: number;
@@ -112,7 +123,7 @@ function env(name: string, localDefault?: string, aliases: string[] = []): strin
     const value = process.env[key]?.trim();
     if (value) return value;
   }
-  if (process.env.APP_ENV?.trim() !== 'production' && localDefault !== undefined) return localDefault;
+  if (runtimeEnvironment() !== 'production' && localDefault !== undefined) return localDefault;
   throw new Error(`Missing required environment variable: ${name}`);
 }
 
@@ -130,14 +141,14 @@ function probability(name: string, localDefault: number): number {
 }
 
 function loadConfig(): WorkerConfig {
-  const appEnv = process.env.APP_ENV?.trim() || 'development';
-  if (!['development', 'test', 'production'].includes(appEnv)) throw new Error('APP_ENV must be development, test or production');
+  const appEnv = runtimeEnvironment();
   const localStorageAliases = appEnv === 'production' ? [] : ['MINIO_ROOT_USER'];
   const localStorageSecretAliases = appEnv === 'production' ? [] : ['MINIO_ROOT_PASSWORD'];
   const low = probability('CLASSIFICATION_LOW_THRESHOLD', 0.2);
   const high = probability('CLASSIFICATION_HIGH_THRESHOLD', 0.55);
   if (low >= high) throw new Error('CLASSIFICATION_LOW_THRESHOLD must be lower than CLASSIFICATION_HIGH_THRESHOLD');
   const config = {
+    appEnv,
     clamavHost: env('CLAMAV_HOST', '127.0.0.1'),
     clamavPort: positiveInt('CLAMAV_PORT', 3310, 1, 65_535),
     classificationHighThreshold: high,
@@ -157,6 +168,7 @@ function loadConfig(): WorkerConfig {
     storageAccessKey: env('OBJECT_STORAGE_ACCESS_KEY', 'salarivo', localStorageAliases),
     storageBucket: env('OBJECT_STORAGE_BUCKET', 'salarivo-documents-local'),
     storageEndpoint: env('OBJECT_STORAGE_ENDPOINT', `http://127.0.0.1:${process.env.MINIO_API_PORT?.trim() || '9000'}`),
+    storageKmsKeyId: appEnv === 'production' ? env('OBJECT_STORAGE_KMS_KEY_ID') : (process.env.OBJECT_STORAGE_KMS_KEY_ID?.trim() || null),
     storageRegion: env('OBJECT_STORAGE_REGION', 'us-east-1'),
     storageSecretKey: env('OBJECT_STORAGE_SECRET_KEY', 'salarivo_local_change_me_123', localStorageSecretAliases),
     uploadCleanupGraceMs: positiveInt('UPLOAD_CLEANUP_GRACE_MS', 15 * 60_000, 60_000, 86_400_000),
@@ -170,7 +182,36 @@ function loadConfig(): WorkerConfig {
   if (config.jobLeaseMs <= config.maxOcrTimeMs * 2 + config.maxParseTimeMs * 6) {
     throw new Error('JOB_TIMEOUT_MS must cover OCR and parser timeouts');
   }
+  if (appEnv === 'production') {
+    if (new URL(config.queueUrl).protocol !== 'rediss:') throw new Error('QUEUE_URL must use TLS in production');
+    if (new URL(config.storageEndpoint).protocol !== 'https:') throw new Error('OBJECT_STORAGE_ENDPOINT must use HTTPS in production');
+  }
   return config;
+}
+
+async function verifyProductionStorage(s3: S3Client, config: WorkerConfig): Promise<void> {
+  if (config.appEnv !== 'production') return;
+  const [versioning, encryption, access] = await Promise.all([
+    s3.send(new GetBucketVersioningCommand({ Bucket: config.storageBucket }), { abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) }),
+    s3.send(new GetBucketEncryptionCommand({ Bucket: config.storageBucket }), { abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) }),
+    s3.send(new GetPublicAccessBlockCommand({ Bucket: config.storageBucket }), { abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) }),
+  ]);
+  if (versioning.Status !== undefined) throw new Error('OBJECT_STORAGE_BUCKET must never have versioning enabled');
+  const kms = encryption.ServerSideEncryptionConfiguration?.Rules?.some((rule) =>
+    rule.ApplyServerSideEncryptionByDefault?.SSEAlgorithm === 'aws:kms'
+    && rule.ApplyServerSideEncryptionByDefault.KMSMasterKeyID === config.storageKmsKeyId);
+  if (!kms) throw new Error('OBJECT_STORAGE_BUCKET must use the configured KMS key');
+  const block = access.PublicAccessBlockConfiguration;
+  if (!block?.BlockPublicAcls || !block.IgnorePublicAcls || !block.BlockPublicPolicy || !block.RestrictPublicBuckets) {
+    throw new Error('OBJECT_STORAGE_BUCKET must block all public access');
+  }
+}
+
+function deleteStorageObject(s3: S3Client, bucket: string, key: string) {
+  return s3.send(
+    new DeleteObjectCommand({ Bucket: bucket, Key: key }),
+    { abortSignal: AbortSignal.timeout(STORAGE_REQUEST_TIMEOUT_MS) },
+  );
 }
 
 async function runProcess(
@@ -415,11 +456,12 @@ async function reconcileDatabaseState(
       user_id: string;
     }>(
       `WITH candidates AS (
-         SELECT id, attempt >= max_attempts AS exhausted
-           FROM processing_jobs
-          WHERE state = 'RUNNING' AND lease_expires_at < now()
-          ORDER BY lease_expires_at
-          FOR UPDATE SKIP LOCKED
+         SELECT job.id, job.attempt >= job.max_attempts AS exhausted
+           FROM processing_jobs AS job
+           JOIN users ON users.id = job.user_id AND users.status = 'ACTIVE'
+          WHERE job.state = 'RUNNING' AND job.lease_expires_at < now()
+          ORDER BY job.lease_expires_at
+          FOR UPDATE OF job SKIP LOCKED
           LIMIT $1
        )
        UPDATE processing_jobs AS job
@@ -451,6 +493,7 @@ async function reconcileDatabaseState(
         [job.document_id, job.user_id],
       );
       await completeBatchIfTerminal(db, job);
+      await scheduleRetentionDeletion(db, job);
     }
     const batches = await completeTerminalBatches(db);
     return {
@@ -467,7 +510,7 @@ async function dispatchOnce(client: QueuePublisher, config: WorkerConfig): Promi
     const active = await db.query<{ count: number; user_id: string }>(
       `SELECT user_id, count(*)::integer AS count
          FROM processing_jobs
-        WHERE state = 'RUNNING'
+        WHERE execution_owner IS NOT NULL
            OR (state = 'PUBLISHED' AND published_at >= now() - ($1 * interval '1 millisecond'))
         GROUP BY user_id`,
       [config.publishedRetryMs],
@@ -475,13 +518,16 @@ async function dispatchOnce(client: QueuePublisher, config: WorkerConfig): Promi
     const activeJobsByUser = new Map(active.rows.map((row) => [row.user_id, row.count]));
     const jobs = await db.query<{ id: string; user_id: string }>(
       `WITH ranked AS (
-         SELECT id, user_id, row_number() OVER (PARTITION BY user_id ORDER BY available_at, created_at) AS user_rank
-           FROM processing_jobs
-          WHERE stage IN ('SECURITY_VALIDATION', 'TEXT_EXTRACTION')
-            AND attempt < max_attempts
+         SELECT job.id, job.user_id,
+                row_number() OVER (PARTITION BY job.user_id ORDER BY job.available_at, job.created_at) AS user_rank
+           FROM processing_jobs AS job
+           JOIN users ON users.id = job.user_id AND users.status = 'ACTIVE'
+          WHERE job.stage IN ('SECURITY_VALIDATION', 'TEXT_EXTRACTION')
+            AND job.execution_owner IS NULL
+            AND job.attempt < job.max_attempts
             AND (
-              (state IN ('PENDING', 'RETRYABLE') AND available_at <= now())
-              OR (state = 'PUBLISHED' AND published_at < now() - ($1 * interval '1 millisecond'))
+              (job.state IN ('PENDING', 'RETRYABLE') AND job.available_at <= now())
+              OR (job.state = 'PUBLISHED' AND job.published_at < now() - ($1 * interval '1 millisecond'))
             )
        )
        SELECT jobs.id, jobs.user_id
@@ -591,8 +637,8 @@ async function cleanupExpiredUploads(
     const canonicalKey = `documents/${createHash('sha256').update(session.id).digest('hex')}.pdf`;
     try {
       await Promise.all([
-        s3.send(new DeleteObjectCommand({ Bucket: config.storageBucket, Key: session.object_key })),
-        s3.send(new DeleteObjectCommand({ Bucket: config.storageBucket, Key: canonicalKey })),
+        deleteStorageObject(s3, config.storageBucket, session.object_key),
+        deleteStorageObject(s3, config.storageBucket, canonicalKey),
       ]);
       const status = uploadCleanupStatus(
         session.expires_at.getTime(), Date.now(), config.uploadCleanupGraceMs, session.user_cancelled,
@@ -616,7 +662,7 @@ async function cleanupExpiredUploads(
   );
   for (const session of confirmed.rows) {
     try {
-      await s3.send(new DeleteObjectCommand({ Bucket: config.storageBucket, Key: session.object_key }));
+      await deleteStorageObject(s3, config.storageBucket, session.object_key);
       if (uploadCleanupStatus(
         session.expires_at.getTime(),
         Date.now(),
@@ -637,7 +683,75 @@ async function cleanupExpiredUploads(
   return { batches: database.batches, items: database.items, objects };
 }
 
-async function cleanupPendingAccounts(s3: S3Client, config: WorkerConfig): Promise<number> {
+async function cleanupStorageDeletionTombstone(
+  s3: S3Client,
+  config: WorkerConfig,
+  excludedUserIds: string[],
+): Promise<{ deleted: number; userId: string } | null> {
+  const leaseOwner = randomUUID();
+  const claimed = await pool.query<{
+    attempt: number;
+    canonical_object_key: string;
+    id: string;
+    incoming_object_key: string;
+    user_id: string;
+  }>(
+    `WITH candidate AS (
+       SELECT tombstone.id
+         FROM storage_deletion_tombstones AS tombstone
+        WHERE tombstone.upload_expires_at <= now() - ($1 * interval '1 millisecond')
+          AND NOT (tombstone.user_id = ANY($2::uuid[]))
+          AND ((tombstone.status = 'PENDING' AND tombstone.available_at <= now())
+            OR (tombstone.status = 'RUNNING' AND tombstone.lease_expires_at <= now()))
+        ORDER BY tombstone.available_at, tombstone.created_at
+        FOR UPDATE OF tombstone SKIP LOCKED
+        LIMIT 1
+     )
+     UPDATE storage_deletion_tombstones AS tombstone
+        SET status = 'RUNNING', attempt = attempt + 1, lease_owner = $3,
+            lease_expires_at = now() + interval '5 minutes', error_code = NULL, updated_at = now()
+       FROM candidate
+      WHERE tombstone.id = candidate.id
+      RETURNING tombstone.id, tombstone.canonical_object_key,
+                tombstone.incoming_object_key, tombstone.attempt, tombstone.user_id`,
+    [config.uploadCleanupGraceMs, excludedUserIds, leaseOwner],
+  );
+  const tombstone = claimed.rows[0];
+  if (!tombstone) return null;
+  try {
+    for (const key of new Set([tombstone.canonical_object_key, tombstone.incoming_object_key])) {
+      await deleteStorageObject(s3, config.storageBucket, key);
+    }
+    const completed = await pool.query(
+      `DELETE FROM storage_deletion_tombstones
+        WHERE id = $1 AND status = 'RUNNING' AND lease_owner = $2`,
+      [tombstone.id, leaseOwner],
+    );
+    return { deleted: completed.rowCount ?? 0, userId: tombstone.user_id };
+  } catch {
+    const delayMs = Math.min(300_000, 1_000 * 2 ** Math.min(tombstone.attempt, 8)) + randomInt(0, 1_000);
+    await pool.query(
+      `UPDATE storage_deletion_tombstones
+          SET status = 'PENDING', available_at = now() + ($3 * interval '1 millisecond'),
+              lease_owner = NULL, lease_expires_at = NULL,
+              error_code = 'STORAGE_UNAVAILABLE', updated_at = now()
+        WHERE id = $1 AND status = 'RUNNING' AND lease_owner = $2`,
+      [tombstone.id, leaseOwner, delayMs],
+    );
+    log('storage_deletion_retry_scheduled');
+    return { deleted: 0, userId: tombstone.user_id };
+  }
+}
+
+async function cleanupPendingAccounts(config: WorkerConfig): Promise<number> {
+  await pool.query(
+    `UPDATE privacy_operations AS export
+        SET status = 'CANCELLED', completed_at = now(), updated_at = now()
+       FROM users
+      WHERE users.id = export.user_id AND users.status = 'DELETION_PENDING'
+        AND export.operation_type = 'DATA_EXPORT' AND export.status = 'RUNNING'
+        AND export.updated_at < now() - interval '15 minutes'`,
+  );
   const claimed = await pool.query<{ id: string; user_id: string }>(
     `WITH candidate AS (
        SELECT operation.id
@@ -650,6 +764,19 @@ async function cleanupPendingAccounts(s3: S3Client, config: WorkerConfig): Promi
             SELECT 1 FROM upload_sessions AS session
              WHERE session.user_id = operation.user_id
                AND session.expires_at > now() - ($1 * interval '1 millisecond')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM storage_deletion_tombstones AS tombstone
+             WHERE tombstone.user_id = operation.user_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM privacy_operations AS export
+             WHERE export.user_id = operation.user_id
+               AND export.operation_type = 'DATA_EXPORT' AND export.status = 'RUNNING'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS job
+             WHERE job.user_id = operation.user_id AND job.execution_owner IS NOT NULL
           )
         ORDER BY operation.created_at
         FOR UPDATE OF operation SKIP LOCKED
@@ -666,37 +793,23 @@ async function cleanupPendingAccounts(s3: S3Client, config: WorkerConfig): Promi
   const operation = claimed.rows[0];
   if (!operation) return 0;
   try {
-    const [documents, sessions, exports] = await Promise.all([
-      pool.query<{ object_key: string }>(
-        `SELECT object_key FROM documents WHERE user_id = $1 AND original_deleted_at IS NULL`,
+    return await withTransaction(async (db: PoolClient) => {
+      const deleted = await db.query(
+        `DELETE FROM users WHERE id = $1 AND status = 'DELETION_PENDING' RETURNING id`,
         [operation.user_id],
-      ),
-      pool.query<{ id: string; object_key: string }>(
-        `SELECT id, object_key FROM upload_sessions WHERE user_id = $1`,
-        [operation.user_id],
-      ),
-      pool.query<{ object_key: string }>(
-        `SELECT object_key FROM privacy_operations WHERE user_id = $1 AND object_key IS NOT NULL`,
-        [operation.user_id],
-      ),
-    ]);
-    const keys = new Set([
-      ...documents.rows.map((row) => row.object_key),
-      ...sessions.rows.map((row) => row.object_key),
-      ...sessions.rows.map((row) => `documents/${createHash('sha256').update(row.id).digest('hex')}.pdf`),
-      ...exports.rows.map((row) => row.object_key),
-    ]);
-    for (const key of keys) {
-      await s3.send(new DeleteObjectCommand({ Bucket: config.storageBucket, Key: key }));
-    }
-    await pool.query(
-      `DELETE FROM users WHERE id = $1 AND status = 'DELETION_PENDING'`,
-      [operation.user_id],
-    );
-    return 1;
+      );
+      if (!deleted.rowCount) return 0;
+      await db.query(
+        `UPDATE account_deletion_receipts
+            SET status = 'COMPLETED', completed_at = now()
+          WHERE operation_id = $1 AND status = 'PENDING'`,
+        [operation.id],
+      );
+      return 1;
+    });
   } catch {
     await pool.query(
-      `UPDATE privacy_operations SET status = 'PENDING', error_code = 'STORAGE_UNAVAILABLE', updated_at = now()
+      `UPDATE privacy_operations SET status = 'PENDING', error_code = 'ACCOUNT_CLEANUP_FAILED', updated_at = now()
         WHERE id = $1 AND status = 'RUNNING'`,
       [operation.id],
     );
@@ -705,8 +818,25 @@ async function cleanupPendingAccounts(s3: S3Client, config: WorkerConfig): Promi
   }
 }
 
+async function cleanupExpiredMfaEnrollments(): Promise<number> {
+  const removed = await pool.query(
+    `DELETE FROM mfa_factors WHERE status = 'PENDING' AND pending_expires_at <= now()`,
+  );
+  return removed.rowCount ?? 0;
+}
+
 async function claimJob(jobId: string, workerId: string, config: WorkerConfig): Promise<{ document: DocumentRow; job: JobRow } | null> {
   return await withTransaction(async (db: PoolClient) => {
+    const owner = await db.query<{ user_id: string }>(
+      `SELECT user_id FROM processing_jobs WHERE id = $1`,
+      [jobId],
+    );
+    if (!owner.rowCount) return null;
+    const activeUser = await db.query(
+      `SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE`,
+      [owner.rows[0]!.user_id],
+    );
+    if (!activeUser.rowCount) return null;
     const candidate = await db.query<{
       available: boolean;
       has_attempts: boolean;
@@ -734,10 +864,13 @@ async function claimJob(jobId: string, workerId: string, config: WorkerConfig): 
     const claimed = await db.query<JobRow>(
       `UPDATE processing_jobs
           SET state = 'RUNNING', attempt = attempt + 1, lease_owner = $2,
+              execution_owner = $2,
               lease_expires_at = now() + ($3 * interval '1 millisecond'),
               started_at = COALESCE(started_at, now()), error_code = NULL, updated_at = now()
         WHERE id = $1 AND stage IN ('SECURITY_VALIDATION', 'TEXT_EXTRACTION') AND state = 'PUBLISHED'
           AND available_at <= now() AND attempt < max_attempts
+          AND execution_owner IS NULL
+          AND EXISTS (SELECT 1 FROM users WHERE id = processing_jobs.user_id AND status = 'ACTIVE')
           AND (SELECT count(*) FROM processing_jobs active
                 WHERE active.user_id = processing_jobs.user_id AND active.state = 'RUNNING') < $4
         RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts, lease_owner`,
@@ -758,7 +891,8 @@ async function claimJob(jobId: string, workerId: string, config: WorkerConfig): 
       await db.query(
         `UPDATE processing_jobs
             SET state = 'CANCELLED', completed_at = now(), lease_owner = NULL,
-                lease_expires_at = NULL, error_code = 'DOCUMENT_DELETED', updated_at = now()
+                lease_expires_at = NULL, execution_owner = NULL,
+                error_code = 'DOCUMENT_DELETED', updated_at = now()
           WHERE id = $1`,
         [job.id],
       );
@@ -862,6 +996,38 @@ async function completeBatchIfTerminal(
   );
 }
 
+async function scheduleRetentionDeletion(
+  db: PoolClient,
+  job: Pick<JobRow, 'document_id' | 'user_id'>,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO storage_deletion_tombstones (
+       id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+     )
+     SELECT $3, document.user_id, document.object_key, session.object_key, session.expires_at
+       FROM documents AS document
+       JOIN upload_sessions AS session
+         ON session.id = document.upload_session_id AND session.user_id = document.user_id
+      WHERE document.id = $1 AND document.user_id = $2
+        AND document.deleted_at IS NULL AND document.original_deleted_at IS NULL
+        AND document.retention_policy = 'DELETE_AFTER_PROCESSING'
+     ON CONFLICT (canonical_object_key) DO NOTHING`,
+    [job.document_id, job.user_id, randomUUID()],
+  );
+  await db.query(
+    `UPDATE documents AS document
+        SET original_deleted_at = now()
+      WHERE document.id = $1 AND document.user_id = $2
+        AND document.deleted_at IS NULL AND document.original_deleted_at IS NULL
+        AND document.retention_policy = 'DELETE_AFTER_PROCESSING'
+        AND EXISTS (
+          SELECT 1 FROM storage_deletion_tombstones AS tombstone
+           WHERE tombstone.canonical_object_key = document.object_key
+        )`,
+    [job.document_id, job.user_id],
+  );
+}
+
 async function finishClassification(
   job: JobRow,
   classification: Classification,
@@ -919,6 +1085,7 @@ async function finishClassification(
         classification.decision === 'UNSUPPORTED' ? 'DOCUMENT_UNSUPPORTED' : 'DOCUMENT_LOW_CONFIDENCE',
       ],
     );
+    if (classification.decision === 'UNSUPPORTED') await scheduleRetentionDeletion(db, job);
     await db.query(
       `UPDATE processing_jobs
           SET state = 'COMPLETED', completed_at = now(), lease_owner = NULL,
@@ -1066,7 +1233,7 @@ async function persistExtraction(
               item.itemType,
               item.isRecurring,
               item.confidence,
-              item.normalizedConceptCode,
+              item.itemType === 'DEDUCTION' ? null : item.normalizedConceptCode,
             ],
           );
         }
@@ -1087,6 +1254,7 @@ async function persistExtraction(
         WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
       [job.document_id, job.user_id, needsReview ? 'NEEDS_REVIEW' : 'COMPLETED'],
     );
+    if (!needsReview) await scheduleRetentionDeletion(db, job);
     await db.query(
       `UPDATE processing_jobs
           SET state = 'COMPLETED', completed_at = now(), lease_owner = NULL,
@@ -1153,6 +1321,7 @@ async function failJob(job: JobRow, rawError: unknown): Promise<void> {
         [job.document_id, job.user_id, error.code],
       );
     }
+    if (!retryable) await scheduleRetentionDeletion(db, job);
     await completeBatchIfTerminal(db, job);
   });
   log('job_failed', { errorCode: error.code, jobId: job.id, retryable: retryable ? 1 : 0 });
@@ -1168,9 +1337,10 @@ async function processJob(
   if (!claim) return;
   const { document, job } = claim;
   const started = Date.now();
-  const directory = await mkdtemp(join(tmpdir(), 'salarivo-job-'));
-  const pdfPath = join(directory, 'document.pdf');
+  let directory: string | null = null;
   try {
+    directory = await mkdtemp(join(tmpdir(), 'salarivo-job-'));
+    const pdfPath = join(directory, 'document.pdf');
     const checksum = await downloadObject(s3, config, document, pdfPath);
     const pages = await inspectPdf(pdfPath, config);
     await scanWithClamAv(pdfPath, config);
@@ -1240,7 +1410,22 @@ async function processJob(
   } catch (error) {
     await failJob(job, error);
   } finally {
-    await rm(directory, { force: true, recursive: true });
+    let removed = true;
+    if (directory) {
+      try {
+        await rm(directory, { force: true, recursive: true });
+      } catch {
+        removed = false;
+        log('job_temp_cleanup_failed', { jobId: job.id });
+      }
+    }
+    if (removed) {
+      await pool.query(
+        `UPDATE processing_jobs SET execution_owner = NULL, updated_at = now()
+          WHERE id = $1 AND execution_owner = $2`,
+        [job.id, workerId],
+      );
+    }
   }
 }
 
@@ -1271,9 +1456,24 @@ async function maintenanceLoop(s3: S3Client, config: WorkerConfig, signal: Abort
       if (cleaned.objects) log('uploads_cleaned', { count: cleaned.objects });
       if (cleaned.items) log('upload_items_cancelled', { count: cleaned.items });
       if (cleaned.batches) log('batches_completed', { count: cleaned.batches });
+      const expiredMfa = await cleanupExpiredMfaEnrollments();
+      if (expiredMfa) log('mfa_enrollments_expired', { count: expiredMfa });
+      let tombstones = 0;
+      const visitedTombstoneUsers = new Set<string>();
+      for (let index = 0; index < 100; index += 1) {
+        let cleaned = await cleanupStorageDeletionTombstone(s3, config, [...visitedTombstoneUsers]);
+        if (!cleaned && visitedTombstoneUsers.size) {
+          visitedTombstoneUsers.clear();
+          cleaned = await cleanupStorageDeletionTombstone(s3, config, []);
+        }
+        if (!cleaned) break;
+        visitedTombstoneUsers.add(cleaned.userId);
+        tombstones += cleaned.deleted;
+      }
+      if (tombstones) log('storage_deletions_completed', { count: tombstones });
       let accounts = 0;
       for (let index = 0; index < 10; index += 1) {
-        const deleted = await cleanupPendingAccounts(s3, config);
+        const deleted = await cleanupPendingAccounts(config);
         if (!deleted) break;
         accounts += deleted;
       }
@@ -1372,6 +1572,7 @@ async function main(): Promise<void> {
     forcePathStyle: true,
     region: config.storageRegion,
   });
+  await verifyProductionStorage(s3, config);
   const abort = new AbortController();
   const stop = () => abort.abort();
   process.once('SIGINT', stop);

@@ -10,13 +10,13 @@ Conserva el documento cifrado para descarga y reprocesamiento hasta que el usuar
 
 ### DELETE_AFTER_PROCESSING
 
-Elimina el original y derivados temporales después de completar, revisar o alcanzar una decisión terminal definida. Conserva sólo información estructurada permitida, trazabilidad mínima y evidencia no sensible.
+Cuando el procesamiento termina —sin revisión o cuando el usuario la completa—, se rechaza como no soportado o falla de forma permanente, bloquea el acceso al original y agenda su borrado durable. El delete físico ocurre después de vencer la autorización de upload y su ventana de gracia. No agenda mientras existe revisión o retry pendiente. Conserva sólo información estructurada permitida, trazabilidad mínima y evidencia no sensible.
 
 ### DELETE_AFTER_N_DAYS
 
 Capacidad futura. El número es configuración visible al usuario; no se habilita hasta implementar scheduler, advertencias, reconciliación y tests.
 
-La preferencia global puede sobrescribirse por documento. Cambiarla hacia menor retención dispara cleanup; nunca restaura un original ya borrado.
+El esquema ya conserva una política por cuenta y la copia al documento, pero el producto actual crea cuentas con `KEEP_ORIGINAL` y todavía no ofrece ruta ni UI para cambiarla. `DELETE_AFTER_PROCESSING` sólo se ejecuta si una operación interna revisada dejó esa política en el documento. Hacer editable la preferencia global o por documento requiere contrato, UX y pruebas; nunca podrá restaurar un original ya borrado.
 
 ## Objetos y lifecycle
 
@@ -24,7 +24,7 @@ La preferencia global puede sobrescribirse por documento. Cambiarla hacia menor 
 | --- | --- | --- |
 | upload incompleto | storage + UploadSession | TTL corto configurable |
 | original en cuarentena | storage + Document | hasta decisión de seguridad y cleanup |
-| original aceptado | storage + preference | según policy del usuario |
+| original aceptado | storage + `Document.retentionPolicy` | según la política persistida; `KEEP_ORIGINAL` por defecto actual |
 | render/OCR/thumbnail temporal | storage/filesystem efímero | mínimo técnico, TTL y cleanup al finalizar |
 | ExtractionRun | PostgreSQL | historial versionado mientras exista el dato estructurado |
 | UserCorrection | PostgreSQL | mientras exista el campo corregido o hasta borrado solicitado |
@@ -33,18 +33,20 @@ La preferencia global puede sobrescribirse por documento. Cambiarla hacia menor 
 | aceptación legal | PostgreSQL | mientras exista la cuenta; la versión publicada permanece sin relación personal al borrar la cuenta |
 | contribución de benchmark | no implementada | futura: hasta revocación/borrado; retirar mapping y recomputar agregados afectados |
 | export | PostgreSQL + respuesta HTTPS autenticada | autorización breve; JSON generado bajo demanda |
-| backup | backup cifrado | ventana declarada y purge diferido documentado |
+| tombstone de storage | PostgreSQL sin FK | hasta confirmar borrado canónico y temporal; luego se elimina |
+| constancia de baja | PostgreSQL sin FK ni PII | estado operativo `PENDING`/`COMPLETED`; plazo definitivo pendiente |
+| backup | no implementada | pendiente de proveedor, ventana, cifrado y lista de supresiones |
 
-Ningún temporal depende sólo de un happy path para borrarse. Un reconciliador encuentra objetos huérfanos por owner, tipo y expiración.
+Uploads vencidos y tombstones se reconcilian fuera del happy path. Producción debe garantizar que ninguna carga iniciada antes del vencimiento termine después de la ventana de gracia o, en su defecto, inventariar y reborrar posteriormente antes de cerrar la baja. Un inventario genérico de objetos huérfanos contra storage sigue pendiente antes de producción.
 
 ## Eliminar original
 
 1. reautenticar cuando el riesgo lo requiera;
 2. autorizar ownership;
-3. impedir nuevas descargas y revocar autorizaciones;
-4. cancelar jobs que necesitan el binario;
+3. registrar el tombstone y bloquear nuevas descargas;
+4. rechazar la operación mientras un job todavía necesita el binario y comprobar un estado terminal;
 5. borrar original, renders, thumbnails y OCR temporales;
-6. actualizar estado sólo tras confirmación/reconciliación;
+6. mantener el tombstone hasta confirmar/reconciliar ambas keys después del vencimiento del upload;
 7. conservar o borrar datos estructurados según elección;
 8. registrar AuditEvent sin contenido sensible.
 
@@ -54,29 +56,28 @@ La operación es idempotente.
 
 Además del original:
 
-- elimina settlements, line items, extractions y corrections dentro del alcance;
-- invalida cache, índices, exports y shares relacionados;
-- cancela/reconcilia jobs;
-- actualiza analytics;
+- elimina por cascada settlements, line items, extractions, corrections, upload session y jobs dentro del alcance;
+- registra y reconcilia el borrado de las keys de storage;
 - conserva sólo lo exigido por una política aprobada y sin payload salarial cuando sea posible.
+
+Cache externas, shares e índices de búsqueda no existen en el MVP. Si se incorporan, deberán entrar en la misma orquestación y sus pruebas antes de habilitarse.
 
 La UI distingue claramente “eliminar original” de “eliminar documento y datos”.
 
 ## Eliminar cuenta
 
-Una orquestación durable recorre:
+La orquestación actual recorre:
 
 - sesiones y acceso;
 - imports y cola;
 - DB y proyecciones;
 - object storage;
-- cache;
 - temporales;
-- exports y shares;
-- índices;
-- backups según ventana.
+- exports.
 
-El usuario recibe estado y alcance; no se afirma borrado total instantáneo si existe retención de backup. Al restaurar un backup, se reaplica una lista de supresión para no resucitar cuentas eliminadas.
+No existen shares, cache externa ni índice de búsqueda en el MVP. Backups y lista de supresiones son un bloqueo P0 separado: deben incorporarse al procedimiento operativo antes de aceptar datos reales.
+
+El navegador genera la constancia opaca antes de solicitar la baja y la muestra cuando el servidor acepta el pedido o la respuesta es ambigua por un error de red/5xx; el servidor guarda sólo su hash y el navegador no la persiste en storage. Si la persona la copia, puede reingresarla en la pantalla pública para consultar `PENDING` o `COMPLETED` aun si se perdió la respuesta o después del cascade. No se afirma borrado total instantáneo si existe retención de backup. Al restaurar un backup deberá reaplicarse una lista de supresión para no resucitar cuentas eliminadas; ese mecanismo aún no está implementado.
 
 ## Backups
 
@@ -93,7 +94,7 @@ Los backups no son un archivo histórico indefinido. No se editan objetos indivi
 
 ## Fallos y reconciliación
 
-Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. El worker reintenta la misma operación y sólo elimina la fila de usuario después de vencer autorizaciones de upload y confirmar el cleanup de storage.
+Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se materializan en tombstones sin cargar el inventario en memoria y el worker los drena en lotes round-robin por usuario. Sólo elimina la fila de usuario después de vencer autorizaciones de upload, confirmar el cleanup de storage y comprobar que ningún job conserva `execution_owner`. El cierre también depende de que el proveedor limite la duración máxima de una carga por debajo de la ventana de gracia o de una reconciliación posterior equivalente. Ese marcador se libera después de limpiar el directorio temporal, incluso si el job ya quedó terminal o reintentable. Un crash puede dejarlo huérfano: la baja permanece bloqueada hasta verificar operativamente que el proceso y su temporal terminaron; alerta y procedimiento de recuperación son pendientes de producción.
 
 ## Decisiones pendientes
 
@@ -101,7 +102,7 @@ Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. El worker re
 - retención legal de auditoría;
 - semántica exacta de borrado de ExtractionRun;
 - proveedor y lifecycle de backups;
-- plazos y comunicación del borrado diferido en producción.
+- plazos y comunicación del borrado diferido en producción;
 - revisión legal de la retención de evidencia de aceptación antes de producción; el MVP prioriza borrado de cuenta y no conserva una identidad separada.
 
 Estas decisiones requieren producto, seguridad y asesoramiento legal aplicable; no deben inventarse en código.

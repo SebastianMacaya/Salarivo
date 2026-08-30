@@ -1,6 +1,6 @@
 FROM node:24.15-bookworm-slim
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production APP_ENV=production
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates poppler-utils tesseract-ocr tesseract-ocr-spa tini \
     && rm -rf /var/lib/apt/lists/*

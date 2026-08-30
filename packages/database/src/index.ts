@@ -1,10 +1,20 @@
 import { Pool, type PoolClient } from "pg";
+import { assertSecureDatabaseUrl } from "./database-url.ts";
 import { runMigrations } from "./migrations.ts";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
+const databaseEnvironment = process.env.NODE_ENV === "production"
+  ? "production"
+  : process.env.APP_ENV?.trim();
+assertSecureDatabaseUrl(databaseUrl, databaseEnvironment, process.env.NODE_TLS_REJECT_UNAUTHORIZED);
 
-export const pool = new Pool({ connectionString: databaseUrl });
+export const pool = new Pool({
+  connectionString: databaseUrl,
+  connectionTimeoutMillis: 5_000,
+  query_timeout: 30_000,
+  statement_timeout: 30_000,
+});
 
 export async function withTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();

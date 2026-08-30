@@ -13,7 +13,7 @@ Términos y Aviso se publican como versiones inmutables con tipo, locale, vigenc
 
 `USER` y `ADMIN` son los únicos roles actuales. Cada request de administración vuelve a leer el rol desde PostgreSQL. El panel inicial es sólo lectura y expone conteos operativos y adopción de versiones legales; excluye personas, emails, documentos, filenames, OCR, importes, conceptos, identificadores fiscales, tokens y URLs. El rol no se puede solicitar durante el registro ni administrar desde la API.
 
-Las nuevas versiones se incorporan por migración revisada. No se agrega todavía publicación desde UI, reaceptación de versiones nuevas, MFA, soporte, impersonación ni RBAC por capacidades.
+Las nuevas versiones se incorporan por migración revisada. No se agrega todavía publicación desde UI, reaceptación de versiones nuevas, soporte, impersonación ni RBAC por capacidades. MFA quedó fuera de esta decisión y fue incorporado después por el [ADR 0008](0008-session-assurance-and-totp-mfa.md).
 
 ## Consecuencias
 
@@ -21,7 +21,7 @@ Las nuevas versiones se incorporan por migración revisada. No se agrega todaví
 - La eliminación de cuenta borra sus acknowledgements personales; las versiones publicadas permanecen.
 - Revocar un rol en DB quita acceso en el siguiente request.
 - Promover administradores es una acción explícita de operador, fuera de endpoints públicos.
-- Antes de producción, los textos y datos del responsable requieren revisión legal y debe definirse MFA para administración.
+- Antes de producción, los textos y datos del responsable requieren revisión legal. La administración exige MFA según el ADR 0008.
 
 ## Evidencia
 

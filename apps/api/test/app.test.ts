@@ -21,6 +21,7 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
   const rejected = await app.inject({ method: "POST", url: "/api/v1/auth/logout" });
   assert.equal(rejected.statusCode, 403);
   assert.equal(rejected.json().error.code, "UNTRUSTED_ORIGIN");
+  assert.equal(rejected.headers["cache-control"], "no-store");
 
   assert.equal(
     derivedDocumentFilename("document.pdf", "2026-07", "Empresa: Sintética / Norte?"),

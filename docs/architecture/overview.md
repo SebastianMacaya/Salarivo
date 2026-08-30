@@ -60,7 +60,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 
 ## Módulos de dominio
 
-- identity: usuarios, sesiones y recuperación;
+- identity: usuarios, sesiones, MFA TOTP, step-up y recuperación;
 - employment: empleadores, relaciones laborales y eventos;
 - imports: sesiones, batches, items y progreso;
 - documents: metadata, lifecycle, seguridad y retención;
@@ -175,7 +175,7 @@ El benchmark futuro agregará, fuera del historial privado, sólo contribuciones
 
 - OCR caído: API disponible; jobs quedan retryable.
 - Cola caída: uploads ya confirmados permanecen en DB/storage y se reconcilian.
-- Worker caído: lease expira y el job idempotente se reintenta.
+- Worker caído: el lease lógico expira, pero el marcador de ejecución queda fail-closed y bloquea retry y baja hasta verificar que el proceso y su temporal terminaron; la recuperación operativa segura sigue pendiente.
 - Proveedor externo caído: no tumba el dominio; se usa fallback permitido o estado visible.
 - Storage caído: no se marca upload como completo.
 - Malware scanner no disponible: fail closed; el objeto no avanza.
@@ -194,8 +194,8 @@ Pipeline CI objetivo:
 lint -> typecheck -> unit -> integration -> security -> build -> dependency/secret scan
 ~~~
 
-No se crea CI hasta existir manifests y una verificación ejecutable real.
+El workflow `.github/workflows/ci.yml` ejecuta lint, typecheck, unit, build web, validación de Compose, migraciones e integración local sintética. SAST, secret scan e image scan bloqueantes siguen pendientes.
 
 ## Decisiones abiertas
 
-El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis y sesiones propias. Siguen abiertos el proveedor cloud, región, cifrado y backups de producción, y MFA. Las decisiones materiales se registran mediante ADR.
+El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias y MFA TOTP. Siguen abiertos el proveedor cloud, región, cifrado y backups de producción. Las decisiones materiales se registran mediante ADR.
