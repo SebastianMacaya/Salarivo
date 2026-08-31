@@ -408,7 +408,8 @@ type EmploymentBody = {
 type EmploymentPatch = Partial<EmploymentBody>;
 type EmploymentDetectionBody = {
   employerName: string;
-  startDate: string;
+  employmentId?: string;
+  startDate?: string;
   endDate?: string | null;
   currencyCode: string;
 };
@@ -1019,9 +1020,10 @@ export async function buildApp(
                 to_char(max(payroll_period), 'YYYY-MM') AS last_period,
                 count(DISTINCT document_id)::integer AS document_count
            FROM detected
-          WHERE employer_name IS NOT NULL AND btrim(employer_name) <> ''
-          GROUP BY lower(btrim(employer_name)), currency_code
-          ORDER BY max(payroll_period) DESC, lower((array_agg(employer_name ORDER BY payroll_period DESC))[1])`,
+          WHERE employer_name IS NOT NULL AND btrim(normalize(employer_name, NFKC)) <> ''
+          GROUP BY lower(btrim(normalize(employer_name, NFKC)) COLLATE "und-x-icu"), currency_code
+          ORDER BY max(payroll_period) DESC,
+                   lower(btrim(normalize((array_agg(employer_name ORDER BY payroll_period DESC))[1], NFKC)) COLLATE "und-x-icu")`,
         [request.authUser!.id],
       );
       return { data: result.rows.map((row) => ({
@@ -1043,9 +1045,10 @@ export async function buildApp(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["employerName", "startDate", "currencyCode"],
+          required: ["employerName", "currencyCode"],
           properties: {
             employerName: { type: "string", minLength: 2, maxLength: 160 },
+            employmentId: { type: "string", pattern: UUID_PATTERN },
             startDate: { type: "string", pattern: DATE_PATTERN },
             endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
             currencyCode: { type: "string", minLength: 3, maxLength: 3 },
@@ -1064,15 +1067,40 @@ export async function buildApp(
     },
     async (request, reply) => {
       const employerName = text(request.body.employerName, 160);
-      const { startDate, endDate } = validateEmploymentDates(request.body.startDate, request.body.endDate ?? null);
       const selectedCurrency = currencyCode(request.body.currencyCode);
+      const requestedEmploymentId = request.body.employmentId ?? null;
+      if (!requestedEmploymentId && !request.body.startDate) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Elegí un empleo existente o indicá su fecha de inicio.");
+      }
+      const requestedDates = requestedEmploymentId
+        ? null
+        : validateEmploymentDates(request.body.startDate!, request.body.endDate ?? null);
       const result = await withTransaction(async (client) => {
         await client.query("SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE", [request.authUser!.id]);
+        let employmentId = requestedEmploymentId;
+        let startDate: unknown = requestedDates?.startDate;
+        let endDate: unknown = requestedDates?.endDate ?? null;
+        if (employmentId) {
+          const existingEmployment = await client.query(
+            `${employmentSelect}
+              WHERE e.id = $1 AND e.user_id = $2 AND e.currency_code = $3
+                AND lower(btrim(normalize(employer.name, NFKC)) COLLATE "und-x-icu")
+                  = lower(btrim(normalize($4, NFKC)) COLLATE "und-x-icu")
+              FOR UPDATE OF e, employer`,
+            [employmentId, request.authUser!.id, selectedCurrency, employerName],
+          );
+          if (!existingEmployment.rowCount) {
+            throw new ApiError(404, "EMPLOYMENT_NOT_FOUND", "No encontramos ese empleo para la empresa detectada.");
+          }
+          startDate = existingEmployment.rows[0].start_date;
+          endDate = existingEmployment.rows[0].end_date;
+        }
         const detected = await client.query(
           `${detectedEmploymentDocuments}
            SELECT DISTINCT document_id
              FROM detected
-            WHERE lower(btrim(employer_name)) = lower(btrim($2))
+            WHERE lower(btrim(normalize(employer_name, NFKC)) COLLATE "und-x-icu")
+                    = lower(btrim(normalize($2, NFKC)) COLLATE "und-x-icu")
               AND currency_code = $3
               AND payroll_period >= date_trunc('month', $4::date)::date
               AND ($5::date IS NULL OR payroll_period <= date_trunc('month', $5::date)::date)
@@ -1092,26 +1120,30 @@ export async function buildApp(
         if (!lockedDocuments.rowCount) {
           throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos recibos sin asociar para esa empresa y período.");
         }
-        let employer = await client.query(
-          `SELECT id FROM employers
-            WHERE user_id = $1 AND lower(btrim(name)) = lower(btrim($2))
-            ORDER BY created_at LIMIT 1 FOR UPDATE`,
-          [request.authUser!.id, employerName],
-        );
-        if (!employer.rowCount) {
-          employer = await client.query(
-            `INSERT INTO employers (id, user_id, name, country_code)
-             VALUES ($1, $2, $3, 'AR') RETURNING id`,
-            [randomUUID(), request.authUser!.id, employerName],
+        if (!employmentId) {
+          let employer = await client.query(
+            `SELECT id FROM employers
+              WHERE user_id = $1
+                AND lower(btrim(normalize(name, NFKC)) COLLATE "und-x-icu")
+                  = lower(btrim(normalize($2, NFKC)) COLLATE "und-x-icu")
+              ORDER BY created_at LIMIT 1 FOR UPDATE`,
+            [request.authUser!.id, employerName],
+          );
+          if (!employer.rowCount) {
+            employer = await client.query(
+              `INSERT INTO employers (id, user_id, name, country_code)
+               VALUES ($1, $2, $3, 'AR') RETURNING id`,
+              [randomUUID(), request.authUser!.id, employerName],
+            );
+          }
+          employmentId = randomUUID();
+          await client.query(
+            `INSERT INTO employments (
+               id, user_id, employer_id, status, start_date, end_date, country_code, currency_code
+             ) VALUES ($1, $2, $3, $4, $5, $6, 'AR', $7)`,
+            [employmentId, request.authUser!.id, employer.rows[0].id, endDate === null ? "ACTIVE" : "ENDED", startDate, endDate, selectedCurrency],
           );
         }
-        const employmentId = randomUUID();
-        await client.query(
-          `INSERT INTO employments (
-             id, user_id, employer_id, status, start_date, end_date, country_code, currency_code
-           ) VALUES ($1, $2, $3, $4, $5, $6, 'AR', $7)`,
-          [employmentId, request.authUser!.id, employer.rows[0].id, endDate === null ? "ACTIVE" : "ENDED", startDate, endDate, selectedCurrency],
-        );
         const documentIds = lockedDocuments.rows.map((row) => String(row.id));
         await client.query(
           `UPDATE documents SET employment_id = $1

@@ -183,7 +183,8 @@ input:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rg
 .sidebar nav { display: grid; gap: 5px; }
 .nav-item { width: 100%; display: flex; align-items: center; gap: 13px; border: 0; border-radius: 10px; background: transparent; padding: 11px 13px; cursor: pointer; color: #56635c; font-size: 14px; font-weight: 670; text-align: left; }
 .nav-item span { width: 22px; color: #7e8e85; font-size: 18px; text-align: center; }
-.nav-item:hover { background: #f0f4f1; color: var(--ink); }
+.nav-item:hover:not(:disabled):not([aria-disabled="true"]) { background: #f0f4f1; color: var(--ink); }
+.nav-item:disabled, .nav-item[aria-disabled="true"] { cursor: not-allowed; opacity: .45; }
 .nav-item.active { background: var(--green-soft); color: var(--green-dark); }
 .nav-item.active span { color: var(--green); }
 .sidebar-user { margin-top: auto; display: grid; grid-template-columns: 38px minmax(0, 1fr) 34px; align-items: center; gap: 10px; border-top: 1px solid var(--line); padding: 18px 3px 0; }
@@ -281,6 +282,7 @@ input:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rg
 .upload-name strong, .upload-name small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upload-name strong { font-size: 12px; }
 .upload-name small { margin-top: 4px; color: var(--muted); font-size: 10px; }
+.upload-name progress { display: block; width: 100%; height: 6px; margin-top: 6px; accent-color: var(--green); }
 .upload-state { border-radius: 999px; background: #edf1ee; padding: 5px 8px; color: var(--muted); font-size: 9px; font-weight: 800; }
 .upload-state.en_cola { background: var(--green-soft); color: var(--green-dark); }
 .upload-state.listo { background: var(--green-soft); color: var(--green-dark); }

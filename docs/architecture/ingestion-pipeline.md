@@ -141,7 +141,7 @@ Los thresholds son configuración versionada. La salida guarda tipo candidato, c
 
 ## ImportBatch
 
-ImportBatch es la fuente de progreso agregado y la web recupera el lote activo al volver. Cada ImportBatchItem conserva su estado y error de dominio; un item fallido no revierte otros. El porcentaje visible cuenta items terminales sobre el total y no inventa una ETA por etapa.
+ImportBatch es la fuente de progreso agregado y la web recupera el lote activo al volver. Cada ImportBatchItem conserva su estado y error de dominio; un item fallido no revierte otros. El porcentaje visible cuenta items terminales sobre el total y no inventa una ETA por etapa. Durante la transferencia directa, el navegador muestra además el porcentaje real de bytes por archivo y advierte antes de abandonar la página; sólo después de confirmar un archivo su procesamiento continúa sin el navegador. Un upload interrumpido queda visible como pendiente, pero sus bytes locales no son recuperables: el MVP permite cancelarlo y volver a seleccionarlo, no reanudarlo.
 
 Contadores derivados:
 

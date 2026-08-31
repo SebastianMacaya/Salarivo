@@ -292,6 +292,14 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
         if (factor.locked_until !== null && new Date(factor.locked_until) > now) {
           return { status: "LOCKED" } as const;
         }
+        const activeFactor = await client.query(
+          `SELECT id FROM mfa_factors WHERE user_id = $1 AND status = 'ACTIVE' FOR UPDATE`,
+          [userId],
+        );
+        if (
+          activeFactor.rowCount !== 0
+          && !await lockValidStepUpSession(client, request.authSessionHash!, userId)
+        ) return { status: "STEP_UP_REQUIRED" } as const;
         const factorId = String(factor.id);
         const secret = decryptMfaSecret(
           String(factor.encrypted_secret),
@@ -336,6 +344,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
       if (outcome.status === "MISSING") throw new ApiError(409, "MFA_ENROLLMENT_NOT_FOUND", "No hay un enrolamiento pendiente.");
       if (outcome.status === "EXPIRED") throw new ApiError(409, "MFA_ENROLLMENT_EXPIRED", "El enrolamiento venció. Iniciá uno nuevo.");
       if (outcome.status === "LOCKED") throw new ApiError(429, "MFA_LOCKED", "El segundo factor quedó bloqueado temporalmente.");
+      if (outcome.status === "STEP_UP_REQUIRED") throw new ApiError(403, outcome.status, "Confirmá tu identidad para continuar.");
       if (outcome.status === "INVALID") throw new ApiError(401, "INVALID_MFA_CODE", "El código no es válido o ya fue usado.");
       if (outcome.status !== "OK") throw new Error("INVALID_MFA_ENROLLMENT_STATE");
       setSession(reply, outcome.session.token);

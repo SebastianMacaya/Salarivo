@@ -21,7 +21,7 @@ La evaluación jurídica es técnica e informativa. Fuentes oficiales consultada
 - MFA obligatorio para `ADMIN`; step-up de diez minutos para exportar, descargar originales y borrar empleador, empleo, original, documento o cuenta.
 - Rotación del token de la sesión exacta y revocación de las otras sesiones en cambios de MFA.
 - Respuestas autenticadas `Cache-Control: no-store`, ownership server-side y URL de descarga firmada por 120 segundos.
-- Export JSON v2 completo, paginado y bajo snapshot, con timeout de stream de diez minutos y máximo local de dos streams; sin PDF, credenciales, secretos, keys de storage ni payload salarial en logs.
+- Export JSON v3 user-facing, paginado y bajo snapshot, con timeout de stream de diez minutos y máximo local de dos streams; conserva los datos útiles y su contexto sin UUID/FK internos, identificadores del proveedor, checksums, tablas de ejecución, PDF, credenciales, secretos, keys de storage ni payload salarial en logs.
 - Borrado durable de keys `incoming/` y canónica mediante tombstones; baja de cuenta con constancia opaca consultable después del cascade.
 - Baja masiva sin inventario en memoria: tombstones materializados en SQL y reconciliados en lotes round-robin por usuario.
 - Aplicación efectiva de `DELETE_AFTER_PROCESSING` en decisiones terminales.

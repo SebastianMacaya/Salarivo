@@ -17,7 +17,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - detección no persistida de empleos a partir de recibos sin asociar, siempre sujeta a confirmación;
 - borrado separado de original o documento completo;
 - MFA TOTP, recovery codes y step-up de acciones sensibles; MFA obligatorio para administración;
-- exportación JSON completa y eliminación durable de cuenta con constancia consultable;
+- exportación JSON legible de los datos de la persona, sin IDs internos ni metadata operativa, y eliminación durable de cuenta con constancia consultable;
 - páginas públicas de Términos/Privacidad y consola admin granular con metadata operativa, comandos acotados y auditoría append-only;
 - reglas para agentes y mejora supervisada en [AGENTS.md](AGENTS.md).
 

@@ -1,6 +1,6 @@
 'use client';
 
-import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, type KeyboardEvent, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { DocumentReview, type DocumentDetail, type ExtractedFieldDetail } from './document-review';
 import { readDocumentLocation, writeDocumentLocation } from './document-evidence';
@@ -184,6 +184,7 @@ type ImportProgress = {
   key: string;
   name: string;
   status: 'PENDIENTE' | 'SUBIENDO' | 'EN_COLA' | 'LISTO' | 'REVISAR' | 'ERROR';
+  uploadPercentage: number;
   message?: string;
 };
 type ImportBatchItem = {
@@ -423,7 +424,13 @@ const importErrorLabels: Record<string, string> = {
 };
 
 function importProgressItem(server: ImportBatchItem, current?: ImportProgress): ImportProgress {
-  const base = { key: server.clientItemKey, name: server.originalFilename };
+  const base = {
+    key: server.clientItemKey,
+    name: server.originalFilename,
+    uploadPercentage: server.status === 'PENDING_UPLOAD' || server.status === 'CANCELLED'
+      ? current?.uploadPercentage ?? 0
+      : 100,
+  };
   if (server.status === 'PENDING_UPLOAD' && (current?.status === 'SUBIENDO' || current?.status === 'ERROR')) return current;
   if (server.status === 'CANCELLED' && current?.status === 'ERROR') return current;
   if (server.status === 'PENDING_UPLOAD') return { ...base, status: 'PENDIENTE', message: 'Esperando carga' };
@@ -433,6 +440,10 @@ function importProgressItem(server: ImportBatchItem, current?: ImportProgress): 
     return { ...base, status: 'ERROR', message: importErrorLabels[server.errorCode ?? ''] ?? server.errorCode ?? 'No se pudo procesar' };
   }
   return { ...base, status: 'EN_COLA', message: server.status === 'PROCESSING' ? 'Procesando' : 'En cola' };
+}
+
+function normalizedEmployerName(value: string) {
+  return value.normalize('NFKC').trim().toLowerCase();
 }
 
 export function SalarivoApp() {
@@ -514,6 +525,7 @@ export function SalarivoApp() {
   return <PrivateApp
     user={user}
     authNotice={authNotice}
+    onAuthNoticeDismiss={() => setAuthNotice('')}
     onUserChanged={setUser}
     onLogout={() => setUser(null)}
     onDeletionRequested={(token, source) => { setDeletionReceiptEntry({ token, source }); setUser(null); }}
@@ -881,9 +893,10 @@ const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'privacy', label: 'Privacidad', icon: '◇' },
 ];
 
-function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionRequested }: {
+function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLogout, onDeletionRequested }: {
   user: User;
   authNotice: string;
+  onAuthNoticeDismiss: () => void;
   onUserChanged: (user: User) => void;
   onLogout: () => void;
   onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
@@ -894,6 +907,7 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
   const stepUpGate = useRef<StepUpGate | null>(null);
   const stepUpReturnFocus = useRef<HTMLElement | null>(null);
   const [stepUpOpen, setStepUpOpen] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
   const [logoutError, setLogoutError] = useState('');
   const [logoutBusy, setLogoutBusy] = useState(false);
   const visibleSections = sections;
@@ -903,6 +917,13 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
     const timer = window.setTimeout(() => setSection('history'));
     return () => window.clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    if (!importBusy) return;
+    const protect = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', protect);
+    return () => window.removeEventListener('beforeunload', protect);
+  }, [importBusy]);
 
   const runSensitive = useCallback<RunSensitive>(async (action) => {
     const callerFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -942,23 +963,23 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
       <aside className={menuOpen ? 'sidebar open' : 'sidebar'} inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
         <div className="sidebar-head"><Brand /><button className="icon-button mobile-only" onClick={() => setMenuOpen(false)} aria-label="Cerrar menú">×</button></div>
         <nav aria-label="Navegación principal">
-          {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
-          {user.role === 'ADMIN' && <Link className="nav-item" href="/admin"><span aria-hidden="true">⚙</span>Administración</Link>}
+          {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} disabled={importBusy} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
+          {user.role === 'ADMIN' && <Link className="nav-item" href="/admin" aria-disabled={importBusy} tabIndex={importBusy ? -1 : undefined} onClick={(event: MouseEvent<HTMLAnchorElement>) => { if (importBusy) event.preventDefault(); }}><span aria-hidden="true">⚙</span>Administración</Link>}
         </nav>
         {logoutError && <p className="message error" role="alert">{logoutError}</p>}
         <div className="sidebar-user">
           <span className="avatar">{(user.displayName || user.email).slice(0, 1).toUpperCase()}</span>
           <span><strong>{user.displayName || 'Mi cuenta'}</strong><small>{user.email}</small></span>
-          <button className="icon-button" disabled={logoutBusy} onClick={logout} title="Cerrar sesión" aria-label="Cerrar sesión">{logoutBusy ? '…' : '↪'}</button>
+          <button className="icon-button" disabled={logoutBusy || importBusy} onClick={logout} title="Cerrar sesión" aria-label="Cerrar sesión">{logoutBusy ? '…' : '↪'}</button>
         </div>
       </aside>
       {menuOpen && <button className="backdrop" aria-label="Cerrar menú" onClick={() => setMenuOpen(false)} />}
       <main className="content" inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
         <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú">☰</button><Brand /></header>
-        {authNotice && <p className="message success" aria-live="polite">{authNotice}</p>}
+        {authNotice && <p className="message success" aria-live="polite">{authNotice} <button type="button" className="text-button" onClick={onAuthNoticeDismiss}>Cerrar</button></p>}
         {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={setSection} />}
         {section === 'jobs' && <Employments key={refreshKey} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={runSensitive} />}
-        {section === 'import' && <Importer onDone={() => setRefreshKey((n) => n + 1)} />}
+        {section === 'import' && <Importer onBusyChange={setImportBusy} onDone={() => setRefreshKey((n) => n + 1)} />}
         {section === 'history' && <History key={refreshKey} runSensitive={runSensitive} />}
         {section === 'privacy' && <Privacy user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
       </main>
@@ -1289,6 +1310,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
     if (!confirmation) return;
     const detection = confirmation;
     const form = new FormData(event.currentTarget);
+    const employmentId = String(form.get('employmentId') ?? '');
     setError(''); setConfirmationError(''); setConfirming(true);
     try {
       await api('/employment-detections/confirm', {
@@ -1296,8 +1318,9 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
         body: JSON.stringify({
           employerName: detection.employerName,
           currencyCode: detection.currencyCode,
-          startDate: form.get('startDate'),
-          endDate: form.get('endDate') || null,
+          ...(employmentId && employmentId !== 'new'
+            ? { employmentId }
+            : { startDate: form.get('startDate'), endDate: form.get('endDate') || null }),
         }),
       });
       setConfirmation(null);
@@ -1312,6 +1335,11 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
     setConfirmation(null); setConfirmationError('');
   }
 
+  const matchingEmployments = confirmation
+    ? items.filter((item) => item.currencyCode === confirmation.currencyCode
+      && normalizedEmployerName(item.employerName) === normalizedEmployerName(confirmation.employerName))
+    : [];
+
   return (
     <div className="page" aria-busy={loading || confirming}>
       <PageHeader eyebrow="Trayectoria" title="Empleos" action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />
@@ -1323,7 +1351,8 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
           <div className="panel-heading"><div><p className="eyebrow">Pendientes de confirmación</p><h2 id="detected-employments-title">Empleos detectados</h2></div></div>
           <div className="employment-grid">{detections.map((detection) => {
             const key = JSON.stringify([detection.employerName, detection.currencyCode]);
-            return <article className="employment-card" key={key}><div className="employer-avatar">{detection.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{detection.employerName}</h2><p>{detection.documentCount} recibo{detection.documentCount === 1 ? '' : 's'} sin asociar</p></div><span className="status pending">Detectado</span><dl><div><dt>Primer recibo</dt><dd>{periodLabel(detection.firstPeriod)}</dd></div><div><dt>Último recibo</dt><dd>{periodLabel(detection.lastPeriod)}</dd></div><div><dt>Moneda</dt><dd>{detection.currencyCode}</dd></div></dl><div className="card-actions"><button type="button" className="button compact" disabled={confirming} onClick={() => { setConfirmationError(''); setConfirmation(detection); }}>Confirmar empleo</button></div></div></article>;
+            const hasMatch = items.some((item) => item.currencyCode === detection.currencyCode && normalizedEmployerName(item.employerName) === normalizedEmployerName(detection.employerName));
+            return <article className="employment-card" key={key}><div className="employer-avatar">{detection.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{detection.employerName}</h2><p>{detection.documentCount} recibo{detection.documentCount === 1 ? '' : 's'} sin asociar</p></div><span className="status pending">{hasMatch ? 'Sin asociar' : 'Detectado'}</span><dl><div><dt>Primer recibo</dt><dd>{periodLabel(detection.firstPeriod)}</dd></div><div><dt>Último recibo</dt><dd>{periodLabel(detection.lastPeriod)}</dd></div><div><dt>Moneda</dt><dd>{detection.currencyCode}</dd></div></dl><div className="card-actions"><button type="button" className="button compact" disabled={confirming} onClick={() => { setConfirmationError(''); setConfirmation(detection); }}>{hasMatch ? 'Asociar recibos' : 'Confirmar empleo'}</button></div></div></article>;
           })}</div>
         </section>}
         <section aria-label="Empleos confirmados">
@@ -1339,9 +1368,10 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
             <label>Empresa<input value={confirmation.employerName} readOnly /></label>
             <div className="field-row"><label>Moneda<input value={confirmation.currencyCode} readOnly /></label><label>Documentos detectados<input value={confirmation.documentCount} readOnly /></label></div>
             <p id="employment-confirmation-description">Detectamos recibos entre {periodLabel(confirmation.firstPeriod)} y {periodLabel(confirmation.lastPeriod)}. El último recibo no implica que el empleo haya finalizado.</p>
-            <div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={`${confirmation.firstPeriod}-01`} required autoFocus /></label><label>Fin (opcional)<input name="endDate" type="date" /></label></div>
+            {matchingEmployments.length > 0 && <label>Asociar a<select name="employmentId" defaultValue={matchingEmployments.length === 1 ? matchingEmployments[0]!.id : ''} required autoFocus><option value="" disabled>Elegí un empleo</option>{matchingEmployments.map((item) => <option key={item.id} value={item.id}>{item.employerName}{item.role ? ` · ${item.role}` : ''} · desde {shortDate(item.startDate)}</option>)}<option value="new">Crear otro empleo</option></select><small>Al elegir uno existente se conservan sus fechas y datos.</small></label>}
+            <div className="field-row"><label>{matchingEmployments.length ? 'Inicio (si creás otro)' : 'Inicio'}<input name="startDate" type="date" defaultValue={`${confirmation.firstPeriod}-01`} required autoFocus={!matchingEmployments.length} /></label><label>Fin (opcional)<input name="endDate" type="date" /></label></div>
             {confirmationError && <p className="message error" role="alert">{confirmationError}</p>}
-            <div className="modal-actions"><button type="button" className="button secondary" disabled={confirming} onClick={closeConfirmation}>Cancelar</button><button className="button primary" disabled={confirming}>{confirming ? 'Confirmando…' : 'Confirmar empleo'}</button></div>
+            <div className="modal-actions"><button type="button" className="button secondary" disabled={confirming} onClick={closeConfirmation}>Cancelar</button><button className="button primary" disabled={confirming}>{confirming ? 'Confirmando…' : matchingEmployments.length ? 'Asociar recibos' : 'Confirmar empleo'}</button></div>
           </form>
         </section>
       </div>}
@@ -1349,7 +1379,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
   );
 }
 
-function Importer({ onDone }: { onDone: () => void }) {
+function Importer({ onBusyChange, onDone }: { onBusyChange: (busy: boolean) => void; onDone: () => void }) {
   const [files, setFiles] = useState<File[]>([]);
   const [progress, setProgress] = useState<ImportProgress[]>([]);
   const [batch, setBatch] = useState<ImportBatch | null>(null);
@@ -1404,12 +1434,12 @@ function Importer({ onDone }: { onDone: () => void }) {
   }, [applyBatch, batch?.id, batch?.status]);
 
   function choose(list: FileList | null) {
-    if (!list || hasActiveBatch) return;
+    if (!list || busy || hasActiveBatch) return;
     const selected = Array.from(list);
     const valid = selected.filter((file) => file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf'));
     setFiles(valid);
     setBatch(null);
-    setProgress(valid.map((file) => ({ key: crypto.randomUUID(), name: file.name, status: 'PENDIENTE' })));
+    setProgress(valid.map((file) => ({ key: crypto.randomUUID(), name: file.name, status: 'PENDIENTE', uploadPercentage: 0 })));
     setError(valid.length !== selected.length ? 'Omitimos archivos que no parecen ser PDF.' : '');
   }
 
@@ -1419,7 +1449,7 @@ function Importer({ onDone }: { onDone: () => void }) {
 
   async function start() {
     if (!files.length || busy) return;
-    setBusy(true); setError('');
+    setBusy(true); onBusyChange(true); setError('');
     try {
       const batch = await api<{ id: string; items: Array<{ id: string; clientItemKey: string }> }>('/imports', {
         method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
@@ -1447,13 +1477,13 @@ function Importer({ onDone }: { onDone: () => void }) {
       for (let index = 0; index < files.length; index += 1) {
         const file = files[index]; const item = batch.items[index];
         if (!file || !item) continue;
-        update(index, { status: 'SUBIENDO', message: undefined });
+        update(index, { status: 'SUBIENDO', uploadPercentage: 0, message: undefined });
         try {
           const upload = await api<{ id: string } & AuthorizedUpload>('/upload-sessions', { method: 'POST', body: JSON.stringify({ itemId: item.id }) });
-          const uploaded = await uploadFile(upload, file);
+          const uploaded = await uploadFile(upload, file, (uploadPercentage) => update(index, { uploadPercentage: Math.min(uploadPercentage, 99) }));
           if (!uploaded.ok) throw new Error(`El almacenamiento rechazó el archivo (${uploaded.status}).`);
           await api(`/upload-sessions/${upload.id}/complete`, { method: 'POST', body: '{}' });
-          update(index, { status: 'EN_COLA', message: 'Validación de seguridad en curso' });
+          update(index, { status: 'EN_COLA', uploadPercentage: 100, message: 'Validación de seguridad en curso' });
         } catch (caught) {
           uploadFailed = true;
           update(index, { status: 'ERROR', message: caught instanceof Error ? caught.message : 'No se pudo subir.' });
@@ -1463,7 +1493,7 @@ function Importer({ onDone }: { onDone: () => void }) {
       setFiles([]);
       onDone();
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la importación.'); }
-    finally { setBusy(false); }
+    finally { setBusy(false); onBusyChange(false); }
   }
 
   async function cancelPending() {
@@ -1480,9 +1510,9 @@ function Importer({ onDone }: { onDone: () => void }) {
       <PageHeader eyebrow="Carga privada" title="Importar recibos" />
       <p className="page-intro">Seleccioná uno o muchos PDFs. Cada archivo avanza por separado y podés cerrar esta pantalla cuando termine la carga.</p>
       <label className="import-employment">Asociar todo el lote a<select value={employmentId} disabled={hasActiveBatch || busy} onChange={(event) => setEmploymentId(event.target.value)}><option value="">Sin asociar · detectar empresa</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}</select><small>Si mezclás empresas, dejalo sin asociar y usá los checkboxes del historial después.</small></label>
-      <label className={`drop-zone${hasActiveBatch ? ' disabled' : ''}`} aria-disabled={hasActiveBatch} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); choose(event.dataTransfer.files); }}><input type="file" accept="application/pdf,.pdf" multiple disabled={hasActiveBatch} onChange={(event) => choose(event.target.files)} /><span className="upload-mark">↑</span><strong>{hasActiveBatch ? 'Hay un lote en curso' : 'Arrastrá tus recibos acá'}</strong><span>{hasActiveBatch ? 'Cuando termine vas a poder iniciar otro' : 'o hacé clic para elegir PDFs'}</span><small>El servidor limita archivos, tamaño total, espacio por cuenta y trabajo simultáneo.</small></label>
+      <label className={`drop-zone${hasActiveBatch || busy ? ' disabled' : ''}`} aria-disabled={hasActiveBatch || busy} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); choose(event.dataTransfer.files); }}><input type="file" accept="application/pdf,.pdf" multiple disabled={hasActiveBatch || busy} onChange={(event) => choose(event.target.files)} /><span className="upload-mark">↑</span><strong>{hasActiveBatch ? 'Hay un lote en curso' : 'Arrastrá tus recibos acá'}</strong><span>{hasActiveBatch ? 'Cuando termine vas a poder iniciar otro' : 'o hacé clic para elegir PDFs'}</span><small>El servidor limita archivos, tamaño total, espacio por cuenta y trabajo simultáneo.</small></label>
       {error && <p className="message error" role="alert">{error}</p>}
-      {progress.length > 0 && <section className="panel upload-list" aria-live="polite"><div className="panel-heading"><div><p className="eyebrow">Lote</p><h2>{progress.length} archivo{progress.length === 1 ? '' : 's'}</h2></div>{batch && <span className="batch-id">Lote {batch.id.slice(0, 8)}</span>}</div>{batch && <div className="upload-summary"><progress max={batch.progress.total} value={batch.progress.resolved} aria-label="Progreso del lote" /><strong>{batch.progress.resolved} de {batch.progress.total} resueltos · {batch.progress.percentage}%</strong><small>{batch.totals.PROCESSING ?? 0} procesando · {(batch.totals.UPLOADED ?? 0) + (batch.totals.PENDING_UPLOAD ?? 0)} pendientes · {batch.totals.NEEDS_REVIEW ?? 0} para revisar · {(batch.totals.REJECTED ?? 0) + (batch.totals.FAILED ?? 0)} no procesados</small></div>}<ul>{progress.map((item) => <li key={item.key}><span className="file-icon">PDF</span><span className="upload-name"><strong>{item.name}</strong><small>{item.message ?? (item.status === 'PENDIENTE' ? 'Listo para subir' : 'Enviando…')}</small></span><span className={`upload-state ${item.status.toLowerCase()}`}>{item.status.replace('_', ' ')}</span></li>)}</ul><div className="upload-footer"><p>Los errores de un archivo no detienen el resto del lote.</p>{hasActiveBatch ? (batch.totals.PENDING_UPLOAD ?? 0) > 0 && <button className="button secondary" disabled={busy} onClick={cancelPending}>Cancelar pendientes</button> : <button className="button primary" disabled={busy || !files.length} onClick={start}>{busy ? 'Subiendo…' : 'Iniciar importación'}</button>}</div></section>}
+      {progress.length > 0 && <section className="panel upload-list" aria-live="polite"><div className="panel-heading"><div><p className="eyebrow">Lote</p><h2>{progress.length} archivo{progress.length === 1 ? '' : 's'}</h2></div>{batch && <span className="batch-id">Lote {batch.id.slice(0, 8)}</span>}</div>{batch && <div className="upload-summary"><progress max={batch.progress.total} value={batch.progress.resolved} aria-label="Progreso del lote" /><strong>{batch.progress.resolved} de {batch.progress.total} resueltos · {batch.progress.percentage}%</strong><small>{batch.totals.PROCESSING ?? 0} procesando · {(batch.totals.UPLOADED ?? 0) + (batch.totals.PENDING_UPLOAD ?? 0)} pendientes · {batch.totals.NEEDS_REVIEW ?? 0} para revisar · {(batch.totals.REJECTED ?? 0) + (batch.totals.FAILED ?? 0)} no procesados</small></div>}<ul>{progress.map((item) => <li key={item.key}><span className="file-icon">PDF</span><span className="upload-name"><strong>{item.name}</strong><small>{item.message ?? (item.status === 'PENDIENTE' ? 'Listo para subir' : 'Enviando…')} · {item.uploadPercentage}% cargado</small><progress max="100" value={item.uploadPercentage} aria-label={`Carga de ${item.name}`} /></span><span className={`upload-state ${item.status.toLowerCase()}`}>{item.status.replace('_', ' ')}</span></li>)}</ul><div className="upload-footer"><p>{hasActiveBatch && !busy && progress.some((item) => item.status === 'PENDIENTE') ? 'La carga se interrumpió. Cancelá los pendientes y volvé a seleccionarlos.' : 'Los errores de un archivo no detienen el resto del lote.'}</p>{hasActiveBatch ? (batch.totals.PENDING_UPLOAD ?? 0) > 0 && <button className="button secondary" disabled={busy} onClick={cancelPending}>Cancelar pendientes</button> : <button className="button primary" disabled={busy || !files.length} onClick={start}>{busy ? 'Subiendo…' : 'Iniciar importación'}</button>}</div></section>}
       <aside className="privacy-note"><span aria-hidden="true">◇</span><div><strong>Privado por diseño</strong><p>Los PDFs se guardan con claves opacas. Antes de extraer datos pasan por validación de formato y malware.</p></div></aside>
     </div>
   );
@@ -2085,7 +2115,7 @@ function MfaSettings({ onUserChanged, runSensitive }: { onUserChanged: (user: Us
         <p>Activo. Además de tu acceso principal, Salarivo pedirá un código para ingresar y proteger acciones sensibles.</p>
         <p>Te quedan <strong>{status.recoveryCodesRemaining}</strong> códigos de recuperación.</p>
         <div className="setting-actions"><button className="button secondary" onClick={regenerateRecoveryCodes}>Generar códigos nuevos</button><button className="button danger-button" onClick={disable}>Desactivar</button></div>
-      </> : status ? <><p>Usá una app autenticadora compatible con códigos TOTP.</p><MfaEnrollment pending={status.pendingEnrollment} onComplete={refresh} /></> : null}
+      </> : status ? <><p>Si no activás TOTP, las acciones sensibles te pedirán volver a confirmar tu cuenta de Google.</p><MfaEnrollment pending={status.pendingEnrollment} onComplete={refresh} /></> : null}
     </div></section>
   );
 }
@@ -2101,12 +2131,21 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   async function requestExport() {
-    setError('');
-    try { await runSensitive(async () => { setExportJob(await api('/privacy/exports', { method: 'POST', body: '{}' })); setMessage('Tu exportación quedó lista para descargar.'); }); }
+    setError(''); setMessage('');
+    try { await runSensitive(async () => {
+      const next = await api<{ id: string; status: string; downloadUrl?: string | null }>('/privacy/exports', { method: 'POST', body: '{}' });
+      setExportJob(next);
+      setMessage(next.status === 'READY'
+        ? 'Tu exportación quedó lista para descargar.'
+        : next.status === 'RUNNING'
+          ? 'Tu exportación se está descargando en otra sesión.'
+          : 'Tu exportación se está preparando.');
+    }); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la exportación.'); }
   }
   async function refreshExport() {
     if (!exportJob) return;
+    setError('');
     try { setExportJob(await api(`/privacy/exports/${exportJob.id}`)); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos consultar la exportación.'); }
   }
@@ -2132,8 +2171,12 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
 
   async function downloadExport() {
     if (!exportJob?.downloadUrl) return;
-    setError('');
-    try { await runSensitive(() => downloadApiFile(exportJob.downloadUrl!, 'salarivo-export.json')); }
+    setError(''); setMessage('');
+    try { await runSensitive(async () => {
+      await downloadApiFile(exportJob.downloadUrl!, 'salarivo-export.json');
+      setExportJob(null);
+      setMessage('La exportación se descargó. Podés solicitar una nueva.');
+    }); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos descargar la exportación.'); }
   }
 
@@ -2152,10 +2195,10 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
   return (
     <div className="page narrow-page">
       <PageHeader eyebrow="Tus datos" title="Privacidad y seguridad" />
-      {error && <p className="message error" role="alert">{error}</p>}{message && <p className="message success" aria-live="polite">{message}</p>}
+      {error && <p className="message error" role="alert">{error}</p>}{message && <p className="message success" aria-live="polite">{message} <button type="button" className="text-button" onClick={() => setMessage('')}>Cerrar</button></p>}
       <MfaSettings key={String(user.mfaEnabled)} onUserChanged={onUserChanged} runSensitive={runSensitive} />
       <section className="settings-card"><div className="setting-icon">↪</div><div><h2>Sesiones activas</h2><p>Cerrá las sesiones abiertas en otros navegadores o dispositivos. Esta sesión seguirá activa.</p></div><div className="setting-actions"><button className="button secondary" onClick={revokeOtherSessions}>Cerrar otras sesiones</button></div></section>
-      <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un JSON con tu cuenta, empleos, importaciones, documentos, extracciones, liquidaciones, correcciones y constancias de privacidad. Los PDFs y secretos no se incluyen.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <button className="button primary" onClick={downloadExport}>Descargar</button> : exportJob ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
+      <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un JSON legible con tu cuenta, empleos, importaciones, documentos, liquidaciones, conceptos, correcciones, accesos y solicitudes de privacidad. No incluye IDs internos, datos técnicos del procesamiento, PDFs ni secretos.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <button className="button primary" onClick={downloadExport}>Descargar</button> : exportJob && !['COMPLETED', 'EXPIRED', 'FAILED', 'CANCELLED'].includes(exportJob.status) ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
       <section className="settings-card"><div className="setting-icon">◇</div><div><h2>Originales y datos estructurados</h2><p>Desde Historial podés borrar un PDF y conservar la liquidación revisada. Cada lifecycle es independiente.</p></div></section>
       <section className="settings-card"><div className="setting-icon">§</div><div><h2>Documentos legales</h2><p>Consultá la versión vigente de los <a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> y el <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a>.</p></div></section>
       {user.role === 'ADMIN'

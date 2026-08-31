@@ -17,7 +17,7 @@ Marcar una fila como borrada no elimina una copia temporal, una autorización de
 - La baja de cuenta revoca sesiones y jobs que aún no se ejecutan, impide nuevos accesos y espera uploads, exports y ejecuciones vigentes. Un `execution_owner` se mantiene hasta limpiar el temporal del worker; recién después se borra storage y se elimina al usuario con sus relaciones.
 - Al pedir la baja, las keys se materializan en tombstones mediante operaciones set-based. El worker los drena en lotes acotados y round-robin por usuario antes de completar la cuenta; no carga el inventario completo en memoria ni deja que una baja monopolice el ciclo.
 - El navegador genera antes del pedido una constancia opaca que puede conservar aun si se pierde la respuesta. Sólo su hash sobrevive en `account_deletion_receipts`, sin FK ni PII; la pantalla pública permite reingresarla para consultar `PENDING` o `COMPLETED` después del cascade, sin persistirla en storage del navegador.
-- El export de acceso se transmite paginado bajo snapshot repetible, con timeout de stream de diez minutos y un máximo local de dos streams simultáneos. Incluye linaje y operaciones de privacidad; excluye contraseñas, tokens, secretos MFA, object keys y PDFs.
+- El export de acceso se transmite paginado bajo snapshot repetible, con timeout de stream de diez minutos y un máximo local de dos streams simultáneos. Su formato v3 presenta cuenta, historia laboral, importaciones, documentos, liquidaciones, conceptos, correcciones, aceptaciones, sesiones y solicitudes de privacidad con contexto comprensible; no expone UUID/FK internos, identificadores del proveedor, checksums, tablas de ejecución, contraseñas, tokens, secretos MFA, object keys ni PDFs.
 
 ## Consecuencias
 
@@ -29,5 +29,5 @@ Backups cifrados, su ventana máxima y una lista de supresiones reaplicada despu
 
 - Migraciones `007_deletion_tombstones_and_receipts.sql`, `008_minimize_sensitive_deductions.sql`, `009_minimize_all_deduction_descriptions.sql` y `011_track_worker_execution_quiescence.sql`.
 - Rutas de privacidad en `apps/api/src/data-routes.ts` y reconciliación en `apps/worker-documents/src/index.ts`.
-- Integración de ownership, URL firmada, borrado de original/documento, export completo, concurrencia y solicitud de baja.
+- Integración de ownership, URL firmada, borrado de original/documento, contrato user-facing del export, concurrencia y solicitud de baja.
 - La integración ejecuta el worker real contra PostgreSQL, Redis y MinIO sintéticos, reintenta un upload firmado después del pedido de borrado y prueba que cada cuenta sólo termina cuando venció esa autorización, desaparecieron ambas keys y no queda una ejecución activa.

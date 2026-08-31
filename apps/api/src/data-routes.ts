@@ -110,61 +110,115 @@ const requiredPayrollReviewPaths = [
 const missingFieldReasons = ["LABEL_OR_LAYOUT_NOT_RECOGNIZED", "VALUE_NOT_INTERPRETABLE"] as const;
 type MissingFieldReason = (typeof missingFieldReasons)[number];
 const exportSections = [
-  ["authAccounts", `SELECT provider, provider_account_id, created_at, updated_at, last_login_at
+  ["authenticationMethods", `SELECT provider AS "method", created_at AS "linkedAt",
+      last_login_at AS "lastUsedAt"
       FROM auth_accounts WHERE user_id = $1 ORDER BY provider`],
-  ["employers", `SELECT id, name, country_code, tax_identifier_type,
-      (tax_identifier_ciphertext IS NOT NULL) AS tax_identifier_stored, created_at, updated_at
-      FROM employers WHERE user_id = $1 ORDER BY id`],
-  ["employments", `SELECT id, employer_id, status, start_date, end_date, role, category,
-      modality, country_code, currency_code, created_at, updated_at
-      FROM employments WHERE user_id = $1 ORDER BY id`],
-  ["importBatches", `SELECT id, status, created_at, updated_at, completed_at
-      FROM import_batches WHERE user_id = $1 ORDER BY id`],
-  ["importItems", `SELECT id, batch_id, employment_id, client_item_key, ordinal, original_filename,
-      declared_mime_type, expected_size_bytes, status, error_code, created_at, updated_at
-      FROM import_batch_items WHERE user_id = $1 ORDER BY id`],
-  ["uploadSessions", `SELECT id, batch_id, item_id, expected_size_bytes, expected_mime_type,
-      status, expires_at, confirmed_at, created_at
-      FROM upload_sessions WHERE user_id = $1 ORDER BY id`],
-  ["documents", `SELECT id, employment_id, original_filename, declared_mime_type, detected_mime_type,
-      size_bytes, page_count, sha256, security_status, classification_status, document_type,
-      classification_confidence, processing_status, retention_policy, created_at, processed_at,
-      original_deleted_at FROM documents WHERE user_id = $1 AND deleted_at IS NULL ORDER BY id`],
-  ["extractionRuns", `SELECT id, document_id, processing_version, status, classifier_name,
-      classifier_version, extractor_name, extractor_version, parser_version, normalizer_version,
-      ocr_provider, ocr_version, started_at, finished_at, confidence, error_code, compute_ms
-      FROM extraction_runs WHERE user_id = $1 ORDER BY id`],
-  ["extractedFields", `SELECT id, document_id, extraction_run_id, field_path, entity_type, raw_value,
-      interpreted_value, confidence, source, page_number, source_region, extractor_version, created_at
-      FROM extracted_fields WHERE user_id = $1 ORDER BY id`],
-  ["settlements", `SELECT id, document_id, extraction_run_id, employment_id, settlement_ordinal,
-      payroll_period, payment_date, issue_date, settlement_type, is_recurring, currency_code,
-      basic_amount, gross_amount, net_amount, remunerative_amount, non_remunerative_amount,
-      deductions_amount, created_at FROM payroll_settlements WHERE user_id = $1 ORDER BY id`],
-  ["lineItems", `SELECT id, settlement_id, item_ordinal, raw_description, normalized_concept_code,
-      amount, currency_code, item_type, is_recurring, confidence, source_page, source_field, created_at
-      FROM payroll_line_items WHERE user_id = $1 ORDER BY id`],
-  ["corrections", `SELECT id, extracted_field_id, document_id, extraction_run_id, field_path,
-      correction_version, extracted_value, corrected_value, inherited_from_correction_id, created_at
-      FROM user_corrections WHERE user_id = $1 ORDER BY id`],
-  ["legalAcknowledgements", `SELECT version.document_type, version.version, version.locale,
-      acknowledgement.accepted_at
+  ["employers", `SELECT name, country_code AS "countryCode", created_at AS "createdAt"
+      FROM employers WHERE user_id = $1 ORDER BY lower(name), created_at, id`],
+  ["employments", `SELECT employer.name AS "employerName",
+      employer.country_code AS "employerCountryCode", employment.status,
+      employment.start_date AS "startDate", employment.end_date AS "endDate", employment.role,
+      employment.category, employment.modality, employment.country_code AS "countryCode",
+      employment.currency_code AS "currencyCode", employment.created_at AS "createdAt"
+      FROM employments employment
+      JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      WHERE employment.user_id = $1
+      ORDER BY employment.start_date, lower(employer.name), employment.created_at, employment.id`],
+  ["imports", `SELECT batch.created_at AS "startedAt", batch.completed_at AS "completedAt",
+      batch.status AS "importStatus", item.ordinal + 1 AS "fileNumber",
+      item.original_filename AS "filename", item.declared_mime_type AS "mediaType",
+      item.expected_size_bytes AS "sizeBytes", item.status,
+      employer.name AS "employerName", employment.start_date AS "employmentStartDate",
+      employment.currency_code AS "employmentCurrencyCode"
+      FROM import_batch_items item
+      JOIN import_batches batch ON batch.id = item.batch_id AND batch.user_id = item.user_id
+      LEFT JOIN employments employment ON employment.id = item.employment_id AND employment.user_id = item.user_id
+      LEFT JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      WHERE item.user_id = $1 ORDER BY batch.created_at, item.ordinal, item.id`],
+  ["documents", `SELECT document.original_filename AS "filename",
+      COALESCE(document.detected_mime_type, document.declared_mime_type) AS "mediaType",
+      document.size_bytes AS "sizeBytes", document.page_count AS "pageCount",
+      document.document_type AS "documentType", document.processing_status AS "processingStatus",
+      document.retention_policy AS "retentionPolicy",
+      (document.original_deleted_at IS NULL) AS "originalAvailable",
+      document.created_at AS "importedAt", document.processed_at AS "processedAt",
+      document.original_deleted_at AS "originalDeletedAt", employer.name AS "employerName",
+      employment.start_date AS "employmentStartDate", employment.end_date AS "employmentEndDate",
+      employment.currency_code AS "employmentCurrencyCode"
+      FROM documents document
+      LEFT JOIN employments employment ON employment.id = document.employment_id AND employment.user_id = document.user_id
+      LEFT JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      WHERE document.user_id = $1 AND document.deleted_at IS NULL
+      ORDER BY document.created_at, document.id`],
+  ["settlements", `WITH latest_runs AS (
+      SELECT DISTINCT ON (document_id) id, document_id, user_id
+      FROM extraction_runs WHERE user_id = $1 AND status = 'COMPLETED'
+      ORDER BY document_id, processing_version DESC
+      )
+      SELECT document.original_filename AS "documentFilename",
+      document.created_at AS "documentImportedAt",
+      settlement.settlement_ordinal AS "settlementNumber", employer.name AS "employerName",
+      employment.start_date AS "employmentStartDate", settlement.payroll_period AS "payrollPeriod",
+      settlement.payment_date AS "paymentDate", settlement.issue_date AS "issueDate",
+      settlement.settlement_type AS "settlementType", settlement.is_recurring AS "isRecurring",
+      settlement.currency_code AS "currencyCode", settlement.basic_amount AS "basicAmount",
+      settlement.gross_amount AS "grossAmount", settlement.net_amount AS "netAmount",
+      settlement.remunerative_amount AS "remunerativeAmount",
+      settlement.non_remunerative_amount AS "nonRemunerativeAmount",
+      settlement.deductions_amount AS "deductionsAmount", settlement.created_at AS "createdAt"
+      FROM payroll_settlements settlement
+      JOIN documents document ON document.id = settlement.document_id AND document.user_id = settlement.user_id
+      JOIN latest_runs run ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
+      LEFT JOIN employments employment ON employment.id = settlement.employment_id AND employment.user_id = settlement.user_id
+      LEFT JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      WHERE settlement.user_id = $1
+      ORDER BY document.created_at, settlement.settlement_ordinal, settlement.id`],
+  ["concepts", `WITH latest_runs AS (
+      SELECT DISTINCT ON (document_id) id, document_id, user_id
+      FROM extraction_runs WHERE user_id = $1 AND status = 'COMPLETED'
+      ORDER BY document_id, processing_version DESC
+      )
+      SELECT document.original_filename AS "documentFilename",
+      document.created_at AS "documentImportedAt",
+      settlement.settlement_ordinal AS "settlementNumber", item.item_ordinal AS "conceptNumber",
+      item.raw_description AS "description", item.normalized_concept_code AS "normalizedConcept",
+      item.amount, item.currency_code AS "currencyCode", item.item_type AS "type",
+      item.is_recurring AS "isRecurring", item.confidence, item.source_page AS "sourcePage",
+      item.created_at AS "createdAt"
+      FROM payroll_line_items item
+      JOIN payroll_settlements settlement ON settlement.id = item.settlement_id AND settlement.user_id = item.user_id
+      JOIN documents document ON document.id = settlement.document_id AND document.user_id = settlement.user_id
+      JOIN latest_runs run ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
+      WHERE item.user_id = $1
+      ORDER BY document.created_at, settlement.settlement_ordinal, item.item_ordinal, item.id`],
+  ["corrections", `SELECT document.original_filename AS "documentFilename",
+      document.created_at AS "documentImportedAt", run.processing_version AS "documentRevision",
+      correction.field_path AS "field", correction.correction_version AS "correctionVersion",
+      correction.extracted_value AS "extractedValue", correction.corrected_value AS "correctedValue",
+      (correction.inherited_from_correction_id IS NOT NULL) AS "inheritedFromEarlierProcessing",
+      correction.created_at AS "correctedAt"
+      FROM user_corrections correction
+      JOIN documents document ON document.id = correction.document_id AND document.user_id = correction.user_id
+      JOIN extraction_runs run ON run.id = correction.extraction_run_id AND run.user_id = correction.user_id
+      WHERE correction.user_id = $1
+      ORDER BY document.created_at, run.processing_version, correction.field_path,
+        correction.correction_version, correction.created_at`],
+  ["legalAcknowledgements", `SELECT version.document_type AS "documentType", version.version,
+      version.locale, acknowledgement.accepted_at AS "acceptedAt"
       FROM legal_acknowledgements acknowledgement
       JOIN legal_document_versions version ON version.id = acknowledgement.document_version_id
       WHERE acknowledgement.user_id = $1 ORDER BY version.document_type, version.version`],
-  ["sessions", `SELECT id, expires_at, revoked_at, created_at, mfa_verified_at, step_up_expires_at
-      FROM sessions WHERE user_id = $1 ORDER BY id`],
-  ["mfa", `SELECT factor.id, factor.status, factor.enabled_at, factor.created_at,
-      count(code.id) FILTER (WHERE code.used_at IS NULL)::integer AS recovery_codes_remaining
-      FROM mfa_factors factor
-      LEFT JOIN mfa_recovery_codes code ON code.factor_id = factor.id AND code.user_id = factor.user_id
-      WHERE factor.user_id = $1
-      GROUP BY factor.id ORDER BY factor.id`],
-  ["privacyOperations", `SELECT id, operation_type, status, output_expires_at, error_code,
-      created_at, updated_at, started_at, completed_at
-      FROM privacy_operations WHERE user_id = $1 ORDER BY id`],
-  ["auditEvents", `SELECT id, action, resource_type, resource_id, result,
-      metadata_no_sensitive, created_at FROM audit_events WHERE user_id = $1 ORDER BY id`],
+  ["sessions", `SELECT CASE
+        WHEN revoked_at IS NOT NULL THEN 'REVOKED'
+        WHEN expires_at <= now() THEN 'EXPIRED'
+        ELSE 'ACTIVE'
+      END AS status, created_at AS "createdAt", last_seen_at AS "lastSeenAt",
+      expires_at AS "expiresAt", revoked_at AS "revokedAt",
+      mfa_verified_at AS "secondFactorVerifiedAt"
+      FROM sessions WHERE user_id = $1 ORDER BY created_at, id`],
+  ["privacyRequests", `SELECT operation_type AS "type", status,
+      created_at AS "requestedAt", started_at AS "startedAt", completed_at AS "completedAt"
+      FROM privacy_operations WHERE user_id = $1 ORDER BY created_at, id`],
 ] as const;
 const idParamsSchema = {
   type: "object",
@@ -517,7 +571,7 @@ function parseSalaryConceptCursor(input: string): SalaryConceptCursor | null {
 }
 
 function detectedEmploymentIdentity(employerName: string) {
-  const key = employerName.trim().normalize("NFKC").toLowerCase();
+  const key = employerName.normalize("NFKC").trim().toLowerCase();
   if (!key || key.includes("\0")) return null;
   return {
     key,
@@ -761,28 +815,42 @@ function privacyExportStream(
         [String(EXPORT_QUERY_TTL_MS), String(EXPORT_STREAM_TTL_MS)],
       );
       const account = await client.query(
-        `SELECT id, email, display_name, role, status, default_retention_policy,
-                email_verified_at, onboarding_completed_at, last_login_at, created_at, updated_at
-           FROM users WHERE id = $1 AND status = 'ACTIVE'`,
+        `SELECT app_user.email, app_user.display_name, app_user.default_retention_policy,
+                app_user.email_verified_at, app_user.onboarding_completed_at,
+                app_user.last_login_at, app_user.created_at,
+                factor.enabled_at AS mfa_enabled_at,
+                COALESCE(recovery.codes_remaining, 0)::integer AS recovery_codes_remaining
+           FROM users app_user
+           LEFT JOIN LATERAL (
+             SELECT id, enabled_at FROM mfa_factors
+              WHERE user_id = app_user.id AND status = 'ACTIVE'
+              LIMIT 1
+           ) factor ON true
+           LEFT JOIN LATERAL (
+             SELECT count(*)::integer AS codes_remaining FROM mfa_recovery_codes
+              WHERE user_id = app_user.id AND factor_id = factor.id AND used_at IS NULL
+           ) recovery ON true
+          WHERE app_user.id = $1 AND app_user.status = 'ACTIVE'`,
         [userId],
       );
       if (account.rowCount !== 1) throw new Error("EXPORT_ACCOUNT_NOT_FOUND");
       const row = account.rows[0];
       yield JSON.stringify({
-        format: "salarivo-export-v2",
+        format: "salarivo-user-export-v3",
         exportedAt: new Date().toISOString(),
         account: {
-          id: row.id,
           email: row.email,
           displayName: row.display_name,
-          role: row.role,
-          status: row.status,
           defaultRetentionPolicy: row.default_retention_policy,
           emailVerifiedAt: row.email_verified_at,
           onboardingCompletedAt: row.onboarding_completed_at,
           lastLoginAt: row.last_login_at,
           createdAt: row.created_at,
-          updatedAt: row.updated_at,
+          secondFactor: {
+            enabled: row.mfa_enabled_at !== null,
+            enabledAt: row.mfa_enabled_at,
+            recoveryCodesRemaining: row.recovery_codes_remaining,
+          },
         },
       }).slice(0, -1);
 
@@ -1523,12 +1591,12 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         }
         includeDetectedEmployer = true;
         conditions.push("settlement.employment_id IS NULL");
-        conditions.push(`lower(normalize(btrim(detected_employer.name), NFKC) COLLATE "und-x-icu") = ${parameter(identity.key)}`);
+        conditions.push(`lower(btrim(normalize(detected_employer.name, NFKC)) COLLATE "und-x-icu") = ${parameter(identity.key)}`);
       } else if (unconfirmedContext !== null && uuid.test(unconfirmedContext[1]!)) {
         includeDetectedEmployer = true;
         conditions.push("settlement.employment_id IS NULL");
         conditions.push(`document.id = ${parameter(unconfirmedContext[1])}::uuid`);
-        conditions.push("NULLIF(btrim(detected_employer.name), '') IS NULL");
+        conditions.push("NULLIF(btrim(normalize(detected_employer.name, NFKC)), '') IS NULL");
       } else {
         return { data: { items: [], nextCursor: null } };
       }

@@ -69,7 +69,7 @@ Campos esenciales de Employment:
 
 El puesto actual vive todavía en Employment. Una futura PositionPeriod conservará cambios de puesto/categoría con vigencia sin sobrescribir historia; no está implementada.
 
-Los recibos sin asociación pueden producir una proyección `DETECTED` agrupada por nombre efectivo del empleador y moneda. Esa detección no crea ni modifica Employment: sólo una confirmación explícita crea o reutiliza Employer, crea Employment y asocia los documentos propios coincidentes.
+Los recibos sin asociación pueden producir una proyección `DETECTED` agrupada por nombre efectivo del empleador y moneda. Esa detección no crea ni modifica Employment: sólo una confirmación explícita crea o reutiliza Employer y permite crear un Employment o elegir uno propio existente del mismo empleador y moneda para asociar los documentos coincidentes.
 
 ### ImportBatch
 

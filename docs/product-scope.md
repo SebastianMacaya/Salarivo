@@ -29,7 +29,7 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - validación de seguridad, malware y clasificación temprana;
 - extracción de empresa, período, tipo, básico, bruto, neto, remunerativo, no remunerativo, descuentos, reintegros y conceptos principales;
 - asociación manual individual o masiva de documentos procesados a un empleo propio;
-- detección no persistida de un posible empleo desde documentos sin asociar y creación/asociación sólo después de confirmación explícita;
+- detección no persistida de un posible empleo desde documentos sin asociar y, sólo después de confirmación explícita, creación de uno nuevo o asociación a un empleo propio existente del mismo empleador y moneda;
 - confidence por campo, carga manual de montos ausentes y cierre explícito de revisión;
 - historial `salary-analytics-v1` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
 - visor privado del PDF por página con evidencia espacial cuando es inequívoca, datos extraídos y procedencia lado a lado;
@@ -74,7 +74,7 @@ Contratos y adendas en allowlist, sin OCR inicial y siempre asociados a un emple
 
 ## Criterios de éxito iniciales
 
-- Un usuario puede cerrar el navegador y el batch continúa.
+- Una vez confirmada la carga de cada archivo, el usuario puede cerrar el navegador y el procesamiento del batch continúa.
 - Un archivo fallido no invalida el resto.
 - Cientos de archivos aumentan la profundidad de cola, no la memoria de la API.
 - Un usuario no puede reservar más lotes, almacenamiento ni workers que sus cuotas server-side.
