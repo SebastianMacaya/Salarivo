@@ -32,6 +32,14 @@ const r2Policy = {
       },
       exposeHeaders: ['ETag'],
       maxAgeSeconds: 300,
+    }, {
+      allowed: {
+        headers: ['Range'],
+        methods: ['GET', 'HEAD'],
+        origins: ['https://www.salarivo.cloud'],
+      },
+      exposeHeaders: ['Accept-Ranges', 'Content-Disposition', 'Content-Length', 'Content-Range', 'Content-Type', 'ETag'],
+      maxAgeSeconds: 300,
     }],
   },
   customDomains: { domains: [] },
@@ -64,7 +72,7 @@ test('R2 production configuration is explicit and exact', () => {
   assert.throws(() => assertProductionStorageConfig({ ...r2Config, cloudflareApiToken: null }), /API_TOKEN/);
 });
 
-test('R2 production policy stays private and upload-only', () => {
+test('R2 production policy stays private with exact upload and download CORS', () => {
   assert.doesNotThrow(() => assertR2StoragePolicy(r2Policy, r2Config.storageBucket, r2Config.publicOrigin));
   assert.throws(() => assertR2StoragePolicy({ ...r2Policy, managedDomain: { enabled: true } }, r2Config.storageBucket, r2Config.publicOrigin), /r2.dev/);
   assert.throws(() => assertR2StoragePolicy({ ...r2Policy, customDomains: { domains: [{ enabled: true }] } }, r2Config.storageBucket, r2Config.publicOrigin), /custom domains/);
@@ -72,8 +80,9 @@ test('R2 production policy stays private and upload-only', () => {
   assert.throws(() => assertR2StoragePolicy({ ...r2Policy, locks: { rules: [{ enabled: true }] } }, r2Config.storageBucket, r2Config.publicOrigin), /lock rules/);
   assert.throws(() => assertR2StoragePolicy({ ...r2Policy, sippy: { enabled: true } }, r2Config.storageBucket, r2Config.publicOrigin), /on-demand migration/);
   assert.throws(() => assertR2StoragePolicy({ ...r2Policy, cors: { rules: [{ allowed: { headers: ['*'], methods: ['GET', 'PUT'], origins: ['*'] } }] } }, r2Config.storageBucket, r2Config.publicOrigin), /CORS/);
-  assert.throws(() => assertR2StoragePolicy({ ...r2Policy, cors: { rules: [{ ...r2Policy.cors.rules[0], exposeHeaders: [] }] } }, r2Config.storageBucket, r2Config.publicOrigin), /CORS/);
-  assert.throws(() => assertR2StoragePolicy({ ...r2Policy, cors: { rules: [{ ...r2Policy.cors.rules[0], maxAgeSeconds: 301 }] } }, r2Config.storageBucket, r2Config.publicOrigin), /CORS/);
+  assert.throws(() => assertR2StoragePolicy({ ...r2Policy, cors: { rules: [{ ...r2Policy.cors.rules[0], exposeHeaders: [] }, r2Policy.cors.rules[1]] } }, r2Config.storageBucket, r2Config.publicOrigin), /CORS/);
+  assert.throws(() => assertR2StoragePolicy({ ...r2Policy, cors: { rules: [r2Policy.cors.rules[0], { ...r2Policy.cors.rules[1], maxAgeSeconds: 301 }] } }, r2Config.storageBucket, r2Config.publicOrigin), /CORS/);
+  assert.throws(() => assertR2StoragePolicy({ ...r2Policy, cors: { rules: [r2Policy.cors.rules[0], { ...r2Policy.cors.rules[1], allowed: { ...r2Policy.cors.rules[1]!.allowed, headers: ['*'] } }] } }, r2Config.storageBucket, r2Config.publicOrigin), /CORS/);
   assert.throws(() => assertR2StoragePolicy({ ...r2Policy, lifecycle: { rules: [] } }, r2Config.storageBucket, r2Config.publicOrigin), /lifecycle/);
   assert.throws(() => assertR2StoragePolicy({ ...r2Policy, lifecycle: { rules: [...r2Policy.lifecycle.rules, {
     conditions: { prefix: '' },

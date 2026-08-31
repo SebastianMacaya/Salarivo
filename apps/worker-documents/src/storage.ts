@@ -18,6 +18,14 @@ const R2_UPLOAD_HEADERS = [
   'x-amz-meta-upload-session',
   'x-amz-storage-class',
 ];
+const R2_DOWNLOAD_EXPOSE_HEADERS = [
+  'accept-ranges',
+  'content-disposition',
+  'content-length',
+  'content-range',
+  'content-type',
+  'etag',
+];
 
 export type StorageProvider = 'aws' | 'r2';
 
@@ -57,6 +65,10 @@ function exactStrings(actual: unknown, expected: string[], lowercase = false): b
   const normalize = (value: string) => lowercase ? value.toLowerCase() : value;
   const normalizedExpected = expected.map(normalize).sort();
   return actual.map(normalize).sort().every((value, index) => value === normalizedExpected[index]);
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function exactHttpsOrigin(value: string): boolean {
@@ -116,15 +128,29 @@ export function assertR2StoragePolicy(policy: R2Policy, bucket: string, publicOr
   }
   if (policy.sippy.enabled !== false) throw new Error('OBJECT_STORAGE_BUCKET must disable on-demand migration');
 
-  const corsRules = policy.cors.rules;
-  if (!Array.isArray(corsRules) || corsRules.length !== 1) throw new Error('OBJECT_STORAGE_BUCKET must have the exact upload CORS policy');
-  const allowed = (corsRules[0] as { allowed?: { headers?: unknown; methods?: unknown; origins?: unknown } } | undefined)?.allowed;
-  if (!exactStrings(allowed?.methods, ['PUT'])
-    || !exactStrings(allowed?.origins, [publicOrigin])
-    || !exactStrings(allowed?.headers, R2_UPLOAD_HEADERS, true)
-    || !exactStrings((corsRules[0] as { exposeHeaders?: unknown }).exposeHeaders, ['ETag'], true)
-    || (corsRules[0] as { maxAgeSeconds?: unknown }).maxAgeSeconds !== 300) {
-    throw new Error('OBJECT_STORAGE_BUCKET must have the exact upload CORS policy');
+  const corsRules = Array.isArray(policy.cors.rules) ? policy.cors.rules : [];
+  const uploadRule = corsRules.find((rule) => record(rule)
+    && record(rule.allowed)
+    && exactStrings(rule.allowed.methods, ['PUT']));
+  const downloadRule = corsRules.find((rule) => record(rule)
+    && record(rule.allowed)
+    && exactStrings(rule.allowed.methods, ['GET', 'HEAD']));
+  const uploadAllowed = record(uploadRule) && record(uploadRule.allowed) ? uploadRule.allowed : null;
+  const downloadAllowed = record(downloadRule) && record(downloadRule.allowed) ? downloadRule.allowed : null;
+  if (corsRules.length !== 2
+    || !record(uploadRule)
+    || !uploadAllowed
+    || !exactStrings(uploadAllowed.origins, [publicOrigin])
+    || !exactStrings(uploadAllowed.headers, R2_UPLOAD_HEADERS, true)
+    || !exactStrings(uploadRule.exposeHeaders, ['ETag'], true)
+    || uploadRule.maxAgeSeconds !== 300
+    || !record(downloadRule)
+    || !downloadAllowed
+    || !exactStrings(downloadAllowed.origins, [publicOrigin])
+    || !exactStrings(downloadAllowed.headers, ['Range'], true)
+    || !exactStrings(downloadRule.exposeHeaders, R2_DOWNLOAD_EXPOSE_HEADERS, true)
+    || downloadRule.maxAgeSeconds !== 300) {
+    throw new Error('OBJECT_STORAGE_BUCKET must have the exact upload and download CORS policies');
   }
 
   const lifecycleRules = policy.lifecycle.rules;
