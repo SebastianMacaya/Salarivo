@@ -130,6 +130,14 @@ El parser no inventa montos. El neto sólo puede derivarse de los totales de una
 
 Confirmar manualmente el tipo nunca salta malware, límites ni parse seguro.
 
+## Resolución de empleador y empleo
+
+Después de la extracción efectiva y antes de materializar PayrollSettlement, el worker resuelve el Employer con el mismo servicio transaccional que usa la API. El resolver admite un identificador fiscal ya validado y protegido con precedencia, pero el worker vigente sólo le entrega el nombre extraído: ingerir CUIT requiere todavía adapter por país y configuración criptográfica dedicada. Sin identificador, recupera candidatos por normalización y sólo reutiliza una coincidencia conservadora y única de nombre o alias dentro del país. Una ambigüedad no dispara OCR adicional, IA ni fuzzy matching: conserva revisión pendiente.
+
+El Employer detectado queda en Document como procedencia aunque `employment_id` permanezca nulo. La autoasociación exige exactamente un Employment del owner, para ese Employer y moneda, cuyo intervalo cubra `payrollPeriod`. Cero o varias filas dejan el documento sin asociar. Cuando hay una única coincidencia, ImportBatchItem, Document y PayrollSettlement convergen transaccionalmente al mismo Employment.
+
+Si un reproceso detecta otro Employer para un documento ya asociado, no borra la decisión existente: preserva las referencias de ImportBatchItem, Document y PayrollSettlement, guarda la nueva detección y deriva el resultado a `NEEDS_REVIEW`.
+
 ## Clasificación por costo
 
 1. Extraer una muestra de texto ya presente y combinar múltiples señales laborales.
@@ -167,6 +175,7 @@ Claves mínimas:
 - userId + documentId + clave de idempotencia del titular para pedir reproceso;
 - providerOperationId para OCR/IA facturable;
 - documentId + extractionRunId para materializar resultados.
+- countryCode + nombre normalizado dentro de un advisory lock para resolver o crear Employer.
 
 Restricciones de DB y transacciones son la última defensa. Un ack perdido o un mensaje duplicado no puede crear otra liquidación.
 

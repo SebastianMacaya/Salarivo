@@ -3,6 +3,7 @@
 - Estado: Accepted
 - Fecha: 2026-08-30
 - Supersede parcialmente: [ADR 0007](0007-versioned-legal-acceptance-and-minimal-admin.md), sólo en su decisión de administración mínima
+- Supersedido parcialmente por: [ADR 0014](0014-global-employer-resolution.md), sólo en la exclusión de administración y merge de empleadores
 
 ## Contexto
 

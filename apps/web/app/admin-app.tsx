@@ -60,8 +60,24 @@ type DocumentDetail = {
   recentJobs: Array<Pick<AdminJob, 'id' | 'stage' | 'processingVersion' | 'state' | 'attempt' | 'maxAttempts' | 'errorCode' | 'updatedAt'>>;
 };
 type AdminEmployer = {
-  id: string; userId: string; name: string; countryCode: string; employmentCount: number;
-  activeEmploymentCount: number; createdAt: string; updatedAt: string;
+  id: string; name: string; normalizedName: string; countryCode: string;
+  status: 'PENDING' | 'VERIFIED' | 'MERGED' | 'REJECTED'; mergedIntoEmployerId: string | null;
+  createdSource: string; employmentCount: number; userCount: number; documentCount: number;
+  createdAt: string; updatedAt: string; verifiedAt: string | null;
+};
+type AdminEmployerDetail = {
+  employer: AdminEmployer;
+  aliases: Array<{ id: string; alias: string; normalizedAlias: string; createdSource: string; createdAt: string }>;
+  identifiers: Array<{ id: string; countryCode: string; identifierType: string; maskedValue: string; createdSource: string; createdAt: string }>;
+  detectionOrigins: Array<{
+    documentId: string; importBatchId: string; employerName: string | null;
+    confidence: number | null; source: string | null; detectedAt: string;
+  }>;
+  possibleMatches: Array<{
+    id: string; name: string; status: 'PENDING' | 'VERIFIED';
+    matchReason: 'EXACT_NORMALIZED_NAME' | 'EXACT_NORMALIZED_ALIAS';
+    employmentCount: number; userCount: number; documentCount: number;
+  }>;
 };
 type StorageData = {
   summary: { totalOriginalBytes: number; documentCount: number; usersWithOriginals: number; pendingDeletions: number; quotaBytesPerUser: number };
@@ -118,7 +134,7 @@ function bytes(value: number | null | undefined) {
 }
 function shortId(value: string) { return `${value.slice(0, 8)}…`; }
 function tone(status: string) {
-  if (['ACTIVE', 'READY', 'SUCCEEDED', 'PROCESSED', 'COMPLETED', 'HEALTHY', 'SUCCESS', 'CLEAN'].includes(status)) return 'ready';
+  if (['ACTIVE', 'READY', 'SUCCEEDED', 'PROCESSED', 'COMPLETED', 'HEALTHY', 'SUCCESS', 'CLEAN', 'VERIFIED'].includes(status)) return 'ready';
   if (['FAILED', 'FAILED_PERMANENT', 'ERROR', 'REJECTED', 'REJECTED_UNSUPPORTED', 'BLOCKED', 'DOWN', 'UNAVAILABLE', 'QUARANTINED', 'OVER_QUOTA', 'CANCELLED'].includes(status)) return 'danger';
   if (['PENDING', 'PUBLISHED', 'PROCESSING', 'RUNNING', 'RETRYABLE', 'FAILED_RETRYABLE', 'RETRY_SCHEDULED', 'DEGRADED', 'SUSPENDED', 'NEAR_QUOTA'].includes(status)) return 'pending';
   return '';
@@ -146,13 +162,13 @@ function PageHeader({ eyebrow, title, description, actions, crumbs }: { eyebrow:
   return <div className="admin-page-head"><div>{crumbs && <nav className="breadcrumbs" aria-label="Ruta">{crumbs.map(([label, href], index) => <span key={`${label}-${index}`}>{href ? <a href={href}>{label}</a> : label}</span>)}</nav>}<p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>{actions && <div className="admin-head-actions">{actions}</div>}</div>;
 }
 
-function QueryFilters({ action, search, children }: { action: string; search: URLSearchParams; children?: ReactNode }) {
+function QueryFilters({ action, search, children, searchPlaceholder = 'UUID exacto' }: { action: string; search: URLSearchParams; children?: ReactNode; searchPlaceholder?: string }) {
   return <form className="admin-filters" action={action} method="get" role="search" onSubmit={(event) => {
     for (const field of Array.from(event.currentTarget.elements)) {
       if ((field instanceof HTMLInputElement || field instanceof HTMLSelectElement) && field.value === '') field.disabled = true;
     }
   }}>
-    <label>Buscar<input name="search" defaultValue={search.get('search') ?? ''} placeholder="UUID exacto" /></label>
+    <label>Buscar<input name="search" defaultValue={search.get('search') ?? ''} placeholder={searchPlaceholder} /></label>
     {children}
     <button className="button secondary" type="submit">Aplicar filtros</button>
     {search.size > 0 && <a className="text-button" href={action}>Limpiar</a>}
@@ -168,13 +184,20 @@ function Pagination({ result, path, search }: { result: { page: number; pageSize
 }
 
 const reasons = ['SUPPORT_REQUEST', 'SECURITY_INCIDENT', 'ABUSE_PREVENTION', 'USER_REQUEST', 'OPERATIONAL_RECOVERY', 'ROLE_ADMINISTRATION'] as const;
-type AdminAction = { title: string; description: string; button: string; execute: (reasonCode: string, reference: string) => Promise<string> };
+type AdminAction = {
+  title: string;
+  description: string;
+  button: string;
+  fields?: ReactNode;
+  danger?: boolean;
+  execute: (reasonCode: string, reference: string, values: Record<string, string>) => Promise<string>;
+};
 function ActionDialog({ action, onClose, onDone }: { action: AdminAction; onClose: () => void; onDone: (message: string) => void }) {
   const ref = useRef<HTMLDialogElement>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [stepUp, setStepUp] = useState(false);
-  const [pending, setPending] = useState<{ reasonCode: string; reference: string } | null>(null);
+  const [pending, setPending] = useState<{ reasonCode: string; reference: string; values: Record<string, string> } | null>(null);
   useEffect(() => { ref.current?.showModal(); }, []);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError(''); setBusy(true);
@@ -182,12 +205,14 @@ function ActionDialog({ action, onClose, onDone }: { action: AdminAction; onClos
     try {
       if (stepUp && pending) {
         await api('/auth/step-up', { method: 'POST', body: JSON.stringify({ code: String(form.get('code') ?? '') }) });
-        onDone(await action.execute(pending.reasonCode, pending.reference)); return;
+        onDone(await action.execute(pending.reasonCode, pending.reference, pending.values)); return;
       }
-      const values = { reasonCode: String(form.get('reasonCode') ?? ''), reference: String(form.get('reference') ?? '') };
-      try { onDone(await action.execute(values.reasonCode, values.reference)); }
+      const values = Object.fromEntries(Array.from(form.entries()).flatMap(([key, value]) => typeof value === 'string' ? [[key, value]] : []));
+      const reasonCode = values.reasonCode ?? '';
+      const reference = values.reference ?? '';
+      try { onDone(await action.execute(reasonCode, reference, values)); }
       catch (caught) {
-        if (caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') { setPending(values); setStepUp(true); return; }
+        if (caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') { setPending({ reasonCode, reference, values }); setStepUp(true); return; }
         throw caught;
       }
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos completar la acción.'); }
@@ -198,11 +223,12 @@ function ActionDialog({ action, onClose, onDone }: { action: AdminAction; onClos
       <div className="modal-head"><div><p className="eyebrow">Acción auditada</p><h2 id="admin-dialog-title">{stepUp ? 'Confirmá tu identidad' : action.title}</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Cerrar">×</button></div>
       <p id="admin-dialog-description">{stepUp ? 'Ingresá el código de tu segundo factor para continuar con la misma acción.' : action.description}</p>
       {stepUp ? <label>Código MFA<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" minLength={6} maxLength={6} required autoFocus /></label> : <>
+        {action.fields}
         <label>Motivo<select name="reasonCode" required defaultValue=""><option value="" disabled>Seleccionar motivo</option>{reasons.map((reason) => <option key={reason}>{reason}</option>)}</select></label>
         <label>Referencia o ticket<input name="reference" required minLength={3} maxLength={80} pattern="[A-Za-z0-9][A-Za-z0-9._:/-]*" placeholder="SUP-1234" /></label>
       </>}
       {error && <p className="message error" role="alert">{error}</p>}
-      <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancelar</button><button className="button primary" disabled={busy}>{busy ? 'Procesando…' : stepUp ? 'Confirmar' : action.button}</button></div>
+      <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>Cancelar</button><button className={`button ${action.danger ? 'danger-button' : 'primary'}`} disabled={busy}>{busy ? 'Procesando…' : stepUp ? 'Confirmar' : action.button}</button></div>
     </form>
   </dialog>;
 }
@@ -308,8 +334,49 @@ function ProcessingPage({ search, permissions }: { search: URLSearchParams; perm
 function EmployersPage({ search }: { search: URLSearchParams }) {
   const query = new URLSearchParams(search); query.set('pageSize', '25');
   const state = useRemote<Paged<AdminEmployer>>(`/admin/employers?${query}`);
-  return <><PageHeader eyebrow="Relaciones laborales" title="Empleadores" description="Vista por usuario del modelo actual. No hay registro global, CUIT ni merge hasta resolver identidad sin destruir evidencia." /><QueryFilters action="/admin/employers" search={search} />
-    {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay empleadores para estos filtros.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Empleador</th><th>Usuario</th><th>País</th><th>Empleos</th><th>Activos</th><th>Actualización</th></tr></thead><tbody>{state.data.items.map((employer) => <tr key={employer.id}><td data-label="Empleador"><strong>{employer.name}</strong><small className="cell-note">{shortId(employer.id)}</small></td><td data-label="Usuario"><a href={`/admin/users/${employer.userId}`}>{shortId(employer.userId)}</a></td><td data-label="País">{employer.countryCode}</td><td data-label="Empleos">{employer.employmentCount}</td><td data-label="Activos">{employer.activeEmploymentCount}</td><td data-label="Actualización">{date(employer.updatedAt)}</td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/employers" search={search} /></>}
+  return <><PageHeader eyebrow="Identidad global" title="Empleadores" description="Organizaciones canónicas y señales agregadas. Los identificadores fiscales permanecen enmascarados." /><QueryFilters action="/admin/employers" search={search} searchPlaceholder="Nombre o UUID"><SelectFilter name="status" label="Estado" values={['PENDING', 'VERIFIED', 'MERGED', 'REJECTED']} search={search} /><label>País<input name="countryCode" defaultValue={search.get('countryCode') ?? ''} minLength={2} maxLength={2} pattern="[A-Za-z]{2}" placeholder="AR" title="Código de país de dos letras" onInput={(event) => { event.currentTarget.value = event.currentTarget.value.toUpperCase(); }} /></label></QueryFilters>
+    {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay empleadores para estos filtros.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Empleador</th><th>Estado</th><th>País</th><th>Usuarios</th><th>Empleos</th><th>Documentos</th><th>Actualización</th><th><span className="sr-only">Acción</span></th></tr></thead><tbody>{state.data.items.map((employer) => <tr key={employer.id}><td data-label="Empleador"><a className="entity-link" href={`/admin/employers/${employer.id}`}><strong>{employer.name}</strong><small>{shortId(employer.id)}</small></a></td><td data-label="Estado"><StatusBadge value={employer.status} /></td><td data-label="País">{employer.countryCode}</td><td data-label="Usuarios">{numberFormatter.format(employer.userCount)}</td><td data-label="Empleos">{numberFormatter.format(employer.employmentCount)}</td><td data-label="Documentos">{numberFormatter.format(employer.documentCount)}</td><td data-label="Actualización">{date(employer.updatedAt)}</td><td data-label="Acción"><a className="button compact secondary" href={`/admin/employers/${employer.id}`}>Ver</a></td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/employers" search={search} /></>}
+  </>;
+}
+
+function EmployerPage({ id, adminRole }: { id: string; adminRole: AdminRole }) {
+  const state = useRemote<AdminEmployerDetail>(`/admin/employers/${id}`);
+  const [action, setAction] = useState<AdminAction | null>(null);
+  const [notice, setNotice] = useState('');
+  if (state.loading) return <><PageHeader eyebrow="Empleadores" title="Detalle global" description="Cargando identidad canónica…" crumbs={[["Admin", "/admin"], ["Empleadores", "/admin/employers"], [shortId(id)]]} /><LoadingState /></>;
+  if (state.error || !state.data) return <><PageHeader eyebrow="Empleadores" title="Detalle global" description="No se pudo recuperar el empleador." crumbs={[["Admin", "/admin"], ["Empleadores", "/admin/employers"], [shortId(id)]]} /><ErrorState message={state.error} retry={state.reload} /></>;
+  const { employer, aliases, identifiers, possibleMatches, detectionOrigins } = state.data;
+  const canManage = adminRole === 'SUPER_ADMIN';
+  const mutable = !['MERGED', 'REJECTED'].includes(employer.status);
+  const hasCuit = identifiers.some((identifier) => identifier.countryCode === 'AR' && identifier.identifierType === 'CUIT');
+  const finish = (message: string) => { setAction(null); setNotice(message); state.reload(); };
+  const auditedMutation = async (path: string, reasonCode: string, reference: string, extra: Record<string, string> = {}) => {
+    await api(path, { method: 'POST', body: JSON.stringify({ ...extra, reasonCode, reference }) });
+  };
+  return <>
+    <PageHeader eyebrow="Empleadores" title={employer.name} description={`Identidad global ${shortId(employer.id)} · creada por ${employer.createdSource}`} crumbs={[["Admin", "/admin"], ["Empleadores", "/admin/employers"], [shortId(id)]]} actions={<StatusBadge value={employer.status} />} />
+    {notice && <p className="message success" aria-live="polite">{notice}</p>}
+    <section className="admin-kpi-grid" aria-label="Métricas del empleador">
+      <article className="admin-kpi"><small>Usuarios</small><strong>{numberFormatter.format(employer.userCount)}</strong><span>con relaciones laborales</span></article>
+      <article className="admin-kpi"><small>Empleos</small><strong>{numberFormatter.format(employer.employmentCount)}</strong><span>episodios asociados</span></article>
+      <article className="admin-kpi"><small>Documentos</small><strong>{numberFormatter.format(employer.documentCount)}</strong><span>relacionados sin exponer contenido</span></article>
+    </section>
+    <div className="admin-detail-grid employer-detail-grid">
+      <section className="admin-card"><h2>Identidad</h2><dl className="admin-definition"><div><dt>ID</dt><dd>{employer.id}</dd></div><div><dt>Nombre canónico</dt><dd>{employer.name}</dd></div><div><dt>Nombre normalizado</dt><dd>{employer.normalizedName}</dd></div><div><dt>País</dt><dd>{employer.countryCode}</dd></div><div><dt>Estado</dt><dd><StatusBadge value={employer.status} /></dd></div><div><dt>Origen</dt><dd>{employer.createdSource}</dd></div><div><dt>Verificación</dt><dd>{date(employer.verifiedAt)}</dd></div><div><dt>Creación</dt><dd>{date(employer.createdAt)}</dd></div><div><dt>Actualización</dt><dd>{date(employer.updatedAt)}</dd></div>{employer.mergedIntoEmployerId && <div><dt>Fusionado en</dt><dd><a href={`/admin/employers/${employer.mergedIntoEmployerId}`}>{shortId(employer.mergedIntoEmployerId)}</a></dd></div>}</dl></section>
+      <section className="admin-card"><h2>Identificadores enmascarados</h2>{identifiers.length ? <ul className="admin-event-list">{identifiers.map((identifier) => <li key={identifier.id}><strong>{identifier.identifierType}</strong><StatusBadge value={identifier.countryCode} /><span>{identifier.maskedValue} · {identifier.createdSource}</span></li>)}</ul> : <p>No hay identificadores verificados.</p>}<p className="admin-footnote">El valor completo se usa una vez para validarlo y protegerlo; el panel sólo vuelve a recibir la versión enmascarada.</p></section>
+    </div>
+    <section className="admin-card"><h2>Aliases</h2>{aliases.length ? <ul className="admin-event-list">{aliases.map((alias) => <li key={alias.id}><strong>{alias.alias}</strong><span>{alias.createdSource}</span><span>Agregado {date(alias.createdAt)}</span></li>)}</ul> : <p>No hay nombres alternativos registrados.</p>}</section>
+    <section className="admin-card"><h2>Procedencia de detección</h2><p>Últimas detecciones asociadas a esta identidad, sin contenido documental ni datos salariales.</p>{detectionOrigins.length ? <ul className="admin-event-list">{detectionOrigins.map((origin) => <li key={origin.documentId}><strong><a href={`/admin/documents/${origin.documentId}`}>Documento {shortId(origin.documentId)}</a></strong><span>{origin.employerName ?? 'Nombre no disponible'} · {origin.source ?? 'Fuente no disponible'} · {origin.confidence === null ? 'Confianza no disponible' : `${Math.round(origin.confidence * 100)}% de confianza`}</span><span>Lote {shortId(origin.importBatchId)} · {date(origin.detectedAt)}</span></li>)}</ul> : <p>No hay detecciones documentales asociadas.</p>}</section>
+    <section className="admin-card"><h2>Posibles coincidencias</h2><p>Comparten un nombre o alias normalizado. Es una señal para revisión, no prueba que sean la misma organización.</p>{possibleMatches.length ? <ul className="admin-event-list">{possibleMatches.map((match) => <li key={match.id}><strong><a href={`/admin/employers/${match.id}`}>{match.name}</a></strong><StatusBadge value={match.status} /><span>{match.matchReason === 'EXACT_NORMALIZED_NAME' ? 'Nombre canónico normalizado' : 'Alias normalizado'} · {numberFormatter.format(match.userCount)} usuarios · {numberFormatter.format(match.employmentCount)} empleos · {numberFormatter.format(match.documentCount)} documentos</span>{canManage && mutable && <button className="button compact danger-button" onClick={() => setAction({ title: 'Fusionar en este empleador', description: `La coincidencia normalizada con ${match.name} no demuestra identidad. Verificá el destino antes de fusionar; la acción queda auditada.`, button: 'Fusionar en este', danger: true, fields: <label>UUID del empleador destino<input name="targetEmployerId" defaultValue={match.id} autoComplete="off" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" required /></label>, execute: async (reasonCode, reference, values) => { await auditedMutation(`/admin/employers/${id}/merge`, reasonCode, reference, { targetEmployerId: values.targetEmployerId?.trim() ?? match.id }); return 'Empleador fusionado en la identidad revisada.'; } })}>Fusionar en este</button>}</li>)}</ul> : <p>No hay coincidencias determinísticas para revisar.</p>}</section>
+    <section className="admin-card"><h2>Acciones sobre la identidad</h2><p>Las mutaciones son exclusivas de SUPER_ADMIN, requieren motivo, referencia y verificación reforzada.</p>{canManage && mutable ? <div className="admin-action-list">
+      {employer.status === 'PENDING' && <button className="button primary" onClick={() => setAction({ title: 'Aprobar empleador', description: 'Verificá el nombre canónico antes de aprobar. La operación queda auditada.', button: 'Aprobar', fields: <label>Nombre canónico<input name="name" defaultValue={employer.name} minLength={2} maxLength={200} required /></label>, execute: async (reasonCode, reference, values) => { const name = values.name?.trim(); await auditedMutation(`/admin/employers/${id}/approve`, reasonCode, reference, name && name !== employer.name ? { name } : {}); return 'Empleador aprobado y verificado.'; } })}>Aprobar</button>}
+      <button className="button secondary" onClick={() => setAction({ title: 'Corregir nombre canónico', description: 'El nombre anterior quedará registrado como alias para no romper futuras importaciones.', button: 'Guardar nombre', fields: <label>Nombre canónico<input name="name" defaultValue={employer.name} minLength={2} maxLength={200} required autoFocus /></label>, execute: async (reasonCode, reference, values) => { await auditedMutation(`/admin/employers/${id}/rename`, reasonCode, reference, { name: values.name?.trim() ?? '' }); return 'Nombre canónico actualizado.'; } })}>Corregir nombre</button>
+      <button className="button secondary" onClick={() => setAction({ title: 'Agregar alias', description: 'Agregá sólo una variante legítima del nombre de esta misma organización.', button: 'Agregar alias', fields: <label>Alias<input name="alias" minLength={2} maxLength={200} required autoFocus /></label>, execute: async (reasonCode, reference, values) => { await auditedMutation(`/admin/employers/${id}/aliases`, reasonCode, reference, { alias: values.alias?.trim() ?? '' }); return 'Alias agregado al empleador.'; } })}>Agregar alias</button>
+      {employer.countryCode === 'AR' && <button className="button secondary" onClick={() => setAction({ title: hasCuit ? 'Corregir CUIT' : 'Agregar CUIT', description: 'Ingresá un CUIT verificado. Se valida el dígito, se protege antes de persistir y no volverá a mostrarse completo.', button: hasCuit ? 'Guardar corrección' : 'Agregar CUIT', fields: <label>CUIT<input name="cuit" inputMode="numeric" autoComplete="off" minLength={11} maxLength={32} pattern="[0-9. -]{11,32}" placeholder="30-71234567-1" required autoFocus /></label>, execute: async (reasonCode, reference, values) => { await auditedMutation(`/admin/employers/${id}/identifiers/cuit`, reasonCode, reference, { cuit: values.cuit?.trim() ?? '' }); return hasCuit ? 'CUIT corregido y protegido.' : 'CUIT agregado y protegido.'; } })}>{hasCuit ? 'Corregir CUIT' : 'Agregar CUIT'}</button>}
+      <button className="button danger-button" onClick={() => setAction({ title: 'Fusionar empleador', description: 'Todos los vínculos pasarán al empleador destino. Confirmá el UUID canónico; esta acción no se revierte desde la consola.', button: 'Fusionar', danger: true, fields: <label>UUID del empleador destino<input name="targetEmployerId" autoComplete="off" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" placeholder="00000000-0000-4000-8000-000000000000" required /></label>, execute: async (reasonCode, reference, values) => { await auditedMutation(`/admin/employers/${id}/merge`, reasonCode, reference, { targetEmployerId: values.targetEmployerId?.trim() ?? '' }); return 'Empleador fusionado en la identidad destino.'; } })}>Fusionar</button>
+      {employer.status === 'PENDING' && <button className="button danger-button" onClick={() => setAction({ title: 'Rechazar empleador', description: 'Rechazá sólo una identidad inválida. Las evidencias privadas no se eliminan.', button: 'Rechazar', danger: true, execute: async (reasonCode, reference) => { await auditedMutation(`/admin/employers/${id}/reject`, reasonCode, reference); return 'Empleador rechazado.'; } })}>Rechazar</button>}
+    </div> : <small>{canManage ? 'Esta identidad ya no admite mutaciones.' : 'Tu rol permite consulta, no cambios sobre la identidad global.'}</small>}</section>
+    {action && <ActionDialog action={action} onClose={() => setAction(null)} onDone={finish} />}
   </>;
 }
 
@@ -400,6 +467,7 @@ export function AdminApp() {
   else if (section === 'users') page = <UsersPage search={search} />;
   else if (section === 'documents' && segments[1]) page = <DocumentPage id={segments[1]} permissions={user.permissions} />;
   else if (section === 'documents') page = <DocumentsPage search={search} permissions={user.permissions} />;
+  else if (section === 'employers' && segments[1]) page = <EmployerPage id={segments[1]} adminRole={user.adminRole!} />;
   else if (section === 'employers') page = <EmployersPage search={search} />;
   else if (section === 'processing') page = <ProcessingPage search={search} permissions={user.permissions} />;
   else if (section === 'storage') page = <StoragePage search={search} />;

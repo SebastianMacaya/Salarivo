@@ -6,7 +6,7 @@
 
 | Clase | Ejemplos | Manejo |
 | --- | --- | --- |
-| Restricted | PDFs, OCR, salarios, salud/obra social, afiliación sindical, futura contribución/mapping de benchmark, DNI/CUIL, banco, email, correcciones, exports, cookies/tokens, códigos OIDC, PKCE verifier, `state`, `nonce`, URLs firmadas, claves | cifrado, acceso mínimo, no logs, no fixtures reales, sharing explícito |
+| Restricted | PDFs, OCR, salarios, salud/obra social, afiliación sindical, futura contribución/mapping de benchmark, CUIT/CUIL/DNI, banco, email, correcciones, exports, cookies/tokens, códigos OIDC, PKCE verifier, `state`, `nonce`, URLs firmadas, claves | cifrado, acceso mínimo, no logs, no fixtures reales, sharing explícito |
 | Confidential | userId interno, documentId, relación `(provider, sub)`, categorías coarse de dispositivo/navegador/SO y timestamps de sesión, rol admin, aceptación legal, employment metadata, audit events sanitizados, configuración no secreta | acceso por rol/servicio, logs limitados, retención definida |
 | Internal | métricas agregadas sin cardinalidad sensible, health, versiones, error codes | uso operativo, sin vínculo innecesario a persona |
 | Public | documentación pública aprobada y contenido de marketing | sin datos derivados de usuarios |
@@ -32,7 +32,7 @@ Para reconocer sesiones se persisten únicamente categorías allowlisted de disp
 
 ### PostgreSQL
 
-Metadata necesaria y datos estructurados. Campos especialmente sensibles pueden requerir cifrado de aplicación/campo. El binario no se almacena en DB. Los intentos OIDC conservan sólo estado breve y de un uso; cualquier secreto comparable se guarda hasheado cuando el protocolo lo permite.
+Metadata necesaria y datos estructurados. El CUIT se persiste sólo cifrado con AES-256-GCM, fingerprint HMAC-SHA-256 y sufijo enmascarado; las claves de cifrado y fingerprint son separadas y no reutilizan MFA ni storage. El binario no se almacena en DB. Los intentos OIDC conservan sólo estado breve y de un uso; cualquier secreto comparable se guarda hasheado cuando el protocolo lo permite.
 
 ### Object storage
 
@@ -56,7 +56,7 @@ Prohibido:
 - request/response bodies genéricos;
 - contenido/documento/OCR;
 - salario y conceptos;
-- DNI/CUIL completos;
+- CUIT/CUIL/DNI completos;
 - cookies, tokens, contraseñas y claves;
 - códigos OIDC, `state`, `nonce`, PKCE verifier y `sub` del proveedor;
 - URL firmada completa;

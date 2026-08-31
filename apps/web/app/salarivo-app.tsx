@@ -7,10 +7,12 @@ import { fetchDocumentPrefix, readDocumentLocation, writeDocumentLocation, type 
 import {
   dateLabel,
   documentStatusLabel,
+  employmentOptionLabel,
   money,
   percentage,
   periodLabel,
   recentPeriodRange,
+  salaryContextOptionLabel,
   salaryCategories,
   settlementTypeLabel,
   timestampLabel,
@@ -55,8 +57,10 @@ type Employment = {
   endDate?: string | null;
   status: 'ACTIVE' | 'ENDED';
   currencyCode: string;
+  employerStatus?: 'PENDING' | 'VERIFIED' | 'MERGED' | 'REJECTED' | null;
 };
 type EmploymentDetection = {
+  employerId: string | null;
   employerName: string;
   currencyCode: string;
   firstPeriod: string;
@@ -1086,10 +1090,6 @@ function deductionOrCredit(value: string | null | undefined, currency: string) {
   return value.startsWith('-') ? `Crédito ${money(value.slice(1), currency)}` : money(value, currency);
 }
 
-function salaryContextName(context: SalaryContext) {
-  return context.employerName || 'Empleo sin confirmar';
-}
-
 function salaryScopeKey(context: SalaryContext) {
   return JSON.stringify([context.employmentContext, context.currencyCode]);
 }
@@ -1114,8 +1114,8 @@ function SalaryScopeControl({ history, selectedKey, onChange, id }: {
     : 'Período no disponible';
   return <section className="scope-control" aria-label="Contexto salarial">
     <div><label htmlFor={id}>Empleo y moneda</label>{history.contexts.length > 1
-      ? <select id={id} value={salaryScopeKey(context)} onChange={(event) => onChange(event.target.value)}>{history.contexts.map((item) => <option value={salaryScopeKey(item)} key={salaryScopeKey(item)}>{salaryContextName(item)} · {item.currencyCode}</option>)}</select>
-      : <strong>{salaryContextName(context)} · {context.currencyCode}</strong>}</div>
+      ? <select id={id} value={salaryScopeKey(context)} onChange={(event) => onChange(event.target.value)}>{history.contexts.map((item) => <option value={salaryScopeKey(item)} key={salaryScopeKey(item)}>{salaryContextOptionLabel(item)}</option>)}</select>
+      : <strong>{salaryContextOptionLabel(context)}</strong>}</div>
     <div className="scope-meta"><span className={`status ${context.state === 'CONFIRMED' ? 'ready' : 'pending'}`}>{status}</span><span>{range}</span></div>
   </section>;
 }
@@ -1292,6 +1292,8 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
   const [confirmation, setConfirmation] = useState<EmploymentDetection | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmationError, setConfirmationError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const load = useCallback(async () => {
     setError(''); setLoading(true);
     try {
@@ -1308,23 +1310,14 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError('');
-    if (!editing) return;
+    if (!editing || savingRef.current) return;
+    savingRef.current = true; setSaving(true);
     const currentEmployment = editing;
     const form = new FormData(event.currentTarget);
     const employerName = String(form.get('employerName') ?? '');
     try {
-      const employerId = currentEmployment === 'new'
-        ? (await api<{ id: string }>('/employers', {
-            method: 'POST', body: JSON.stringify({ name: employerName, countryCode: 'AR' }),
-          })).id
-        : currentEmployment.employerId;
-      if (currentEmployment !== 'new' && employerName !== currentEmployment.employerName) {
-        await api(`/employers/${currentEmployment.employerId}`, {
-          method: 'PATCH', body: JSON.stringify({ name: employerName }),
-        });
-      }
       const payload = {
-        employerId, role: form.get('role') || null,
+        employerName, role: form.get('role') || null,
         startDate: form.get('startDate'), endDate: form.get('endDate') || null,
         countryCode: 'AR', currencyCode: form.get('currencyCode') || 'ARS',
       };
@@ -1332,6 +1325,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
       await api(path, { method: currentEmployment === 'new' ? 'POST' : 'PATCH', body: JSON.stringify(payload) });
       setEditing(null); await load(); onChanged();
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar el empleo.'); }
+    finally { savingRef.current = false; setSaving(false); }
   }
 
   async function remove(item: Employment) {
@@ -1339,7 +1333,6 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
     try {
       await runSensitive(async () => {
         await api(`/employments/${item.id}`, { method: 'DELETE', body: '{}' });
-        await api(`/employers/${item.employerId}`, { method: 'DELETE', body: '{}' }).catch(() => undefined);
         await load(); onChanged();
       });
     }
@@ -1357,6 +1350,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
       await api('/employment-detections/confirm', {
         method: 'POST',
         body: JSON.stringify({
+          employerId: detection.employerId,
           employerName: detection.employerName,
           currencyCode: detection.currencyCode,
           ...(employmentId && employmentId !== 'new'
@@ -1378,12 +1372,14 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
 
   const matchingEmployments = confirmation
     ? items.filter((item) => item.currencyCode === confirmation.currencyCode
-      && normalizedEmployerName(item.employerName) === normalizedEmployerName(confirmation.employerName))
+      && (confirmation.employerId
+        ? item.employerId === confirmation.employerId
+        : normalizedEmployerName(item.employerName) === normalizedEmployerName(confirmation.employerName)))
     : [];
 
   return (
-    <div className="page" aria-busy={loading || confirming}>
-      <PageHeader eyebrow="Trayectoria" title="Empleos" action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />
+    <div className="page" aria-busy={loading || confirming || saving}>
+      <PageHeader eyebrow="Trayectoria" title="Empleos" action={<button className="button primary" disabled={saving} onClick={() => setEditing('new')}>Agregar empleo</button>} />
       <p className="page-intro">Usalos para agrupar recibos y entender cada etapa de tu carrera.</p>
       {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Recargando…' : 'Recargar'}</button></p>}
       <div className="stack-form">
@@ -1391,17 +1387,19 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
         {detections.length > 0 && <section className="panel" aria-labelledby="detected-employments-title">
           <div className="panel-heading"><div><p className="eyebrow">Pendientes de confirmación</p><h2 id="detected-employments-title">Empleos detectados</h2></div></div>
           <div className="employment-grid">{detections.map((detection) => {
-            const key = JSON.stringify([detection.employerName, detection.currencyCode]);
-            const hasMatch = items.some((item) => item.currencyCode === detection.currencyCode && normalizedEmployerName(item.employerName) === normalizedEmployerName(detection.employerName));
+            const key = JSON.stringify([detection.employerId ?? detection.employerName, detection.currencyCode]);
+            const hasMatch = items.some((item) => item.currencyCode === detection.currencyCode && (detection.employerId
+              ? item.employerId === detection.employerId
+              : normalizedEmployerName(item.employerName) === normalizedEmployerName(detection.employerName)));
             return <article className="employment-card" key={key}><div className="employer-avatar">{detection.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{detection.employerName}</h2><p>{detection.documentCount} recibo{detection.documentCount === 1 ? '' : 's'} sin asociar</p></div><span className="status pending">{hasMatch ? 'Sin asociar' : 'Detectado'}</span><dl><div><dt>Primer recibo</dt><dd>{periodLabel(detection.firstPeriod)}</dd></div><div><dt>Último recibo</dt><dd>{periodLabel(detection.lastPeriod)}</dd></div><div><dt>Moneda</dt><dd>{detection.currencyCode}</dd></div></dl><div className="card-actions"><button type="button" className="button compact" disabled={confirming} onClick={() => { setConfirmationError(''); setConfirmation(detection); }}>{hasMatch ? 'Asociar recibos' : 'Confirmar empleo'}</button></div></div></article>;
           })}</div>
         </section>}
         <section aria-label="Empleos confirmados">
           {detections.length > 0 && <div className="panel-heading"><div><p className="eyebrow">Trayectoria confirmada</p><h2>Empleos confirmados</h2></div></div>}
-          {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p></div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />}
+          {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p>{item.employerStatus === 'PENDING' && <span className="status pending">Empresa por verificar</span>}</div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" disabled={saving} onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" disabled={saving} onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" disabled={saving} onClick={() => setEditing('new')}>Agregar empleo</button>} />}
         </section>
       </div>
-      {editing && <div className="modal-layer" role="presentation" onMouseDown={() => setEditing(null)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setEditing(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" onClick={() => setEditing(null)} aria-label="Cerrar">×</button></div><form className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><label>Moneda<select name="currencyCode" defaultValue={editing === 'new' ? 'ARS' : editing.currencyCode}><option value="ARS">ARS — Peso argentino</option><option value="USD">USD — Dólar</option><option value="EUR">EUR — Euro</option></select></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setEditing(null)}>Cancelar</button><button className="button primary">Guardar</button></div></form></section></div>}
+      {editing && <div className="modal-layer" role="presentation" onMouseDown={() => { if (!saving) setEditing(null); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-title" aria-busy={saving} tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => { if (!saving) setEditing(null); })} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" disabled={saving} onClick={() => setEditing(null)} aria-label="Cerrar">×</button></div><form className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><label>Moneda<select name="currencyCode" defaultValue={editing === 'new' ? 'ARS' : editing.currencyCode}><option value="ARS">ARS — Peso argentino</option><option value="USD">USD — Dólar</option><option value="EUR">EUR — Euro</option></select></label>{error && <p className="message error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="button secondary" disabled={saving} onClick={() => setEditing(null)}>Cancelar</button><button className="button primary" disabled={saving}>{saving ? 'Guardando…' : 'Guardar'}</button></div></form></section></div>}
       {confirmation && <div className="modal-layer" role="presentation" onMouseDown={closeConfirmation}>
         <section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-confirmation-title" aria-describedby="employment-confirmation-description" tabIndex={-1} onKeyDown={(event) => handleDialogKey(event, closeConfirmation)} onMouseDown={(event) => event.stopPropagation()}>
           <div className="modal-head"><div><p className="eyebrow">Empleo detectado</p><h2 id="employment-confirmation-title">Confirmar empleo</h2></div><button type="button" className="icon-button" disabled={confirming} onClick={closeConfirmation} aria-label="Cerrar">×</button></div>
@@ -1409,7 +1407,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
             <label>Empresa<input value={confirmation.employerName} readOnly /></label>
             <div className="field-row"><label>Moneda<input value={confirmation.currencyCode} readOnly /></label><label>Documentos detectados<input value={confirmation.documentCount} readOnly /></label></div>
             <p id="employment-confirmation-description">Detectamos recibos entre {periodLabel(confirmation.firstPeriod)} y {periodLabel(confirmation.lastPeriod)}. El último recibo no implica que el empleo haya finalizado.</p>
-            {matchingEmployments.length > 0 && <label>Asociar a<select name="employmentId" defaultValue={matchingEmployments.length === 1 ? matchingEmployments[0]!.id : ''} required autoFocus><option value="" disabled>Elegí un empleo</option>{matchingEmployments.map((item) => <option key={item.id} value={item.id}>{item.employerName}{item.role ? ` · ${item.role}` : ''} · desde {dateLabel(item.startDate)}</option>)}<option value="new">Crear otro empleo</option></select><small>Al elegir uno existente se conservan sus fechas y datos.</small></label>}
+            {matchingEmployments.length > 0 && <label>Asociar a<select name="employmentId" defaultValue={matchingEmployments.length === 1 ? matchingEmployments[0]!.id : ''} required autoFocus><option value="" disabled>Elegí un empleo</option>{matchingEmployments.map((item) => <option key={item.id} value={item.id}>{employmentOptionLabel(item)}</option>)}<option value="new">Crear otro empleo</option></select><small>Al elegir uno existente se conservan sus fechas y datos.</small></label>}
             <div className="field-row"><label>{matchingEmployments.length ? 'Inicio (si creás otro)' : 'Inicio'}<input name="startDate" type="date" defaultValue={`${confirmation.firstPeriod}-01`} required autoFocus={!matchingEmployments.length} /></label><label>Fin (opcional)<input name="endDate" type="date" /></label></div>
             {confirmationError && <p className="message error" role="alert">{confirmationError}</p>}
             <div className="modal-actions"><button type="button" className="button secondary" disabled={confirming} onClick={closeConfirmation}>Cancelar</button><button className="button primary" disabled={confirming}>{confirming ? 'Confirmando…' : matchingEmployments.length ? 'Asociar recibos' : 'Confirmar empleo'}</button></div>
@@ -1550,7 +1548,7 @@ function Importer({ onBusyChange, onDone }: { onBusyChange: (busy: boolean) => v
     <div className="page">
       <PageHeader eyebrow="Carga privada" title="Importar recibos" />
       <p className="page-intro">Seleccioná uno o muchos PDFs. Cada archivo avanza por separado y podés cerrar esta pantalla cuando termine la carga.</p>
-      <label className="import-employment">Asociar todo el lote a<select value={employmentId} disabled={hasActiveBatch || busy} onChange={(event) => setEmploymentId(event.target.value)}><option value="">Sin asociar · detectar empresa</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}</select><small>Si mezclás empresas, dejalo sin asociar y usá los checkboxes del historial después.</small></label>
+      <label className="import-employment">Asociar todo el lote a<select value={employmentId} disabled={hasActiveBatch || busy} onChange={(event) => setEmploymentId(event.target.value)}><option value="">Sin asociar · detectar empresa</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employmentOptionLabel(employment)}</option>)}</select><small>Si mezclás empresas, dejalo sin asociar y usá los checkboxes del historial después.</small></label>
       <label className={`drop-zone${hasActiveBatch || busy ? ' disabled' : ''}`} aria-disabled={hasActiveBatch || busy} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); choose(event.dataTransfer.files); }}><input type="file" accept="application/pdf,.pdf" multiple disabled={hasActiveBatch || busy} onChange={(event) => choose(event.target.files)} /><span className="upload-mark">↑</span><strong>{hasActiveBatch ? 'Hay un lote en curso' : 'Arrastrá tus recibos acá'}</strong><span>{hasActiveBatch ? 'Cuando termine vas a poder iniciar otro' : 'o hacé clic para elegir PDFs'}</span><small>El servidor limita archivos, tamaño total, espacio por cuenta y trabajo simultáneo.</small></label>
       {error && <p className="message error" role="alert">{error}</p>}
       {progress.length > 0 && <section className="panel upload-list" aria-live="polite"><div className="panel-heading"><div><p className="eyebrow">Lote</p><h2>{progress.length} archivo{progress.length === 1 ? '' : 's'}</h2></div>{batch && <span className="batch-id">Lote {batch.id.slice(0, 8)}</span>}</div>{batch && <div className="upload-summary"><progress max={batch.progress.total} value={batch.progress.resolved} aria-label="Progreso del lote" /><strong>{batch.progress.resolved} de {batch.progress.total} resueltos · {batch.progress.percentage}%</strong><small>{batch.totals.PROCESSING ?? 0} procesando · {(batch.totals.UPLOADED ?? 0) + (batch.totals.PENDING_UPLOAD ?? 0)} pendientes · {batch.totals.NEEDS_REVIEW ?? 0} para revisar · {(batch.totals.REJECTED ?? 0) + (batch.totals.FAILED ?? 0)} no procesados</small></div>}<ul>{progress.map((item) => <li key={item.key}><span className="file-icon">PDF</span><span className="upload-name"><strong>{item.name}</strong><small>{item.message ?? (item.status === 'PENDIENTE' ? 'Listo para subir' : 'Enviando…')} · {item.uploadPercentage}% cargado</small><progress max="100" value={item.uploadPercentage} aria-label={`Carga de ${item.name}`} /></span><span className={`upload-state ${item.status.toLowerCase()}`}>{item.status.replace('_', ' ')}</span></li>)}</ul><div className="upload-footer"><p>{hasActiveBatch && !busy && progress.some((item) => item.status === 'PENDIENTE') ? 'La carga se interrumpió. Cancelá los pendientes y volvé a seleccionarlos.' : 'Los errores de un archivo no detienen el resto del lote.'}</p>{hasActiveBatch ? (batch.totals.PENDING_UPLOAD ?? 0) > 0 && <button className="button secondary" disabled={busy} onClick={cancelPending}>Cancelar pendientes</button> : <button className="button primary" disabled={busy || !files.length} onClick={start}>{busy ? 'Subiendo…' : 'Iniciar importación'}</button>}</div></section>}
@@ -1988,19 +1986,20 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const conceptEmploymentContext = context?.employmentContext ?? '';
   const conceptCurrency = context?.currencyCode ?? '';
   const conceptEmployerName = context?.state === 'DETECTED' ? context.employerName ?? '' : '';
+  const stableDetectedContext = /^detected:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(conceptEmploymentContext);
   const buildConceptQuery = useCallback((cursor?: string) => {
-    if (!conceptEmploymentContext || !conceptCurrency || (conceptEmploymentContext.startsWith('detected:') && !conceptEmployerName)) return null;
+    if (!conceptEmploymentContext || !conceptCurrency || (conceptEmploymentContext.startsWith('detected:') && !stableDetectedContext && !conceptEmployerName)) return null;
     const query = new URLSearchParams({
       employmentContext: conceptEmploymentContext,
       currencyCode: conceptCurrency,
       limit: '100',
     });
-    if (conceptEmployerName) query.set('employerName', conceptEmployerName);
+    if (!stableDetectedContext && conceptEmployerName) query.set('employerName', conceptEmployerName);
     if (selectedYear !== 'all') query.set('year', selectedYear);
     if (categoryFilter !== 'all') query.set('category', categoryFilter);
     if (cursor) query.set('cursor', cursor);
     return `/salary-history/concepts?${query}`;
-  }, [categoryFilter, conceptCurrency, conceptEmployerName, conceptEmploymentContext, selectedYear]);
+  }, [categoryFilter, conceptCurrency, conceptEmployerName, conceptEmploymentContext, selectedYear, stableDetectedContext]);
   useEffect(() => {
     const path = tab === 'concepts' ? buildConceptQuery() : null;
     if (!path) return;
@@ -2137,10 +2136,10 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
 
       {tab === 'documents' && <section id="history-panel-documents" role="tabpanel" aria-labelledby="history-tab-documents" tabIndex={0}>
         <div className="document-kind" role="group" aria-label="Tipo de documento">{documentKinds.map(([value, label]) => <button type="button" aria-pressed={documentKind === value} className={documentKind === value ? 'active' : ''} onClick={() => selectDocumentKind(value)} key={value}>{label}</button>)}</div>
-        <form className="document-filters" role="search" onSubmit={(event) => { event.preventDefault(); setDocumentSearch(documentSearchDraft.trim()); setDocumentYear(documentYearDraft || 'all'); }}><label>Buscar<input type="search" value={documentSearchDraft} maxLength={100} placeholder="Archivo o empresa" onChange={(event) => setDocumentSearchDraft(event.target.value)} /></label><label>Empleo<select value={documentEmploymentId} onChange={(event) => setDocumentEmploymentId(event.target.value)}><option value="all">Todos</option><option value="unassociated">Sin empleo asociado</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}</select></label><label>Año<input type="text" inputMode="numeric" pattern="20[0-9]{2}" maxLength={4} value={documentYearDraft} placeholder="Todos" title="Ingresá un año entre 2000 y 2099" onChange={(event) => setDocumentYearDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label><label>Período<input type="month" value={documentPeriod} onChange={(event) => setDocumentPeriod(event.target.value)} /></label>{documentKind !== 'UNSUPPORTED' && <label>Tipo de liquidación<select value={documentSettlementType} onChange={(event) => setDocumentSettlementType(event.target.value)}><option value="all">Todos</option>{settlementTypeOptions.map((value) => <option value={value} key={value}>{settlementTypeLabel(value)}</option>)}</select></label>}<label>Estado<select value={documentStatusGroup} onChange={(event) => setDocumentStatusGroup(event.target.value as (typeof documentStatusGroups)[number][0])}>{documentStatusGroups.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><button type="submit" className="button secondary compact">Buscar</button>{(documentSearch || documentYear !== 'all' || documentPeriod || documentSettlementType !== 'all' || documentEmploymentId !== 'all' || documentStatusGroup !== 'ALL') && <button type="button" className="text-button" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all'); setDocumentEmploymentId('all'); setDocumentStatusGroup('ALL'); }}>Limpiar filtros</button>}</form>
+        <form className="document-filters" role="search" onSubmit={(event) => { event.preventDefault(); setDocumentSearch(documentSearchDraft.trim()); setDocumentYear(documentYearDraft || 'all'); }}><label>Buscar<input type="search" value={documentSearchDraft} maxLength={100} placeholder="Archivo o empresa" onChange={(event) => setDocumentSearchDraft(event.target.value)} /></label><label>Empleo<select value={documentEmploymentId} onChange={(event) => setDocumentEmploymentId(event.target.value)}><option value="all">Todos</option><option value="unassociated">Sin empleo asociado</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employmentOptionLabel(employment)}</option>)}</select></label><label>Año<input type="text" inputMode="numeric" pattern="20[0-9]{2}" maxLength={4} value={documentYearDraft} placeholder="Todos" title="Ingresá un año entre 2000 y 2099" onChange={(event) => setDocumentYearDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label><label>Período<input type="month" value={documentPeriod} onChange={(event) => setDocumentPeriod(event.target.value)} /></label>{documentKind !== 'UNSUPPORTED' && <label>Tipo de liquidación<select value={documentSettlementType} onChange={(event) => setDocumentSettlementType(event.target.value)}><option value="all">Todos</option>{settlementTypeOptions.map((value) => <option value={value} key={value}>{settlementTypeLabel(value)}</option>)}</select></label>}<label>Estado<select value={documentStatusGroup} onChange={(event) => setDocumentStatusGroup(event.target.value as (typeof documentStatusGroups)[number][0])}>{documentStatusGroups.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><button type="submit" className="button secondary compact">Buscar</button>{(documentSearch || documentYear !== 'all' || documentPeriod || documentSettlementType !== 'all' || documentEmploymentId !== 'all' || documentStatusGroup !== 'ALL') && <button type="button" className="text-button" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all'); setDocumentEmploymentId('all'); setDocumentStatusGroup('ALL'); }}>Limpiar filtros</button>}</form>
         {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void reloadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
         {!documentsLoading && !documentError && <p className="document-count">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {documentPendingReview} para revisar · mostrando {documents.length}</p>}
-        {documentKind === 'PAYROLL' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}<option value="none">Quitar asociación</option></select><button type="button" className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={() => void associateDocuments()}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
+        {documentKind === 'PAYROLL' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employmentOptionLabel(employment)}</option>)}<option value="none">Quitar asociación</option></select><button type="button" className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={() => void associateDocuments()}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
         <div id="document-results">{documentError ? null : documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-list">{documents.map(documentRow)}</div>{documentCursor && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title="No encontramos documentos con estos filtros" body="Probá limpiar los filtros o importá un PDF nuevo." />}</div>
       </section>}
 

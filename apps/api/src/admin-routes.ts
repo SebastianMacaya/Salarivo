@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { pool, withTransaction, type PoolClient } from "@salarivo/database";
+import {
+  followMergedEmployer,
+  lockEmployerMutation,
+  normalizeEmployerNameInDatabase,
+  pool,
+  withTransaction,
+  type PoolClient,
+} from "@salarivo/database";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
 import {
@@ -11,6 +18,10 @@ import {
   type AdminPermission,
   type AdminRole,
 } from "./admin-rbac.ts";
+import {
+  InvalidArgentineCuitError,
+  protectArgentineCuit,
+} from "./employer-identifiers.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
@@ -23,6 +34,8 @@ const reasonCodes = [
   "OPERATIONAL_RECOVERY",
   "ROLE_ADMINISTRATION",
 ] as const;
+const employerStatuses = ["PENDING", "VERIFIED", "MERGED", "REJECTED"] as const;
+const employerSources = ["LEGACY", "MANUAL", "DOCUMENT", "ADMIN"] as const;
 type ReasonCode = typeof reasonCodes[number];
 
 type ApiErrorConstructor = new (
@@ -84,6 +97,16 @@ const reasonBodySchema = {
   additionalProperties: false,
   required: ["reasonCode", "reference"],
   properties: reasonProperties,
+};
+
+const employerIdentifierSchema = {
+  type: "object", additionalProperties: false,
+  required: ["id", "countryCode", "identifierType", "maskedValue", "createdSource", "createdAt"],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN }, countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
+    identifierType: { type: "string" }, maskedValue: { type: "string", pattern: "^\\*\\*\\*[A-Za-z0-9]*$" },
+    createdSource: { type: "string", enum: [...employerSources] }, createdAt: { type: "string" },
+  },
 };
 
 const uuidRegex = new RegExp(UUID_PATTERN, "i");
@@ -176,6 +199,51 @@ function text(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
 }
 
+export function maskEmployerIdentifier(suffix: unknown): string {
+  return typeof suffix === "string" && suffix.length > 0 ? `***${suffix}` : "***";
+}
+
+async function employerNameInput(
+  client: PoolClient,
+  value: string,
+  ApiError: ApiErrorConstructor,
+): Promise<{ value: string; normalized: string }> {
+  const trimmed = value.trim();
+  if (!trimmed) throw new ApiError(400, "VALIDATION_ERROR", "El nombre del empleador no es válido.");
+  const normalized = await normalizeEmployerNameInDatabase(client, trimmed);
+  if (!normalized || [...normalized].length > 200) {
+    throw new ApiError(400, "VALIDATION_ERROR", "El nombre del empleador no es válido.");
+  }
+  return { value: trimmed, normalized };
+}
+
+function employerAdminDto(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    normalizedName: String(row.normalized_name),
+    countryCode: String(row.country_code),
+    status: String(row.status),
+    mergedIntoEmployerId: text(row.merged_into_employer_id),
+    createdSource: String(row.created_source),
+    employmentCount: integer(row.employment_count),
+    userCount: integer(row.user_count),
+    documentCount: integer(row.document_count),
+    createdAt: timestamp(row.created_at as Date | string | null)!,
+    updatedAt: timestamp(row.updated_at as Date | string | null)!,
+    verifiedAt: timestamp(row.verified_at as Date | string | null),
+  };
+}
+
+function employerStateDto(row: Record<string, unknown>) {
+  return {
+    id: String(row.id), name: String(row.name), normalizedName: String(row.normalized_name),
+    status: String(row.status), mergedIntoEmployerId: text(row.merged_into_employer_id),
+    updatedAt: timestamp(row.updated_at as Date | string | null)!,
+    verifiedAt: timestamp(row.verified_at as Date | string | null),
+  };
+}
+
 async function lockActor(
   client: PoolClient,
   request: FastifyRequest,
@@ -208,6 +276,170 @@ async function lockActor(
     throw new ApiError(403, "ADMIN_PERMISSION_REQUIRED", "No tenés permisos para realizar esta operación.");
   }
   return row.admin_role;
+}
+
+export async function lockEmployerManagement(
+  client: PoolClient,
+  request: FastifyRequest,
+  ApiError: ApiErrorConstructor,
+): Promise<AdminRole> {
+  // ponytail: one global admin-employer lock; split by employer only if measured contention appears.
+  await lockEmployerMutation(client);
+  return lockActor(client, request, "employers.manage", ApiError);
+}
+
+async function lockEmployerNames(
+  client: PoolClient,
+  countryCode: string,
+  normalizedNames: readonly string[],
+): Promise<void> {
+  const keys = [...new Set(normalizedNames)]
+    .map((name) => `employer-name:${countryCode}:${name}`)
+    .sort();
+  for (const key of keys) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [key]);
+  }
+}
+
+async function lockEmployerIdentities(
+  client: PoolClient,
+  names: readonly { countryCode: string; normalizedName: string }[],
+  identifiers: readonly { countryCode: string; identifierType: string; fingerprint: string }[],
+): Promise<ReadonlySet<string>> {
+  const identifierKeys = [...new Set(identifiers.map((identifier) =>
+    `employer-identifier:${identifier.countryCode}:${identifier.identifierType}:${identifier.fingerprint}`))].sort();
+  const nameKeys = [...new Set(names.map((name) =>
+    `employer-name:${name.countryCode}:${name.normalizedName}`))].sort();
+  const keys = [...identifierKeys, ...nameKeys];
+  for (const key of keys) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [key]);
+  }
+  return new Set(keys);
+}
+
+type EmployerMergeRow = {
+  id: string;
+  name: string;
+  normalized_name: string;
+  country_code: string;
+  status: string;
+  merged_into_employer_id: string | null;
+};
+
+async function readEmployerMergeChain(
+  client: PoolClient,
+  employerId: string,
+  ApiError: ApiErrorConstructor,
+): Promise<EmployerMergeRow[]> {
+  const chain: EmployerMergeRow[] = [];
+  const visited = new Set<string>();
+  let currentId = employerId;
+  for (let depth = 0; depth < 32; depth += 1) {
+    if (visited.has(currentId)) {
+      throw new ApiError(409, "EMPLOYER_MERGE_CHAIN_INVALID", "La cadena de fusión del destino no es válida.");
+    }
+    visited.add(currentId);
+    const result = await client.query<EmployerMergeRow>(
+      `SELECT id, name, normalized_name, country_code, status, merged_into_employer_id
+         FROM employers
+        WHERE id = $1`,
+      [currentId],
+    );
+    const row = result.rows[0];
+    if (!row || row.status === "REJECTED") {
+      throw new ApiError(404, "TARGET_EMPLOYER_NOT_FOUND", "El empleador destino no existe o fue rechazado.");
+    }
+    chain.push(row);
+    if (row.status !== "MERGED") return chain;
+    if (!row.merged_into_employer_id) {
+      throw new ApiError(409, "EMPLOYER_MERGE_CHAIN_INVALID", "La cadena de fusión del destino no es válida.");
+    }
+    currentId = row.merged_into_employer_id;
+  }
+  throw new ApiError(409, "EMPLOYER_MERGE_CHAIN_INVALID", "La cadena de fusión del destino es demasiado larga.");
+}
+
+type EmployerNameIdentityRow = { employer_id: string; country_code: string; normalized_name: string };
+type EmployerIdentifierIdentityRow = {
+  employer_id: string;
+  country_code: string;
+  identifier_type: string;
+  identifier_fingerprint: string;
+};
+
+async function readEmployerIdentitySnapshot(client: PoolClient, employerIds: readonly string[]) {
+  const names = await client.query<EmployerNameIdentityRow>(
+    `SELECT id AS employer_id, country_code, normalized_name
+       FROM employers
+      WHERE id = ANY($1::uuid[])
+     UNION
+     SELECT alias.employer_id, employer.country_code, alias.normalized_alias AS normalized_name
+       FROM employer_aliases alias
+       JOIN employers employer ON employer.id = alias.employer_id
+      WHERE alias.employer_id = ANY($1::uuid[])`,
+    [employerIds],
+  );
+  const identifiers = await client.query<EmployerIdentifierIdentityRow>(
+    `SELECT employer_id, country_code, identifier_type, identifier_fingerprint
+       FROM employer_identifiers
+      WHERE employer_id = ANY($1::uuid[]) AND identifier_fingerprint IS NOT NULL`,
+    [employerIds],
+  );
+  return { names: names.rows, identifiers: identifiers.rows };
+}
+
+function identityLockKey(row: EmployerNameIdentityRow | EmployerIdentifierIdentityRow): string {
+  if ("identifier_fingerprint" in row) {
+    return `employer-identifier:${row.country_code}:${row.identifier_type}:${row.identifier_fingerprint}`;
+  }
+  return `employer-name:${row.country_code}:${row.normalized_name}`;
+}
+
+async function assertEmployerNameAvailable(
+  client: PoolClient,
+  employerId: string,
+  countryCode: string,
+  normalizedName: string,
+  ApiError: ApiErrorConstructor,
+  allowDistinctStrongIdentifiers = false,
+): Promise<void> {
+  const matches = await client.query(
+    `SELECT id
+       FROM employers
+      WHERE country_code = $1 AND normalized_name = $2 AND status <> 'REJECTED'
+     UNION
+     SELECT alias.employer_id AS id
+       FROM employer_aliases alias
+       JOIN employers employer ON employer.id = alias.employer_id
+      WHERE employer.country_code = $1 AND alias.normalized_alias = $2 AND employer.status <> 'REJECTED'
+     ORDER BY id`,
+    [countryCode, normalizedName],
+  );
+  for (const match of matches.rows) {
+    const canonical = await followMergedEmployer(client, String(match.id));
+    if (canonical && canonical.id !== employerId) {
+      if (allowDistinctStrongIdentifiers) {
+        const distinction = await client.query<{ proven: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1
+               FROM employer_identifiers candidate
+               JOIN employer_identifiers existing
+                 ON existing.country_code = candidate.country_code
+                AND existing.identifier_type = candidate.identifier_type
+              WHERE candidate.employer_id = $1
+                AND existing.employer_id = $2
+                AND candidate.country_code = $3
+                AND candidate.identifier_fingerprint IS NOT NULL
+                AND existing.identifier_fingerprint IS NOT NULL
+                AND candidate.identifier_fingerprint <> existing.identifier_fingerprint
+           ) AS proven`,
+          [employerId, canonical.id, countryCode],
+        );
+        if (distinction.rows[0]?.proven) continue;
+      }
+      throw new ApiError(409, "EMPLOYER_NAME_CONFLICT", "Ese nombre o alias pertenece a otro empleador; usá la fusión.");
+    }
+  }
 }
 
 async function audit(
@@ -617,7 +849,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           `SELECT employment.id, employment.employer_id, employer.name AS employer_name,
                   employment.status, employment.start_date, employment.end_date, employment.country_code
              FROM employments AS employment
-             JOIN employers AS employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+             JOIN employers AS employer ON employer.id = employment.employer_id
             WHERE employment.user_id = $1 AND $2::boolean
             ORDER BY employment.start_date DESC, employment.id
             LIMIT 25`,
@@ -721,6 +953,116 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
         });
         return { data: { id: request.params.id, status: request.body.status, revokedSessions: revoked.rowCount ?? 0 } };
       });
+    },
+  );
+
+  app.post<{ Params: IdParams; Body: Reason & { cuit: string } }>(
+    "/api/v1/admin/employers/:id/identifiers/cuit",
+    {
+      config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_IDENTIFIER_SET", resourceType: "EMPLOYER" } },
+      preHandler: guard("employers.manage", true),
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object", additionalProperties: false, required: ["cuit", "reasonCode", "reference"],
+          properties: { cuit: { type: "string", minLength: 11, maxLength: 32 }, ...reasonProperties },
+        },
+        ...ok(employerIdentifierSchema),
+      },
+    },
+    async (request) => {
+      let identifier;
+      try {
+        identifier = protectArgentineCuit(request.body.cuit, config.employerIdentifierProtection);
+      } catch (error) {
+        if (error instanceof InvalidArgentineCuitError) {
+          throw new ApiError(400, "INVALID_CUIT", "El CUIT no tiene un formato o dígito verificador válido.");
+        }
+        throw error;
+      }
+      const response = await withTransaction(async (client) => {
+        const actorRole = await lockEmployerManagement(client, request, ApiError);
+        const employer = await client.query(
+          `SELECT id, country_code, status FROM employers WHERE id = $1 FOR UPDATE`,
+          [request.params.id],
+        );
+        if (employer.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        if (employer.rows[0].country_code !== "AR") {
+          throw new ApiError(409, "EMPLOYER_IDENTIFIER_UNSUPPORTED", "Este identificador sólo está habilitado para empleadores de Argentina.");
+        }
+        if (!["PENDING", "VERIFIED"].includes(employer.rows[0].status)) {
+          throw new ApiError(409, "EMPLOYER_NOT_EDITABLE", "El empleador no admite cambios de identificador.");
+        }
+        const existing = await client.query(
+          `SELECT id FROM employer_identifiers
+            WHERE employer_id = $1 AND country_code = 'AR' AND identifier_type = 'CUIT'
+            FOR UPDATE`,
+          [request.params.id],
+        );
+        const conflict = await client.query(
+          `SELECT 1 FROM employer_identifiers
+            WHERE country_code = 'AR' AND identifier_type = 'CUIT'
+              AND identifier_fingerprint = $1 AND employer_id <> $2
+            LIMIT 1`,
+          [identifier.fingerprint, request.params.id],
+        );
+        if (conflict.rowCount) {
+          throw new ApiError(409, "EMPLOYER_IDENTIFIER_CONFLICT", "Ese CUIT ya pertenece a otro empleador; revisá o fusioná las identidades.");
+        }
+        const values = [
+          request.params.id,
+          Buffer.from(identifier.ciphertext),
+          identifier.fingerprint,
+          identifier.keyVersion,
+          identifier.maskedSuffix,
+          request.authUser!.id,
+        ];
+        const saved = existing.rowCount
+          ? await client.query(
+            `UPDATE employer_identifiers
+                SET identifier_ciphertext = $2, identifier_fingerprint = $3,
+                    identifier_key_version = $4, masked_suffix = $5,
+                    created_source = 'ADMIN', created_by_user_id = $6
+              WHERE employer_id = $1 AND country_code = 'AR' AND identifier_type = 'CUIT'
+              RETURNING id, country_code, identifier_type, masked_suffix, created_source, created_at`,
+            values,
+          )
+          : await client.query(
+            `INSERT INTO employer_identifiers (
+               id, employer_id, country_code, identifier_type, identifier_ciphertext,
+               identifier_fingerprint, identifier_key_version, masked_suffix,
+               created_source, created_by_user_id
+             ) VALUES ($7, $1, 'AR', 'CUIT', $2, $3, $4, $5, 'ADMIN', $6)
+             RETURNING id, country_code, identifier_type, masked_suffix, created_source, created_at`,
+            [...values, randomUUID()],
+          );
+        await client.query("UPDATE employers SET updated_at = now() WHERE id = $1", [request.params.id]);
+        const row = saved.rows[0];
+        const operation = existing.rowCount ? "CORRECTED" : "ADDED";
+        await audit(
+          client,
+          request,
+          actorRole,
+          "employers.manage",
+          "EMPLOYER_IDENTIFIER_SET",
+          "EMPLOYER",
+          request.params.id,
+          null,
+          { reasonCode: request.body.reasonCode, reference: request.body.reference },
+          { identifierId: row.id, countryCode: "AR", identifierType: "CUIT", operation },
+        );
+        return { data: {
+          id: String(row.id), countryCode: String(row.country_code), identifierType: String(row.identifier_type),
+          maskedValue: maskEmployerIdentifier(row.masked_suffix), createdSource: String(row.created_source),
+          createdAt: timestamp(row.created_at)!,
+        } };
+      });
+      request.log.info({
+        event: "employer.identifier.set", employerId: request.params.id,
+        countryCode: "AR", identifierType: "CUIT", result: "SUCCESS",
+        actorUserId: request.authUser!.id, actorAdminRole: request.authUser!.adminRole,
+      }, "employer identifier set");
+      return response;
     },
   );
 
@@ -1270,7 +1612,76 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     }),
   );
 
-  app.get<{ Querystring: ListQuery & { userId?: string; countryCode?: string } }>(
+  const employerItemSchema = {
+    type: "object", additionalProperties: false,
+    required: [
+      "id", "name", "normalizedName", "countryCode", "status", "mergedIntoEmployerId",
+      "createdSource", "employmentCount", "userCount", "documentCount", "createdAt", "updatedAt", "verifiedAt",
+    ],
+    properties: {
+      id: { type: "string", pattern: UUID_PATTERN }, name: { type: "string" }, normalizedName: { type: "string" },
+      countryCode: { type: "string", pattern: "^[A-Z]{2}$" }, status: { type: "string", enum: [...employerStatuses] },
+      mergedIntoEmployerId: { anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }] },
+      createdSource: { type: "string", enum: [...employerSources] }, employmentCount: { type: "integer", minimum: 0 },
+      userCount: { type: "integer", minimum: 0 }, documentCount: { type: "integer", minimum: 0 },
+      createdAt: { type: "string" }, updatedAt: { type: "string" },
+      verifiedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+    },
+  };
+
+  const employerAliasSchema = {
+    type: "object", additionalProperties: false,
+    required: ["id", "alias", "normalizedAlias", "createdSource", "createdAt"],
+    properties: {
+      id: { type: "string", pattern: UUID_PATTERN }, alias: { type: "string" }, normalizedAlias: { type: "string" },
+      createdSource: { type: "string", enum: [...employerSources] }, createdAt: { type: "string" },
+    },
+  };
+
+  const employerPossibleMatchSchema = {
+    type: "object", additionalProperties: false,
+    required: ["id", "name", "status", "matchReason", "employmentCount", "userCount", "documentCount"],
+    properties: {
+      id: { type: "string", pattern: UUID_PATTERN }, name: { type: "string" },
+      status: { type: "string", enum: ["PENDING", "VERIFIED"] },
+      matchReason: { type: "string", enum: ["EXACT_NORMALIZED_NAME", "EXACT_NORMALIZED_ALIAS"] },
+      employmentCount: { type: "integer", minimum: 0 }, userCount: { type: "integer", minimum: 0 },
+      documentCount: { type: "integer", minimum: 0 },
+    },
+  };
+
+  const employerDetectionOriginSchema = {
+    type: "object", additionalProperties: false,
+    required: ["documentId", "importBatchId", "employerName", "confidence", "source", "detectedAt"],
+    properties: {
+      documentId: { type: "string", pattern: UUID_PATTERN },
+      importBatchId: { type: "string", pattern: UUID_PATTERN },
+      employerName: { anyOf: [{ type: "string", maxLength: 200 }, { type: "null" }] },
+      confidence: { anyOf: [{ type: "number", minimum: 0, maximum: 1 }, { type: "null" }] },
+      source: {
+        anyOf: [
+          { type: "string", enum: ["PDF_TEXT", "OCR", "RULE", "TEMPLATE", "AI_FALLBACK", "HUMAN_CORRECTION"] },
+          { type: "null" },
+        ],
+      },
+      detectedAt: { type: "string" },
+    },
+  };
+
+  const employerStateSchema = {
+    type: "object", additionalProperties: false,
+    required: ["id", "name", "normalizedName", "status", "mergedIntoEmployerId", "updatedAt", "verifiedAt"],
+    properties: {
+      id: { type: "string", pattern: UUID_PATTERN }, name: { type: "string" }, normalizedName: { type: "string" },
+      status: { type: "string", enum: [...employerStatuses] },
+      mergedIntoEmployerId: { anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }] },
+      updatedAt: { type: "string" }, verifiedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+    },
+  };
+
+  type EmployerQuery = ListQuery & { status?: typeof employerStatuses[number]; countryCode?: string };
+
+  app.get<{ Querystring: EmployerQuery }>(
     "/api/v1/admin/employers",
     {
       preHandler: guard("employers.read_metadata"),
@@ -1279,9 +1690,9 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           type: "object", additionalProperties: false,
           properties: {
             ...pagingProperties,
-            search: { type: "string", minLength: 1, maxLength: 120 }, userId: { type: "string", pattern: UUID_PATTERN },
+            search: { type: "string", minLength: 1, maxLength: 120 }, status: { type: "string", enum: [...employerStatuses] },
             countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
-            sort: { type: "string", enum: ["createdAt", "name", "employments"] },
+            sort: { type: "string", enum: ["createdAt", "name", "status", "employments", "users", "documents"] },
             direction: { type: "string", enum: ["asc", "desc"] },
           },
         },
@@ -1289,16 +1700,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           type: "object", additionalProperties: false, required: ["items", "page", "pageSize", "total"],
           properties: {
             items: {
-              type: "array", items: {
-                type: "object", additionalProperties: false,
-                required: ["id", "userId", "name", "countryCode", "employmentCount", "activeEmploymentCount", "createdAt", "updatedAt"],
-                properties: {
-                  id: { type: "string", pattern: UUID_PATTERN }, userId: { type: "string", pattern: UUID_PATTERN },
-                  name: { type: "string" }, countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
-                  employmentCount: { type: "integer", minimum: 0 }, activeEmploymentCount: { type: "integer", minimum: 0 },
-                  createdAt: { type: "string" }, updatedAt: { type: "string" },
-                },
-              },
+              type: "array", items: employerItemSchema,
             },
             ...paginationFields,
           },
@@ -1308,31 +1710,702 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     async (request) => {
       const { page, pageSize, offset } = pageOf(request.query);
       const order = sortOf(request.query.sort, request.query.direction, {
-        createdAt: "employer.created_at", name: "lower(employer.name)", employments: "employment_count",
+        createdAt: "employer.created_at", name: "employer.normalized_name", status: "employer.status",
+        employments: "employment_count", users: "user_count", documents: "document_count",
       }, "createdAt");
-      const sql = `SELECT employer.id, employer.user_id, employer.name, employer.country_code,
-                employer.created_at, employer.updated_at,
-                count(employment.id)::integer AS employment_count,
-                count(employment.id) FILTER (WHERE employment.status = 'ACTIVE')::integer AS active_employment_count,
+      const sql = `SELECT employer.id, employer.name, employer.normalized_name, employer.country_code,
+                employer.status, employer.merged_into_employer_id, employer.created_source,
+                employer.created_at, employer.updated_at, employer.verified_at,
+                (SELECT count(*)::integer FROM employments employment WHERE employment.employer_id = employer.id) AS employment_count,
+                (SELECT count(DISTINCT employment.user_id)::integer FROM employments employment WHERE employment.employer_id = employer.id) AS user_count,
+                (SELECT count(*)::integer
+                   FROM documents document
+                  WHERE document.deleted_at IS NULL
+                    AND (document.detected_employer_id = employer.id OR EXISTS (
+                      SELECT 1 FROM employments employment
+                       WHERE employment.id = document.employment_id
+                         AND employment.user_id = document.user_id
+                         AND employment.employer_id = employer.id
+                    ))) AS document_count,
                 count(*) OVER ()::integer AS total
            FROM employers employer
-           LEFT JOIN employments employment ON employment.employer_id = employer.id AND employment.user_id = employer.user_id
-          WHERE ($1::text IS NULL OR employer.id::text = $1 OR employer.user_id::text = $1 OR lower(employer.name) LIKE lower($1) || '%' ESCAPE '\\')
-            AND ($2::uuid IS NULL OR employer.user_id = $2)
-            AND ($3::text IS NULL OR employer.country_code = $3)
-          GROUP BY employer.id
+          WHERE ($1::text IS NULL OR employer.id::text = $1 OR lower(employer.name) LIKE lower($1) || '%' ESCAPE '\\'
+                 OR (NULLIF(normalize_employer_name($2), '') IS NOT NULL
+                   AND left(employer.normalized_name, length(normalize_employer_name($2))) = normalize_employer_name($2))
+                 OR EXISTS (
+                   SELECT 1 FROM employer_aliases alias
+                    WHERE alias.employer_id = employer.id
+                      AND NULLIF(normalize_employer_name($2), '') IS NOT NULL
+                      AND left(alias.normalized_alias, length(normalize_employer_name($2))) = normalize_employer_name($2)
+                 ))
+            AND ($3::text IS NULL OR employer.status = $3)
+            AND ($4::text IS NULL OR employer.country_code = $4)
           ORDER BY ${order}, employer.id
-          LIMIT $4 OFFSET $5`;
-      const values = [prefixSearchOf(request.query.search), request.query.userId ?? null, request.query.countryCode ?? null, pageSize, offset];
+          LIMIT $5 OFFSET $6`;
+      const search = searchOf(request.query.search);
+      const values = [prefixSearchOf(search ?? undefined), search,
+        request.query.status ?? null, request.query.countryCode ?? null, pageSize, offset];
       const result = await pool.query(sql, values);
       const total = await totalForPage(sql, values, result.rows[0]?.total, offset);
       return {
-        data: paged(result.rows.map((row) => ({
-          id: String(row.id), userId: String(row.user_id), name: String(row.name), countryCode: String(row.country_code),
-          employmentCount: integer(row.employment_count), activeEmploymentCount: integer(row.active_employment_count),
-          createdAt: timestamp(row.created_at)!, updatedAt: timestamp(row.updated_at)!,
-        })), page, pageSize, total),
+        data: paged(result.rows.map(employerAdminDto), page, pageSize, total),
       };
+    },
+  );
+
+  app.get<{ Params: IdParams }>(
+    "/api/v1/admin/employers/:id",
+    {
+      preHandler: guard("employers.read_metadata"),
+      schema: {
+        params: idParamsSchema,
+        ...ok({
+          type: "object", additionalProperties: false,
+          required: ["employer", "aliases", "identifiers", "possibleMatches", "detectionOrigins"],
+          properties: {
+            employer: employerItemSchema,
+            aliases: { type: "array", items: employerAliasSchema },
+            identifiers: { type: "array", items: employerIdentifierSchema },
+            possibleMatches: { type: "array", items: employerPossibleMatchSchema },
+            detectionOrigins: { type: "array", maxItems: 20, items: employerDetectionOriginSchema },
+          },
+        }),
+      },
+    },
+    async (request) => {
+      const employer = await pool.query(
+        `SELECT employer.id, employer.name, employer.normalized_name, employer.country_code,
+                employer.status, employer.merged_into_employer_id, employer.created_source,
+                employer.created_at, employer.updated_at, employer.verified_at,
+                (SELECT count(*)::integer FROM employments employment WHERE employment.employer_id = employer.id) AS employment_count,
+                (SELECT count(DISTINCT employment.user_id)::integer FROM employments employment WHERE employment.employer_id = employer.id) AS user_count,
+                (SELECT count(*)::integer
+                   FROM documents document
+                  WHERE document.deleted_at IS NULL
+                    AND (document.detected_employer_id = employer.id OR EXISTS (
+                      SELECT 1 FROM employments employment
+                       WHERE employment.id = document.employment_id
+                         AND employment.user_id = document.user_id
+                         AND employment.employer_id = employer.id
+                    ))) AS document_count
+           FROM employers employer
+          WHERE employer.id = $1`,
+        [request.params.id],
+      );
+      if (employer.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const [aliases, identifiers, possibleMatches, detectionOrigins] = await Promise.all([
+        pool.query(
+          `SELECT id, alias, normalized_alias, created_source, created_at
+             FROM employer_aliases WHERE employer_id = $1
+            ORDER BY normalized_alias, id`,
+          [request.params.id],
+        ),
+        pool.query(
+          `SELECT id, country_code, identifier_type, masked_suffix, created_source, created_at
+             FROM employer_identifiers WHERE employer_id = $1
+            ORDER BY country_code, identifier_type, id`,
+          [request.params.id],
+        ),
+        pool.query(
+          `WITH current_identity AS (
+             SELECT normalized_name
+               FROM employers
+              WHERE id = $1
+             UNION
+             SELECT normalized_alias
+               FROM employer_aliases
+              WHERE employer_id = $1
+           ), candidate_matches AS (
+             SELECT candidate.id AS employer_id, 'EXACT_NORMALIZED_NAME'::text AS match_reason, 1 AS priority
+               FROM employers candidate
+               JOIN current_identity identity ON identity.normalized_name = candidate.normalized_name
+              WHERE candidate.id <> $1
+                AND candidate.country_code = $2
+                AND candidate.status IN ('PENDING', 'VERIFIED')
+             UNION ALL
+             SELECT candidate.id AS employer_id, 'EXACT_NORMALIZED_ALIAS'::text AS match_reason, 2 AS priority
+               FROM employers candidate
+               JOIN employer_aliases alias ON alias.employer_id = candidate.id
+               JOIN current_identity identity ON identity.normalized_name = alias.normalized_alias
+              WHERE candidate.id <> $1
+                AND candidate.country_code = $2
+                AND candidate.status IN ('PENDING', 'VERIFIED')
+           ), best_matches AS (
+             SELECT DISTINCT ON (employer_id) employer_id, match_reason
+               FROM candidate_matches
+              ORDER BY employer_id, priority
+           )
+           SELECT candidate.id, candidate.name, candidate.status, match.match_reason,
+                  (SELECT count(*)::integer FROM employments employment
+                    WHERE employment.employer_id = candidate.id) AS employment_count,
+                  (SELECT count(DISTINCT employment.user_id)::integer FROM employments employment
+                    WHERE employment.employer_id = candidate.id) AS user_count,
+                  (SELECT count(*)::integer
+                     FROM documents document
+                    WHERE document.deleted_at IS NULL
+                      AND (document.detected_employer_id = candidate.id OR EXISTS (
+                        SELECT 1 FROM employments employment
+                         WHERE employment.id = document.employment_id
+                           AND employment.user_id = document.user_id
+                           AND employment.employer_id = candidate.id
+                      ))) AS document_count
+             FROM best_matches match
+             JOIN employers candidate ON candidate.id = match.employer_id
+            ORDER BY candidate.normalized_name, candidate.id`,
+          [request.params.id, String(employer.rows[0].country_code)],
+        ),
+        pool.query(
+          `WITH latest_completed_runs AS (
+             SELECT DISTINCT ON (run.document_id)
+                    run.id, run.user_id, run.document_id, run.finished_at,
+                    document.import_batch_id
+               FROM documents document
+               JOIN extraction_runs run
+                 ON run.document_id = document.id AND run.user_id = document.user_id
+              WHERE document.detected_employer_id = $1
+                AND document.deleted_at IS NULL
+                AND run.status = 'COMPLETED'
+              ORDER BY run.document_id, run.processing_version DESC, run.id DESC
+           )
+           SELECT latest.document_id, latest.import_batch_id,
+                  COALESCE(
+                    CASE WHEN jsonb_typeof(correction.corrected_value) = 'string'
+                      THEN left(NULLIF(btrim(correction.corrected_value #>> '{}'), ''), 200)
+                    END,
+                    CASE WHEN jsonb_typeof(field.interpreted_value) = 'string'
+                      THEN left(NULLIF(btrim(field.interpreted_value #>> '{}'), ''), 200)
+                    END
+                  ) AS employer_name,
+                  CASE WHEN correction.id IS NULL THEN field.confidence ELSE NULL END AS confidence,
+                  CASE WHEN correction.id IS NOT NULL THEN 'HUMAN_CORRECTION' ELSE field.source END AS source,
+                  COALESCE(correction.created_at, field.created_at, latest.finished_at) AS detected_at
+             FROM latest_completed_runs latest
+             LEFT JOIN extracted_fields field
+               ON field.user_id = latest.user_id
+              AND field.document_id = latest.document_id
+              AND field.extraction_run_id = latest.id
+              AND field.field_path = 'employer.name'
+             LEFT JOIN LATERAL (
+               SELECT current.id, current.corrected_value, current.created_at
+                 FROM user_corrections current
+                WHERE current.user_id = latest.user_id
+                  AND current.document_id = latest.document_id
+                  AND current.extraction_run_id = latest.id
+                  AND current.field_path = 'employer.name'
+                ORDER BY current.correction_version DESC, current.created_at DESC, current.id DESC
+                LIMIT 1
+             ) correction ON true
+            ORDER BY detected_at DESC, latest.document_id DESC
+            LIMIT 20`,
+          [request.params.id],
+        ),
+      ]);
+      return {
+        data: {
+          employer: employerAdminDto(employer.rows[0]),
+          aliases: aliases.rows.map((row) => ({
+            id: String(row.id), alias: String(row.alias), normalizedAlias: String(row.normalized_alias),
+            createdSource: String(row.created_source), createdAt: timestamp(row.created_at)!,
+          })),
+          identifiers: identifiers.rows.map((row) => ({
+            id: String(row.id), countryCode: String(row.country_code), identifierType: String(row.identifier_type),
+            maskedValue: maskEmployerIdentifier(row.masked_suffix), createdSource: String(row.created_source),
+            createdAt: timestamp(row.created_at)!,
+          })),
+          possibleMatches: possibleMatches.rows.map((row) => ({
+            id: String(row.id), name: String(row.name), status: String(row.status),
+            matchReason: String(row.match_reason), employmentCount: integer(row.employment_count),
+            userCount: integer(row.user_count), documentCount: integer(row.document_count),
+          })),
+          detectionOrigins: detectionOrigins.rows.map((row) => ({
+            documentId: String(row.document_id), importBatchId: String(row.import_batch_id),
+            employerName: text(row.employer_name),
+            confidence: row.confidence === null ? null : Number(row.confidence),
+            source: text(row.source), detectedAt: timestamp(row.detected_at)!,
+          })),
+        },
+      };
+    },
+  );
+
+  app.post<{ Params: IdParams; Body: Reason & { name?: string } }>(
+    "/api/v1/admin/employers/:id/approve",
+    {
+      config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_APPROVED", resourceType: "EMPLOYER" } },
+      preHandler: guard("employers.manage", true),
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object", additionalProperties: false, required: ["reasonCode", "reference"],
+          properties: { name: { type: "string", minLength: 1, maxLength: 200 }, ...reasonProperties },
+        },
+        ...ok(employerStateSchema),
+      },
+    },
+    async (request) => {
+      const response = await withTransaction(async (client) => {
+        const actorRole = await lockEmployerManagement(client, request, ApiError);
+      const observed = await client.query(
+        `SELECT id, name, normalized_name, country_code FROM employers WHERE id = $1`,
+        [request.params.id],
+      );
+      if (observed.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const proposed = request.body.name === undefined
+        ? { value: String(observed.rows[0].name), normalized: String(observed.rows[0].normalized_name) }
+        : await employerNameInput(client, request.body.name, ApiError);
+      await lockEmployerNames(client, String(observed.rows[0].country_code), [String(observed.rows[0].normalized_name), proposed.normalized]);
+      const current = await client.query(
+        `SELECT id, name, normalized_name, country_code, status
+           FROM employers WHERE id = $1 FOR UPDATE`,
+        [request.params.id],
+      );
+      if (current.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const row = current.rows[0];
+      if (!["PENDING", "REJECTED"].includes(row.status)) {
+        throw new ApiError(409, "EMPLOYER_NOT_APPROVABLE", "El empleador no está pendiente de aprobación.");
+      }
+      const next = request.body.name === undefined
+        ? { value: String(row.name), normalized: String(row.normalized_name) }
+        : proposed;
+      await assertEmployerNameAvailable(client, request.params.id, String(row.country_code), next.normalized, ApiError, true);
+      if (next.normalized !== row.normalized_name) {
+        await client.query(
+          `INSERT INTO employer_aliases (
+             id, employer_id, alias, created_source, created_by_user_id
+           ) VALUES ($1, $2, $3, 'ADMIN', $4)
+           ON CONFLICT (employer_id, normalized_alias) DO NOTHING`,
+          [randomUUID(), request.params.id, row.name, request.authUser!.id],
+        );
+      }
+      const updated = await client.query(
+        `UPDATE employers
+            SET name = $2, status = 'VERIFIED', merged_into_employer_id = NULL,
+                verified_at = now(), verified_by_user_id = $3, updated_at = now()
+          WHERE id = $1
+          RETURNING id, name, normalized_name, status, merged_into_employer_id, updated_at, verified_at`,
+        [request.params.id, next.value, request.authUser!.id],
+      );
+      await audit(client, request, actorRole, "employers.manage", "EMPLOYER_APPROVED", "EMPLOYER", request.params.id, null, request.body, {
+        previousStatus: row.status, renamed: next.value !== row.name,
+      });
+        return { data: employerStateDto(updated.rows[0]) };
+      });
+      request.log.info({
+        event: "employer.approved", employerId: request.params.id, result: "SUCCESS",
+        actorUserId: request.authUser!.id, actorAdminRole: request.authUser!.adminRole,
+      }, "employer approved");
+      return response;
+    },
+  );
+
+  app.post<{ Params: IdParams; Body: Reason & { name: string } }>(
+    "/api/v1/admin/employers/:id/rename",
+    {
+      config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_RENAMED", resourceType: "EMPLOYER" } },
+      preHandler: guard("employers.manage", true),
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object", additionalProperties: false, required: ["name", "reasonCode", "reference"],
+          properties: { name: { type: "string", minLength: 1, maxLength: 200 }, ...reasonProperties },
+        },
+        ...ok(employerStateSchema),
+      },
+    },
+    async (request) => withTransaction(async (client) => {
+      const actorRole = await lockEmployerManagement(client, request, ApiError);
+      const next = await employerNameInput(client, request.body.name, ApiError);
+      const observed = await client.query(
+        `SELECT id, normalized_name, country_code FROM employers WHERE id = $1`,
+        [request.params.id],
+      );
+      if (observed.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      await lockEmployerNames(client, String(observed.rows[0].country_code), [String(observed.rows[0].normalized_name), next.normalized]);
+      const current = await client.query(
+        `SELECT id, name, normalized_name, country_code, status
+           FROM employers WHERE id = $1 FOR UPDATE`,
+        [request.params.id],
+      );
+      if (current.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const row = current.rows[0];
+      if (!["PENDING", "VERIFIED"].includes(row.status)) {
+        throw new ApiError(409, "EMPLOYER_NOT_RENAMEABLE", "El empleador no admite cambios de nombre.");
+      }
+      if (next.value === row.name) throw new ApiError(409, "NAME_UNCHANGED", "El empleador ya tiene ese nombre.");
+      await assertEmployerNameAvailable(client, request.params.id, String(row.country_code), next.normalized, ApiError);
+      if (next.normalized !== row.normalized_name) {
+        await client.query(
+          `INSERT INTO employer_aliases (
+             id, employer_id, alias, created_source, created_by_user_id
+           ) VALUES ($1, $2, $3, 'ADMIN', $4)
+           ON CONFLICT (employer_id, normalized_alias) DO NOTHING`,
+          [randomUUID(), request.params.id, row.name, request.authUser!.id],
+        );
+      }
+      const updated = await client.query(
+        `UPDATE employers SET name = $2, updated_at = now()
+          WHERE id = $1
+          RETURNING id, name, normalized_name, status, merged_into_employer_id, updated_at, verified_at`,
+        [request.params.id, next.value],
+      );
+      await audit(client, request, actorRole, "employers.manage", "EMPLOYER_RENAMED", "EMPLOYER", request.params.id, null, request.body, {
+        normalizedNameChanged: next.normalized !== row.normalized_name,
+      });
+      return { data: employerStateDto(updated.rows[0]) };
+    }),
+  );
+
+  app.post<{ Params: IdParams; Body: Reason & { alias: string } }>(
+    "/api/v1/admin/employers/:id/aliases",
+    {
+      config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_ALIAS_ADDED", resourceType: "EMPLOYER" } },
+      preHandler: guard("employers.manage", true),
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object", additionalProperties: false, required: ["alias", "reasonCode", "reference"],
+          properties: { alias: { type: "string", minLength: 1, maxLength: 200 }, ...reasonProperties },
+        },
+        ...ok(employerAliasSchema),
+      },
+    },
+    async (request) => withTransaction(async (client) => {
+      const actorRole = await lockEmployerManagement(client, request, ApiError);
+      const alias = await employerNameInput(client, request.body.alias, ApiError);
+      const observed = await client.query(
+        `SELECT id, normalized_name, country_code FROM employers WHERE id = $1`,
+        [request.params.id],
+      );
+      if (observed.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      await lockEmployerNames(client, String(observed.rows[0].country_code), [String(observed.rows[0].normalized_name), alias.normalized]);
+      const employer = await client.query(
+        `SELECT id, normalized_name, country_code, status FROM employers WHERE id = $1 FOR UPDATE`,
+        [request.params.id],
+      );
+      if (employer.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      if (!["PENDING", "VERIFIED"].includes(employer.rows[0].status)) {
+        throw new ApiError(409, "EMPLOYER_NOT_EDITABLE", "El empleador no admite aliases.");
+      }
+      if (alias.normalized === employer.rows[0].normalized_name) {
+        throw new ApiError(409, "ALIAS_MATCHES_NAME", "El alias coincide con el nombre del empleador.");
+      }
+      await assertEmployerNameAvailable(client, request.params.id, String(employer.rows[0].country_code), alias.normalized, ApiError);
+      const inserted = await client.query(
+        `INSERT INTO employer_aliases (
+           id, employer_id, alias, created_source, created_by_user_id
+         ) VALUES ($1, $2, $3, 'ADMIN', $4)
+         ON CONFLICT (employer_id, normalized_alias) DO NOTHING
+         RETURNING id, alias, normalized_alias, created_source, created_at`,
+        [randomUUID(), request.params.id, alias.value, request.authUser!.id],
+      );
+      if (inserted.rowCount !== 1) throw new ApiError(409, "ALIAS_EXISTS", "El empleador ya tiene ese alias.");
+      const row = inserted.rows[0];
+      await audit(client, request, actorRole, "employers.manage", "EMPLOYER_ALIAS_ADDED", "EMPLOYER", request.params.id, null, request.body, {
+        aliasId: row.id,
+      });
+      return { data: {
+        id: String(row.id), alias: String(row.alias), normalizedAlias: String(row.normalized_alias),
+        createdSource: String(row.created_source), createdAt: timestamp(row.created_at)!,
+      } };
+    }),
+  );
+
+  app.post<{ Params: IdParams; Body: Reason }>(
+    "/api/v1/admin/employers/:id/reject",
+    {
+      config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_REJECTED", resourceType: "EMPLOYER" } },
+      preHandler: guard("employers.manage", true),
+      schema: { params: idParamsSchema, body: reasonBodySchema, ...ok(employerStateSchema) },
+    },
+    async (request) => withTransaction(async (client) => {
+      const actorRole = await lockEmployerManagement(client, request, ApiError);
+      const observed = await client.query(
+        `SELECT id, normalized_name, country_code FROM employers WHERE id = $1`,
+        [request.params.id],
+      );
+      if (observed.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      await lockEmployerNames(client, String(observed.rows[0].country_code), [String(observed.rows[0].normalized_name)]);
+      const current = await client.query(
+        `SELECT id, status FROM employers WHERE id = $1 FOR UPDATE`,
+        [request.params.id],
+      );
+      if (current.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      if (current.rows[0].status !== "PENDING") {
+        throw new ApiError(409, "EMPLOYER_NOT_REJECTABLE", "Sólo se puede rechazar un empleador pendiente.");
+      }
+      const references = await client.query(
+        `SELECT
+           (SELECT count(*)::integer FROM employments WHERE employer_id = $1) AS employment_count,
+           (SELECT count(*)::integer FROM documents WHERE detected_employer_id = $1) AS detected_document_count,
+           (SELECT count(*)::integer FROM employers WHERE merged_into_employer_id = $1) AS merged_source_count`,
+        [request.params.id],
+      );
+      if (
+        integer(references.rows[0].employment_count) > 0
+        || integer(references.rows[0].detected_document_count) > 0
+        || integer(references.rows[0].merged_source_count) > 0
+      ) {
+        throw new ApiError(409, "EMPLOYER_IN_USE", "El empleador tiene referencias; fusionálo para conservarlas.");
+      }
+      const updated = await client.query(
+        `UPDATE employers
+            SET status = 'REJECTED', merged_into_employer_id = NULL,
+                verified_at = NULL, verified_by_user_id = NULL, updated_at = now()
+          WHERE id = $1
+          RETURNING id, name, normalized_name, status, merged_into_employer_id, updated_at, verified_at`,
+        [request.params.id],
+      );
+      await audit(client, request, actorRole, "employers.manage", "EMPLOYER_REJECTED", "EMPLOYER", request.params.id, null, request.body, {
+        employmentCount: integer(references.rows[0].employment_count),
+        detectedDocumentCount: integer(references.rows[0].detected_document_count),
+        mergedSourceCount: integer(references.rows[0].merged_source_count),
+      });
+      return { data: employerStateDto(updated.rows[0]) };
+    }),
+  );
+
+  app.post<{ Params: IdParams; Body: Reason & { targetEmployerId: string } }>(
+    "/api/v1/admin/employers/:id/merge",
+    {
+      config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_MERGED", resourceType: "EMPLOYER" } },
+      preHandler: guard("employers.manage", true),
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object", additionalProperties: false, required: ["targetEmployerId", "reasonCode", "reference"],
+          properties: { targetEmployerId: { type: "string", pattern: UUID_PATTERN }, ...reasonProperties },
+        },
+        ...ok({
+          type: "object", additionalProperties: false,
+          required: [
+            "id", "status", "mergedIntoEmployerId", "movedEmploymentCount", "consolidatedEmploymentCount",
+            "relinkedImportItemCount", "relinkedDocumentCount", "relinkedSettlementCount",
+            "movedDetectedDocumentCount", "movedAliasCount", "deduplicatedAliasCount", "movedIdentifierCount",
+          ],
+          properties: {
+            id: { type: "string", pattern: UUID_PATTERN }, status: { type: "string", const: "MERGED" },
+            mergedIntoEmployerId: { type: "string", pattern: UUID_PATTERN },
+            movedEmploymentCount: { type: "integer", minimum: 0 }, consolidatedEmploymentCount: { type: "integer", minimum: 0 },
+            relinkedImportItemCount: { type: "integer", minimum: 0 }, relinkedDocumentCount: { type: "integer", minimum: 0 },
+            relinkedSettlementCount: { type: "integer", minimum: 0 }, movedDetectedDocumentCount: { type: "integer", minimum: 0 },
+            movedAliasCount: { type: "integer", minimum: 0 }, deduplicatedAliasCount: { type: "integer", minimum: 0 },
+            movedIdentifierCount: { type: "integer", minimum: 0 },
+          },
+        }),
+      },
+    },
+    async (request) => {
+      const response = await withTransaction(async (client) => {
+        const actorRole = await lockEmployerManagement(client, request, ApiError);
+      const targetChain = await readEmployerMergeChain(client, request.body.targetEmployerId, ApiError);
+      const targetChainIds = targetChain.map((row) => row.id);
+      if (targetChainIds.includes(request.params.id)) {
+        throw new ApiError(409, "EMPLOYER_MERGE_CYCLE", "El empleador no puede fusionarse consigo mismo.");
+      }
+      const canonicalPreflight = targetChain.at(-1)!;
+      const employerIds = [request.params.id, ...targetChainIds];
+      const identityPreflight = await readEmployerIdentitySnapshot(client, employerIds);
+      const lockedIdentityKeys = await lockEmployerIdentities(
+        client,
+        identityPreflight.names.map((row) => ({ countryCode: row.country_code, normalizedName: row.normalized_name })),
+        identityPreflight.identifiers.map((row) => ({
+          countryCode: row.country_code, identifierType: row.identifier_type, fingerprint: row.identifier_fingerprint,
+        })),
+      );
+      const locked = await client.query<EmployerMergeRow>(
+        `SELECT id, name, normalized_name, country_code, status, merged_into_employer_id
+           FROM employers
+          WHERE id = ANY($1::uuid[])
+          ORDER BY id
+          FOR UPDATE`,
+        [employerIds],
+      );
+      if (locked.rowCount !== employerIds.length) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const byId = new Map(locked.rows.map((row) => [row.id, row]));
+      const chainIsStable = targetChainIds.every((id, index) => {
+        const current = byId.get(id);
+        const nextId = targetChainIds[index + 1];
+        return current !== undefined && (nextId === undefined
+          ? ["PENDING", "VERIFIED"].includes(current.status) && current.merged_into_employer_id === null
+          : current.status === "MERGED" && current.merged_into_employer_id === nextId);
+      });
+      if (!chainIsStable || canonicalPreflight.id !== targetChainIds.at(-1)) {
+        throw new ApiError(409, "TARGET_EMPLOYER_CHANGED", "El empleador destino cambió; volvé a intentarlo.");
+      }
+      const identityCurrent = await readEmployerIdentitySnapshot(client, employerIds);
+      if ([...identityCurrent.names, ...identityCurrent.identifiers]
+        .some((row) => !lockedIdentityKeys.has(identityLockKey(row)))) {
+        throw new ApiError(409, "TARGET_EMPLOYER_CHANGED", "La identidad del empleador cambió; volvé a intentarlo.");
+      }
+      const source = byId.get(request.params.id)!;
+      const target = byId.get(canonicalPreflight.id)!;
+      if (!["PENDING", "VERIFIED"].includes(source.status)) {
+        throw new ApiError(409, "EMPLOYER_NOT_MERGEABLE", "El empleador origen no admite fusión.");
+      }
+      if (!["PENDING", "VERIFIED"].includes(target.status) || target.merged_into_employer_id !== null) {
+        throw new ApiError(409, "TARGET_EMPLOYER_CHANGED", "El empleador destino cambió; volvé a intentarlo.");
+      }
+      if (source.country_code !== target.country_code) {
+        throw new ApiError(409, "EMPLOYER_COUNTRY_MISMATCH", "Los empleadores deben pertenecer al mismo país.");
+      }
+      if (source.status === "VERIFIED" && target.status !== "VERIFIED") {
+        throw new ApiError(409, "TARGET_EMPLOYER_NOT_CANONICAL", "Un empleador verificado sólo puede fusionarse en otro verificado.");
+      }
+      const mergeEmployerIds = [request.params.id, target.id];
+      const mergeIdentifiers = await client.query<{
+        employer_id: string; country_code: string; identifier_type: string; identifier_fingerprint: string | null;
+      }>(
+        `SELECT employer_id, country_code, identifier_type, identifier_fingerprint
+           FROM employer_identifiers
+          WHERE employer_id = ANY($1::uuid[])
+          ORDER BY employer_id, country_code, identifier_type
+          FOR UPDATE`,
+        [mergeEmployerIds],
+      );
+      if (mergeIdentifiers.rows.some((identifier) => identifier.identifier_fingerprint === null)) {
+        throw new ApiError(409, "EMPLOYER_IDENTIFIER_REVIEW_REQUIRED", "Hay un identificador histórico que debe corregirse antes de fusionar.");
+      }
+      const identifierByType = new Map<string, string>();
+      for (const identifier of mergeIdentifiers.rows) {
+        const key = `${identifier.country_code}\0${identifier.identifier_type}`;
+        const knownFingerprint = identifierByType.get(key);
+        if (knownFingerprint !== undefined && knownFingerprint !== identifier.identifier_fingerprint) {
+          throw new ApiError(409, "EMPLOYER_IDENTIFIER_CONFLICT", "Los empleadores tienen identificadores fiscales diferentes.");
+        }
+        identifierByType.set(key, identifier.identifier_fingerprint!);
+      }
+
+      await client.query(
+        `WITH locked_employments AS MATERIALIZED (
+           SELECT id
+             FROM employments
+            WHERE employer_id = ANY($1::uuid[])
+            ORDER BY id
+            FOR UPDATE
+         ) SELECT count(*) FROM locked_employments`,
+        [mergeEmployerIds],
+      );
+      const collisions = await client.query(
+        `WITH ranked AS (
+           SELECT id, employer_id,
+                  first_value(id) OVER (
+                    PARTITION BY user_id, start_date, end_date, role, category, modality, country_code, currency_code
+                    ORDER BY (employer_id = $2)::integer DESC, created_at, id
+                  ) AS survivor_id
+             FROM employments
+            WHERE employer_id = ANY($3::uuid[])
+         )
+         SELECT id AS source_id, survivor_id
+           FROM ranked
+          WHERE employer_id = $1 AND id <> survivor_id
+          ORDER BY id`,
+        [request.params.id, target.id, mergeEmployerIds],
+      );
+      const sourceEmploymentIds = collisions.rows.map((row) => String(row.source_id));
+      const survivorEmploymentIds = collisions.rows.map((row) => String(row.survivor_id));
+      let relinkedImportItemCount = 0;
+      let relinkedDocumentCount = 0;
+      let relinkedSettlementCount = 0;
+      if (sourceEmploymentIds.length > 0) {
+        relinkedImportItemCount = (await client.query(
+          `UPDATE import_batch_items item
+              SET employment_id = mapping.survivor_id, updated_at = now()
+             FROM unnest($1::uuid[], $2::uuid[]) AS mapping(source_id, survivor_id)
+            WHERE item.employment_id = mapping.source_id`,
+          [sourceEmploymentIds, survivorEmploymentIds],
+        )).rowCount ?? 0;
+        relinkedDocumentCount = (await client.query(
+          `UPDATE documents document
+              SET employment_id = mapping.survivor_id
+             FROM unnest($1::uuid[], $2::uuid[]) AS mapping(source_id, survivor_id)
+            WHERE document.employment_id = mapping.source_id`,
+          [sourceEmploymentIds, survivorEmploymentIds],
+        )).rowCount ?? 0;
+        relinkedSettlementCount = (await client.query(
+          `UPDATE payroll_settlements settlement
+              SET employment_id = mapping.survivor_id
+             FROM unnest($1::uuid[], $2::uuid[]) AS mapping(source_id, survivor_id)
+            WHERE settlement.employment_id = mapping.source_id`,
+          [sourceEmploymentIds, survivorEmploymentIds],
+        )).rowCount ?? 0;
+        await client.query(`DELETE FROM employments WHERE id = ANY($1::uuid[])`, [sourceEmploymentIds]);
+      }
+      const movedEmployments = await client.query(
+        `UPDATE employments SET employer_id = $2, updated_at = now() WHERE employer_id = $1`,
+        [request.params.id, target.id],
+      );
+      const movedDetectedDocuments = await client.query(
+        `UPDATE documents SET detected_employer_id = $2 WHERE detected_employer_id = $1`,
+        [request.params.id, target.id],
+      );
+
+      const deduplicatedAliases = await client.query(
+        `DELETE FROM employer_aliases source_alias
+          WHERE source_alias.employer_id = $1
+            AND (source_alias.normalized_alias = $3 OR EXISTS (
+              SELECT 1 FROM employer_aliases target_alias
+               WHERE target_alias.employer_id = $2
+                 AND target_alias.normalized_alias = source_alias.normalized_alias
+            ))`,
+        [request.params.id, target.id, target.normalized_name],
+      );
+      const movedAliases = await client.query(
+        `UPDATE employer_aliases SET employer_id = $2 WHERE employer_id = $1`,
+        [request.params.id, target.id],
+      );
+      const sourceNameAlias = source.normalized_name === target.normalized_name ? { rowCount: 0 } : await client.query(
+        `INSERT INTO employer_aliases (
+           id, employer_id, alias, created_source, created_by_user_id
+         ) VALUES ($1, $2, $3, 'ADMIN', $4)
+         ON CONFLICT (employer_id, normalized_alias) DO NOTHING`,
+        [randomUUID(), target.id, source.name, request.authUser!.id],
+      );
+      const deduplicatedIdentifiers = await client.query(
+        `DELETE FROM employer_identifiers source_identifier
+          USING employer_identifiers target_identifier
+          WHERE source_identifier.employer_id = $1
+            AND target_identifier.employer_id = $2
+            AND source_identifier.identifier_fingerprint IS NOT NULL
+            AND source_identifier.country_code = target_identifier.country_code
+            AND source_identifier.identifier_type = target_identifier.identifier_type
+            AND source_identifier.identifier_fingerprint = target_identifier.identifier_fingerprint`,
+        [request.params.id, target.id],
+      );
+      const movedIdentifiers = await client.query(
+        `UPDATE employer_identifiers SET employer_id = $2 WHERE employer_id = $1`,
+        [request.params.id, target.id],
+      );
+      const merged = await client.query(
+        `UPDATE employers
+            SET status = 'MERGED', merged_into_employer_id = $2,
+                verified_at = NULL, verified_by_user_id = NULL, updated_at = now()
+          WHERE id = $1
+          RETURNING id`,
+        [request.params.id, target.id],
+      );
+      if (merged.rowCount !== 1) throw new ApiError(409, "EMPLOYER_MERGE_FAILED", "No se pudo completar la fusión.");
+      const result = {
+        id: request.params.id,
+        status: "MERGED" as const,
+        mergedIntoEmployerId: target.id,
+        movedEmploymentCount: movedEmployments.rowCount ?? 0,
+        consolidatedEmploymentCount: sourceEmploymentIds.length,
+        relinkedImportItemCount,
+        relinkedDocumentCount,
+        relinkedSettlementCount,
+        movedDetectedDocumentCount: movedDetectedDocuments.rowCount ?? 0,
+        movedAliasCount: (movedAliases.rowCount ?? 0) + (sourceNameAlias.rowCount ?? 0),
+        deduplicatedAliasCount: deduplicatedAliases.rowCount ?? 0,
+        movedIdentifierCount: (movedIdentifiers.rowCount ?? 0) + (deduplicatedIdentifiers.rowCount ?? 0),
+      };
+      await audit(client, request, actorRole, "employers.manage", "EMPLOYER_MERGED", "EMPLOYER", request.params.id, null, request.body, result);
+        return { data: result };
+      });
+      request.log.info({
+        event: "employer.merged", employerId: request.params.id, targetEmployerId: response.data.mergedIntoEmployerId,
+        result: "SUCCESS", actorUserId: request.authUser!.id, actorAdminRole: request.authUser!.adminRole,
+      }, "employer merged");
+      return response;
     },
   );
 

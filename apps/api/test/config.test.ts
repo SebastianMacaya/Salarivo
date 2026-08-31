@@ -14,6 +14,9 @@ const productionEnv = (overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => 
   GOOGLE_OAUTH_REDIRECT_URI: "https://example.test/api/v1/auth/google/callback",
   MFA_ENCRYPTION_KEY_VERSION: "1",
   MFA_ENCRYPTION_KEY_BASE64: "bG9jYWwtbWZhLWtleS1vbmx5LWZvci10ZXN0cyEhISE=",
+  EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_VERSION: "1",
+  EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64: "bG9jYWwtZW1wbG95ZXItZW5jcnlwdGlvbi12MSEhISE=",
+  EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64: "bG9jYWwtZW1wbG95ZXItZmluZ2VycHJpbnQtdjEhISE=",
   MAX_FILE_BYTES: "20971520",
   MAX_FILES_PER_BATCH: "200",
   MAX_BATCH_BYTES: "536870912",
@@ -41,6 +44,11 @@ test("config keeps local defaults but requires explicit production security sett
   assert.equal(local.maxUserDocuments, 5_000);
   assert.equal(local.mfaKeyring.activeVersion, 1);
   assert.equal(local.mfaKeyring.keys.get(1)?.length, 32);
+  assert.equal(local.employerIdentifierProtection.encryptionKeyVersion, 1);
+  assert.equal(local.employerIdentifierProtection.encryptionKey.length, 32);
+  assert.equal(local.employerIdentifierProtection.fingerprintKey.length, 32);
+  assert.equal(local.employerIdentifierProtection.encryptionKey.equals(local.employerIdentifierProtection.fingerprintKey), false);
+  assert.equal(local.employerIdentifierProtection.encryptionKey.equals(local.mfaKeyring.keys.get(1)!), false);
   assert.equal(local.googleOAuth, null);
 
   assert.throws(() => loadConfig({ NODE_ENV: "production" }), /PUBLIC_ORIGIN/);
@@ -87,12 +95,23 @@ test("config keeps local defaults but requires explicit production security sett
       SESSION_TTL_SECONDS: "3600",
       MFA_ENCRYPTION_KEY_VERSION: "1",
       MFA_ENCRYPTION_KEY_BASE64: "bG9jYWwtbWZhLWtleS1vbmx5LWZvci10ZXN0cyEhISE=",
+      EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_VERSION: "1",
+      EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64: "bG9jYWwtZW1wbG95ZXItZW5jcnlwdGlvbi12MSEhISE=",
+      EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64: "bG9jYWwtZW1wbG95ZXItZmluZ2VycHJpbnQtdjEhISE=",
       GOOGLE_CLIENT_ID: "client-id",
       GOOGLE_CLIENT_SECRET: "client-secret",
       GOOGLE_OAUTH_REDIRECT_URI: "https://api.example.test/api/v1/auth/google/callback",
       OBJECT_STORAGE_PROVIDER: "aws",
     }),
     /MAX_FILE_BYTES/,
+  );
+  assert.throws(
+    () => loadConfig(productionEnv({ EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64: undefined })),
+    /EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64 is required/,
+  );
+  assert.throws(
+    () => loadConfig(productionEnv({ EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64: undefined })),
+    /EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64 is required/,
   );
 });
 
@@ -195,6 +214,20 @@ test("config rejects non-origin URLs and unsafe integer values", () => {
   assert.throws(
     () => loadConfig({ APP_ENV: "test", MFA_ENCRYPTION_KEY_BASE64: "not-a-key" }),
     /exactly 32 bytes/,
+  );
+  assert.throws(
+    () => loadConfig({
+      APP_ENV: "test",
+      EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64: "bG9jYWwtZW1wbG95ZXItZW5jcnlwdGlvbi12MSEhISE=",
+    }),
+    /must be distinct/,
+  );
+  assert.throws(
+    () => loadConfig({
+      APP_ENV: "test",
+      EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64: "bG9jYWwtbWZhLWtleS1vbmx5LWZvci10ZXN0cyEhISE=",
+    }),
+    /must be distinct/,
   );
   assert.throws(
     () => loadConfig({

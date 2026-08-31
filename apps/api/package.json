@@ -6,7 +6,7 @@
     "dev": "node --watch --experimental-strip-types src/server.ts",
     "start": "node --experimental-strip-types src/server.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "test:integration": "node --env-file=../../.env.example --env-file-if-exists=../../.env --experimental-strip-types --test test/integration/*.integration.ts",
+    "test:integration": "node --env-file=../../.env.example --env-file-if-exists=../../.env --experimental-strip-types --test --test-concurrency=1 test/integration/*.integration.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

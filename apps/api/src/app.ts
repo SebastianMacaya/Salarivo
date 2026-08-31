@@ -4,7 +4,16 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit, { normalizeIP } from "@fastify/rate-limit";
-import { pool, withTransaction } from "@salarivo/database";
+import {
+  EmployerResolutionError,
+  followMergedEmployer,
+  lockEmployerMutation,
+  pool,
+  resolveEmployer,
+  type PoolClient,
+  type ResolveEmployerInput,
+  withTransaction,
+} from "@salarivo/database";
 import Fastify, {
   LogController,
   type FastifyInstance,
@@ -65,6 +74,54 @@ class ApiError extends Error {
     super(message);
     this.statusCode = statusCode;
     this.code = code;
+  }
+}
+
+async function resolveEmployerForApi(
+  client: PoolClient,
+  input: ResolveEmployerInput,
+  request: FastifyRequest,
+) {
+  try {
+    const employer = await resolveEmployer(client, input);
+    const event = employer.outcome === "CREATED"
+      ? "employer.pending.created"
+      : employer.status === "PENDING"
+        ? "employer.pending.reused"
+        : "employer.reused";
+    request.log.info({
+      event,
+      employerId: employer.id,
+      employerStatus: employer.status,
+      matchType: employer.outcome,
+      source: input.createdSource,
+      ...(input.createdByUserId ? { userId: input.createdByUserId } : {}),
+    }, event);
+    return employer;
+  } catch (error) {
+    if (error instanceof EmployerResolutionError) {
+      request.log.warn({
+        event: error.code === "AMBIGUOUS"
+          ? "employer.match.ambiguous"
+          : error.code === "REJECTED_IDENTIFIER"
+            ? "employer.identifier.rejected"
+            : "employer.match.invalid",
+        resolutionErrorCode: error.code,
+        source: input.createdSource,
+        ...(input.createdByUserId ? { userId: input.createdByUserId } : {}),
+      }, "employer resolution rejected");
+      if (error.code === "INVALID_NAME") {
+        throw new ApiError(400, "INVALID_EMPLOYER_NAME", "El nombre del empleador no es válido.");
+      }
+      throw new ApiError(
+        409,
+        error.code === "AMBIGUOUS" ? "EMPLOYER_AMBIGUOUS" : "EMPLOYER_IDENTIFIER_REJECTED",
+        error.code === "AMBIGUOUS"
+          ? "Hay más de una empresa compatible; elegí un empleo existente o solicitá revisión."
+          : "El identificador de empresa requiere revisión.",
+      );
+    }
+    throw error;
   }
 }
 
@@ -185,13 +242,12 @@ const legalDocumentSchema = {
 const employerSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["id", "name", "countryCode", "createdAt", "updatedAt"],
+  required: ["id", "name", "countryCode", "status"],
   properties: {
     id: { type: "string", pattern: UUID_PATTERN },
     name: { type: "string" },
     countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
-    createdAt: { type: "string" },
-    updatedAt: { type: "string" },
+    status: { type: "string", enum: ["PENDING", "VERIFIED"] },
   },
 };
 
@@ -202,6 +258,7 @@ const employmentSchema = {
     "id",
     "employerId",
     "employerName",
+    "employerStatus",
     "status",
     "startDate",
     "endDate",
@@ -217,6 +274,7 @@ const employmentSchema = {
     id: { type: "string", pattern: UUID_PATTERN },
     employerId: { type: "string", pattern: UUID_PATTERN },
     employerName: { type: "string" },
+    employerStatus: { type: "string", enum: ["PENDING", "VERIFIED"] },
     status: { type: "string", enum: ["ACTIVE", "ENDED"] },
     startDate: { type: "string", pattern: DATE_PATTERN },
     endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
@@ -233,8 +291,9 @@ const employmentSchema = {
 const employmentDetectionSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["employerName", "currencyCode", "firstPeriod", "lastPeriod", "documentCount", "state"],
+  required: ["employerId", "employerName", "currencyCode", "firstPeriod", "lastPeriod", "documentCount", "state"],
   properties: {
+    employerId: { anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }] },
     employerName: { type: "string" },
     currencyCode: { type: "string", pattern: "^[A-Z]{3}$" },
     firstPeriod: { type: "string", pattern: "^\\d{4}-\\d{2}$" },
@@ -335,8 +394,7 @@ function employerFrom(row: Record<string, unknown>) {
     id: String(row.id),
     name: String(row.name),
     countryCode: String(row.country_code),
-    createdAt: timestamp(row.created_at as Date | string),
-    updatedAt: timestamp(row.updated_at as Date | string),
+    status: String(row.status),
   };
 }
 
@@ -345,6 +403,7 @@ function employmentFrom(row: Record<string, unknown>) {
     id: String(row.id),
     employerId: String(row.employer_id),
     employerName: String(row.employer_name),
+    employerStatus: String(row.employer_status),
     status: String(row.status),
     startDate: row.start_date instanceof Date
       ? row.start_date.toISOString().slice(0, 10)
@@ -427,7 +486,8 @@ function isDatabaseError(error: unknown): error is { code: string } {
 type EmployerBody = { name: string; countryCode: string };
 type EmployerPatch = { name?: string; countryCode?: string };
 type EmploymentBody = {
-  employerId: string;
+  employerId?: string;
+  employerName?: string;
   startDate: string;
   endDate?: string | null;
   role?: string | null;
@@ -438,6 +498,7 @@ type EmploymentBody = {
 };
 type EmploymentPatch = Partial<EmploymentBody>;
 type EmploymentDetectionBody = {
+  employerId?: string | null;
   employerName: string;
   employmentId?: string;
   startDate?: string;
@@ -943,9 +1004,16 @@ export async function buildApp(
     },
     async (request) => {
       const result = await pool.query(
-        `SELECT id, name, country_code, created_at, updated_at
-           FROM employers
-          WHERE user_id = $1
+        `SELECT employer.id, employer.name, employer.country_code, employer.status
+           FROM employers AS employer
+          WHERE employer.status IN ('PENDING', 'VERIFIED')
+            AND (
+              employer.created_by_user_id = $1
+              OR EXISTS (
+                SELECT 1 FROM employments AS employment
+                 WHERE employment.employer_id = employer.id AND employment.user_id = $1
+              )
+            )
           ORDER BY lower(name), id`,
         [request.authUser!.id],
       );
@@ -971,18 +1039,21 @@ export async function buildApp(
       },
     },
     async (request, reply) => {
-      const result = await pool.query(
-        `INSERT INTO employers (id, user_id, name, country_code)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, name, country_code, created_at, updated_at`,
-        [
-          randomUUID(),
-          request.authUser!.id,
-          text(request.body.name, 160),
-          countryCode(request.body.countryCode),
-        ],
-      );
-      return reply.code(201).send({ data: employerFrom(result.rows[0]) });
+      const row = await withTransaction(async (client) => {
+        const employer = await resolveEmployerForApi(client, {
+          name: text(request.body.name, 160),
+          countryCode: countryCode(request.body.countryCode),
+          createdByUserId: request.authUser!.id,
+          createdSource: "MANUAL",
+        }, request);
+        const selected = await client.query(
+          `SELECT id, name, country_code, status
+             FROM employers WHERE id = $1`,
+          [employer.id],
+        );
+        return selected.rows[0];
+      });
+      return reply.code(201).send({ data: employerFrom(row) });
     },
   );
 
@@ -993,13 +1064,26 @@ export async function buildApp(
       schema: { params: idParamsSchema, response: responses(200, employerSchema) },
     },
     async (request) => {
-      const result = await pool.query(
-        `SELECT id, name, country_code, created_at, updated_at
-           FROM employers WHERE id = $1 AND user_id = $2`,
-        [request.params.id, request.authUser!.id],
-      );
-      if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      return { data: employerFrom(result.rows[0]) };
+      const row = await withTransaction(async (client) => {
+        const canonical = await followMergedEmployer(client, request.params.id);
+        if (!canonical) return null;
+        const result = await client.query(
+          `SELECT employer.id, employer.name, employer.country_code, employer.status
+             FROM employers AS employer
+            WHERE employer.id = $1
+              AND (
+                employer.created_by_user_id = $2
+                OR EXISTS (
+                  SELECT 1 FROM employments AS employment
+                   WHERE employment.employer_id = employer.id AND employment.user_id = $2
+                )
+              )`,
+          [canonical.id, request.authUser!.id],
+        );
+        return result.rows[0] ?? null;
+      });
+      if (!row) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: employerFrom(row) };
     },
   );
 
@@ -1022,26 +1106,8 @@ export async function buildApp(
       },
     },
     async (request) => {
-      const values: unknown[] = [request.params.id, request.authUser!.id];
-      const updates: string[] = [];
-      if (request.body.name !== undefined) {
-        values.push(text(request.body.name, 160));
-        updates.push(`name = $${values.length}`);
-      }
-      if (request.body.countryCode !== undefined) {
-        values.push(countryCode(request.body.countryCode));
-        updates.push(`country_code = $${values.length}`);
-      }
-      updates.push("updated_at = now()");
-
-      const result = await pool.query(
-        `UPDATE employers SET ${updates.join(", ")}
-          WHERE id = $1 AND user_id = $2
-          RETURNING id, name, country_code, created_at, updated_at`,
-        values,
-      );
-      if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      return { data: employerFrom(result.rows[0]) };
+      void request;
+      throw new ApiError(409, "EMPLOYER_GLOBAL_IMMUTABLE", "Editá la empresa desde el empleo asociado.");
     },
   );
 
@@ -1052,40 +1118,18 @@ export async function buildApp(
       schema: { params: idParamsSchema, response: responses(200, { type: "null" }) },
     },
     async (request) => {
-      const outcome = await withTransaction(async (client) => {
-        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
-          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
-        }
-        const employer = await client.query(
-          `SELECT id FROM employers WHERE id = $1 AND user_id = $2 FOR UPDATE`,
-          [request.params.id, request.authUser!.id],
-        );
-        if (employer.rowCount !== 1) return "NOT_FOUND";
-        const employment = await client.query(
-          `SELECT 1 FROM employments WHERE employer_id = $1 AND user_id = $2 LIMIT 1`,
-          [request.params.id, request.authUser!.id],
-        );
-        if (employment.rowCount !== 0) return "IN_USE";
-        await client.query(`DELETE FROM employers WHERE id = $1 AND user_id = $2`, [
-          request.params.id,
-          request.authUser!.id,
-        ]);
-        return "DELETED";
-      });
-      if (outcome === "NOT_FOUND") throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      if (outcome === "IN_USE") {
-        throw new ApiError(409, "RESOURCE_IN_USE", "El empleador tiene empleos asociados.");
-      }
-      return { data: null };
+      void request;
+      throw new ApiError(409, "EMPLOYER_GLOBAL_IMMUTABLE", "La identidad global de empresa no se elimina desde esta ruta.");
     },
   );
 
   const employmentSelect = `
-    SELECT e.id, e.employer_id, employer.name AS employer_name, e.status,
+    SELECT e.id, e.employer_id, employer.name AS employer_name,
+           employer.status AS employer_status, e.status,
            e.start_date, e.end_date, e.role, e.category, e.modality,
            e.country_code, e.currency_code, e.created_at, e.updated_at
       FROM employments e
-      JOIN employers employer ON employer.id = e.employer_id AND employer.user_id = e.user_id`;
+      JOIN employers employer ON employer.id = e.employer_id`;
 
   const detectedEmploymentDocuments = `
     WITH latest_runs AS (
@@ -1094,23 +1138,30 @@ export async function buildApp(
        WHERE run.user_id = $1 AND run.status = 'COMPLETED'
        ORDER BY run.document_id, run.processing_version DESC
     ), detected AS (
-      SELECT document.id AS document_id,
-             COALESCE(correction.corrected_value #>> '{}', field.interpreted_value #>> '{}') AS employer_name,
+      SELECT document.id AS document_id, document.detected_employer_id,
+             COALESCE(detected_employer.name, correction.corrected_value #>> '{}', field.interpreted_value #>> '{}') AS employer_name,
              settlement.payroll_period, settlement.currency_code
         FROM documents document
         JOIN latest_runs run
           ON run.document_id = document.id AND run.user_id = document.user_id
-        JOIN extracted_fields field
-          ON field.extraction_run_id = run.id AND field.user_id = run.user_id
-         AND field.document_id = run.document_id AND field.field_path = 'employer.name'
+        LEFT JOIN employers detected_employer ON detected_employer.id = document.detected_employer_id
         LEFT JOIN LATERAL (
           SELECT current.corrected_value
             FROM user_corrections current
-           WHERE current.user_id = field.user_id
-             AND current.extraction_run_id = field.extraction_run_id
-             AND current.field_path = field.field_path
+           WHERE current.user_id = run.user_id
+             AND current.extraction_run_id = run.id
+             AND current.field_path = 'employer.name'
            ORDER BY current.correction_version DESC LIMIT 1
         ) correction ON true
+        LEFT JOIN LATERAL (
+          SELECT current.interpreted_value
+            FROM extracted_fields current
+           WHERE current.user_id = run.user_id
+             AND current.document_id = run.document_id
+             AND current.extraction_run_id = run.id
+             AND current.field_path = 'employer.name'
+           LIMIT 1
+        ) field ON true
         JOIN payroll_settlements settlement
           ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
        WHERE document.user_id = $1 AND document.employment_id IS NULL
@@ -1128,17 +1179,19 @@ export async function buildApp(
       const result = await pool.query(
         `${detectedEmploymentDocuments}
          SELECT (array_agg(employer_name ORDER BY payroll_period DESC))[1] AS employer_name,
-                currency_code, to_char(min(payroll_period), 'YYYY-MM') AS first_period,
+                 max(detected_employer_id::text)::uuid AS employer_id,
+                 currency_code, to_char(min(payroll_period), 'YYYY-MM') AS first_period,
                 to_char(max(payroll_period), 'YYYY-MM') AS last_period,
                 count(DISTINCT document_id)::integer AS document_count
            FROM detected
           WHERE employer_name IS NOT NULL AND btrim(normalize(employer_name, NFKC)) <> ''
-          GROUP BY lower(btrim(normalize(employer_name, NFKC)) COLLATE "und-x-icu"), currency_code
+          GROUP BY COALESCE(detected_employer_id::text, normalize_employer_name_conservative(employer_name)), currency_code
           ORDER BY max(payroll_period) DESC,
                    lower(btrim(normalize((array_agg(employer_name ORDER BY payroll_period DESC))[1], NFKC)) COLLATE "und-x-icu")`,
         [request.authUser!.id],
       );
       return { data: result.rows.map((row) => ({
+        employerId: row.employer_id === null ? null : String(row.employer_id),
         employerName: String(row.employer_name),
         currencyCode: String(row.currency_code),
         firstPeriod: String(row.first_period),
@@ -1160,6 +1213,7 @@ export async function buildApp(
           required: ["employerName", "currencyCode"],
           properties: {
             employerName: { type: "string", minLength: 2, maxLength: 160 },
+            employerId: { anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }] },
             employmentId: { type: "string", pattern: UUID_PATTERN },
             startDate: { type: "string", pattern: DATE_PATTERN },
             endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
@@ -1180,6 +1234,7 @@ export async function buildApp(
     async (request, reply) => {
       const employerName = text(request.body.employerName, 160);
       const selectedCurrency = currencyCode(request.body.currencyCode);
+      const requestedDetectedEmployerId = request.body.employerId ?? null;
       const requestedEmploymentId = request.body.employmentId ?? null;
       if (!requestedEmploymentId && !request.body.startDate) {
         throw new ApiError(400, "VALIDATION_ERROR", "Elegí un empleo existente o indicá su fecha de inicio.");
@@ -1187,37 +1242,88 @@ export async function buildApp(
       const requestedDates = requestedEmploymentId
         ? null
         : validateEmploymentDates(request.body.startDate!, request.body.endDate ?? null);
-      const result = await withTransaction(async (client) => {
+        const result = await withTransaction(async (client) => {
+        await lockEmployerMutation(client);
         await client.query("SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE", [request.authUser!.id]);
         let employmentId = requestedEmploymentId;
+        let employerId: string;
+        let detectedEmployerId: string | null = null;
         let startDate: unknown = requestedDates?.startDate;
         let endDate: unknown = requestedDates?.endDate ?? null;
         if (employmentId) {
+          const observedEmployment = await client.query<{
+            employer_id: string;
+            currency_code: string;
+          }>(
+            `SELECT employer_id, currency_code
+               FROM employments
+              WHERE id = $1 AND user_id = $2`,
+            [employmentId, request.authUser!.id],
+          );
+          if (!observedEmployment.rowCount || observedEmployment.rows[0]!.currency_code !== selectedCurrency) {
+            throw new ApiError(404, "EMPLOYMENT_NOT_FOUND", "No encontramos ese empleo para la empresa detectada.");
+          }
+          const observedEmployerId = observedEmployment.rows[0]!.employer_id;
+          const existingEmployer = await followMergedEmployer(client, observedEmployerId);
+          if (!existingEmployer) {
+            throw new ApiError(404, "EMPLOYMENT_NOT_FOUND", "No encontramos ese empleo para la empresa detectada.");
+          }
+          employerId = existingEmployer.id;
+          if (requestedDetectedEmployerId) {
+            const detectedEmployer = await followMergedEmployer(client, requestedDetectedEmployerId);
+            if (!detectedEmployer || detectedEmployer.id !== employerId) {
+              throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos esa detección para el empleo elegido.");
+            }
+            detectedEmployerId = detectedEmployer.id;
+          }
           const existingEmployment = await client.query(
             `${employmentSelect}
               WHERE e.id = $1 AND e.user_id = $2 AND e.currency_code = $3
-                AND lower(btrim(normalize(employer.name, NFKC)) COLLATE "und-x-icu")
-                  = lower(btrim(normalize($4, NFKC)) COLLATE "und-x-icu")
-              FOR UPDATE OF e, employer`,
-            [employmentId, request.authUser!.id, selectedCurrency, employerName],
+              FOR UPDATE OF e`,
+            [employmentId, request.authUser!.id, selectedCurrency],
           );
-          if (!existingEmployment.rowCount) {
-            throw new ApiError(404, "EMPLOYMENT_NOT_FOUND", "No encontramos ese empleo para la empresa detectada.");
+          if (!existingEmployment.rowCount
+            || ![observedEmployerId, existingEmployer.id].includes(String(existingEmployment.rows[0].employer_id))) {
+            throw new ApiError(409, "EMPLOYMENT_CHANGED", "El empleo cambió; recargá e intentá nuevamente.");
           }
           startDate = existingEmployment.rows[0].start_date;
           endDate = existingEmployment.rows[0].end_date;
+        } else if (requestedDetectedEmployerId) {
+          const detectedEmployer = await followMergedEmployer(client, requestedDetectedEmployerId);
+          if (!detectedEmployer) {
+            throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos esa detección.");
+          }
+          employerId = detectedEmployer.id;
+          detectedEmployerId = detectedEmployer.id;
+        } else {
+          employerId = (await resolveEmployerForApi(client, {
+            name: employerName,
+            countryCode: "AR",
+            createdByUserId: request.authUser!.id,
+            createdSource: "DOCUMENT",
+          }, request)).id;
         }
         const detected = await client.query(
           `${detectedEmploymentDocuments}
            SELECT DISTINCT document_id
              FROM detected
-            WHERE lower(btrim(normalize(employer_name, NFKC)) COLLATE "und-x-icu")
-                    = lower(btrim(normalize($2, NFKC)) COLLATE "und-x-icu")
-              AND currency_code = $3
-              AND payroll_period >= date_trunc('month', $4::date)::date
-              AND ($5::date IS NULL OR payroll_period <= date_trunc('month', $5::date)::date)
+            WHERE (
+                    ($2::uuid IS NOT NULL AND detected_employer_id = $2)
+                    OR ($2::uuid IS NULL AND (
+                      detected_employer_id = $3
+                      OR (detected_employer_id IS NULL
+                          AND normalize_employer_name_conservative(employer_name)
+                            = normalize_employer_name_conservative($4))
+                    ))
+                  )
+              AND currency_code = $5
+              AND payroll_period >= date_trunc('month', $6::date)::date
+              AND ($7::date IS NULL OR payroll_period <= date_trunc('month', $7::date)::date)
             ORDER BY document_id`,
-          [request.authUser!.id, employerName, selectedCurrency, startDate, endDate],
+          [
+            request.authUser!.id, detectedEmployerId, employerId, employerName,
+            selectedCurrency, startDate, endDate,
+          ],
         );
         if (!detected.rowCount) {
           throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos recibos sin asociar para esa empresa y período.");
@@ -1233,39 +1339,44 @@ export async function buildApp(
           throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos recibos sin asociar para esa empresa y período.");
         }
         if (!employmentId) {
-          let employer = await client.query(
-            `SELECT id FROM employers
-              WHERE user_id = $1
-                AND lower(btrim(normalize(name, NFKC)) COLLATE "und-x-icu")
-                  = lower(btrim(normalize($2, NFKC)) COLLATE "und-x-icu")
-              ORDER BY created_at LIMIT 1 FOR UPDATE`,
-            [request.authUser!.id, employerName],
+          const existing = await client.query<{ id: string }>(
+            `SELECT id FROM employments
+              WHERE user_id = $1 AND employer_id = $2 AND country_code = 'AR'
+                AND currency_code = $3 AND start_date = $4
+                AND end_date IS NOT DISTINCT FROM $5::date
+                AND role IS NULL AND category IS NULL AND modality IS NULL
+              ORDER BY id LIMIT 1 FOR UPDATE`,
+            [request.authUser!.id, employerId, selectedCurrency, startDate, endDate],
           );
-          if (!employer.rowCount) {
-            employer = await client.query(
-              `INSERT INTO employers (id, user_id, name, country_code)
-               VALUES ($1, $2, $3, 'AR') RETURNING id`,
-              [randomUUID(), request.authUser!.id, employerName],
+          employmentId = existing.rows[0]?.id ?? randomUUID();
+          if (!existing.rowCount) {
+            await client.query(
+              `INSERT INTO employments (
+                 id, user_id, employer_id, status, start_date, end_date, country_code, currency_code
+               ) VALUES ($1, $2, $3, $4, $5, $6, 'AR', $7)`,
+              [employmentId, request.authUser!.id, employerId, endDate === null ? "ACTIVE" : "ENDED", startDate, endDate, selectedCurrency],
             );
           }
-          employmentId = randomUUID();
-          await client.query(
-            `INSERT INTO employments (
-               id, user_id, employer_id, status, start_date, end_date, country_code, currency_code
-             ) VALUES ($1, $2, $3, $4, $5, $6, 'AR', $7)`,
-            [employmentId, request.authUser!.id, employer.rows[0].id, endDate === null ? "ACTIVE" : "ENDED", startDate, endDate, selectedCurrency],
-          );
         }
         const documentIds = lockedDocuments.rows.map((row) => String(row.id));
         await client.query(
-          `UPDATE documents SET employment_id = $1
-            WHERE user_id = $2 AND employment_id IS NULL AND id = ANY($3::uuid[])`,
-          [employmentId, request.authUser!.id, documentIds],
+          `UPDATE documents SET employment_id = $1, detected_employer_id = $2
+            WHERE user_id = $3 AND employment_id IS NULL AND id = ANY($4::uuid[])`,
+          [employmentId, employerId, request.authUser!.id, documentIds],
         );
         await client.query(
           `UPDATE payroll_settlements SET employment_id = $1
-            WHERE user_id = $2 AND employment_id IS NULL AND document_id = ANY($3::uuid[])`,
+            WHERE user_id = $2 AND document_id = ANY($3::uuid[])`,
           [employmentId, request.authUser!.id, documentIds],
+        );
+        await client.query(
+          `UPDATE import_batch_items AS item SET employment_id = $1, updated_at = now()
+            FROM documents AS document
+           WHERE document.id = ANY($2::uuid[])
+             AND document.import_batch_item_id = item.id
+             AND document.user_id = $3 AND item.user_id = $3
+             `,
+          [employmentId, documentIds, request.authUser!.id],
         );
         await client.query(
           `INSERT INTO audit_events (
@@ -1310,9 +1421,10 @@ export async function buildApp(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["employerId", "startDate", "countryCode", "currencyCode"],
+          required: ["startDate", "countryCode", "currencyCode"],
           properties: {
             employerId: { type: "string", pattern: UUID_PATTERN },
+            employerName: { type: "string", minLength: 1, maxLength: 160 },
             startDate: { type: "string", pattern: DATE_PATTERN },
             endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
             role: nullableText(120),
@@ -1326,38 +1438,82 @@ export async function buildApp(
       },
     },
     async (request, reply) => {
+      if ((request.body.employerId === undefined) === (request.body.employerName === undefined)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Indicá una empresa por nombre o por ID, no ambas.");
+      }
       const { startDate, endDate } = validateEmploymentDates(request.body.startDate, request.body.endDate ?? null);
+      const selectedCountry = countryCode(request.body.countryCode);
+      const selectedCurrency = currencyCode(request.body.currencyCode);
+      const role = optionalText(request.body.role, 120) ?? null;
+      const category = optionalText(request.body.category, 120) ?? null;
+      const modality = optionalText(request.body.modality, 80) ?? null;
 
       const created = await withTransaction(async (client) => {
-        const result = await client.query(
-          `INSERT INTO employments (
-             id, user_id, employer_id, status, start_date, end_date, role, category,
-             modality, country_code, currency_code
-           )
-           SELECT $1, $2, employer.id, $4, $5, $6, $7, $8, $9, $10, $11
-             FROM employers employer
-            WHERE employer.id = $3 AND employer.user_id = $2
-           RETURNING id`,
+        await lockEmployerMutation(client);
+        await client.query(
+          "SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE",
+          [request.authUser!.id],
+        );
+        let employerId: string;
+        if (request.body.employerName !== undefined) {
+          employerId = (await resolveEmployerForApi(client, {
+            name: text(request.body.employerName, 160),
+            countryCode: selectedCountry,
+            createdByUserId: request.authUser!.id,
+            createdSource: "MANUAL",
+          }, request)).id;
+        } else {
+          const canonical = await followMergedEmployer(client, request.body.employerId!);
+          if (!canonical || canonical.countryCode !== selectedCountry) {
+            throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
+          }
+          const allowed = await client.query(
+            `SELECT 1 FROM employers AS employer
+              WHERE employer.id = $1
+                AND (
+                  employer.status = 'VERIFIED'
+                  OR employer.created_by_user_id = $2
+                  OR EXISTS (
+                    SELECT 1 FROM employments AS employment
+                     WHERE employment.employer_id = employer.id AND employment.user_id = $2
+                  )
+                )`,
+            [canonical.id, request.authUser!.id],
+          );
+          if (!allowed.rowCount) throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
+          employerId = canonical.id;
+        }
+        const existing = await client.query<{ id: string }>(
+          `SELECT id FROM employments
+            WHERE user_id = $1 AND employer_id = $2 AND start_date = $3
+              AND end_date IS NOT DISTINCT FROM $4::date
+              AND role IS NOT DISTINCT FROM $5::text
+              AND category IS NOT DISTINCT FROM $6::text
+              AND modality IS NOT DISTINCT FROM $7::text
+              AND country_code = $8 AND currency_code = $9
+            ORDER BY id LIMIT 1 FOR UPDATE`,
           [
-            randomUUID(),
-            request.authUser!.id,
-            request.body.employerId,
-            endDate === null ? "ACTIVE" : "ENDED",
-            startDate,
-            endDate,
-            optionalText(request.body.role, 120) ?? null,
-            optionalText(request.body.category, 120) ?? null,
-            optionalText(request.body.modality, 80) ?? null,
-            countryCode(request.body.countryCode),
-            currencyCode(request.body.currencyCode),
+            request.authUser!.id, employerId, startDate, endDate, role, category,
+            modality, selectedCountry, selectedCurrency,
           ],
         );
-        if (result.rowCount !== 1) {
-          throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
+        const employmentId = existing.rows[0]?.id ?? randomUUID();
+        if (!existing.rowCount) {
+          await client.query(
+            `INSERT INTO employments (
+               id, user_id, employer_id, status, start_date, end_date, role, category,
+               modality, country_code, currency_code
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [
+              employmentId, request.authUser!.id, employerId,
+              endDate === null ? "ACTIVE" : "ENDED", startDate, endDate,
+              role, category, modality, selectedCountry, selectedCurrency,
+            ],
+          );
         }
         const selected = await client.query(
           `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
-          [result.rows[0].id, request.authUser!.id],
+          [employmentId, request.authUser!.id],
         );
         return selected.rows[0];
       });
@@ -1393,6 +1549,7 @@ export async function buildApp(
           minProperties: 1,
           properties: {
             employerId: { type: "string", pattern: UUID_PATTERN },
+            employerName: { type: "string", minLength: 1, maxLength: 160 },
             startDate: { type: "string", pattern: DATE_PATTERN },
             endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
             role: nullableText(120),
@@ -1407,48 +1564,122 @@ export async function buildApp(
     },
     async (request) => {
       const userId = request.authUser!.id;
-      const values: unknown[] = [request.params.id, userId];
-      const updates: string[] = [];
-      const add = (column: string, value: unknown) => {
-        values.push(value);
-        updates.push(`${column} = $${values.length}`);
-      };
-      if (request.body.employerId !== undefined) add("employer_id", request.body.employerId);
-      if (request.body.startDate !== undefined) add("start_date", date(request.body.startDate));
-      if (request.body.endDate !== undefined) {
-        add("end_date", request.body.endDate === null ? null : date(request.body.endDate));
-        add("status", request.body.endDate === null ? "ACTIVE" : "ENDED");
+      if (request.body.employerId !== undefined && request.body.employerName !== undefined) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Indicá una empresa por nombre o por ID, no ambas.");
       }
-      if (request.body.role !== undefined) add("role", optionalText(request.body.role, 120));
-      if (request.body.category !== undefined) add("category", optionalText(request.body.category, 120));
-      if (request.body.modality !== undefined) add("modality", optionalText(request.body.modality, 80));
-      if (request.body.countryCode !== undefined) add("country_code", countryCode(request.body.countryCode));
-      if (request.body.currencyCode !== undefined) add("currency_code", currencyCode(request.body.currencyCode));
-      updates.push("updated_at = now()");
 
       const row = await withTransaction(async (client) => {
-        if (request.body.employerId !== undefined) {
-          const employer = await client.query(
-            `SELECT 1 FROM employers WHERE id = $1 AND user_id = $2 FOR KEY SHARE`,
-            [request.body.employerId, userId],
-          );
-          if (employer.rowCount !== 1) {
+        await lockEmployerMutation(client);
+        await client.query("SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE", [userId]);
+        const observed = await client.query(
+          `SELECT e.employer_id, e.start_date::text, e.end_date::text, e.role, e.category,
+                  e.modality, e.country_code, e.currency_code, e.updated_at::text
+             FROM employments AS e
+            WHERE e.id = $1 AND e.user_id = $2`,
+          [request.params.id, userId],
+        );
+        if (observed.rowCount !== 1) {
+          throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        }
+        const beforeLock = observed.rows[0];
+        const nextCountry = request.body.countryCode === undefined
+          ? String(beforeLock.country_code)
+          : countryCode(request.body.countryCode);
+        let employerId = String(beforeLock.employer_id);
+        if (request.body.employerName !== undefined) {
+          employerId = (await resolveEmployerForApi(client, {
+            name: text(request.body.employerName, 160),
+            countryCode: nextCountry,
+            createdByUserId: userId,
+            createdSource: "MANUAL",
+          }, request)).id;
+        } else if (request.body.employerId !== undefined) {
+          const canonical = await followMergedEmployer(client, request.body.employerId);
+          if (!canonical || canonical.countryCode !== nextCountry) {
             throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
           }
+          const allowed = await client.query(
+            `SELECT 1 FROM employers AS employer
+              WHERE employer.id = $1
+                AND (
+                  employer.status = 'VERIFIED'
+                  OR employer.created_by_user_id = $2
+                  OR EXISTS (
+                    SELECT 1 FROM employments AS employment
+                     WHERE employment.employer_id = employer.id AND employment.user_id = $2
+                  )
+                )`,
+            [canonical.id, userId],
+          );
+          if (!allowed.rowCount) throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
+          employerId = canonical.id;
+        }
+        const current = await client.query(
+          `SELECT e.employer_id, e.start_date::text, e.end_date::text, e.role, e.category,
+                  e.modality, e.country_code, e.currency_code, e.updated_at::text
+             FROM employments AS e
+            WHERE e.id = $1 AND e.user_id = $2
+            FOR UPDATE`,
+          [request.params.id, userId],
+        );
+        if (current.rowCount !== 1) {
+          throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        }
+        if (String(current.rows[0].updated_at) !== String(beforeLock.updated_at)) {
+          throw new ApiError(409, "EMPLOYMENT_CHANGED", "El empleo cambió; recargá e intentá nuevamente.");
+        }
+        const previous = current.rows[0];
+        const nextStart = request.body.startDate === undefined
+          ? String(previous.start_date)
+          : date(request.body.startDate);
+        const nextEnd = request.body.endDate === undefined
+          ? previous.end_date === null ? null : String(previous.end_date)
+          : request.body.endDate === null ? null : date(request.body.endDate);
+        validateEmploymentDates(nextStart, nextEnd);
+        const nextRole = request.body.role === undefined
+          ? previous.role
+          : optionalText(request.body.role, 120) ?? null;
+        const nextCategory = request.body.category === undefined
+          ? previous.category
+          : optionalText(request.body.category, 120) ?? null;
+        const nextModality = request.body.modality === undefined
+          ? previous.modality
+          : optionalText(request.body.modality, 80) ?? null;
+        const nextCurrency = request.body.currencyCode === undefined
+          ? String(previous.currency_code)
+          : currencyCode(request.body.currencyCode);
+        const duplicate = await client.query(
+          `SELECT 1 FROM employments
+            WHERE user_id = $1 AND id <> $2 AND employer_id = $3 AND start_date = $4
+              AND end_date IS NOT DISTINCT FROM $5::date
+              AND role IS NOT DISTINCT FROM $6::text
+              AND category IS NOT DISTINCT FROM $7::text
+              AND modality IS NOT DISTINCT FROM $8::text
+              AND country_code = $9 AND currency_code = $10
+            LIMIT 1`,
+          [
+            userId, request.params.id, employerId, nextStart, nextEnd, nextRole,
+            nextCategory, nextModality, nextCountry, nextCurrency,
+          ],
+        );
+        if (duplicate.rowCount) {
+          throw new ApiError(409, "EMPLOYMENT_DUPLICATE", "Ese empleo ya existe.");
         }
         const updated = await client.query(
-          `UPDATE employments SET ${updates.join(", ")}
+          `UPDATE employments
+              SET employer_id = $3, status = $4, start_date = $5, end_date = $6,
+                  role = $7, category = $8, modality = $9, country_code = $10,
+                  currency_code = $11, updated_at = now()
             WHERE id = $1 AND user_id = $2
             RETURNING id, start_date::text, end_date::text`,
-          values,
+          [
+            request.params.id, userId, employerId, nextEnd === null ? "ACTIVE" : "ENDED",
+            nextStart, nextEnd, nextRole, nextCategory, nextModality, nextCountry, nextCurrency,
+          ],
         );
         if (updated.rowCount !== 1) {
           throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         }
-        validateEmploymentDates(
-          String(updated.rows[0].start_date),
-          updated.rows[0].end_date === null ? null : String(updated.rows[0].end_date),
-        );
         const selected = await client.query(
           `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
           [request.params.id, userId],
@@ -1467,6 +1698,7 @@ export async function buildApp(
     },
     async (request) => {
       const result = await withTransaction(async (client) => {
+        await lockEmployerMutation(client);
         if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }

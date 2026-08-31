@@ -128,12 +128,12 @@ Recursos iniciales:
 | upload-sessions | crear y confirmar upload |
 | imports | crear, consultar, recuperar el lote activo y cancelar uploads pendientes; pausa/reanudación quedan pendientes |
 | documents | listar, consultar, asociar masivamente a un empleo, corregir, cerrar revisión, eliminar y confirmar tipo; reproceso queda pendiente |
-| employments | listar, crear y editar/finalizar |
+| employments | listar, crear y editar/finalizar mediante el resolver global de Employer; confirmar detecciones inequívocas |
 | payroll-settlements | listar la proyección; las correcciones se aplican desde documents |
 | salary-history | resumen, evolución y anual agregados; comparación y conceptos paginados owner-only; posibles duplicados sólo como advertencia |
 | exports | solicitar y consultar export privado |
 | privacy | eliminar cuenta; preferencias editables quedan pendientes |
-| admin | dashboard, metadata paginada, diagnóstico y comandos acotados por capacidad; sin acceso a contenido privado |
+| admin | dashboard, metadata paginada, diagnóstico, revisión/merge de Employer y comandos acotados por capacidad; sin acceso a contenido privado |
 
 Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se incorpore OpenAPI describirá auth, schemas, límites y respuestas; los detalles de proveedor quedarán fuera del contrato HTTP.
 
@@ -193,7 +193,7 @@ Toda variable se valida al arranque y se obtiene de entorno/secret manager. No h
 | Classification | CLASSIFICATION_HIGH_THRESHOLD, CLASSIFICATION_LOW_THRESHOLD, BATCH_REJECTION_SAMPLE_SIZE, BATCH_REJECTION_RATIO |
 | Cost | DOCUMENT_BUDGET, USER_DAILY_BUDGET, BATCH_BUDGET |
 | Privacy | DEFAULT_RETENTION_POLICY, DELETE_AFTER_DAYS, TEMP_RETENTION_HOURS |
-| Security | CLAMAV_HOST, CLAMAV_PORT, ENCRYPTION_KEY_ID |
+| Security | CLAMAV_HOST, CLAMAV_PORT, MFA_ENCRYPTION_KEY_VERSION, MFA_ENCRYPTION_KEY_BASE64, EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_VERSION, EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64, EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64 |
 | Observability | OTEL_ENDPOINT, ERROR_REPORTING_DSN, PII_REDACTION_ENABLED |
 
 Los valores del archivo .env.example sólo levantan infraestructura local. Límites de producto se fijarán junto con tests de abuso y carga, no por intuición.

@@ -1,4 +1,5 @@
 import type { MfaKeyring } from "./mfa.ts";
+import type { EmployerIdentifierProtection } from "./employer-identifiers.ts";
 
 export type AppEnvironment = "development" | "test" | "production";
 export type ObjectStorageProvider = "aws" | "r2";
@@ -16,6 +17,7 @@ export type ApiConfig = Readonly<{
     redirectUri: string;
   }> | null;
   mfaKeyring: MfaKeyring;
+  employerIdentifierProtection: EmployerIdentifierProtection;
   maxFileBytes: number;
   maxFilesPerBatch: number;
   maxBatchBytes: number;
@@ -179,6 +181,35 @@ function mfaKeyring(env: NodeJS.ProcessEnv, production: boolean): MfaKeyring {
   return Object.freeze({ activeVersion, keys });
 }
 
+function employerIdentifierProtection(
+  env: NodeJS.ProcessEnv,
+  production: boolean,
+  mfa: MfaKeyring,
+): EmployerIdentifierProtection {
+  const encryptionKeyVersion = integer(
+    env.EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_VERSION,
+    "EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_VERSION",
+    production ? undefined : 1,
+    1,
+    2_147_483_647,
+  );
+  const encryption = production
+    ? required(env.EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64, "EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64")
+    : (env.EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64 ?? "bG9jYWwtZW1wbG95ZXItZW5jcnlwdGlvbi12MSEhISE=");
+  const fingerprint = production
+    ? required(env.EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64, "EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64")
+    : (env.EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64 ?? "bG9jYWwtZW1wbG95ZXItZmluZ2VycHJpbnQtdjEhISE=");
+  const identifierEncryptionKey = encryptionKey(encryption, "EMPLOYER_IDENTIFIER_ENCRYPTION_KEY_BASE64");
+  const fingerprintKey = encryptionKey(fingerprint, "EMPLOYER_IDENTIFIER_FINGERPRINT_KEY_BASE64");
+  if (
+    identifierEncryptionKey.equals(fingerprintKey)
+    || [...mfa.keys.values()].some((key) => key.equals(identifierEncryptionKey) || key.equals(fingerprintKey))
+  ) {
+    throw new Error("Employer identifier encryption, fingerprint and MFA keys must be distinct");
+  }
+  return Object.freeze({ encryptionKeyVersion, encryptionKey: identifierEncryptionKey, fingerprintKey });
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   const configuredAppEnv = env.APP_ENV?.trim();
   if (env.NODE_ENV === "production" && configuredAppEnv && configuredAppEnv !== "production") {
@@ -244,6 +275,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     }
   }
 
+  const configuredGoogleOAuth = googleOAuth(env, production);
+  const configuredMfaKeyring = mfaKeyring(env, production);
+  const configuredEmployerIdentifierProtection = employerIdentifierProtection(
+    env,
+    production,
+    configuredMfaKeyring,
+  );
+
   return Object.freeze({
     appEnv: appEnv as AppEnvironment,
     host,
@@ -257,8 +296,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
       300,
       2_592_000,
     ),
-    googleOAuth: googleOAuth(env, production),
-    mfaKeyring: mfaKeyring(env, production),
+    googleOAuth: configuredGoogleOAuth,
+    mfaKeyring: configuredMfaKeyring,
+    employerIdentifierProtection: configuredEmployerIdentifierProtection,
     maxFileBytes: integer(env.MAX_FILE_BYTES, "MAX_FILE_BYTES", production ? undefined : 20 * 1024 * 1024, 1_024, 100 * 1024 * 1024),
     maxFilesPerBatch: integer(env.MAX_FILES_PER_BATCH, "MAX_FILES_PER_BATCH", production ? undefined : 200, 1, 1_000),
     maxBatchBytes: integer(env.MAX_BATCH_BYTES, "MAX_BATCH_BYTES", production ? undefined : 512 * 1024 * 1024, 1_024, 10 * 1024 * 1024 * 1024),

@@ -22,14 +22,14 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 ### Incluye
 
 - alta e inicio de sesión exclusivamente con Google, aceptación versionada de Términos y confirmación del Aviso de Privacidad, onboarding, logout y gestión owner-only de sesiones activas con revocación individual o masiva;
-- alta, edición y cierre de múltiples empleadores y empleos simultáneos o sucesivos;
+- alta, edición y cierre de múltiples empleos simultáneos o sucesivos sobre un registro global de empleadores con revisión conservadora;
 - carga individual y masiva de PDFs;
 - ImportBatch persistente, recuperable al volver a la pantalla, con progreso agregado y por archivo;
 - admisión acotada por lote activo, cantidad, bytes, espacio de cuenta y concurrencia por usuario;
 - validación de seguridad, malware y clasificación temprana;
 - extracción de empresa, período, tipo, básico, bruto, neto, remunerativo, no remunerativo, descuentos, reintegros y conceptos principales;
 - asociación manual individual o masiva de documentos procesados a un empleo propio;
-- detección no persistida de un posible empleo desde documentos sin asociar y, sólo después de confirmación explícita, creación de uno nuevo o asociación a un empleo propio existente del mismo empleador y moneda;
+- detección persistida del empleador de un documento y autoasociación sólo cuando existe un único empleo propio del mismo empleador y moneda que cubre el período; los casos sin coincidencia o ambiguos requieren confirmación explícita;
 - confidence por campo, carga manual de montos ausentes y cierre explícito de revisión;
 - historial `salary-analytics-v1` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
 - visor privado del PDF por página con evidencia espacial cuando es inequívoca, datos extraídos y procedencia lado a lado;
@@ -37,9 +37,9 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - eliminación de original, documento o cuenta;
 - exportación de datos;
 - auditoría de acciones sensibles;
-- consola administrativa interna con RBAC por capacidades, MFA obligatorio, metadata paginada de usuarios/documentos/empleos/jobs/storage y comandos operativos acotados con auditoría append-only.
+- consola administrativa interna con RBAC por capacidades, MFA obligatorio, metadata paginada de usuarios/documentos/empleos/jobs/storage, revisión y merge de empleadores, y comandos operativos acotados con auditoría append-only.
 
-La administración no altera ownership ni concede acceso general al contenido privado. Las listas usan metadata mínima y contacto enmascarado; leer un email completo es una operación separada con permiso, step-up, motivo y auditoría. No se exponen PDFs, filenames, URLs firmadas, object keys, OCR, salarios, conceptos, identificadores fiscales completos, tokens ni secretos. Tampoco están habilitados break-glass, impersonación, reproceso completo, baja administrativa de cuenta, merge global de empleadores, tickets, flags o configuración dinámica. Ver [ADR 0012](adr/0012-granular-admin-console.md).
+La administración no altera ownership ni concede acceso general al contenido privado. Las listas usan metadata mínima y contacto enmascarado; leer un email completo es una operación separada con permiso, step-up, motivo y auditoría. Los merges de empleadores mueven referencias estructurales y conservan la fila origen, pero no abren documentos ni contenido laboral. No se exponen PDFs, filenames, URLs firmadas, object keys, OCR, salarios, conceptos, identificadores fiscales completos, tokens ni secretos. Tampoco están habilitados break-glass, impersonación, reproceso completo, baja administrativa de cuenta, tickets, flags o configuración dinámica. Ver [ADR 0012](adr/0012-granular-admin-console.md) y [ADR 0014](adr/0014-global-employer-resolution.md).
 
 La identidad del dominio sigue siendo el UUID interno. Google OIDC agrega una cuenta de autenticación identificada sólo por `(provider, sub)` y emite la misma sesión opaca propia: un email coincidente no identifica ni auto-vincula usuarios, y la aplicación no conserva access, refresh ni ID tokens del proveedor. Las cuentas `BLOCKED` o `SUSPENDED` fallan cerradas. El ownership de empleos, imports, documentos, liquidaciones, analytics, exports y operaciones de privacidad no cambia con el método de login.
 
@@ -84,6 +84,7 @@ Contratos y adendas en allowlist, sin OCR inicial y siempre asociados a un emple
 - Una corrección humana tiene precedencia dentro de la corrida vigente y se hereda explícitamente al reprocesar sin sobrescribir historia.
 - Un deep-link del visor conserva sólo IDs opacos, página y evidencia; nunca salario, OCR ni URL firmada.
 - El dashboard no lee PDFs; consulta datos estructurados.
+- Un recibo sólo se autoasocia cuando país, empleador, moneda y período producen un único empleo propio; una ambigüedad nunca se resuelve por heurística.
 - El usuario puede eliminar originales sin perder datos estructurados cuando elige conservarlos.
 - Una colisión de email entre una cuenta existente y Google nunca vincula, modifica ni expone detalles de la cuenta existente.
 - El callback OIDC no crea una cuenta activa antes de que el navegador ligado al intento complete el registro y la aceptación legal; el onboarding permanece pendiente después del alta.

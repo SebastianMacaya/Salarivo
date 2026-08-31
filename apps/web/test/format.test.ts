@@ -3,11 +3,13 @@ import test from 'node:test';
 import {
   dateLabel,
   documentStatusLabel,
+  employmentOptionLabel,
   extractionSourceLabel,
   money,
   percentage,
   periodLabel,
   recentPeriodRange,
+  salaryContextOptionLabel,
   settlementTypeLabel,
   timestampLabel,
 } from '../app/format.ts';
@@ -33,6 +35,22 @@ test('separa fechas calendario de instantes en Buenos Aires', () => {
   assert.equal(timestampLabel('2026-08-31T03:30:00.000Z'), '31 de ago de 2026, 00:30');
   assert.equal(timestampLabel('2026-08-31'), '—');
   assert.equal(timestampLabel('invalid'), '—');
+});
+
+test('distingue episodios laborales y contextos salariales en selectores', () => {
+  assert.equal(employmentOptionLabel({
+    employerName: 'Empresa sintética', role: 'Analista', startDate: '2024-11-01',
+    endDate: null, status: 'ACTIVE', currencyCode: 'ARS',
+  }), 'Empresa sintética · Analista · Activo · 1 nov 2024 a actualidad · ARS');
+  assert.equal(salaryContextOptionLabel({
+    employerName: 'Empresa sintética', state: 'CONFIRMED', currencyCode: 'ARS',
+    employmentStatus: 'ACTIVE', startDate: '2024-11-01', endDate: null,
+    firstPeriod: '2026-06', lastPeriod: '2026-07',
+  }), 'Empresa sintética · Confirmado · Activo · 1 nov 2024 a actualidad · ARS');
+  assert.equal(salaryContextOptionLabel({
+    employerName: 'Empresa sintética', state: 'DETECTED', currencyCode: 'ARS',
+    firstPeriod: '2026-07', lastPeriod: '2026-07',
+  }), 'Empresa sintética · Recibos sin asociar · Julio 2026 · ARS');
 });
 
 test('los rangos temporales usan meses calendario aunque falten recibos', () => {

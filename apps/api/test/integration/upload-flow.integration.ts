@@ -1231,19 +1231,12 @@ test("upload privado crea un único documento y un único intent durable", async
   const revokedAdmin = await app.inject({ method: "GET", url: "/api/v1/admin/overview", headers: { cookie: cookieA } });
   assert.equal(revokedAdmin.statusCode, 403, revokedAdmin.body);
   async function createEmployment(cookie: string, employerName: string) {
-    const employer = await app.inject({
-      method: "POST",
-      url: "/api/v1/employers",
-      headers: { origin, cookie },
-      payload: { name: employerName, countryCode: "AR" },
-    });
-    assert.equal(employer.statusCode, 201, employer.body);
     const employment = await app.inject({
       method: "POST",
       url: "/api/v1/employments",
       headers: { origin, cookie },
       payload: {
-        employerId: employer.json().data.id,
+        employerName,
         startDate: "2026-01-01",
         countryCode: "AR",
         currencyCode: "ARS",
@@ -1255,6 +1248,73 @@ test("upload privado crea un único documento y un único intent durable", async
   const employmentA = await createEmployment(cookieA, "Empresa Asociada A");
   const employmentB = await createEmployment(cookieB, "Empresa Ajena B");
   const googleEmployment = await createEmployment(googleCookie, "Empresa Google Sintética");
+  const priorEmploymentA = await app.inject({
+    method: "POST",
+    url: "/api/v1/employments",
+    headers: { origin, cookie: cookieA },
+    payload: {
+      employerName: "Empresa Asociada A",
+      startDate: "2024-01-01",
+      endDate: "2025-12-31",
+      countryCode: "AR",
+      currencyCode: "ARS",
+    },
+  });
+  assert.equal(priorEmploymentA.statusCode, 201, priorEmploymentA.body);
+  const employmentEpisodes = await app.inject({ method: "GET", url: "/api/v1/employments", headers: { cookie: cookieA } });
+  assert.equal(employmentEpisodes.statusCode, 200, employmentEpisodes.body);
+  const currentEmploymentA = employmentEpisodes.json().data.find((employment: { id: string }) => employment.id === employmentA);
+  assert.ok(currentEmploymentA);
+  assert.deepEqual(
+    employmentEpisodes.json().data
+      .filter((employment: { employerId: string }) => employment.employerId === currentEmploymentA.employerId)
+      .map((employment: { startDate: string; endDate: string | null }) => [employment.startDate, employment.endDate])
+      .sort(),
+    [["2024-01-01", "2025-12-31"], ["2026-01-01", null]],
+  );
+  const invalidExpandedEmployer = await app.inject({
+    method: "POST",
+    url: "/api/v1/employments",
+    headers: { origin, cookie: cookieA },
+    payload: {
+      employerName: "ﬃ".repeat(100), startDate: "2025-01-01", countryCode: "AR", currencyCode: "ARS",
+    },
+  });
+  assert.equal(invalidExpandedEmployer.statusCode, 400, invalidExpandedEmployer.body);
+  assert.equal(invalidExpandedEmployer.json().error.code, "INVALID_EMPLOYER_NAME");
+  const ownOrphanEmployerName = `Empresa Pendiente Propia Sin Empleo ${suffix}`;
+  const unrelatedEmployerName = `Empresa Ajena Sin Vínculo ${suffix}`;
+  const ownOrphanEmployer = await app.inject({
+    method: "POST", url: "/api/v1/employers", headers: { origin, cookie: cookieA },
+    payload: { name: ownOrphanEmployerName, countryCode: "AR" },
+  });
+  assert.equal(ownOrphanEmployer.statusCode, 201, ownOrphanEmployer.body);
+  const unrelatedEmployer = await app.inject({
+    method: "POST", url: "/api/v1/employers", headers: { origin, cookie: cookieB },
+    payload: { name: unrelatedEmployerName, countryCode: "AR" },
+  });
+  assert.equal(unrelatedEmployer.statusCode, 201, unrelatedEmployer.body);
+  const sharedEmployment = await app.inject({
+    method: "POST", url: "/api/v1/employments", headers: { origin, cookie: cookieA },
+    payload: {
+      employerName: "Empresa Ajena B", startDate: "2025-01-01", countryCode: "AR", currencyCode: "ARS",
+    },
+  });
+  assert.equal(sharedEmployment.statusCode, 201, sharedEmployment.body);
+  const ownerEmployers = await app.inject({ method: "GET", url: "/api/v1/employers", headers: { cookie: cookieA } });
+  assert.equal(ownerEmployers.statusCode, 200, ownerEmployers.body);
+  assert.ok(ownerEmployers.json().data.some((employer: { name: string }) => employer.name === ownOrphanEmployerName));
+  assert.ok(ownerEmployers.json().data.some((employer: { name: string }) => employer.name === "Empresa Ajena B"));
+  assert.equal(ownerEmployers.json().data.some((employer: { name: string }) => employer.name === unrelatedEmployerName), false);
+  assert.equal(/createdAt|updatedAt|createdSource|createdBy/i.test(ownerEmployers.body), false);
+  await pool.query(
+    `INSERT INTO employers (
+       id, created_by_user_id, name, country_code, status, created_source, merged_into_employer_id
+     ) VALUES
+       ($1, $3, 'Empresa Propia Fusionada', 'AR', 'MERGED', 'ADMIN', $4),
+       ($2, $3, 'Empresa Propia Rechazada', 'AR', 'REJECTED', 'ADMIN', NULL)`,
+    [crypto.randomUUID(), crypto.randomUUID(), userIdA, ownOrphanEmployer.json().data.id],
+  );
   await pool.query("UPDATE users SET role = 'ADMIN', admin_role = 'SUPER_ADMIN', updated_at = now() WHERE id = $1", [userIdA]);
   const wildcardEmployerSearch = await app.inject({
     method: "GET",
@@ -2249,6 +2309,49 @@ test("upload privado crea un único documento y un único intent durable", async
       query,
     );
   }
+  const groupedEmploymentDocuments = [
+    { documentId: listFixtures[2]!.id, runId: crypto.randomUUID(), settlementId: crypto.randomUUID(), period: "2026-06-01" },
+    { documentId: listFixtures[3]!.id, runId: crypto.randomUUID(), settlementId: crypto.randomUUID(), period: "2026-07-01" },
+  ];
+  for (const fixture of groupedEmploymentDocuments) {
+    await pool.query("UPDATE documents SET processing_status = 'COMPLETED' WHERE id = $1", [fixture.documentId]);
+    await pool.query(
+      `INSERT INTO extraction_runs (
+         id, user_id, document_id, processing_version, status, extractor_name,
+         extractor_version, parser_version, normalizer_version, finished_at
+       ) VALUES ($1, $2, $3, 1, 'COMPLETED', 'synthetic-selector', '1', '1', '1', now())`,
+      [fixture.runId, userId, fixture.documentId],
+    );
+    await pool.query(
+      `INSERT INTO payroll_settlements (
+         id, user_id, document_id, extraction_run_id, employment_id, settlement_ordinal,
+         payroll_period, settlement_type, is_recurring, currency_code, basic_amount
+       ) VALUES ($1, $2, $3, $4, $5, 1, $6, 'NORMAL', true, 'ARS', 900.00)`,
+      [fixture.settlementId, userId, fixture.documentId, fixture.runId, employmentA, fixture.period],
+    );
+  }
+  const groupedEmploymentHistory = await app.inject({
+    method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
+  });
+  assert.equal(groupedEmploymentHistory.statusCode, 200, groupedEmploymentHistory.body);
+  const groupedEmploymentContexts = groupedEmploymentHistory.json().data.contexts.filter(
+    (context: { employmentContext: string }) => context.employmentContext === employmentA,
+  );
+  assert.deepEqual(
+    groupedEmploymentContexts.map((context: { firstPeriod: string; lastPeriod: string }) => ({
+      firstPeriod: context.firstPeriod, lastPeriod: context.lastPeriod,
+    })),
+    [{ firstPeriod: "2026-06", lastPeriod: "2026-07" }],
+  );
+  await pool.query("DELETE FROM extraction_runs WHERE id = ANY($1::uuid[])", [
+    groupedEmploymentDocuments.map(({ runId }) => runId),
+  ]);
+  await pool.query(
+    `UPDATE documents
+        SET processing_status = CASE id WHEN $1 THEN 'OCR' WHEN $2 THEN 'FAILED_PERMANENT' END
+      WHERE id = ANY($3::uuid[])`,
+    [listFixtures[2]!.id, listFixtures[3]!.id, [listFixtures[2]!.id, listFixtures[3]!.id]],
+  );
   await pool.query(
     `UPDATE payroll_settlements
         SET basic_amount = 1000.00, remunerative_amount = 1000.00, non_remunerative_amount = 0.00
@@ -2265,6 +2368,83 @@ test("upload privado crea un único documento y un único intent durable", async
        ($5, $2, $3, 6, 'Haber desconocido sintético', NULL, 15.00, 'ARS', 'EARNING', NULL, 0.50)`,
     [crypto.randomUUID(), userId, settlementId, crypto.randomUUID(), crypto.randomUUID()],
   );
+  const detectedCanonicalEmployer = await pool.query(
+    `SELECT document.detected_employer_id, employer.name
+       FROM documents document
+       JOIN employers employer ON employer.id = document.detected_employer_id
+      WHERE document.id = $1`,
+    [documentId],
+  );
+  assert.equal(detectedCanonicalEmployer.rowCount, 1);
+  const detectedCanonicalEmployerId = String(detectedCanonicalEmployer.rows[0].detected_employer_id);
+  const detectedCanonicalEmployerName = String(detectedCanonicalEmployer.rows[0].name);
+  await pool.query(
+    "UPDATE employers SET name = 'Empresa Canónica Renombrada SA', updated_at = now() WHERE id = $1",
+    [detectedCanonicalEmployerId],
+  );
+  const renamedCanonicalSalaryHistory = await app.inject({
+    method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
+  });
+  assert.equal(renamedCanonicalSalaryHistory.statusCode, 200, renamedCanonicalSalaryHistory.body);
+  assert.equal(
+    renamedCanonicalSalaryHistory.json().data.contexts.find(
+      (context: { employmentContext: string }) => context.employmentContext === `detected:${detectedCanonicalEmployerId}`,
+    )?.employerName,
+    "Empresa Canónica Renombrada SA",
+  );
+  const renamedCanonicalDetections = await app.inject({
+    method: "GET", url: "/api/v1/employment-detections", headers: { cookie: cookieA },
+  });
+  assert.equal(renamedCanonicalDetections.statusCode, 200, renamedCanonicalDetections.body);
+  assert.equal(
+    renamedCanonicalDetections.json().data.find(
+      (detection: { employerId: string | null }) => detection.employerId === detectedCanonicalEmployerId,
+    )?.employerName,
+    "Empresa Canónica Renombrada SA",
+  );
+  await pool.query(
+    `UPDATE user_corrections
+        SET extracted_field_id = NULL, field_path = 'employer.name.hidden'
+      WHERE user_id = $1 AND extraction_run_id = $2 AND field_path = 'employer.name'`,
+    [userId, runId],
+  );
+  await pool.query("UPDATE extracted_fields SET field_path = 'employer.name.hidden' WHERE id = $1", [employerFieldId]);
+  const fieldlessCanonicalDetections = await app.inject({
+    method: "GET", url: "/api/v1/employment-detections", headers: { cookie: cookieA },
+  });
+  assert.equal(fieldlessCanonicalDetections.statusCode, 200, fieldlessCanonicalDetections.body);
+  assert.equal(
+    fieldlessCanonicalDetections.json().data.find(
+      (detection: { employerId: string | null }) => detection.employerId === detectedCanonicalEmployerId,
+    )?.employerName,
+    "Empresa Canónica Renombrada SA",
+  );
+  await pool.query("UPDATE documents SET detected_employer_id = $2 WHERE id = $1", [
+    documentId, currentEmploymentA.employerId,
+  ]);
+  const postMergeCanonicalDetections = await app.inject({
+    method: "GET", url: "/api/v1/employment-detections", headers: { cookie: cookieA },
+  });
+  assert.equal(postMergeCanonicalDetections.statusCode, 200, postMergeCanonicalDetections.body);
+  assert.equal(
+    postMergeCanonicalDetections.json().data.find(
+      (detection: { employerId: string | null }) => detection.employerId === currentEmploymentA.employerId,
+    )?.employerName,
+    currentEmploymentA.employerName,
+  );
+  await pool.query("UPDATE documents SET detected_employer_id = $2 WHERE id = $1", [
+    documentId, detectedCanonicalEmployerId,
+  ]);
+  await pool.query("UPDATE extracted_fields SET field_path = 'employer.name' WHERE id = $1", [employerFieldId]);
+  await pool.query(
+    `UPDATE user_corrections
+        SET extracted_field_id = $3, field_path = 'employer.name'
+      WHERE user_id = $1 AND extraction_run_id = $2 AND field_path = 'employer.name.hidden'`,
+    [userId, runId, employerFieldId],
+  );
+  await pool.query("UPDATE employers SET name = $2, updated_at = now() WHERE id = $1", [
+    detectedCanonicalEmployerId, detectedCanonicalEmployerName,
+  ]);
   const salaryHistory = await app.inject({ method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA } });
   assert.equal(salaryHistory.statusCode, 200, salaryHistory.body);
   assert.equal(salaryHistory.json().data.calculationVersion, "salary-analytics-v1");
@@ -2274,12 +2454,14 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal("settlements" in salaryHistory.json().data.analytics.scopes[0].evolution[0], false);
   assert.doesNotMatch(salaryHistory.body, /Sueldo básico sintético|Bono sintético|Haber desconocido sintético/);
   const employmentContext = salaryHistory.json().data.contexts[0].employmentContext as string;
+  assert.match(employmentContext, /^detected:[0-9a-f-]{36}$/);
+  const detectedEmployerContextId = employmentContext.slice("detected:".length);
   const conceptContextQuery = `employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa Sintética SA")}`;
   assert.equal((await app.inject({
     method: "GET",
     url: `/api/v1/salary-history/concepts?employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=ARS&employerName=Otra`,
     headers: { cookie: cookieA },
-  })).statusCode, 400);
+  })).statusCode, 200);
   const firstConcepts = await app.inject({
     method: "GET",
     url: `/api/v1/salary-history/concepts?${conceptContextQuery}&limit=1`,
@@ -2321,6 +2503,40 @@ test("upload privado crea un único documento y un único intent durable", async
     url: `/api/v1/salary-history/concepts?${conceptContextQuery}&limit=101`,
     headers: { cookie: cookieA },
   })).statusCode, 400);
+  const employerCorrectionState = await pool.query(
+    `SELECT id, corrected_value
+       FROM user_corrections
+      WHERE user_id = $1 AND extraction_run_id = $2 AND field_path = 'employer.name'
+      ORDER BY correction_version DESC
+      LIMIT 1`,
+    [userId, runId],
+  );
+  assert.equal(employerCorrectionState.rowCount, 1);
+  await pool.query("UPDATE documents SET detected_employer_id = NULL WHERE id = $1", [documentId]);
+  await pool.query("UPDATE user_corrections SET corrected_value = $2::jsonb WHERE id = $1", [
+    employerCorrectionState.rows[0].id, JSON.stringify("Empresa+Sintética SA"),
+  ]);
+  const legacyPunctuationSalaryHistory = await app.inject({
+    method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
+  });
+  assert.equal(legacyPunctuationSalaryHistory.statusCode, 200, legacyPunctuationSalaryHistory.body);
+  const legacyPunctuationContext = legacyPunctuationSalaryHistory.json().data.contexts.find(
+    (context: { employerName: string }) => context.employerName === "Empresa+Sintética SA",
+  )?.employmentContext as string;
+  assert.match(legacyPunctuationContext, /^detected:[0-9a-f]{24}$/);
+  const legacyPunctuationConcepts = await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?employmentContext=${encodeURIComponent(legacyPunctuationContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa+Sintética SA")}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(legacyPunctuationConcepts.statusCode, 200, legacyPunctuationConcepts.body);
+  assert.ok(legacyPunctuationConcepts.json().data.items.length > 0);
+  await pool.query("UPDATE user_corrections SET corrected_value = $2::jsonb WHERE id = $1", [
+    employerCorrectionState.rows[0].id, JSON.stringify(employerCorrectionState.rows[0].corrected_value),
+  ]);
+  await pool.query("UPDATE documents SET detected_employer_id = $2 WHERE id = $1", [
+    documentId, detectedCanonicalEmployerId,
+  ]);
   const isolatedSalaryHistory = await app.inject({ method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieB } });
   assert.equal(isolatedSalaryHistory.statusCode, 200, isolatedSalaryHistory.body);
   assert.deepEqual(isolatedSalaryHistory.json().data.analytics.scopes, []);
@@ -2333,6 +2549,7 @@ test("upload privado crea un único documento y un único intent durable", async
   const detectedEmployments = await app.inject({ method: "GET", url: "/api/v1/employment-detections", headers: { cookie: cookieA } });
   assert.equal(detectedEmployments.statusCode, 200, detectedEmployments.body);
   assert.deepEqual(detectedEmployments.json().data[0], {
+    employerId: detectedEmployerContextId,
     employerName: "Empresa Sintética SA",
     currencyCode: "ARS",
     firstPeriod: "2026-08",
@@ -2391,14 +2608,17 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(associatedSettlements.json().data[0].employerName, "Empresa Asociada A");
   const persistedAssociation = await pool.query(
     `SELECT document.employment_id AS document_employment_id,
-            settlement.employment_id AS settlement_employment_id
+            settlement.employment_id AS settlement_employment_id,
+            item.employment_id AS item_employment_id
        FROM documents document
        JOIN payroll_settlements settlement ON settlement.document_id = document.id
+       JOIN import_batch_items item ON item.id = document.import_batch_item_id
       WHERE document.id = $1`,
     [documentId],
   );
   assert.equal(String(persistedAssociation.rows[0].document_employment_id), employmentA);
   assert.equal(String(persistedAssociation.rows[0].settlement_employment_id), employmentA);
+  assert.equal(String(persistedAssociation.rows[0].item_employment_id), employmentA);
 
   const disassociation = await app.inject({
     method: "PATCH",
@@ -2409,27 +2629,38 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(disassociation.statusCode, 200, disassociation.body);
   const clearedAssociation = await pool.query(
     `SELECT document.employment_id AS document_employment_id,
-            settlement.employment_id AS settlement_employment_id
+            settlement.employment_id AS settlement_employment_id,
+            item.employment_id AS item_employment_id
        FROM documents document
        JOIN payroll_settlements settlement ON settlement.document_id = document.id
+       JOIN import_batch_items item ON item.id = document.import_batch_item_id
       WHERE document.id = $1`,
     [documentId],
   );
   assert.equal(clearedAssociation.rows[0].document_employment_id, null);
   assert.equal(clearedAssociation.rows[0].settlement_employment_id, null);
+  assert.equal(clearedAssociation.rows[0].item_employment_id, null);
 
   const foreignDetectionConfirmation = await app.inject({
     method: "POST",
     url: "/api/v1/employment-detections/confirm",
     headers: { origin, cookie: cookieB },
-    payload: { employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
+    payload: { employerId: detectedEmployerContextId, employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
   });
   assert.equal(foreignDetectionConfirmation.statusCode, 404, foreignDetectionConfirmation.body);
+  await Promise.all([
+    pool.query("UPDATE payroll_settlements SET employment_id = $1 WHERE document_id = $2", [employmentA, documentId]),
+    pool.query(
+      `UPDATE import_batch_items SET employment_id = $1
+        WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $2)`,
+      [employmentA, documentId],
+    ),
+  ]);
   const confirmedDetection = await app.inject({
     method: "POST",
     url: "/api/v1/employment-detections/confirm",
     headers: { origin, cookie: cookieA },
-    payload: { employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
+    payload: { employerId: detectedEmployerContextId, employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
   });
   assert.equal(confirmedDetection.statusCode, 201, confirmedDetection.body);
   assert.equal(confirmedDetection.json().data.associatedDocuments, 1);
@@ -2438,14 +2669,17 @@ test("upload privado crea un único documento y un único intent durable", async
   const detectedEmployerId = String(confirmedDetection.json().data.employment.employerId);
   assert.deepEqual((await pool.query(
     `SELECT document.employment_id AS document_employment_id,
-            settlement.employment_id AS settlement_employment_id
+            settlement.employment_id AS settlement_employment_id,
+            item.employment_id AS item_employment_id
        FROM documents document
        JOIN payroll_settlements settlement ON settlement.document_id = document.id
+       JOIN import_batch_items item ON item.id = document.import_batch_item_id
       WHERE document.id = $1`,
     [documentId],
   )).rows[0], {
     document_employment_id: detectedEmploymentId,
     settlement_employment_id: detectedEmploymentId,
+    item_employment_id: detectedEmploymentId,
   });
   const clearDetectedEmployment = await app.inject({
     method: "PATCH",
@@ -2485,6 +2719,7 @@ test("upload privado crea un único documento y un único intent durable", async
     headers: { origin, cookie: cookieA },
     payload: {
       employerName: "empresa sintética sa",
+      employerId: detectedEmployerId,
       currencyCode: "ARS",
       employmentId: detectedEmploymentId,
     },
@@ -2498,14 +2733,17 @@ test("upload privado crea un único documento y un único intent durable", async
   );
   assert.deepEqual((await pool.query(
     `SELECT document.employment_id AS document_employment_id,
-            settlement.employment_id AS settlement_employment_id
+            settlement.employment_id AS settlement_employment_id,
+            item.employment_id AS item_employment_id
        FROM documents document
        JOIN payroll_settlements settlement ON settlement.document_id = document.id
+       JOIN import_batch_items item ON item.id = document.import_batch_item_id
       WHERE document.id = $1`,
     [documentId],
   )).rows[0], {
     document_employment_id: detectedEmploymentId,
     settlement_employment_id: detectedEmploymentId,
+    item_employment_id: detectedEmploymentId,
   });
   assert.equal((await app.inject({
     method: "PATCH",
@@ -2514,7 +2752,7 @@ test("upload privado crea un único documento y un único intent durable", async
     payload: { documentIds: [documentId], employmentId: null },
   })).statusCode, 200);
   await pool.query("DELETE FROM employments WHERE id = $1 AND user_id = $2", [detectedEmploymentId, userId]);
-  await pool.query("DELETE FROM employers WHERE id = $1 AND user_id = $2", [detectedEmployerId, userId]);
+  await pool.query("DELETE FROM employers WHERE id = $1 AND created_by_user_id = $2", [detectedEmployerId, userId]);
 
   const correction = await app.inject({
     method: "POST",
@@ -2836,6 +3074,13 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(steppedUp.statusCode, 200, steppedUp.body);
   cookieA = rotatedCookie(steppedUp, cookieA);
+  const foreignDetectedEmployerId = String(unrelatedEmployer.json().data.id);
+  assert.equal((await pool.query(
+    `UPDATE documents
+        SET detected_employer_id = $2
+      WHERE id = $1 AND user_id = $3 AND employment_id IS NULL`,
+    [documentId, foreignDetectedEmployerId, userIdA],
+  )).rowCount, 1);
   const firstExport = await app.inject({
     method: "POST",
     url: "/api/v1/privacy/exports",
@@ -2903,6 +3148,10 @@ test("upload privado crea un único documento y un único intent durable", async
   const downloads = await Promise.all([download(), download()]);
   assert.deepEqual(downloads.map((response) => response.statusCode).sort(), [200, 409]);
   const exported = downloads.find(({ statusCode }) => statusCode === 200)!.json();
+  assert.equal((await pool.query(
+    "UPDATE documents SET detected_employer_id = NULL WHERE id = $1 AND user_id = $2",
+    [documentId, userIdA],
+  )).rowCount, 1);
   assert.equal(exported.format, "salarivo-user-export-v3");
   assert.deepEqual(Object.keys(exported), [
     "format", "exportedAt", "account", "authenticationMethods", "employers", "employments",
@@ -2910,10 +3159,31 @@ test("upload privado crea un único documento y un único intent durable", async
     "sessions", "privacyRequests",
   ]);
   assert.equal(exported.account.secondFactor.enabled, true);
+  assert.ok(exported.employers.some((employer: { name: string; firstLinkedAt: string | null }) =>
+    employer.name === ownOrphanEmployerName && employer.firstLinkedAt === null));
+  assert.ok(exported.employers.some((employer: {
+    name: string; firstLinkedAt: string | null; status: string | null; createdAt: string | null;
+  }) => employer.name === "Empresa Ajena B" && typeof employer.firstLinkedAt === "string"
+    && employer.status === null && employer.createdAt === null));
+  assert.ok(exported.employers.some((employer: {
+    name: string; firstLinkedAt: string | null; status: string | null; createdAt: string | null;
+  }) => employer.name === unrelatedEmployerName && employer.firstLinkedAt === null
+    && employer.status === null && employer.createdAt === null));
+  for (const [name, status] of [
+    ["Empresa Propia Fusionada", "MERGED"], ["Empresa Propia Rechazada", "REJECTED"],
+  ]) {
+    assert.ok(exported.employers.some((employer: {
+      name: string; status: string | null; createdAt: string | null;
+    }) => employer.name === name && employer.status === status && typeof employer.createdAt === "string"));
+  }
+  assert.equal(/updatedAt|createdSource|createdBy/i.test(JSON.stringify(exported.employers)), false);
   assert.ok(exported.imports.some((item: { filename: string }) => item.filename === "recibo-sintetico.pdf"));
-  assert.ok(exported.documents.some((document: { filename: string }) => document.filename === "recibo-sintetico.pdf"));
-  assert.ok(exported.settlements.some((settlement: { payrollPeriod: string; grossAmount: string }) =>
-    settlement.payrollPeriod.startsWith("2026-10") && settlement.grossAmount === "1000.00"));
+  assert.ok(exported.documents.some((document: { filename: string; employerName: string | null }) =>
+    document.filename === "recibo-sintetico.pdf" && document.employerName === unrelatedEmployerName));
+  assert.ok(exported.settlements.some((settlement: {
+    payrollPeriod: string; grossAmount: string; employerName: string | null;
+  }) => settlement.payrollPeriod.startsWith("2026-10") && settlement.grossAmount === "1000.00"
+    && settlement.employerName === unrelatedEmployerName));
   assert.equal(exported.settlements.some((settlement: { payrollPeriod: string }) =>
     settlement.payrollPeriod.startsWith("2026-08")), false);
   assert.ok(exported.concepts.some((concept: { description: string; type: string }) =>
@@ -2933,6 +3203,7 @@ test("upload privado crea un único documento y un único intent durable", async
     manualRunId,
     manualGrossFieldId,
     employmentA,
+    foreignDetectedEmployerId,
     createHash("sha256").update(emailA).digest("base64url"),
   ]) assert.equal(exportedText.includes(internalIdentifier), false);
   assert.equal(
@@ -3095,6 +3366,13 @@ test("upload privado crea un único documento y un único intent durable", async
   }
   assert.deepEqual(releasedStatuses, ["READY", "READY"]);
 
+  const associatedBeforeMismatchedReprocess = await app.inject({
+    method: "PATCH",
+    url: "/api/v1/documents/employment",
+    headers: { origin, cookie: cookieA },
+    payload: { documentIds: [documentId], employmentId: employmentA },
+  });
+  assert.equal(associatedBeforeMismatchedReprocess.statusCode, 200, associatedBeforeMismatchedReprocess.body);
   const lineageBeforeReprocess = (await pool.query(
     `SELECT
        (SELECT count(*)::integer FROM extraction_runs WHERE document_id = $1) AS runs,
@@ -3212,7 +3490,7 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(runningReprocess.rowCount, 1);
   const reprocessedExtraction = extractArgentinePayroll([
     "RECIBO DE SUELDO",
-    "Empleador: Empresa Sintetica SA",
+    "Empleador: Empresa Distinta En Reproceso SA",
     "Periodo de liquidacion: 08/2026",
     "Sueldo basico $ 1.234.567,89",
     "Presentismo $ 123.456,78",
@@ -3236,6 +3514,38 @@ test("upload privado crea un único documento y un único intent durable", async
     1,
   );
   assert.equal(reprocessResult, "NEEDS_REVIEW");
+  const mismatchState = (await pool.query(
+    `SELECT document.employment_id AS document_employment_id,
+            document.detected_employer_id, document.processing_status,
+            item.employment_id AS item_employment_id,
+            ARRAY(
+              SELECT DISTINCT settlement.employment_id::text
+                FROM payroll_settlements settlement
+               WHERE settlement.document_id = document.id
+               ORDER BY settlement.employment_id::text
+            ) AS settlement_employment_ids
+       FROM documents document
+       JOIN import_batch_items item ON item.id = document.import_batch_item_id
+      WHERE document.id = $1`,
+    [documentId],
+  )).rows[0];
+  assert.equal(String(mismatchState.document_employment_id), employmentA);
+  assert.equal(String(mismatchState.item_employment_id), employmentA);
+  assert.deepEqual(mismatchState.settlement_employment_ids, [employmentA]);
+  assert.equal(mismatchState.processing_status, "NEEDS_REVIEW");
+  assert.notEqual(
+    String(mismatchState.detected_employer_id),
+    String((await pool.query("SELECT employer_id FROM employments WHERE id = $1", [employmentA])).rows[0].employer_id),
+  );
+  const mismatchAudit = await pool.query(
+    `SELECT metadata_no_sensitive FROM audit_events
+      WHERE action = 'EMPLOYMENT_ASSOCIATION_MISMATCH' AND resource_id = $1
+      ORDER BY created_at DESC LIMIT 1`,
+    [documentId],
+  );
+  assert.equal(mismatchAudit.rowCount, 1);
+  const mismatchAuditText = JSON.stringify(mismatchAudit.rows[0].metadata_no_sensitive);
+  assert.doesNotMatch(mismatchAuditText, /Empresa|sueldo|salary|ocr|gross|net/i);
   await pool.query(
     "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
     [reprocess.json().data.job.id],
@@ -3842,7 +4152,7 @@ test("upload privado crea un único documento y un único intent durable", async
          (SELECT count(*)::integer FROM sessions WHERE user_id = $1) AS sessions,
          (SELECT count(*)::integer FROM mfa_factors WHERE user_id = $1) AS mfa_factors,
          (SELECT count(*)::integer FROM mfa_recovery_codes WHERE user_id = $1) AS recovery_codes,
-         (SELECT count(*)::integer FROM employers WHERE user_id = $1) AS employers,
+         (SELECT count(*)::integer FROM employers WHERE created_by_user_id = $1) AS employers,
          (SELECT count(*)::integer FROM employments WHERE user_id = $1) AS employments,
          (SELECT count(*)::integer FROM import_batches WHERE user_id = $1) AS import_batches,
          (SELECT count(*)::integer FROM upload_sessions WHERE user_id = $1) AS upload_sessions,

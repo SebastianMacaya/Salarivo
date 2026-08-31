@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–017. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–019. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -19,12 +19,15 @@ erDiagram
     USER ||--o{ SESSION : opens
     USER ||--o{ EMPLOYMENT : owns
     EMPLOYER ||--o{ EMPLOYMENT : participates
+    EMPLOYER ||--o{ EMPLOYER_ALIAS : known_as
+    EMPLOYER ||--o{ EMPLOYER_IDENTIFIER : identified_by
     USER ||--o{ IMPORT_BATCH : starts
     IMPORT_BATCH ||--o{ IMPORT_BATCH_ITEM : contains
     IMPORT_BATCH ||--o{ UPLOAD_SESSION : authorizes
     UPLOAD_SESSION ||--o{ IMPORT_BATCH_ITEM : scopes
     USER ||--o{ DOCUMENT : owns
     EMPLOYMENT o|--o{ DOCUMENT : groups
+    EMPLOYER o|--o{ DOCUMENT : detected_in
     IMPORT_BATCH_ITEM o|--o| DOCUMENT : becomes
     DOCUMENT ||--o{ EXTRACTION_RUN : processed_as
     DOCUMENT ||--o{ PROCESSING_JOB : schedules
@@ -57,7 +60,9 @@ Session sigue siendo propia y opaca: sólo su hash se persiste y su UUID interno
 
 ### Employer y Employment
 
-Employer representa una organización con nombre, país y 0..N identificadores fiscales tipados. Employment representa una relación del usuario con ese empleador. Un usuario puede tener varias relaciones simultáneas o sucesivas con el mismo Employer.
+Employer representa una organización global con nombre, nombre normalizado, país, aliases y 0..N identificadores fiscales tipados y protegidos, con un máximo por país/tipo. Su estado es `PENDING`, `VERIFIED`, `MERGED` o `REJECTED`; `createdByUserId` registra procedencia mínima pero no ownership ni acceso. Un `MERGED` conserva la evidencia y apunta al canónico. AR/CUIT es el único adapter de escritura actual: valida checksum, cifra el valor con AES-256-GCM y conserva una huella HMAC-SHA-256 con clave separada; sólo el sufijo enmascarado sale de la API.
+
+Employment representa la relación privada de un usuario con ese empleador. Un usuario puede tener varias relaciones simultáneas o sucesivas con el mismo Employer. Document y PayrollSettlement conservan `userId` como autoridad primaria y, cuando existe `employmentId`, el servidor valida además que el Employment pertenezca al mismo usuario. El UUID global del Employer nunca autoriza datos laborales.
 
 Campos esenciales de Employment:
 
@@ -69,7 +74,9 @@ Campos esenciales de Employment:
 
 El puesto actual vive todavía en Employment. Una futura PositionPeriod conservará cambios de puesto/categoría con vigencia sin sobrescribir historia; no está implementada.
 
-Los recibos sin asociación pueden producir una proyección `DETECTED` agrupada por nombre efectivo del empleador y moneda. Esa detección no crea ni modifica Employment: sólo una confirmación explícita crea o reutiliza Employer y permite crear un Employment o elegir uno propio existente del mismo empleador y moneda para asociar los documentos coincidentes.
+Toda alta pasa por un resolver transaccional compartido. Prioriza un identificador fiscal exacto protegido, luego recupera candidatos por nombre normalizado y sólo reutiliza un nombre canónico o alias único que también coincida con la comparación conservadora. Si no existe una coincidencia inequívoca crea un Employer `PENDING`. No hay merge fuzzy ni unicidad global por nombre. La concurrencia se serializa durante la mutación de identidad.
+
+Los recibos conservan el Employer detectado aunque todavía no tengan Employment. Sólo se autoasocian cuando existe exactamente un empleo propio del mismo empleador y moneda cuyo rango cubre el período salarial. Cero o varias coincidencias mantienen una proyección `DETECTED` hasta confirmación humana.
 
 ### ImportBatch
 
@@ -97,7 +104,7 @@ Representa un archivo recibido, no un recibo ni una liquidación.
 
 Metadata mínima:
 
-- id, userId y employmentId opcional;
+- id, userId, detectedEmployerId y employmentId opcionales;
 - opaqueObjectKey; nunca filename original como path;
 - originalFilename sólo como metadata sanitizada;
 - declaredMimeType y detectedMimeType separados;
@@ -108,7 +115,7 @@ Metadata mínima:
 
 El nombre visible del recibo se deriva de la proyección vigente (`payrollPeriod` y empresa efectiva); no reemplaza `originalFilename` ni la key opaca del objeto.
 
-La asociación con Employment puede definirse al importar o después del procesamiento. El cambio posterior actualiza en una sola transacción el Document y sus PayrollSettlement; nunca se asocia por nombre sin confirmación humana.
+La asociación con Employment puede definirse al importar, resolverse de manera inequívoca durante el procesamiento o confirmarse después. El cambio actualiza en una sola transacción el ImportBatchItem, el Document y sus PayrollSettlement. Un nombre aislado nunca basta cuando hay más de un candidato.
 
 No hay deduplicación física global. La advertencia de checksum se consulta por userId para evitar un canal lateral.
 
@@ -241,6 +248,8 @@ countryCode es explícito. Un adapter de nómina contiene reglas locales; AR es 
 Las migraciones vigentes materializan:
 
 - FK y ownership coherentes entre user, employment, document y settlement;
+- Employer global con estados/cadena de merge válidos, aliases e identificadores protegidos; Employment conserva el límite owner-only;
+- una relación laboral exactamente igual no puede insertarse dos veces, sin impedir períodos o roles distintos;
 - unique de AuthAccount por provider + sub y vínculo a un único User;
 - intentos OIDC de un solo uso, expirables y ligados al navegador y propósito;
 - unique por userId + checksum para duplicado lógico vigente;

@@ -18,6 +18,7 @@ export const adminPermissions = [
   "documents.read_metadata",
   "documents.quarantine",
   "employers.read_metadata",
+  "employers.manage",
   "processing.read",
   "processing.retry",
   "processing.cancel",

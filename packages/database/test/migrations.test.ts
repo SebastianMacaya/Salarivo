@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { assertSecureDatabaseUrl } from "../src/database-url.ts";
+import { normalizeEmployerName, normalizeEmployerNameConservative } from "../src/employers.ts";
 import { loadMigrations, pendingMigrations } from "../src/migrations.ts";
 
 test("production database URLs require full certificate and hostname verification", () => {
@@ -22,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 18);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 18 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 19);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 19 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 18, name: "session_management" },
+    { version: 19, name: "global_employers" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -165,4 +166,48 @@ test("session management stores only coarse client metadata and initializes acti
   assert.match(migration.sql, /ALTER COLUMN last_seen_at SET DEFAULT now\(\)/);
   assert.match(migration.sql, /ALTER COLUMN last_seen_at SET NOT NULL/);
   assert.doesNotMatch(migration.sql, /\b(?:user_agent|ip_address|geolocation|latitude|longitude)\b/i);
+});
+
+test("global employer migration preserves ownership boundaries and repairs only deterministic references", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 19);
+  assert.ok(migration);
+  assert.equal(migration.name, "global_employers");
+  const { sql } = migration;
+
+  assert.match(sql, /GLOBAL_EMPLOYER_EMPTY_NORMALIZATION/);
+  assert.match(sql, /GLOBAL_EMPLOYER_NORMALIZATION_TOO_LONG/);
+  assert.match(sql, /RENAME COLUMN user_id TO created_by_user_id/);
+  assert.match(sql, /ALTER COLUMN created_by_user_id DROP NOT NULL/);
+  assert.match(sql, /REFERENCES users\(id\) ON DELETE SET NULL/);
+  assert.match(sql, /FOREIGN KEY \(user_id\) REFERENCES users\(id\) ON DELETE CASCADE/);
+  assert.match(sql, /FOREIGN KEY \(employer_id\) REFERENCES employers\(id\) ON DELETE RESTRICT/);
+  for (const status of ["PENDING", "VERIFIED", "MERGED", "REJECTED"]) assert.match(sql, new RegExp(`'${status}'`));
+  for (const source of ["LEGACY", "MANUAL", "DOCUMENT", "ADMIN"]) assert.match(sql, new RegExp(`'${source}'`));
+  assert.match(sql, /CREATE TABLE employer_aliases/);
+  assert.match(sql, /CREATE TABLE employer_identifiers/);
+  assert.match(sql, /identifier_fingerprint text/);
+  assert.match(sql, /WHERE identifier_fingerprint IS NOT NULL/);
+  assert.match(sql, /CREATE UNIQUE INDEX employer_identifiers_employer_type_uidx/);
+  assert.match(sql, /ADD COLUMN detected_employer_id uuid REFERENCES employers\(id\) ON DELETE SET NULL/);
+  assert.match(sql, /CREATE TEMP TABLE employment_duplicate_map ON COMMIT DROP/);
+  assert.match(sql, /CREATE UNIQUE INDEX employments_exact_identity_uidx[\s\S]*NULLS NOT DISTINCT/);
+  assert.match(sql, /GLOBAL_EMPLOYMENT_REFERENCE_CONFLICT/);
+  assert.match(sql, /GLOBAL_EMPLOYMENT_REFERENCE_AMBIGUOUS/);
+  assert.match(sql, /employment references diverged during global employer migration/);
+  assert.match(sql, /UPDATE import_batch_items AS item[\s\S]*document\.employment_id/);
+  assert.match(sql, /UPDATE payroll_settlements AS settlement[\s\S]*document\.employment_id/);
+  assert.doesNotMatch(sql, /UNIQUE\s*\(\s*(?:country_code\s*,\s*)?normalized_name\s*\)/i);
+  assert.doesNotMatch(sql, /tax_identifier_ciphertext\s*::\s*text|encode\s*\(\s*tax_identifier_ciphertext/i);
+});
+
+test("employer normalization aligns legal suffix punctuation without retaining punctuation-only input", () => {
+  assert.equal(normalizeEmployerName("  Acme SA  "), "acme sa");
+  assert.equal(normalizeEmployerName("\tAcme SA\n"), "acme sa");
+  assert.equal(normalizeEmployerName("ACME S.A."), "acme sa");
+  assert.equal(normalizeEmployerName("Empresa-Sintética"), "empresa sintética");
+  assert.equal(normalizeEmployerName("Empresa+Norte"), "empresa norte");
+  assert.equal(normalizeEmployerNameConservative("ACME S.A."), "acme sa");
+  assert.equal(normalizeEmployerNameConservative("\tACME S.A.\n"), "acme sa");
+  assert.notEqual(normalizeEmployerNameConservative("Empresa+Norte"), normalizeEmployerNameConservative("Empresa-Norte"));
+  assert.equal(normalizeEmployerName("..."), "");
 });

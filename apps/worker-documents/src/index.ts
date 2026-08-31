@@ -3,7 +3,15 @@ import {
   GetObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { migrate, pool, withTransaction } from '@salarivo/database';
+import {
+  EmployerResolutionError,
+  followMergedEmployer,
+  lockEmployerMutation,
+  migrate,
+  pool,
+  resolveEmployer,
+  withTransaction,
+} from '@salarivo/database';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createReadStream } from 'node:fs';
@@ -1211,6 +1219,7 @@ export async function persistExtraction(
   computeMs: number,
 ): Promise<'COMPLETED' | 'NEEDS_REVIEW' | null> {
   return await withTransaction(async (db: PoolClient) => {
+    await lockEmployerMutation(db);
     const activeJob = await db.query(
       `SELECT 1 FROM processing_jobs
         WHERE id = $1 AND state = 'RUNNING' AND document_id = $2 AND user_id = $3 AND lease_owner = $4
@@ -1218,11 +1227,12 @@ export async function persistExtraction(
       [job.id, job.document_id, job.user_id, job.lease_owner],
     );
     if (!activeJob.rowCount) return null;
-    const activeDocument = await db.query(
-      `SELECT 1 FROM documents WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE`,
+    const observedDocument = await db.query<{ employment_id: string | null }>(
+      `SELECT employment_id FROM documents
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
       [job.document_id, job.user_id],
     );
-    if (!activeDocument.rowCount) {
+    if (!observedDocument.rowCount) {
       await db.query(
         `UPDATE processing_jobs
             SET state = 'CANCELLED', completed_at = now(), lease_owner = NULL,
@@ -1231,6 +1241,115 @@ export async function persistExtraction(
         [job.id, job.lease_owner],
       );
       return null;
+    }
+
+    const anticipatedCorrections = await db.query<{ corrected_value: unknown; field_path: string }>(
+      `SELECT DISTINCT ON (correction.field_path)
+              correction.field_path, correction.corrected_value
+         FROM user_corrections AS correction
+         JOIN extraction_runs AS previous_run
+           ON previous_run.id = correction.extraction_run_id
+          AND previous_run.user_id = correction.user_id
+          AND previous_run.document_id = correction.document_id
+        WHERE correction.user_id = $1 AND correction.document_id = $2
+          AND previous_run.status = 'COMPLETED'
+          AND previous_run.processing_version < $3
+        ORDER BY correction.field_path, previous_run.processing_version DESC,
+                 correction.correction_version DESC, correction.created_at DESC, correction.id DESC`,
+      [job.user_id, job.document_id, job.processing_version],
+    );
+    const anticipatedExtraction = applySettlementCorrections(
+      extraction,
+      anticipatedCorrections.rows.map((correction) => ({
+        correctedValue: correction.corrected_value,
+        fieldPath: correction.field_path,
+      })),
+    );
+    let resolvedEmployer: Awaited<ReturnType<typeof resolveEmployer>> | null = null;
+    let employerResolutionError: EmployerResolutionError | null = null;
+    if (anticipatedExtraction.employerName) {
+      try {
+        resolvedEmployer = await resolveEmployer(db, {
+          name: anticipatedExtraction.employerName,
+          countryCode: 'AR',
+          createdByUserId: job.user_id,
+          createdSource: 'DOCUMENT',
+        });
+      } catch (error) {
+        if (!(error instanceof EmployerResolutionError)) throw error;
+        employerResolutionError = error;
+      }
+    }
+
+    const observedEmploymentId = observedDocument.rows[0]?.employment_id ?? null;
+    let currentCanonicalEmployerId: string | null = null;
+    if (observedEmploymentId) {
+      const observedEmployment = await db.query<{ employer_id: string }>(
+        `SELECT employer_id FROM employments WHERE id = $1 AND user_id = $2`,
+        [observedEmploymentId, job.user_id],
+      );
+      const observedEmployerId = observedEmployment.rows[0]?.employer_id;
+      const currentEmployer = observedEmployerId
+        ? await followMergedEmployer(db, observedEmployerId)
+        : null;
+      const lockedEmployment = await db.query<{ employer_id: string }>(
+        `SELECT employer_id FROM employments
+          WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [observedEmploymentId, job.user_id],
+      );
+      if (!lockedEmployment.rows[0]
+        || !observedEmployerId
+        || ![observedEmployerId, currentEmployer?.id].includes(lockedEmployment.rows[0].employer_id)) {
+        throw new WorkerError('EMPLOYMENT_ASSOCIATION_CHANGED', true);
+      }
+      currentCanonicalEmployerId = currentEmployer?.id ?? null;
+    }
+
+    let automaticEmploymentId: string | null = null;
+    let automaticMatchRule: string | null = null;
+    if (!observedEmploymentId && resolvedEmployer && anticipatedExtraction.payrollPeriod) {
+      const candidates = await db.query<{ id: string }>(
+        `SELECT employment.id
+           FROM employments AS employment
+           JOIN employers AS employer ON employer.id = employment.employer_id
+          WHERE employment.user_id = $1
+            AND employment.employer_id = $2
+            AND employment.currency_code = $3
+            AND date_trunc('month', employment.start_date)::date <= $4::date
+            AND (employment.end_date IS NULL
+              OR date_trunc('month', employment.end_date)::date >= $4::date)
+            AND ($6::boolean OR normalize_employer_name_conservative(employer.name)
+              = normalize_employer_name_conservative($5))
+          ORDER BY employment.id
+          LIMIT 2
+          FOR SHARE OF employment`,
+        [
+          job.user_id,
+          resolvedEmployer.id,
+          anticipatedExtraction.currencyCode,
+          `${anticipatedExtraction.payrollPeriod}-01`,
+          anticipatedExtraction.employerName,
+          resolvedEmployer.outcome === 'ALIAS' || resolvedEmployer.outcome === 'IDENTIFIER',
+        ],
+      );
+      if (candidates.rowCount === 1) {
+        automaticEmploymentId = candidates.rows[0]!.id;
+        automaticMatchRule = resolvedEmployer.outcome === 'ALIAS'
+          ? 'EXACT_ALIAS_CURRENCY_PERIOD_UNIQUE'
+          : resolvedEmployer.outcome === 'IDENTIFIER'
+            ? 'EXACT_IDENTIFIER_CURRENCY_PERIOD_UNIQUE'
+            : 'EXACT_CONSERVATIVE_NAME_CURRENCY_PERIOD_UNIQUE';
+      }
+    }
+
+    const activeDocument = await db.query<{ employment_id: string | null }>(
+      `SELECT employment_id FROM documents
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE`,
+      [job.document_id, job.user_id],
+    );
+    if (!activeDocument.rowCount) throw new WorkerError('DOCUMENT_NOT_AVAILABLE', false);
+    if (String(activeDocument.rows[0]?.employment_id) !== String(observedEmploymentId)) {
+      throw new WorkerError('EMPLOYMENT_ASSOCIATION_CHANGED', true);
     }
 
     const inserted = await db.query<{ id: string }>(
@@ -1267,6 +1386,7 @@ export async function persistExtraction(
     if (!runId) throw new WorkerError('EXTRACTION_PERSISTENCE_CONFLICT', true);
 
     let effectiveExtraction = extraction;
+    let employerAssociationNeedsReview = false;
     if (inserted.rowCount) {
       await insertClassificationField(db, job, runId, classification);
       for (const field of extraction.fields) {
@@ -1350,6 +1470,141 @@ export async function persistExtraction(
           fieldPath: correction.field_path,
         })),
       );
+      if (
+        effectiveExtraction.employerName !== anticipatedExtraction.employerName
+        || effectiveExtraction.payrollPeriod !== anticipatedExtraction.payrollPeriod
+        || effectiveExtraction.currencyCode !== anticipatedExtraction.currencyCode
+      ) {
+        throw new WorkerError('CORRECTION_CHANGED_DURING_PROCESSING', true);
+      }
+
+      if (effectiveExtraction.employerName) {
+        if (employerResolutionError) {
+          const resolutionEvent = employerResolutionError.code === 'AMBIGUOUS'
+            ? 'employer.match.ambiguous'
+            : employerResolutionError.code === 'REJECTED_IDENTIFIER'
+              ? 'employer.identifier.rejected'
+              : 'employer.match.invalid';
+          employerAssociationNeedsReview = true;
+          log(resolutionEvent, {
+            jobId: job.id,
+            resolutionCode: employerResolutionError.code,
+            source: 'DOCUMENT',
+            userId: job.user_id,
+          });
+        }
+        if (resolvedEmployer) {
+          const employerEvent = resolvedEmployer.outcome === 'CREATED'
+            ? 'employer.pending.created'
+            : resolvedEmployer.status === 'PENDING'
+              ? 'employer.pending.reused'
+              : 'employer.reused';
+          log(employerEvent, {
+            employerId: resolvedEmployer.id,
+            employerStatus: resolvedEmployer.status,
+            matchType: resolvedEmployer.outcome,
+            source: 'DOCUMENT',
+            userId: job.user_id,
+          });
+          let employmentId = activeDocument.rows[0]?.employment_id ?? null;
+          let existingEmployerMismatch = false;
+          if (employmentId && currentCanonicalEmployerId !== resolvedEmployer.id) {
+              existingEmployerMismatch = true;
+              employerAssociationNeedsReview = true;
+              await db.query(
+                `UPDATE documents SET detected_employer_id = $1
+                  WHERE id = $2 AND user_id = $3`,
+                [resolvedEmployer.id, job.document_id, job.user_id],
+              );
+              await db.query(
+                `INSERT INTO audit_events (
+                   id, user_id, actor_user_id, action, resource_type, resource_id,
+                   result, metadata_no_sensitive
+                 ) VALUES ($1, $2, NULL, 'EMPLOYMENT_ASSOCIATION_MISMATCH', 'DOCUMENT', $3,
+                   'SUCCESS', $4::jsonb)`,
+                [
+                  randomUUID(), job.user_id, job.document_id,
+                  JSON.stringify({
+                    detectedEmployerId: resolvedEmployer.id,
+                    preservedEmploymentId: employmentId,
+                    matchRule: 'EMPLOYER_CHANGED_ON_REPROCESS',
+                    resolverVersion: 'employer-resolver-v1',
+                    source: 'WORKER',
+                  }),
+                ],
+              );
+              log('employment.association_mismatch', {
+                documentId: job.document_id,
+                detectedEmployerId: resolvedEmployer.id,
+                preservedEmploymentId: employmentId,
+                matchRule: 'EMPLOYER_CHANGED_ON_REPROCESS',
+                resolverVersion: 'employer-resolver-v1',
+                source: 'WORKER',
+                userId: job.user_id,
+              });
+          }
+          if (!employmentId && !existingEmployerMismatch) {
+            employmentId = automaticEmploymentId;
+          }
+          await db.query(
+            `UPDATE documents
+                SET detected_employer_id = $1,
+                    employment_id = COALESCE(employment_id, $2)
+              WHERE id = $3 AND user_id = $4`,
+            [resolvedEmployer.id, employmentId, job.document_id, job.user_id],
+          );
+          if (!activeDocument.rows[0]?.employment_id && employmentId) {
+            await db.query(
+              `UPDATE import_batch_items AS item
+                  SET employment_id = $1, updated_at = now()
+                FROM documents AS document
+               WHERE document.id = $2 AND document.user_id = $3
+                 AND item.id = document.import_batch_item_id AND item.user_id = document.user_id`,
+              [employmentId, job.document_id, job.user_id],
+            );
+            await db.query(
+              `INSERT INTO audit_events (
+                 id, user_id, actor_user_id, action, resource_type, resource_id,
+                 result, metadata_no_sensitive
+               ) VALUES ($1, $2, NULL, 'EMPLOYMENT_AUTO_ASSOCIATED', 'DOCUMENT', $3,
+                 'SUCCESS', $4::jsonb)`,
+              [
+                randomUUID(),
+                job.user_id,
+                job.document_id,
+                JSON.stringify({
+                  employerId: resolvedEmployer.id,
+                  employmentId,
+                  matchRule: automaticMatchRule,
+                  resolverVersion: 'employer-resolver-v1',
+                  source: 'WORKER',
+                }),
+              ],
+            );
+            log('employment.auto_associated', {
+              documentId: job.document_id,
+              employerId: resolvedEmployer.id,
+              employmentId,
+              matchRule: automaticMatchRule ?? 'UNKNOWN',
+              resolverVersion: 'employer-resolver-v1',
+              source: 'WORKER',
+              userId: job.user_id,
+            });
+          }
+        } else {
+          await db.query(
+            `UPDATE documents SET detected_employer_id = NULL
+              WHERE id = $1 AND user_id = $2`,
+            [job.document_id, job.user_id],
+          );
+        }
+      } else {
+        await db.query(
+          `UPDATE documents SET detected_employer_id = NULL
+            WHERE id = $1 AND user_id = $2`,
+          [job.document_id, job.user_id],
+        );
+      }
 
       if (effectiveExtraction.payrollPeriod) {
         const settlement = await db.query<{ id: string }>(
@@ -1411,6 +1666,7 @@ export async function persistExtraction(
 
     const needsReview = job.previous_document_status === 'NEEDS_REVIEW'
       || partialOcr
+      || employerAssociationNeedsReview
       || payrollExtractionNeedsReview(effectiveExtraction);
     await db.query(
       `UPDATE documents

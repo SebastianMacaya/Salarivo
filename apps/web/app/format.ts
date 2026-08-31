@@ -40,6 +40,62 @@ export function dateLabel(value?: string | null) {
     : dateFormatter.format(date);
 }
 
+export function employmentOptionLabel(employment: {
+  employerName: string;
+  role?: string | null;
+  startDate: string;
+  endDate?: string | null;
+  status: string;
+  currencyCode?: string | null;
+}) {
+  const status = employment.status === 'ACTIVE'
+    ? 'Activo'
+    : employment.status === 'ENDED' ? 'Finalizado' : employment.status;
+  const range = `${dateLabel(employment.startDate)} a ${employment.endDate ? dateLabel(employment.endDate) : 'actualidad'}`;
+  return [
+    employment.employerName,
+    employment.role || 'Puesto sin especificar',
+    status,
+    range,
+    employment.currencyCode,
+  ].filter(Boolean).join(' · ');
+}
+
+export function salaryContextOptionLabel(context: {
+  employerName?: string | null;
+  state: 'CONFIRMED' | 'DETECTED' | 'UNCONFIRMED';
+  currencyCode: string;
+  employmentStatus?: string | null;
+  startDate?: string | null;
+  endDate?: string | null;
+  firstPeriod?: string | null;
+  lastPeriod?: string | null;
+}) {
+  const state = context.state === 'CONFIRMED'
+    ? 'Confirmado'
+    : context.state === 'DETECTED' ? 'Recibos sin asociar' : 'Sin confirmar';
+  const employmentStatus = context.employmentStatus === 'ACTIVE'
+    ? 'Activo'
+    : context.employmentStatus === 'ENDED' ? 'Finalizado' : context.employmentStatus;
+  const employmentRange = context.startDate
+    ? `${dateLabel(context.startDate)} a ${context.endDate ? dateLabel(context.endDate) : 'actualidad'}`
+    : null;
+  const observedRange = context.firstPeriod && context.lastPeriod
+    ? context.firstPeriod === context.lastPeriod
+      ? periodLabel(context.firstPeriod)
+      : `${periodLabel(context.firstPeriod)} a ${periodLabel(context.lastPeriod)}`
+    : context.firstPeriod || context.lastPeriod
+      ? periodLabel(context.firstPeriod ?? context.lastPeriod)
+      : null;
+  return [
+    context.employerName || 'Empleo sin confirmar',
+    state,
+    context.state === 'CONFIRMED' ? employmentStatus : null,
+    employmentRange ?? observedRange ?? 'Período no disponible',
+    context.currencyCode,
+  ].filter(Boolean).join(' · ');
+}
+
 export function timestampLabel(value?: string | null) {
   if (!value || !value.includes('T')) return '—';
   const date = new Date(value);

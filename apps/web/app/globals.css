@@ -660,6 +660,7 @@ td { border-top: 1px solid #edf1ee; padding: 14px 15px; white-space: nowrap; }
 .admin-card > p { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .admin-card-grid, .admin-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .admin-card-grid .admin-card, .admin-detail-grid .admin-card { margin-top: 0; }
+.employer-detail-grid { margin-top: 14px; }
 .admin-definition { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; margin: 0 0 20px; }
 .admin-definition div { min-width: 0; border-top: 1px solid #edf1ee; padding: 12px 0; }
 .admin-definition dt { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }

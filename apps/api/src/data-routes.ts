@@ -1,6 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
-import { pool, withTransaction, type PoolClient } from "@salarivo/database";
+import {
+  EmployerResolutionError,
+  followMergedEmployer,
+  lockEmployerMutation,
+  normalizeEmployerNameConservative,
+  pool,
+  resolveEmployer,
+  withTransaction,
+  type PoolClient,
+} from "@salarivo/database";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
 import {
@@ -122,15 +131,32 @@ const exportSections = [
   ["authenticationMethods", `SELECT provider AS "method", created_at AS "linkedAt",
       last_login_at AS "lastUsedAt"
       FROM auth_accounts WHERE user_id = $1 ORDER BY provider`],
-  ["employers", `SELECT name, country_code AS "countryCode", created_at AS "createdAt"
-      FROM employers WHERE user_id = $1 ORDER BY lower(name), created_at, id`],
+  ["employers", `SELECT employer.name, employer.country_code AS "countryCode",
+      CASE WHEN employer.created_by_user_id = $1 THEN employer.status ELSE NULL END AS status,
+      CASE WHEN employer.created_by_user_id = $1 THEN employer.created_at ELSE NULL END AS "createdAt",
+      min(employment.created_at) AS "firstLinkedAt"
+      FROM employers employer
+      LEFT JOIN employments employment
+        ON employment.employer_id = employer.id AND employment.user_id = $1
+      WHERE employer.created_by_user_id = $1
+         OR (employment.id IS NOT NULL AND employer.status IN ('PENDING', 'VERIFIED'))
+         OR (employer.status IN ('PENDING', 'VERIFIED') AND EXISTS (
+           SELECT 1
+             FROM documents document
+            WHERE document.user_id = $1
+              AND document.deleted_at IS NULL
+              AND document.detected_employer_id = employer.id
+         ))
+      GROUP BY employer.id, employer.name, employer.country_code, employer.status,
+               employer.created_by_user_id, employer.created_at
+      ORDER BY lower(employer.name), employer.name`],
   ["employments", `SELECT employer.name AS "employerName",
       employer.country_code AS "employerCountryCode", employment.status,
       employment.start_date AS "startDate", employment.end_date AS "endDate", employment.role,
       employment.category, employment.modality, employment.country_code AS "countryCode",
       employment.currency_code AS "currencyCode", employment.created_at AS "createdAt"
       FROM employments employment
-      JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      JOIN employers employer ON employer.id = employment.employer_id
       WHERE employment.user_id = $1
       ORDER BY employment.start_date, lower(employer.name), employment.created_at, employment.id`],
   ["imports", `SELECT batch.created_at AS "startedAt", batch.completed_at AS "completedAt",
@@ -142,7 +168,7 @@ const exportSections = [
       FROM import_batch_items item
       JOIN import_batches batch ON batch.id = item.batch_id AND batch.user_id = item.user_id
       LEFT JOIN employments employment ON employment.id = item.employment_id AND employment.user_id = item.user_id
-      LEFT JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      LEFT JOIN employers employer ON employer.id = employment.employer_id
       WHERE item.user_id = $1 ORDER BY batch.created_at, item.ordinal, item.id`],
   ["documents", `SELECT document.original_filename AS "filename",
       COALESCE(document.detected_mime_type, document.declared_mime_type) AS "mediaType",
@@ -156,7 +182,7 @@ const exportSections = [
       employment.currency_code AS "employmentCurrencyCode"
       FROM documents document
       LEFT JOIN employments employment ON employment.id = document.employment_id AND employment.user_id = document.user_id
-      LEFT JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      LEFT JOIN employers employer ON employer.id = COALESCE(employment.employer_id, document.detected_employer_id)
       WHERE document.user_id = $1 AND document.deleted_at IS NULL
       ORDER BY document.created_at, document.id`],
   ["settlements", `WITH latest_runs AS (
@@ -179,7 +205,7 @@ const exportSections = [
       JOIN documents document ON document.id = settlement.document_id AND document.user_id = settlement.user_id
       JOIN latest_runs run ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
       LEFT JOIN employments employment ON employment.id = settlement.employment_id AND employment.user_id = settlement.user_id
-      LEFT JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = employment.user_id
+      LEFT JOIN employers employer ON employer.id = COALESCE(employment.employer_id, document.detected_employer_id)
       WHERE settlement.user_id = $1
       ORDER BY document.created_at, settlement.settlement_ordinal, settlement.id`],
   ["concepts", `WITH latest_runs AS (
@@ -614,7 +640,7 @@ function parseSalaryConceptCursor(input: string): SalaryConceptCursor | null {
 }
 
 function detectedEmploymentIdentity(employerName: string) {
-  const key = employerName.normalize("NFKC").trim().toLowerCase();
+  const key = normalizeEmployerNameConservative(employerName);
   if (!key || key.includes("\0")) return null;
   return {
     key,
@@ -639,19 +665,21 @@ const salaryConceptCategorySql = `CASE
 END`;
 
 const detectedEmployerNameJoin = `LEFT JOIN LATERAL (
-  SELECT COALESCE(correction.corrected_value #>> '{}', field.interpreted_value #>> '{}') AS name
-    FROM extracted_fields field
-    LEFT JOIN LATERAL (
-      SELECT current.corrected_value FROM user_corrections current
-       WHERE current.user_id = field.user_id
-         AND current.extraction_run_id = field.extraction_run_id
-         AND current.field_path = field.field_path
-       ORDER BY current.correction_version DESC LIMIT 1
-    ) correction ON true
-   WHERE field.user_id = settlement.user_id
-     AND field.extraction_run_id = settlement.extraction_run_id
-     AND field.field_path = 'employer.name'
-   LIMIT 1
+  SELECT COALESCE(
+           (SELECT employer.name FROM employers employer WHERE employer.id = document.detected_employer_id),
+           (SELECT correction.corrected_value #>> '{}'
+              FROM user_corrections correction
+             WHERE correction.user_id = settlement.user_id
+               AND correction.extraction_run_id = settlement.extraction_run_id
+               AND correction.field_path = 'employer.name'
+             ORDER BY correction.correction_version DESC LIMIT 1),
+           (SELECT field.interpreted_value #>> '{}'
+              FROM extracted_fields field
+             WHERE field.user_id = settlement.user_id
+               AND field.extraction_run_id = settlement.extraction_run_id
+               AND field.field_path = 'employer.name'
+             LIMIT 1)
+         ) AS name
 ) detected_employer ON true`;
 
 async function loadSalaryHistory(userId: string) {
@@ -664,6 +692,7 @@ async function loadSalaryHistory(userId: string) {
           ORDER BY run.document_id, run.processing_version DESC
        )
        SELECT settlement.id, settlement.document_id, settlement.employment_id,
+              document.detected_employer_id,
               to_char(settlement.payroll_period, 'YYYY-MM') AS payroll_period,
               settlement.settlement_type, settlement.is_recurring, settlement.currency_code,
               settlement.basic_amount, settlement.gross_amount, settlement.net_amount,
@@ -682,7 +711,7 @@ async function loadSalaryHistory(userId: string) {
          LEFT JOIN employments employment
            ON employment.id = settlement.employment_id AND employment.user_id = settlement.user_id
          LEFT JOIN employers employer
-           ON employer.id = employment.employer_id AND employer.user_id = settlement.user_id
+           ON employer.id = employment.employer_id
          ${detectedEmployerNameJoin}
          LEFT JOIN LATERAL (
            SELECT jsonb_agg(jsonb_build_object(
@@ -730,11 +759,14 @@ async function loadSalaryHistory(userId: string) {
   }>();
   const settlements: SalarySettlement[] = result.rows.map((row) => {
     const employmentId = value(row, "employment_id");
+    const detectedEmployerId = value(row, "detected_employer_id");
     const employerName = value(row, "employer_name")?.trim() || null;
     const currency = String(row.currency_code);
     const documentId = String(row.document_id);
     const employmentContext = employmentId
-      ?? (employerName
+      ?? (detectedEmployerId
+        ? `detected:${detectedEmployerId}`
+        : employerName
         ? detectedEmploymentIdentity(employerName)!.context
         : `unconfirmed:${documentId}`);
     const metadataKey = JSON.stringify([employmentContext, currency]);
@@ -1621,11 +1653,15 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         "item.normalized_concept_code IS NOT NULL",
       ];
       let includeDetectedEmployer = false;
-      const detectedContext = /^detected:[0-9a-f]{24}$/.test(request.query.employmentContext);
+      const stableDetectedContext = /^detected:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.exec(request.query.employmentContext);
+      const legacyDetectedContext = /^detected:[0-9a-f]{24}$/.test(request.query.employmentContext);
       const unconfirmedContext = /^unconfirmed:([0-9a-f-]{36})$/.exec(request.query.employmentContext);
       if (uuid.test(request.query.employmentContext)) {
         conditions.push(`settlement.employment_id = ${parameter(request.query.employmentContext)}::uuid`);
-      } else if (detectedContext) {
+      } else if (stableDetectedContext) {
+        conditions.push("settlement.employment_id IS NULL");
+        conditions.push(`document.detected_employer_id = ${parameter(stableDetectedContext[1])}::uuid`);
+      } else if (legacyDetectedContext) {
         const identity = request.query.employerName === undefined
           ? null
           : detectedEmploymentIdentity(request.query.employerName);
@@ -1634,7 +1670,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         }
         includeDetectedEmployer = true;
         conditions.push("settlement.employment_id IS NULL");
-        conditions.push(`lower(btrim(normalize(detected_employer.name, NFKC)) COLLATE "und-x-icu") = ${parameter(identity.key)}`);
+        conditions.push(`normalize_employer_name_conservative(detected_employer.name) = ${parameter(identity.key)}`);
       } else if (unconfirmedContext !== null && uuid.test(unconfirmedContext[1]!)) {
         includeDetectedEmployer = true;
         conditions.push("settlement.employment_id IS NULL");
@@ -1829,7 +1865,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             LEFT JOIN employments employment
               ON employment.id = document.employment_id AND employment.user_id = document.user_id
             LEFT JOIN employers employer
-              ON employer.id = employment.employer_id AND employer.user_id = document.user_id
+              ON employer.id = employment.employer_id
             ${documentProjectionJoin}`;
       const countFrom = search || request.query.year || request.query.period || request.query.settlementType
         ? from
@@ -1902,7 +1938,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
            LEFT JOIN employments employment
              ON employment.id = document.employment_id AND employment.user_id = document.user_id
            LEFT JOIN employers employer
-             ON employer.id = employment.employer_id AND employer.user_id = document.user_id
+             ON employer.id = employment.employer_id
            ${documentProjectionJoin}
           WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL`,
         [request.params.id, request.authUser!.id],
@@ -2211,6 +2247,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       const userId = request.authUser!.id;
       const { documentIds, employmentId } = request.body;
       const result = await withTransaction(async (client) => {
+        await lockEmployerMutation(client);
         if (employmentId) {
           const employment = await client.query(
             "SELECT 1 FROM employments WHERE id = $1 AND user_id = $2 FOR KEY SHARE",
@@ -2236,6 +2273,16 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         );
         await client.query(
           "UPDATE payroll_settlements SET employment_id = $1 WHERE user_id = $2 AND document_id = ANY($3::uuid[])",
+          [employmentId, userId, documentIds],
+        );
+        await client.query(
+          `UPDATE import_batch_items AS item
+              SET employment_id = $1, updated_at = now()
+             FROM documents AS document
+            WHERE document.id = ANY($3::uuid[])
+              AND document.user_id = $2
+              AND document.import_batch_item_id = item.id
+              AND item.user_id = $2`,
           [employmentId, userId, documentIds],
         );
         await audit(client, userId, "DOCUMENTS_EMPLOYMENT_UPDATED", "DOCUMENT_BATCH", null, {
@@ -2285,7 +2332,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
            FROM payroll_settlements settlement
            JOIN extraction_runs run ON run.id = settlement.extraction_run_id
            LEFT JOIN employments employment ON employment.id = settlement.employment_id AND employment.user_id = settlement.user_id
-           LEFT JOIN employers employer ON employer.id = employment.employer_id AND employer.user_id = settlement.user_id
+           LEFT JOIN employers employer ON employer.id = employment.employer_id
            LEFT JOIN LATERAL (
              SELECT correction.corrected_value #>> '{}' AS corrected_name,
                     field.interpreted_value #>> '{}' AS extracted_name
@@ -2565,13 +2612,76 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       if ((request.body.extractedFieldId === undefined) === (request.body.fieldPath === undefined)) {
         throw new ApiError(400, "INVALID_CORRECTION_TARGET", "Elegí un único campo para corregir.");
       }
+      const targetPath = request.body.fieldPath ?? (await pool.query<{ field_path: string }>(
+        `SELECT field_path FROM extracted_fields
+          WHERE id = $1 AND document_id = $2 AND user_id = $3 AND extraction_run_id = $4`,
+        [request.body.extractedFieldId, request.params.id, request.authUser!.id, request.body.extractionRunId],
+      )).rows[0]?.field_path;
+      const employerNameTarget = targetPath === "employer.name";
       const result = await withTransaction(async (client) => {
+        if (employerNameTarget) await lockEmployerMutation(client);
+        const observedDocument = await client.query(
+          `SELECT processing_status, import_batch_item_id, employment_id FROM documents
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (!observedDocument.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        let resolvedEmployer: Awaited<ReturnType<typeof resolveEmployer>> | null = null;
+        let resolutionError: EmployerResolutionError | null = null;
+        let currentCanonicalEmployerId: string | null = null;
+        if (employerNameTarget) {
+          if (!corrected || corrected.length > 200) {
+            throw new ApiError(400, "INVALID_EMPLOYER_NAME", "El nombre del empleador no es válido.");
+          }
+          try {
+            resolvedEmployer = await resolveEmployer(client, {
+              name: corrected,
+              countryCode: "AR",
+              createdByUserId: request.authUser!.id,
+              createdSource: "DOCUMENT",
+            });
+          } catch (error) {
+            if (!(error instanceof EmployerResolutionError)) throw error;
+            if (error.code === "INVALID_NAME") {
+              throw new ApiError(400, "INVALID_EMPLOYER_NAME", "El nombre del empleador no es válido.");
+            }
+            resolutionError = error;
+          }
+          const observedEmploymentId = observedDocument.rows[0].employment_id === null
+            ? null
+            : String(observedDocument.rows[0].employment_id);
+          if (observedEmploymentId) {
+            const observedEmployment = await client.query<{ employer_id: string }>(
+              `SELECT employer_id FROM employments WHERE id = $1 AND user_id = $2`,
+              [observedEmploymentId, request.authUser!.id],
+            );
+            const observedEmployerId = observedEmployment.rows[0]?.employer_id;
+            const currentEmployer = observedEmployerId
+              ? await followMergedEmployer(client, observedEmployerId)
+              : null;
+            const lockedEmployment = await client.query<{ employer_id: string }>(
+              `SELECT employer_id FROM employments
+                WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+              [observedEmploymentId, request.authUser!.id],
+            );
+            if (!lockedEmployment.rows[0]
+              || !observedEmployerId
+              || ![observedEmployerId, currentEmployer?.id].includes(lockedEmployment.rows[0].employer_id)) {
+              throw new ApiError(409, "EMPLOYMENT_CHANGED", "El empleo cambió; recargá e intentá nuevamente.");
+            }
+            currentCanonicalEmployerId = currentEmployer?.id ?? null;
+          }
+        }
         const correctionDocument = await client.query(
-          `SELECT processing_status, import_batch_item_id FROM documents
+          `SELECT processing_status, import_batch_item_id, employment_id FROM documents
             WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE`,
           [request.params.id, request.authUser!.id],
         );
         if (!correctionDocument.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        if (employerNameTarget
+          && String(correctionDocument.rows[0].employment_id) !== String(observedDocument.rows[0].employment_id)) {
+          throw new ApiError(409, "EMPLOYMENT_CHANGED", "El empleo cambió; recargá e intentá nuevamente.");
+        }
         if (!["NEEDS_REVIEW", "COMPLETED"].includes(String(correctionDocument.rows[0].processing_status))) {
           throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento para corregirlo.");
         }
@@ -2656,6 +2766,57 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [id, request.authUser!.id, row.id, request.params.id, row.extraction_run_id, fieldPath,
             version.rows[0].version, JSON.stringify(row.interpreted_value ?? null), JSON.stringify(correctedJson)],
         );
+        if (fieldPath === "employer.name") {
+          const resolvedEmployerId = resolvedEmployer?.id ?? null;
+          if (resolvedEmployer) {
+            request.log.info({
+              event: resolvedEmployer.outcome === "CREATED"
+                ? "employer.pending.created"
+                : resolvedEmployer.status === "PENDING"
+                  ? "employer.pending.reused"
+                  : "employer.reused",
+              employerId: resolvedEmployer.id,
+              employerStatus: resolvedEmployer.status,
+              employerSource: resolvedEmployer.createdSource,
+              resolutionOutcome: resolvedEmployer.outcome,
+              userId: request.authUser!.id,
+            }, "employer resolution completed");
+          } else if (resolutionError) {
+            request.log.warn({
+              event: resolutionError.code === "AMBIGUOUS" ? "employer.match.ambiguous" : "employer.identifier.rejected",
+              resolutionErrorCode: resolutionError.code,
+              userId: request.authUser!.id,
+            }, "employer resolution needs review");
+          }
+          const currentEmploymentId = correctionDocument.rows[0].employment_id === null
+            ? null
+            : String(correctionDocument.rows[0].employment_id);
+          const sameCanonical = currentEmploymentId === null
+            || (resolvedEmployerId !== null && currentCanonicalEmployerId === resolvedEmployerId);
+          if (resolvedEmployerId !== null && sameCanonical) {
+            await client.query(
+              `UPDATE documents SET detected_employer_id = $1
+                WHERE id = $2 AND user_id = $3`,
+              [resolvedEmployerId, request.params.id, request.authUser!.id],
+            );
+          } else {
+            await client.query(
+              `UPDATE documents SET employment_id = NULL, detected_employer_id = $1
+                WHERE id = $2 AND user_id = $3`,
+              [resolvedEmployerId, request.params.id, request.authUser!.id],
+            );
+            await client.query(
+              `UPDATE payroll_settlements SET employment_id = NULL
+                WHERE document_id = $1 AND user_id = $2`,
+              [request.params.id, request.authUser!.id],
+            );
+            await client.query(
+              `UPDATE import_batch_items SET employment_id = NULL, updated_at = now()
+                WHERE id = $1 AND user_id = $2`,
+              [correctionDocument.rows[0].import_batch_item_id, request.authUser!.id],
+            );
+          }
+        }
         if (amountColumn) {
           await client.query(
             `UPDATE payroll_settlements SET ${amountColumn} = $1
