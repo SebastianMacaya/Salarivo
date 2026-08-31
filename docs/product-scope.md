@@ -32,6 +32,8 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - detección no persistida de un posible empleo desde documentos sin asociar y creación/asociación sólo después de confirmación explícita;
 - confidence por campo, carga manual de montos ausentes y cierre explícito de revisión;
 - historial `salary-analytics-v1` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
+- visor privado del PDF por página con evidencia espacial cuando es inequívoca, datos extraídos y procedencia lado a lado;
+- corrección en bloque y reproceso versionado que conserva la precedencia humana entre corridas;
 - eliminación de original, documento o cuenta;
 - exportación de datos;
 - auditoría de acciones sensibles;
@@ -79,7 +81,8 @@ Contratos y adendas en allowlist, sin OCR inicial y siempre asociados a un emple
 - Una factura se rechaza antes de OCR completo.
 - Un retry no duplica documentos, liquidaciones ni cargos externos.
 - Usuario A nunca accede a recursos de usuario B.
-- Una corrección humana tiene precedencia dentro de la corrida de extracción vigente.
+- Una corrección humana tiene precedencia dentro de la corrida vigente y se hereda explícitamente al reprocesar sin sobrescribir historia.
+- Un deep-link del visor conserva sólo IDs opacos, página y evidencia; nunca salario, OCR ni URL firmada.
 - El dashboard no lee PDFs; consulta datos estructurados.
 - El usuario puede eliminar originales sin perder datos estructurados cuando elige conservarlos.
 - Una colisión de email entre una cuenta existente y Google nunca vincula, modifica ni expone detalles de la cuenta existente.

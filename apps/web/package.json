@@ -6,15 +6,18 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "predev": "node scripts/copy-pdfjs-assets.mjs",
     "dev": "vinext dev",
+    "prebuild": "node scripts/copy-pdfjs-assets.mjs",
     "build": "vinext build",
     "start": "vinext start",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern public/pdfjs",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "next": "16.3.3",
+    "pdfjs-dist": "6.3.289",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "uqr": "0.1.3"

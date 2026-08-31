@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  applySettlementCorrections,
+  attachSpatialEvidence,
   classifyPayrollText,
   extractArgentinePayroll,
   hasPdfMagic,
   parseArgentineAmount,
   parseJobMessage,
+  parseTextEvidenceTsv,
+  payrollExtractionNeedsReview,
   pendingUploadCutoff,
   selectDispatchCandidates,
   uploadCleanupStatus,
@@ -35,6 +39,7 @@ test('valida magic bytes y estructura acotada', () => {
   assert.deepEqual(validatePdfInfo('Pages:          2\nEncrypted:      yes\n', 20), { errorCode: 'DOCUMENT_ENCRYPTED' });
   assert.equal(validateRenderPixels('Page size:      595 x 842 pts\n', 144, 10_000_000), true);
   assert.equal(validateRenderPixels('Page size:      100000 x 100000 pts\n', 144, 10_000_000), false);
+  assert.equal(validateRenderPixels('Page size:      1 x 10000 pts\n', 144, 10_000_000), false);
 });
 
 test('la cola acepta exclusivamente un jobId interno', () => {
@@ -461,4 +466,115 @@ test('rechaza texto comercial sin señales salariales', () => {
     classifyPayrollText('RECIBO DE HABERES\nSueldo básico\nDescuentos\nNeto\nLiquidación de impuesto a las ganancias').decision,
     'SUPPORTED',
   );
+});
+
+test('normaliza evidencia TSV de Poppler y sólo ubica texto literal no derivado', () => {
+  const tsv = [
+    'level\tpage_num\tpar_num\tblock_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext',
+    '1\t1\t0\t0\t0\t0\t0\t0\t1000\t2000\t-1\t',
+    '5\t1\t1\t1\t1\t1\t100\t200\t60\t20\t99\tPeríodo',
+    '5\t1\t1\t1\t1\t2\t165\t200\t20\t20\t99\tde',
+    '5\t1\t1\t1\t1\t3\t190\t200\t100\t20\t99\tliquidación:',
+    '5\t1\t1\t1\t1\t4\t300\t200\t80\t20\t99\t08/2026',
+  ].join('\n');
+  const extraction = attachSpatialEvidence(
+    extractArgentinePayroll('RECIBO DE SUELDO\nPeríodo de liquidación: 08/2026', 'PDF_TEXT'),
+    parseTextEvidenceTsv(tsv),
+  );
+  const period = extraction.fields.find(({ fieldPath }) => fieldPath === 'settlement.payrollPeriod');
+
+  assert.equal(period?.rawValue, 'Período de liquidación: 08/2026');
+  assert.equal(period?.pageNumber, 1);
+  assert.deepEqual(period?.sourceRegion, {
+    version: 1,
+    space: 'PAGE_NORMALIZED',
+    origin: 'TOP_LEFT',
+    x: 0.1,
+    y: 0.1,
+    width: 0.28,
+    height: 0.01,
+  });
+  assert.equal(extraction.fields.find(({ fieldPath }) => fieldPath === 'settlement.type')?.sourceRegion, undefined);
+});
+
+test('omite evidencia ambigua y conserva el número real de página OCR', () => {
+  const header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext';
+  const page = (pageNumber: number) => [
+    `1\t${pageNumber}\t0\t0\t0\t0\t0\t0\t1000\t2000\t-1\t`,
+    `5\t${pageNumber}\t1\t1\t1\t1\t100\t200\t20\t20\t99\t$`,
+    `5\t${pageNumber}\t1\t1\t1\t2\t125\t200\t80\t20\t99\t1.000,00`,
+  ];
+  const pages = parseTextEvidenceTsv([header, ...page(1), ...page(2)].join('\n'));
+  const extraction = attachSpatialEvidence(
+    extractArgentinePayroll('RECIBO DE SUELDO\nPeríodo: 08/2026\nTotal bruto $ 1.000,00', 'PDF_TEXT'),
+    pages,
+  );
+
+  assert.equal(extraction.fields.find(({ fieldPath }) => fieldPath === 'settlement.grossAmount')?.pageNumber, undefined);
+  assert.equal(parseTextEvidenceTsv([header, ...page(1)].join('\n'), 7)[0]?.pageNumber, 7);
+
+  const splitAcrossLines = parseTextEvidenceTsv([
+    header,
+    '1\t1\t0\t0\t0\t0\t0\t0\t1000\t2000\t-1\t',
+    '5\t1\t1\t1\t1\t1\t100\t200\t20\t20\t99\t$',
+    '5\t1\t1\t1\t2\t1\t125\t240\t80\t20\t99\t1.000,00',
+  ].join('\n'));
+  const splitExtraction = attachSpatialEvidence(
+    extractArgentinePayroll('RECIBO DE SUELDO\nPeríodo: 08/2026\nTotal bruto $ 1.000,00', 'PDF_TEXT'),
+    splitAcrossLines,
+  );
+  assert.equal(splitExtraction.fields.find(({ fieldPath }) => fieldPath === 'settlement.grossAmount')?.sourceRegion, undefined);
+});
+
+test('materializa una nueva liquidación con las correcciones efectivas sin mutar la extracción', () => {
+  const extraction = extractArgentinePayroll('RECIBO DE SUELDO\nTotal bruto $ 1.000,00', 'PDF_TEXT');
+  const effective = applySettlementCorrections(extraction, [
+    { fieldPath: 'settlement.payrollPeriod', correctedValue: '2026-08' },
+    { fieldPath: 'settlement.grossAmount', correctedValue: { amount: '1250.50', currencyCode: 'ARS' } },
+    { fieldPath: 'settlement.remunerativeAmount', correctedValue: { amount: '900.00', currencyCode: 'ARS' } },
+    { fieldPath: 'settlement.nonRemunerativeAmount', correctedValue: { amount: '350.50', currencyCode: 'ARS' } },
+    { fieldPath: 'settlement.deductionsAmount', correctedValue: { amount: '-50', currencyCode: 'ARS' } },
+    { fieldPath: 'settlement.type', correctedValue: 'REINTEGRO' },
+  ]);
+
+  assert.equal(extraction.payrollPeriod, null);
+  assert.equal(extraction.grossAmount, '1000.00');
+  assert.equal(extraction.settlementType, 'NORMAL');
+  assert.equal(effective.payrollPeriod, '2026-08');
+  assert.equal(effective.grossAmount, '1250.50');
+  assert.equal(effective.remunerativeAmount, '900.00');
+  assert.equal(effective.nonRemunerativeAmount, '350.50');
+  assert.equal(effective.deductionsAmount, '-50.00');
+  assert.equal(effective.settlementType, 'REINTEGRO');
+  assert.equal(effective.fields, extraction.fields);
+  assert.equal(effective.lineItems, extraction.lineItems);
+});
+
+test('recalcula revisión sobre valores efectivos y conserva aritmética decimal exacta', () => {
+  const extraction = extractArgentinePayroll(
+    syntheticReceipt.replace('Período de liquidación: 08/2026', ''),
+    'PDF_TEXT',
+  );
+  assert.equal(extraction.needsReview, true);
+  const corrected = applySettlementCorrections(extraction, [
+    { fieldPath: 'settlement.payrollPeriod', correctedValue: '2026-08' },
+  ]);
+  assert.equal(payrollExtractionNeedsReview(corrected), false);
+
+  const inconsistent = applySettlementCorrections(corrected, [
+    { fieldPath: 'settlement.netAmount', correctedValue: { amount: '1000', currencyCode: 'ARS' } },
+  ]);
+  assert.equal(inconsistent.netAmount, '1000.00');
+  assert.equal(payrollExtractionNeedsReview(inconsistent), true);
+
+  assert.equal(payrollExtractionNeedsReview({
+    ...corrected,
+    grossAmount: '1000.00',
+    deductionsAmount: '-50.00',
+    netAmount: '1050.00',
+    lineItems: [{
+      amount: '-50.00', confidence: 0.9, isRecurring: null, itemType: 'DEDUCTION',
+      normalizedConceptCode: null, rawDescription: 'Crédito sintético',
+    }],
+  }), false);
 });

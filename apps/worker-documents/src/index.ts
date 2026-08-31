@@ -13,21 +13,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import type { PoolClient } from 'pg';
 import { createClient } from 'redis';
 import {
+  applySettlementCorrections,
+  attachSpatialEvidence,
   classifyPayrollText,
   extractArgentinePayroll,
   hasPdfMagic,
   parseJobMessage,
+  parseTextEvidenceTsv,
+  payrollExtractionNeedsReview,
   pendingUploadCutoff,
   selectDispatchCandidates,
+  textFromEvidencePages,
   uploadCleanupStatus,
   validatePdfInfo,
   validateRenderPixels,
   type Classification,
   type FieldSource,
   type PayrollExtraction,
+  type TextEvidencePage,
 } from './engine.ts';
 import { runtimeEnvironment, type RuntimeEnvironment } from './environment.ts';
 import {
@@ -75,12 +82,13 @@ type WorkerConfig = {
   workerConcurrencyPerUser: number;
 };
 
-type JobRow = {
+export type JobRow = {
   attempt: number;
   document_id: string;
   id: string;
   lease_owner: string;
   max_attempts: number;
+  previous_document_status: 'COMPLETED' | 'NEEDS_REVIEW' | 'FAILED_PERMANENT' | 'CANCELLED' | null;
   processing_version: number;
   stage: 'SECURITY_VALIDATION' | 'TEXT_EXTRACTION';
   user_id: string;
@@ -109,7 +117,7 @@ type QueueWorkerClient = QueueConsumer & {
   destroy: () => void;
 };
 
-class WorkerError extends Error {
+export class WorkerError extends Error {
   readonly code: string;
   readonly retryable: boolean;
 
@@ -120,6 +128,18 @@ class WorkerError extends Error {
     this.name = 'WorkerError';
   }
 }
+
+const securityRejectionErrorCodes = new Set([
+  'DOCUMENT_ACTIVE_CONTENT',
+  'DOCUMENT_CORRUPTED',
+  'DOCUMENT_EMBEDDED_FILE',
+  'DOCUMENT_ENCRYPTED',
+  'DOCUMENT_INVALID_TYPE',
+  'DOCUMENT_RENDER_LIMIT',
+  'DOCUMENT_SIZE_MISMATCH',
+  'DOCUMENT_TOO_LARGE',
+  'DOCUMENT_TOO_MANY_PAGES',
+]);
 
 const log = (event: string, data: Record<string, string | number> = {}) => {
   process.stdout.write(`${JSON.stringify({ event, ...data, at: new Date().toISOString() })}\n`);
@@ -375,15 +395,30 @@ async function inspectActiveContent(path: string, config: WorkerConfig): Promise
   }
 }
 
-async function extractPdfText(path: string, pages: number, config: WorkerConfig): Promise<string> {
-  const result = await runProcess(
-    'pdftotext',
-    ['-f', '1', '-l', String(pages), '-layout', '-enc', 'UTF-8', path, '-'],
-    config.maxParseTimeMs,
-    config.maxTextBytes,
-    'DOCUMENT_CORRUPTED',
-  );
-  return result.stdout.replaceAll('\0', '').trim();
+type TextExtraction = { evidence: TextEvidencePage[]; text: string };
+const evidenceOutputLimit = (config: WorkerConfig) => Math.min(16 * 1024 * 1024, config.maxTextBytes * 4);
+
+async function extractPdfText(path: string, pages: number, config: WorkerConfig): Promise<TextExtraction> {
+  const [layout, evidence] = await Promise.all([
+    runProcess(
+      'pdftotext',
+      ['-f', '1', '-l', String(pages), '-cropbox', '-layout', '-enc', 'UTF-8', path, '-'],
+      config.maxParseTimeMs,
+      config.maxTextBytes,
+      'DOCUMENT_CORRUPTED',
+    ),
+    runProcess(
+      'pdftotext',
+      ['-f', '1', '-l', String(pages), '-cropbox', '-tsv', '-enc', 'UTF-8', path, '-'],
+      config.maxParseTimeMs,
+      evidenceOutputLimit(config),
+      'DOCUMENT_CORRUPTED',
+    ).then((result) => parseTextEvidenceTsv(result.stdout)).catch((): TextEvidencePage[] => []),
+  ]);
+  return {
+    evidence,
+    text: layout.stdout.replaceAll('\0', '').trim(),
+  };
 }
 
 async function extractOcrText(
@@ -391,12 +426,16 @@ async function extractOcrText(
   pages: number,
   directory: string,
   config: WorkerConfig,
-): Promise<{ partial: boolean; text: string }> {
+): Promise<TextExtraction & { partial: boolean }> {
   const selectedPages = Math.min(pages, config.maxOcrPages);
   // ponytail: OCR is capped per document; paginate/resume when supported scanned receipts exceed this measured ceiling.
   const deadline = Date.now() + config.maxOcrTimeMs;
+  const evidence: TextEvidencePage[] = [];
   const output: string[] = [];
-  let totalBytes = 0;
+  const maxEvidenceBytes = evidenceOutputLimit(config);
+  let evidenceBytes = 0;
+  let evidenceEnabled = true;
+  let textBytes = 0;
   for (let page = 1; page <= selectedPages; page += 1) {
     const remaining = () => {
       const value = deadline - Date.now();
@@ -407,24 +446,51 @@ async function extractOcrText(
     const imagePath = `${prefix}.png`;
     await runProcess(
       'pdftoppm',
-      ['-f', String(page), '-l', String(page), '-singlefile', '-r', '144', '-png', path, prefix],
+      ['-f', String(page), '-l', String(page), '-singlefile', '-cropbox', '-r', '144', '-png', path, prefix],
       remaining(),
       64 * 1024,
       'OCR_TEMPORARILY_UNAVAILABLE',
     );
-    const result = await runProcess(
-      'tesseract',
-      [imagePath, 'stdout', '-l', 'spa', '--psm', '6'],
-      remaining(),
-      config.maxTextBytes,
-      'OCR_TEMPORARILY_UNAVAILABLE',
-    );
-    totalBytes += Buffer.byteLength(result.stdout);
-    if (totalBytes > config.maxTextBytes) throw new WorkerError('DOCUMENT_OUTPUT_LIMIT', false);
-    output.push(result.stdout);
+    let pageEvidence: TextEvidencePage[] = [];
+    if (evidenceEnabled) {
+      try {
+        const result = await runProcess(
+          'tesseract',
+          [imagePath, 'stdout', '-l', 'spa', '--psm', '6', 'tsv'],
+          remaining(),
+          maxEvidenceBytes,
+          'OCR_TEMPORARILY_UNAVAILABLE',
+        );
+        evidenceBytes += Buffer.byteLength(result.stdout);
+        if (evidenceBytes <= maxEvidenceBytes) pageEvidence = parseTextEvidenceTsv(result.stdout, page);
+        else evidenceEnabled = false;
+      } catch {
+        evidenceEnabled = false;
+        pageEvidence = [];
+      }
+    }
+    let pageText = pageEvidence.some(({ words }) => words.length)
+      ? textFromEvidencePages(pageEvidence)
+      : '';
+    if (!pageText.trim()) {
+      pageEvidence = [];
+      const plain = await runProcess(
+        'tesseract',
+        [imagePath, 'stdout', '-l', 'spa', '--psm', '6'],
+        remaining(),
+        config.maxTextBytes,
+        'OCR_TEMPORARILY_UNAVAILABLE',
+      );
+      pageText = plain.stdout;
+    }
+    pageText = pageText.replaceAll('\0', '').trim();
+    textBytes += Buffer.byteLength(pageText);
+    if (textBytes > config.maxTextBytes) throw new WorkerError('DOCUMENT_OUTPUT_LIMIT', false);
+    evidence.push(...pageEvidence);
+    output.push(pageText);
     await rm(imagePath, { force: true });
   }
-  return { partial: selectedPages < pages, text: output.join('\n').replaceAll('\0', '').trim() };
+  return { evidence, partial: selectedPages < pages, text: output.filter(Boolean).join('\n') };
 }
 
 async function completeTerminalBatches(db: PoolClient): Promise<number> {
@@ -441,12 +507,63 @@ async function completeTerminalBatches(db: PoolClient): Promise<number> {
   return completed.rowCount ?? 0;
 }
 
+type RestorableJob = Pick<JobRow, 'document_id' | 'previous_document_status' | 'user_id'>;
+
+async function persistPermanentFailureState(
+  db: PoolClient,
+  job: RestorableJob,
+  errorCode: string,
+  failureSecurityStatus: 'ERROR' | 'REJECTED' = 'REJECTED',
+): Promise<boolean> {
+  const securityRejected = securityRejectionErrorCodes.has(errorCode);
+  if (job.previous_document_status && !securityRejected) {
+    await db.query(
+      `UPDATE documents
+          SET security_status = 'CLEAN', processing_status = $3
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [job.document_id, job.user_id, job.previous_document_status],
+    );
+    await db.query(
+      `UPDATE import_batch_items
+          SET status = CASE $3
+                WHEN 'COMPLETED' THEN 'COMPLETED'
+                WHEN 'NEEDS_REVIEW' THEN 'NEEDS_REVIEW'
+                WHEN 'CANCELLED' THEN 'CANCELLED'
+                ELSE 'FAILED'
+              END,
+              error_code = CASE WHEN $3 IN ('COMPLETED', 'NEEDS_REVIEW') THEN NULL ELSE $4 END,
+              updated_at = now()
+        WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
+      [job.document_id, job.user_id, job.previous_document_status, errorCode],
+    );
+    return true;
+  }
+  await db.query(
+    `UPDATE documents
+        SET security_status = CASE
+              WHEN $4::boolean THEN 'REJECTED'
+              WHEN security_status = 'CLEAN' THEN 'CLEAN'
+              ELSE $3
+            END,
+            processing_status = 'FAILED_PERMANENT'
+      WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+    [job.document_id, job.user_id, failureSecurityStatus, securityRejected],
+  );
+  await db.query(
+    `UPDATE import_batch_items SET status = 'FAILED', error_code = $3, updated_at = now()
+      WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
+    [job.document_id, job.user_id, errorCode],
+  );
+  return false;
+}
+
 async function reconcileDatabaseState(
   config: WorkerConfig,
 ): Promise<{ batches: number; exhausted: number; recovered: number }> {
   return await withTransaction(async (db: PoolClient) => {
     const expired = await db.query<{
       document_id: string;
+      previous_document_status: JobRow['previous_document_status'];
       state: 'FAILED' | 'RETRYABLE';
       user_id: string;
     }>(
@@ -469,26 +586,14 @@ async function reconcileDatabaseState(
               updated_at = now()
          FROM candidates
         WHERE job.id = candidates.id
-        RETURNING job.user_id, job.document_id, job.state`,
+        RETURNING job.user_id, job.document_id, job.state, job.previous_document_status`,
       [config.dispatcherBatchSize],
     );
     const exhausted = expired.rows.filter((job) => job.state === 'FAILED');
     for (const job of exhausted) {
-      await db.query(
-        `UPDATE documents
-            SET security_status = CASE WHEN security_status = 'CLEAN' THEN 'CLEAN' ELSE 'ERROR' END,
-                processing_status = 'FAILED_PERMANENT'
-          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-        [job.document_id, job.user_id],
-      );
-      await db.query(
-        `UPDATE import_batch_items SET status = 'FAILED',
-                error_code = 'WORKER_LEASE_EXHAUSTED', updated_at = now()
-          WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
-        [job.document_id, job.user_id],
-      );
+      const restored = await persistPermanentFailureState(db, job, 'WORKER_LEASE_EXHAUSTED', 'ERROR');
       await completeBatchIfTerminal(db, job);
-      await scheduleRetentionDeletion(db, job);
+      if (!restored) await scheduleRetentionDeletion(db, job);
     }
     const batches = await completeTerminalBatches(db);
     return {
@@ -869,7 +974,8 @@ async function claimJob(jobId: string, workerId: string, config: WorkerConfig): 
           AND EXISTS (SELECT 1 FROM users WHERE id = processing_jobs.user_id AND status = 'ACTIVE')
           AND (SELECT count(*) FROM processing_jobs active
                 WHERE active.user_id = processing_jobs.user_id AND active.state = 'RUNNING') < $4
-        RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts, lease_owner`,
+        RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
+                  lease_owner, previous_document_status`,
       [jobId, workerId, config.jobLeaseMs, config.workerConcurrencyPerUser],
     );
     const job = claimed.rows[0];
@@ -896,9 +1002,10 @@ async function claimJob(jobId: string, workerId: string, config: WorkerConfig): 
     }
     await db.query(
       `UPDATE documents
-          SET processing_status = 'SECURITY_VALIDATION', security_status = 'PENDING'
+          SET processing_status = 'SECURITY_VALIDATION',
+              security_status = CASE WHEN $3 = 'SECURITY_VALIDATION' THEN 'PENDING' ELSE security_status END
         WHERE id = $1 AND user_id = $2`,
-      [document.id, document.user_id],
+      [document.id, document.user_id, job.stage],
     );
     await db.query(
       `UPDATE import_batch_items SET status = 'PROCESSING', error_code = NULL, updated_at = now()
@@ -909,7 +1016,7 @@ async function claimJob(jobId: string, workerId: string, config: WorkerConfig): 
   });
 }
 
-async function setDocumentStage(job: JobRow, processingStatus: string, values: Record<string, unknown> = {}): Promise<void> {
+export async function setDocumentStage(job: JobRow, processingStatus: string, values: Record<string, unknown> = {}): Promise<void> {
   const allowed = new Map([
     ['security_status', 'security_status'],
     ['detected_mime_type', 'detected_mime_type'],
@@ -922,6 +1029,7 @@ async function setDocumentStage(job: JobRow, processingStatus: string, values: R
   const assignments = ['processing_status = $3'];
   const parameters: unknown[] = [job.document_id, job.user_id, processingStatus];
   for (const [key, value] of Object.entries(values)) {
+    if (job.previous_document_status && ['classification_status', 'document_type', 'classification_confidence'].includes(key)) continue;
     const column = allowed.get(key);
     if (!column) continue;
     parameters.push(value);
@@ -1093,22 +1201,22 @@ async function finishClassification(
   });
 }
 
-async function persistExtraction(
+export async function persistExtraction(
   job: JobRow,
   classification: Classification,
   extraction: PayrollExtraction,
   source: FieldSource,
   partialOcr: boolean,
   computeMs: number,
-): Promise<void> {
-  await withTransaction(async (db: PoolClient) => {
+): Promise<'COMPLETED' | 'NEEDS_REVIEW' | null> {
+  return await withTransaction(async (db: PoolClient) => {
     const activeJob = await db.query(
       `SELECT 1 FROM processing_jobs
         WHERE id = $1 AND state = 'RUNNING' AND document_id = $2 AND user_id = $3 AND lease_owner = $4
         FOR UPDATE`,
       [job.id, job.document_id, job.user_id, job.lease_owner],
     );
-    if (!activeJob.rowCount) return;
+    if (!activeJob.rowCount) return null;
     const activeDocument = await db.query(
       `SELECT 1 FROM documents WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE`,
       [job.document_id, job.user_id],
@@ -1121,7 +1229,7 @@ async function persistExtraction(
           WHERE id = $1 AND lease_owner = $2`,
         [job.id, job.lease_owner],
       );
-      return;
+      return null;
     }
 
     const inserted = await db.query<{ id: string }>(
@@ -1157,14 +1265,16 @@ async function persistExtraction(
     }
     if (!runId) throw new WorkerError('EXTRACTION_PERSISTENCE_CONFLICT', true);
 
+    let effectiveExtraction = extraction;
     if (inserted.rowCount) {
       await insertClassificationField(db, job, runId, classification);
       for (const field of extraction.fields) {
         await db.query(
           `INSERT INTO extracted_fields (
              id, user_id, document_id, extraction_run_id, field_path, entity_type,
-             raw_value, interpreted_value, confidence, source, extractor_version, signals
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb)`,
+             raw_value, interpreted_value, confidence, source, page_number, source_region,
+             extractor_version, signals
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13, $14::jsonb)`,
           [
             randomUUID(),
             job.user_id,
@@ -1176,13 +1286,71 @@ async function persistExtraction(
             JSON.stringify(field.interpretedValue),
             field.confidence,
             field.source,
+            field.pageNumber ?? null,
+            field.sourceRegion ? JSON.stringify(field.sourceRegion) : null,
             WORKER_VERSION,
             JSON.stringify(field.signals ?? {}),
           ],
         );
       }
 
-      if (extraction.payrollPeriod) {
+      const previousCorrections = await db.query<{
+        corrected_value: unknown;
+        extracted_field_id: string | null;
+        extracted_value: unknown;
+        field_path: string;
+        inherited_root_id: string;
+      }>(
+        `SELECT DISTINCT ON (correction.field_path)
+                correction.field_path, correction.corrected_value,
+                COALESCE(correction.inherited_from_correction_id, correction.id) AS inherited_root_id,
+                current_field.id AS extracted_field_id,
+                current_field.interpreted_value AS extracted_value
+           FROM user_corrections AS correction
+           JOIN extraction_runs AS previous_run
+             ON previous_run.id = correction.extraction_run_id
+            AND previous_run.user_id = correction.user_id
+            AND previous_run.document_id = correction.document_id
+           LEFT JOIN extracted_fields AS current_field
+             ON current_field.user_id = correction.user_id
+            AND current_field.document_id = correction.document_id
+            AND current_field.extraction_run_id = $3
+            AND current_field.field_path = correction.field_path
+          WHERE correction.user_id = $1 AND correction.document_id = $2
+            AND previous_run.status = 'COMPLETED'
+            AND previous_run.processing_version < $4
+          ORDER BY correction.field_path, previous_run.processing_version DESC,
+                   correction.correction_version DESC, correction.created_at DESC, correction.id DESC`,
+        [job.user_id, job.document_id, runId, job.processing_version],
+      );
+      for (const correction of previousCorrections.rows) {
+        await db.query(
+          `INSERT INTO user_corrections (
+             id, user_id, extracted_field_id, document_id, extraction_run_id, field_path,
+             correction_version, extracted_value, corrected_value, inherited_from_correction_id
+           ) VALUES ($1, $2, $3, $4, $5, $6, 1, $7::jsonb, $8::jsonb, $9)`,
+          [
+            randomUUID(),
+            job.user_id,
+            correction.extracted_field_id,
+            job.document_id,
+            runId,
+            correction.field_path,
+            JSON.stringify(correction.extracted_value ?? null),
+            JSON.stringify(correction.corrected_value ?? null),
+            correction.inherited_root_id,
+          ],
+        );
+      }
+      effectiveExtraction = applySettlementCorrections(
+        extraction,
+        previousCorrections.rows.map((correction) => ({
+          correctedValue: correction.corrected_value,
+          fieldPath: correction.field_path,
+        })),
+      );
+
+      if (effectiveExtraction.payrollPeriod) {
         const settlement = await db.query<{ id: string }>(
           `INSERT INTO payroll_settlements (
              id, user_id, document_id, extraction_run_id, employment_id, settlement_ordinal,
@@ -1198,16 +1366,16 @@ async function persistExtraction(
             job.user_id,
             job.document_id,
             runId,
-            `${extraction.payrollPeriod}-01`,
-            extraction.settlementType,
-            extraction.settlementType === 'NORMAL',
-            extraction.currencyCode,
-            extraction.basicAmount,
-            extraction.grossAmount,
-            extraction.netAmount,
-            extraction.remunerativeAmount,
-            extraction.nonRemunerativeAmount,
-            extraction.deductionsAmount,
+            `${effectiveExtraction.payrollPeriod}-01`,
+            effectiveExtraction.settlementType,
+            effectiveExtraction.settlementType === 'NORMAL',
+            effectiveExtraction.currencyCode,
+            effectiveExtraction.basicAmount,
+            effectiveExtraction.grossAmount,
+            effectiveExtraction.netAmount,
+            effectiveExtraction.remunerativeAmount,
+            effectiveExtraction.nonRemunerativeAmount,
+            effectiveExtraction.deductionsAmount,
           ],
         );
         const settlementId = settlement.rows[0]?.id;
@@ -1229,7 +1397,7 @@ async function persistExtraction(
               item.rawDescription,
               item.normalizedConceptCode,
               item.amount,
-              extraction.currencyCode,
+              effectiveExtraction.currencyCode,
               item.itemType,
               item.isRecurring,
               item.confidence,
@@ -1240,7 +1408,9 @@ async function persistExtraction(
       }
     }
 
-    const needsReview = extraction.needsReview || partialOcr;
+    const needsReview = job.previous_document_status === 'NEEDS_REVIEW'
+      || partialOcr
+      || payrollExtractionNeedsReview(effectiveExtraction);
     await db.query(
       `UPDATE documents
           SET classification_status = 'SUPPORTED', document_type = 'PAYROLL',
@@ -1263,6 +1433,7 @@ async function persistExtraction(
       [job.id, job.lease_owner],
     );
     await completeBatchIfTerminal(db, job);
+    return needsReview ? 'NEEDS_REVIEW' : 'COMPLETED';
   });
 }
 
@@ -1270,11 +1441,12 @@ function normalizeError(error: unknown): WorkerError {
   return error instanceof WorkerError ? error : new WorkerError('WORKER_INTERNAL_ERROR', true);
 }
 
-async function failJob(job: JobRow, rawError: unknown): Promise<void> {
+export async function failJob(job: JobRow, rawError: unknown): Promise<void> {
   const error = normalizeError(rawError);
   const retryable = error.retryable && job.attempt < job.max_attempts;
   const delayMs = Math.min(300_000, 1_000 * 2 ** Math.min(job.attempt, 8)) + randomInt(0, 1_000);
   await withTransaction(async (db: PoolClient) => {
+    let restoredPreviousState = false;
     const updated = await db.query(
       `UPDATE processing_jobs
           SET state = $3, available_at = CASE WHEN $3 = 'RETRYABLE'
@@ -1309,19 +1481,9 @@ async function failJob(job: JobRow, rawError: unknown): Promise<void> {
         [job.document_id, job.user_id, error.code],
       );
     } else {
-      await db.query(
-        `UPDATE documents SET security_status = CASE WHEN security_status = 'CLEAN' THEN security_status ELSE 'REJECTED' END,
-                              processing_status = 'FAILED_PERMANENT'
-          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-        [job.document_id, job.user_id],
-      );
-      await db.query(
-        `UPDATE import_batch_items SET status = 'FAILED', error_code = $3, updated_at = now()
-          WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
-        [job.document_id, job.user_id, error.code],
-      );
+      restoredPreviousState = await persistPermanentFailureState(db, job, error.code);
     }
-    if (!retryable) await scheduleRetentionDeletion(db, job);
+    if (!retryable && !restoredPreviousState) await scheduleRetentionDeletion(db, job);
     await completeBatchIfTerminal(db, job);
   });
   log('job_failed', { errorCode: error.code, jobId: job.id, retryable: retryable ? 1 : 0 });
@@ -1354,12 +1516,12 @@ async function processJob(
 
     let source: FieldSource = 'PDF_TEXT';
     let sample = await extractPdfText(pdfPath, Math.min(2, pages), config);
-    if (sample.length < 80) {
+    if (sample.text.length < 80) {
       source = 'OCR';
-      sample = (await extractOcrText(pdfPath, 1, directory, config)).text;
+      sample = await extractOcrText(pdfPath, 1, directory, config);
     }
     const automaticClassification = classifyPayrollText(
-      sample,
+      sample.text,
       config.classificationLowThreshold,
       config.classificationHighThreshold,
     );
@@ -1383,30 +1545,33 @@ async function processJob(
       document_type: 'PAYROLL',
     });
     let partialOcr = false;
-    let text: string;
+    let extracted: TextExtraction;
     if (source === 'OCR') {
       if (pages === 1) {
-        text = sample;
+        extracted = sample;
       } else {
         const ocr = await extractOcrText(pdfPath, pages, directory, config);
-        text = ocr.text;
+        extracted = ocr;
         partialOcr = ocr.partial;
       }
     } else {
-      text = pages <= 2 ? sample : await extractPdfText(pdfPath, pages, config);
-      if (text.length < 80) {
+      extracted = pages <= 2 ? sample : await extractPdfText(pdfPath, pages, config);
+      if (extracted.text.length < 80) {
         source = 'OCR';
         const ocr = await extractOcrText(pdfPath, pages, directory, config);
-        text = ocr.text;
+        extracted = ocr;
         partialOcr = ocr.partial;
       }
     }
-    if (text.length < 40) throw new WorkerError('DOCUMENT_TEXT_UNREADABLE', false);
+    if (extracted.text.length < 40) throw new WorkerError('DOCUMENT_TEXT_UNREADABLE', false);
 
     await setDocumentStage(job, 'PARSING');
-    const extraction = extractArgentinePayroll(text, source === 'OCR' ? 'OCR' : 'PDF_TEXT');
-    await persistExtraction(job, classification, extraction, source, partialOcr, Date.now() - started);
-    log('job_completed', { jobId: job.id, result: extraction.needsReview || partialOcr ? 'NEEDS_REVIEW' : 'COMPLETED' });
+    const extraction = attachSpatialEvidence(
+      extractArgentinePayroll(extracted.text, source === 'OCR' ? 'OCR' : 'PDF_TEXT'),
+      extracted.evidence,
+    );
+    const result = await persistExtraction(job, classification, extraction, source, partialOcr, Date.now() - started);
+    log('job_completed', { jobId: job.id, result: result ?? 'STALE' });
   } catch (error) {
     await failJob(job, error);
   } finally {
@@ -1590,7 +1755,9 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch(() => {
-  log('worker_start_failed');
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  void main().catch(() => {
+    log('worker_start_failed');
+    process.exitCode = 1;
+  });
+}

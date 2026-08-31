@@ -35,8 +35,13 @@ type ImportItemInput = {
 };
 type ImportBody = { items: ImportItemInput[] };
 type UploadBody = { itemId: string };
-type CorrectionBody = { extractedFieldId?: string; fieldPath?: string; correctedValue: string };
-type ReviewCompleteBody = { acceptDeductionsMismatch?: boolean };
+type CorrectionBody = {
+  extractedFieldId?: string;
+  fieldPath?: string;
+  correctedValue: string;
+  extractionRunId: string;
+};
+type ReviewCompleteBody = { acceptDeductionsMismatch?: boolean; extractionRunId: string };
 type DocumentEmploymentBody = { documentIds: string[]; employmentId: string | null };
 type SalaryComparisonQuery = {
   employmentContext: string;
@@ -64,6 +69,7 @@ type DocumentListQuery = {
   documentType?: string;
   settlementType?: string;
 };
+type OriginalQuery = { disposition?: "inline" | "attachment" };
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const TOKEN_PATTERN = "^[A-Za-z0-9_-]{43}$";
@@ -90,7 +96,10 @@ const settlementTypes = new Set([
   "HORAS_EXTRA", "LIQUIDACION_FINAL", "INDEMNIZACION", "AJUSTE", "REINTEGRO", "OTRO_LABORAL",
 ]);
 const manualCorrectionPaths = new Set([
-  "settlement.type", "settlement.payrollPeriod", ...settlementAmountColumns.keys(),
+  "employer.name", "settlement.type", "settlement.payrollPeriod", ...settlementAmountColumns.keys(),
+]);
+const reprocessableDocumentStatuses = new Set([
+  "COMPLETED", "NEEDS_REVIEW", "FAILED_PERMANENT", "CANCELLED",
 ]);
 const requiredPayrollReviewPaths = [
   "settlement.payrollPeriod",
@@ -126,7 +135,7 @@ const exportSections = [
       ocr_provider, ocr_version, started_at, finished_at, confidence, error_code, compute_ms
       FROM extraction_runs WHERE user_id = $1 ORDER BY id`],
   ["extractedFields", `SELECT id, document_id, extraction_run_id, field_path, entity_type, raw_value,
-      interpreted_value, confidence, source, page_number, extractor_version, created_at
+      interpreted_value, confidence, source, page_number, source_region, extractor_version, created_at
       FROM extracted_fields WHERE user_id = $1 ORDER BY id`],
   ["settlements", `SELECT id, document_id, extraction_run_id, employment_id, settlement_ordinal,
       payroll_period, payment_date, issue_date, settlement_type, is_recurring, currency_code,
@@ -136,7 +145,7 @@ const exportSections = [
       amount, currency_code, item_type, is_recurring, confidence, source_page, source_field, created_at
       FROM payroll_line_items WHERE user_id = $1 ORDER BY id`],
   ["corrections", `SELECT id, extracted_field_id, document_id, extraction_run_id, field_path,
-      correction_version, extracted_value, corrected_value, created_at
+      correction_version, extracted_value, corrected_value, inherited_from_correction_id, created_at
       FROM user_corrections WHERE user_id = $1 ORDER BY id`],
   ["legalAcknowledgements", `SELECT version.document_type, version.version, version.locale,
       acknowledgement.accepted_at
@@ -184,7 +193,7 @@ function cleanFilename(input: string): string {
 function safeFilenamePart(input: string): string {
   const cleaned = input
     .normalize("NFKC")
-    .replace(/[\u0000-\u001f<>:"/\\|?*]/g, " ")
+    .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069<>:"/\\|?*]/g, " ")
     .replace(/\s+/g, " ")
     .replace(/[. ]+$/g, "")
     .trim();
@@ -219,8 +228,18 @@ const documentProjectionJoin = `
          FROM payroll_settlements settlement
         WHERE settlement.user_id = document.user_id AND settlement.document_id = document.id
         ORDER BY settlement.created_at DESC LIMIT 1) AS settlement_type,
-      max(correction.corrected_value #>> '{}')
-        FILTER (WHERE field.field_path = 'employer.name') AS corrected_employer_name,
+      (SELECT correction.corrected_value #>> '{}'
+         FROM user_corrections correction
+        WHERE correction.user_id = document.user_id
+          AND correction.document_id = document.id
+          AND correction.extraction_run_id = (
+            SELECT run.id FROM extraction_runs run
+             WHERE run.user_id = document.user_id AND run.document_id = document.id
+               AND run.status = 'COMPLETED'
+             ORDER BY run.processing_version DESC LIMIT 1
+          )
+           AND correction.field_path = 'employer.name'
+        ORDER BY correction.correction_version DESC LIMIT 1) AS corrected_employer_name,
       max(field.interpreted_value #>> '{}')
         FILTER (WHERE field.field_path = 'employer.name') AS extracted_employer_name
       FROM extracted_fields field
@@ -407,11 +426,37 @@ function readMissingFieldReason(signals: unknown): MissingFieldReason | undefine
   return missingFieldReasons.find((reason) => reason === value);
 }
 
+type SourceRegion = {
+  version: 1;
+  space: "PAGE_NORMALIZED";
+  origin: "TOP_LEFT";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+function validatedSourceRegion(input: unknown): SourceRegion | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const region = input as Record<string, unknown>;
+  if (region.version !== 1 || region.space !== "PAGE_NORMALIZED" || region.origin !== "TOP_LEFT") return null;
+  const { x, y, width, height } = region;
+  if (typeof x !== "number" || !Number.isFinite(x)
+    || typeof y !== "number" || !Number.isFinite(y)
+    || typeof width !== "number" || !Number.isFinite(width)
+    || typeof height !== "number" || !Number.isFinite(height)) return null;
+  if (x < 0 || y < 0 || width <= 0 || height <= 0 || x > 1 || y > 1 || width > 1 || height > 1
+    || x + width > 1.000001 || y + height > 1.000001) return null;
+  return { version: 1, space: "PAGE_NORMALIZED", origin: "TOP_LEFT", x, y, width, height };
+}
+
 function normalizeDecimal(input: string): string | null {
   const compact = input.trim().replace(/[\s$]/g, "");
   const normalized = compact.includes(",")
     ? compact.replaceAll(".", "").replace(",", ".")
-    : compact;
+    : /^-?\d{1,3}(?:\.\d{3})+$/.test(compact)
+      ? compact.replaceAll(".", "")
+      : compact;
   return /^-?\d{1,18}(?:\.\d{1,2})?$/.test(normalized) ? normalized : null;
 }
 
@@ -1675,12 +1720,16 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   app.get<{ Params: IdParams }>(
     "/api/v1/documents/:id",
     { preHandler: requireAuth, schema: { params: idParamsSchema } },
-    async (request) => {
-      const document = await pool.query(
+    async (request) => withTransaction(async (client) => {
+      await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const document = await client.query(
         `SELECT document.id, document.employment_id, document.original_filename, document.created_at,
                 document.processing_status, document.document_type,
                 document.classification_confidence, document.original_deleted_at,
-                document.deleted_at, item.error_code, projection.payroll_period, projection.settlement_type,
+                document.deleted_at, document.declared_mime_type, document.detected_mime_type,
+                document.size_bytes, document.page_count, document.security_status,
+                document.classification_status, document.retention_policy, document.processed_at,
+                item.error_code, projection.payroll_period, projection.settlement_type,
                 COALESCE(employer.name, projection.corrected_employer_name,
                          projection.extracted_employer_name) AS employer_name
            FROM documents document
@@ -1695,36 +1744,66 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         [request.params.id, request.authUser!.id],
       );
       if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      const latestRun = await pool.query(
-        `SELECT id FROM extraction_runs
+      const latestRun = await client.query(
+        `SELECT id, processing_version, extractor_name, extractor_version, parser_version,
+                normalizer_version, ocr_provider, ocr_version, confidence, finished_at
+           FROM extraction_runs
           WHERE document_id = $1 AND user_id = $2 AND status = 'COMPLETED'
           ORDER BY processing_version DESC LIMIT 1`,
         [request.params.id, request.authUser!.id],
       );
+      const lastReprocessJob = await client.query(
+        `SELECT state, processing_version, error_code, completed_at
+           FROM processing_jobs
+          WHERE document_id = $1 AND user_id = $2
+            AND previous_document_status IS NOT NULL
+          ORDER BY processing_version DESC LIMIT 1`,
+        [request.params.id, request.authUser!.id],
+      );
       const extractionRunId = latestRun.rowCount ? String(latestRun.rows[0].id) : null;
-      const fields = extractionRunId ? await pool.query(
-        `SELECT field.id, field.field_path, field.interpreted_value, field.confidence, field.source, field.signals,
-                correction.corrected_value
+      const fields = extractionRunId ? await client.query(
+        `SELECT field.id, field.field_path, field.raw_value, field.interpreted_value,
+                field.confidence, field.source, field.page_number, field.source_region,
+                field.extractor_version, field.signals, correction.id AS correction_id,
+                correction.corrected_value, correction.correction_version, correction.created_at AS corrected_at
            FROM extracted_fields field
            LEFT JOIN LATERAL (
-             SELECT corrected_value FROM user_corrections
-              WHERE user_id = field.user_id
-                AND extraction_run_id = field.extraction_run_id
-                AND field_path = field.field_path
-              ORDER BY correction_version DESC LIMIT 1
+             SELECT COALESCE(root.id, correction.id) AS id, correction.corrected_value,
+                    COALESCE(root.correction_version, correction.correction_version) AS correction_version,
+                    COALESCE(root.created_at, correction.created_at) AS created_at
+               FROM user_corrections correction
+               LEFT JOIN user_corrections root
+                 ON root.id = correction.inherited_from_correction_id
+                AND root.user_id = correction.user_id
+                AND root.document_id = correction.document_id
+                AND root.field_path = correction.field_path
+              WHERE correction.user_id = field.user_id
+                AND correction.extraction_run_id = field.extraction_run_id
+                AND correction.field_path = field.field_path
+              ORDER BY correction.correction_version DESC LIMIT 1
            ) correction ON true
           WHERE field.document_id = $1 AND field.user_id = $2 AND field.extraction_run_id = $3
           ORDER BY field.field_path`,
         [request.params.id, request.authUser!.id, extractionRunId],
       ) : { rows: [] as Record<string, unknown>[] };
-      const manual = extractionRunId ? await pool.query(
-        `SELECT DISTINCT ON (field_path) field_path, corrected_value
-           FROM user_corrections
-          WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3
-          ORDER BY field_path, correction_version DESC`,
+      const manual = extractionRunId ? await client.query(
+        `SELECT DISTINCT ON (correction.field_path)
+                COALESCE(root.id, correction.id) AS id,
+                correction.field_path, correction.corrected_value,
+                COALESCE(root.correction_version, correction.correction_version) AS correction_version,
+                COALESCE(root.created_at, correction.created_at) AS corrected_at
+           FROM user_corrections correction
+           LEFT JOIN user_corrections root
+             ON root.id = correction.inherited_from_correction_id
+            AND root.user_id = correction.user_id
+            AND root.document_id = correction.document_id
+            AND root.field_path = correction.field_path
+          WHERE correction.user_id = $1 AND correction.document_id = $2
+            AND correction.extraction_run_id = $3
+          ORDER BY correction.field_path, correction.correction_version DESC`,
         [request.authUser!.id, request.params.id, extractionRunId],
       ) : { rows: [] as Record<string, unknown>[] };
-      const settlement = extractionRunId ? await pool.query(
+      const settlement = extractionRunId ? await client.query(
         `SELECT settlement.id, settlement.document_id, settlement.employment_id,
                 to_char(settlement.payroll_period, 'YYYY-MM-DD') AS payroll_period,
                 settlement.settlement_type, settlement.is_recurring, settlement.currency_code,
@@ -1776,7 +1855,19 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           ORDER BY settlement.settlement_ordinal LIMIT 1`,
         [request.authUser!.id, request.params.id, extractionRunId],
       ) : { rows: [] as Record<string, unknown>[] };
-      const manualValues = new Map(manual.rows.map((row) => [String(row.field_path), row.corrected_value]));
+      const lineItems = extractionRunId ? await client.query(
+        `SELECT item.id, item.item_ordinal, item.raw_description, item.normalized_concept_code,
+                item.amount, item.currency_code, item.item_type, item.is_recurring,
+                item.confidence, item.source_page, item.source_field
+           FROM payroll_line_items item
+           JOIN payroll_settlements settlement
+             ON settlement.id = item.settlement_id AND settlement.user_id = item.user_id
+          WHERE settlement.document_id = $1 AND settlement.user_id = $2
+            AND settlement.extraction_run_id = $3
+          ORDER BY settlement.settlement_ordinal, item.item_ordinal`,
+        [request.params.id, request.authUser!.id, extractionRunId],
+      ) : { rows: [] as Record<string, unknown>[] };
+      const manualValues = new Map(manual.rows.map((row) => [String(row.field_path), row]));
       const effectiveSettlement = settlement.rows[0] ?? {};
       const missingEffectivePaths = new Set([
         ...(!effectiveSettlement.payroll_period ? ["settlement.payrollPeriod"] : []),
@@ -1788,18 +1879,34 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       const extractedFields: Array<{
         id: string | null;
         fieldPath: string;
+        rawValue: string | null;
         interpretedValue: string | null;
         correctedValue: string | null;
+        effectiveValue: string | null;
         confidence: string;
         source: string;
+        pageNumber: number | null;
+        sourceRegion: SourceRegion | null;
+        extractorVersion: string | null;
+        correction: { id: string; version: number; correctedAt: string } | null;
         missingReason?: MissingFieldReason;
       }> = fields.rows.map((field) => {
         const missingReason = readMissingFieldReason(field.signals);
+        const correctedValue = displayExtracted(field.corrected_value);
+        const interpretedValue = displayExtracted(field.interpreted_value);
         return {
           id: String(field.id), fieldPath: String(field.field_path),
-          interpretedValue: displayExtracted(field.interpreted_value),
-          correctedValue: displayExtracted(field.corrected_value),
+          rawValue: value(field, "raw_value"), interpretedValue, correctedValue,
+          effectiveValue: correctedValue ?? interpretedValue,
           confidence: String(field.confidence), source: String(field.source),
+          pageNumber: field.page_number === null ? null : Number(field.page_number),
+          sourceRegion: validatedSourceRegion(field.source_region),
+          extractorVersion: value(field, "extractor_version"),
+          correction: field.correction_id === null ? null : {
+            id: String(field.correction_id),
+            version: Number(field.correction_version),
+            correctedAt: timestamp(field.corrected_at),
+          },
           ...(missingReason ? { missingReason } : {}),
         };
       });
@@ -1808,23 +1915,94 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         for (const fieldPath of requiredPayrollReviewPaths) {
           const existing = extractedFields.find((field) => field.fieldPath === fieldPath);
           if (existing && missingEffectivePaths.has(fieldPath)) existing.source = "MANUAL_REQUIRED";
-          if (!existingPaths.has(fieldPath)) extractedFields.push({
-            id: null,
-            fieldPath,
-            interpretedValue: null,
-            correctedValue: displayExtracted(manualValues.get(fieldPath)),
-            confidence: "0",
-            source: "MANUAL_REQUIRED",
+          if (!existingPaths.has(fieldPath)) {
+            const correction = manualValues.get(fieldPath);
+            const correctedValue = displayExtracted(correction?.corrected_value);
+            extractedFields.push({
+              id: null,
+              fieldPath,
+              rawValue: null,
+              interpretedValue: null,
+              correctedValue,
+              effectiveValue: correctedValue,
+              confidence: "0",
+              source: "MANUAL_REQUIRED",
+              pageNumber: null,
+              sourceRegion: null,
+              extractorVersion: null,
+              correction: correction ? {
+                id: String(correction.id),
+                version: Number(correction.correction_version),
+                correctedAt: timestamp(correction.corrected_at),
+              } : null,
+            });
+          }
+        }
+        if (!existingPaths.has("employer.name") && manualValues.has("employer.name")) {
+          const correction = manualValues.get("employer.name")!;
+          const correctedValue = displayExtracted(correction.corrected_value);
+          extractedFields.push({
+            id: null, fieldPath: "employer.name", rawValue: null, interpretedValue: null,
+            correctedValue, effectiveValue: correctedValue, confidence: "0", source: "MANUAL_REQUIRED",
+            pageNumber: null, sourceRegion: null, extractorVersion: null,
+            correction: {
+              id: String(correction.id),
+              version: Number(correction.correction_version),
+              correctedAt: timestamp(correction.corrected_at),
+            },
           });
         }
         extractedFields.sort((left, right) => left.fieldPath.localeCompare(right.fieldPath));
       }
+      const row = document.rows[0];
       return { data: {
-        ...documentView(document.rows[0]),
+        ...documentView(row),
+        declaredMimeType: String(row.declared_mime_type),
+        detectedMimeType: value(row, "detected_mime_type"),
+        sizeBytes: Number(row.size_bytes),
+        pageCount: row.page_count === null ? null : Number(row.page_count),
+        securityStatus: String(row.security_status),
+        classificationStatus: String(row.classification_status),
+        retentionPolicy: String(row.retention_policy),
+        processedAt: row.processed_at === null ? null : timestamp(row.processed_at),
+        lastReprocessError: lastReprocessJob.rows[0]?.state === "FAILED" ? {
+          code: String(lastReprocessJob.rows[0].error_code),
+          processingVersion: Number(lastReprocessJob.rows[0].processing_version),
+          failedAt: timestamp(lastReprocessJob.rows[0].completed_at),
+        } : null,
+        reviewSettlement: settlement.rows.length ? {
+          totalsBalance: settlement.rows[0].totals_balance === true,
+          deductionsMatchTotal: settlement.rows[0].deductions_match_total === true,
+        } : null,
+        extractionRun: latestRun.rowCount ? {
+          id: String(latestRun.rows[0].id),
+          processingVersion: Number(latestRun.rows[0].processing_version),
+          extractorName: String(latestRun.rows[0].extractor_name),
+          extractorVersion: String(latestRun.rows[0].extractor_version),
+          parserVersion: String(latestRun.rows[0].parser_version),
+          normalizerVersion: String(latestRun.rows[0].normalizer_version),
+          ocrProvider: value(latestRun.rows[0], "ocr_provider"),
+          ocrVersion: value(latestRun.rows[0], "ocr_version"),
+          confidence: value(latestRun.rows[0], "confidence"),
+          finishedAt: timestamp(latestRun.rows[0].finished_at),
+        } : null,
         extractedFields,
         settlement: settlement.rows.length ? settlementView(settlement.rows[0]!) : null,
+        lineItems: lineItems.rows.map((item) => ({
+          id: String(item.id),
+          itemOrdinal: Number(item.item_ordinal),
+          rawDescription: String(item.raw_description),
+          normalizedConceptCode: value(item, "normalized_concept_code"),
+          amount: String(item.amount),
+          currencyCode: String(item.currency_code),
+          itemType: String(item.item_type),
+          isRecurring: item.is_recurring === null ? null : Boolean(item.is_recurring),
+          confidence: value(item, "confidence"),
+          sourcePage: item.source_page === null ? null : Number(item.source_page),
+          sourceField: value(item, "source_field"),
+        })),
       } };
-    },
+    }),
   );
 
   app.patch<{ Body: DocumentEmploymentBody }>(
@@ -2089,6 +2267,97 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     },
   );
 
+  app.post<{ Params: IdParams }>(
+    "/api/v1/documents/:id/reprocess",
+    { preHandler: requireAuth, schema: { params: idParamsSchema } },
+    async (request, reply) => {
+      const requestedKey = request.headers["idempotency-key"];
+      if (typeof requestedKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(requestedKey)) {
+        throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Falta una clave de idempotencia válida.");
+      }
+      const idempotencyKey = `reprocess:${request.authUser!.id}:${request.params.id}:${createHash("sha256").update(requestedKey).digest("hex")}`;
+      const result = await withTransaction(async (client) => {
+        const document = await client.query(
+          `SELECT processing_status, security_status, document_type, original_deleted_at
+             FROM documents
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+            FOR UPDATE`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        const existing = await client.query(
+          `SELECT id, state, processing_version FROM processing_jobs
+            WHERE document_id = $1 AND user_id = $2 AND idempotency_key = $3`,
+          [request.params.id, request.authUser!.id, idempotencyKey],
+        );
+        if (existing.rowCount) {
+          return {
+            created: false,
+            processingStatus: String(document.rows[0].processing_status),
+            job: {
+              id: String(existing.rows[0].id),
+              state: String(existing.rows[0].state),
+              processingVersion: Number(existing.rows[0].processing_version),
+            },
+          };
+        }
+        const row = document.rows[0];
+        if (!reprocessableDocumentStatuses.has(String(row.processing_status))) {
+          throw new ApiError(409, "REPROCESS_NOT_ALLOWED", "El documento todavía no puede reprocesarse.");
+        }
+        if (row.original_deleted_at !== null) {
+          throw new ApiError(409, "ORIGINAL_NOT_AVAILABLE", "El original no está disponible para reprocesarlo.");
+        }
+        if (row.security_status !== "CLEAN" || row.document_type !== "PAYROLL") {
+          throw new ApiError(409, "REPROCESS_NOT_ALLOWED", "El documento no es elegible para reprocesamiento.");
+        }
+        const activeJob = await client.query(
+          `SELECT 1 FROM processing_jobs
+            WHERE document_id = $1 AND user_id = $2
+              AND (state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') OR execution_owner IS NOT NULL)
+            LIMIT 1`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (activeJob.rowCount) {
+          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento actual.");
+        }
+        const version = await client.query(
+          `SELECT GREATEST(
+                    COALESCE((SELECT max(processing_version) FROM processing_jobs
+                               WHERE document_id = $1 AND user_id = $2), 0),
+                    COALESCE((SELECT max(processing_version) FROM extraction_runs
+                               WHERE document_id = $1 AND user_id = $2), 0)
+                  )::integer + 1 AS processing_version`,
+          [request.params.id, request.authUser!.id],
+        );
+        const processingVersion = Number(version.rows[0].processing_version);
+        const jobId = randomUUID();
+        await client.query(
+          `INSERT INTO processing_jobs (
+             id, user_id, document_id, stage, processing_version, idempotency_key,
+             previous_document_status
+           ) VALUES ($1, $2, $3, 'TEXT_EXTRACTION', $4, $5, $6)`,
+          [jobId, request.authUser!.id, request.params.id, processingVersion, idempotencyKey, row.processing_status],
+        );
+        await client.query(
+          `UPDATE documents SET processing_status = 'UPLOADED'
+            WHERE id = $1 AND user_id = $2`,
+          [request.params.id, request.authUser!.id],
+        );
+        await audit(client, request.authUser!.id, "DOCUMENT_REPROCESS_REQUESTED", "DOCUMENT", request.params.id, {
+          processingVersion,
+        });
+        return {
+          created: true,
+          processingStatus: "UPLOADED",
+          job: { id: jobId, state: "PENDING", processingVersion },
+        };
+      });
+      const { created, ...data } = result;
+      return reply.code(created ? 201 : 200).send({ data });
+    },
+  );
+
   app.post<{ Params: IdParams; Body: CorrectionBody }>(
     "/api/v1/documents/:id/corrections",
     {
@@ -2097,12 +2366,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         params: idParamsSchema,
         body: {
           type: "object", additionalProperties: false,
-          required: ["correctedValue"],
+          required: ["correctedValue", "extractionRunId"],
           anyOf: [{ required: ["extractedFieldId"] }, { required: ["fieldPath"] }],
           properties: {
             extractedFieldId: { type: "string", pattern: UUID_PATTERN },
             fieldPath: { type: "string", minLength: 1, maxLength: 300 },
             correctedValue: { type: "string", minLength: 1, maxLength: 500 },
+            extractionRunId: { type: "string", pattern: UUID_PATTERN },
           },
         },
       },
@@ -2122,6 +2392,17 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (!["NEEDS_REVIEW", "COMPLETED"].includes(String(correctionDocument.rows[0].processing_status))) {
           throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento para corregirlo.");
         }
+        const latestRun = await client.query(
+          `SELECT id FROM extraction_runs
+            WHERE document_id = $1 AND user_id = $2 AND status = 'COMPLETED'
+            ORDER BY processing_version DESC LIMIT 1 FOR UPDATE`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (!latestRun.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        const latestRunId = String(latestRun.rows[0].id);
+        if (request.body.extractionRunId !== latestRunId) {
+          throw new ApiError(409, "STALE_EXTRACTION_RUN", "La extracción cambió; recargá el documento antes de corregirlo.");
+        }
         const field = request.body.extractedFieldId ? await client.query(
           `SELECT field.id, field.field_path, field.interpreted_value, field.extraction_run_id,
                   settlement.currency_code
@@ -2129,34 +2410,29 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
              LEFT JOIN payroll_settlements settlement
                ON settlement.extraction_run_id = field.extraction_run_id
               AND settlement.user_id = field.user_id AND settlement.settlement_ordinal = 1
-            WHERE field.id = $1 AND field.document_id = $2 AND field.user_id = $3
-              AND field.extraction_run_id = (
-                SELECT run.id FROM extraction_runs run
-                 WHERE run.user_id = field.user_id AND run.document_id = field.document_id
-                   AND run.status = 'COMPLETED'
-                 ORDER BY run.processing_version DESC LIMIT 1
-              )
-            FOR UPDATE OF field`,
-          [request.body.extractedFieldId, request.params.id, request.authUser!.id],
+             WHERE field.id = $1 AND field.document_id = $2 AND field.user_id = $3
+               AND field.extraction_run_id = $4
+             FOR UPDATE OF field`,
+          [request.body.extractedFieldId, request.params.id, request.authUser!.id, latestRunId],
         ) : await client.query(
           `SELECT NULL::uuid AS id, $3::text AS field_path, NULL::jsonb AS interpreted_value,
-                  run.id AS extraction_run_id, settlement.currency_code
-             FROM documents document
-             JOIN extraction_runs run ON run.document_id = document.id AND run.user_id = document.user_id
-              LEFT JOIN payroll_settlements settlement
-                ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
-               AND settlement.settlement_ordinal = 1
-            WHERE document.id = $1 AND document.user_id = $2
-              AND document.processing_status IN ('NEEDS_REVIEW', 'COMPLETED') AND run.status = 'COMPLETED'
-            ORDER BY run.processing_version DESC LIMIT 1
-            FOR UPDATE OF document, run`,
-          [request.params.id, request.authUser!.id, request.body.fieldPath],
+                   run.id AS extraction_run_id, settlement.currency_code
+             FROM extraction_runs run
+             LEFT JOIN payroll_settlements settlement
+               ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
+              AND settlement.settlement_ordinal = 1
+            WHERE run.id = $4 AND run.document_id = $1 AND run.user_id = $2
+            FOR UPDATE OF run`,
+          [request.params.id, request.authUser!.id, request.body.fieldPath, latestRunId],
         );
         if (!field.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         const row = field.rows[0];
         const fieldPath = String(row.field_path);
         if (!manualCorrectionPaths.has(fieldPath)) {
           throw new ApiError(400, "INVALID_FIELD_PATH", "Ese campo no admite carga manual.");
+        }
+        if (fieldPath === "employer.name" && (!corrected || corrected.length > 200)) {
+          throw new ApiError(400, "INVALID_EMPLOYER_NAME", "El nombre del empleador no es válido.");
         }
         let correctedJson: unknown = corrected;
         const amountColumn = settlementAmountColumns.get(fieldPath);
@@ -2221,11 +2497,20 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                     COALESCE(candidate.settlement_type = 'NORMAL', false), 'ARS'
                FROM documents document
                LEFT JOIN LATERAL (
-                 SELECT field.interpreted_value #>> '{}' AS settlement_type
-                   FROM extracted_fields field
-                  WHERE field.user_id = document.user_id AND field.document_id = document.id
-                    AND field.extraction_run_id = $2 AND field.field_path = 'settlement.type'
-                  LIMIT 1
+                 SELECT COALESCE(
+                   (SELECT correction.corrected_value #>> '{}'
+                      FROM user_corrections correction
+                     WHERE correction.user_id = document.user_id
+                       AND correction.document_id = document.id
+                       AND correction.extraction_run_id = $2
+                       AND correction.field_path = 'settlement.type'
+                     ORDER BY correction.correction_version DESC LIMIT 1),
+                   (SELECT field.interpreted_value #>> '{}'
+                      FROM extracted_fields field
+                     WHERE field.user_id = document.user_id AND field.document_id = document.id
+                       AND field.extraction_run_id = $2 AND field.field_path = 'settlement.type'
+                     LIMIT 1)
+                 ) AS settlement_type
                ) candidate ON true
               WHERE document.id = $4 AND document.user_id = $5
              ON CONFLICT (extraction_run_id, settlement_ordinal)
@@ -2244,8 +2529,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             [correctionDocument.rows[0].import_batch_item_id, request.authUser!.id],
           );
         }
-        await audit(client, request.authUser!.id, "FIELD_CORRECTED", row.id ? "EXTRACTED_FIELD" : "MANUAL_FIELD", row.id ? String(row.id) : request.params.id, { fieldPath });
-        return { id, fieldPath, correctedValue: displayExtracted(correctedJson) };
+        await audit(client, request.authUser!.id, "FIELD_CORRECTED", row.id ? "EXTRACTED_FIELD" : "MANUAL_FIELD", row.id ? String(row.id) : request.params.id, { fieldPath, extractionRunId: latestRunId });
+        return { id, extractionRunId: latestRunId, fieldPath, correctedValue: displayExtracted(correctedJson) };
       });
       return reply.code(201).send({ data: result });
     },
@@ -2259,7 +2544,11 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         params: idParamsSchema,
         body: {
           type: "object", additionalProperties: false,
-          properties: { acceptDeductionsMismatch: { type: "boolean" } },
+          required: ["extractionRunId"],
+          properties: {
+            acceptDeductionsMismatch: { type: "boolean" },
+            extractionRunId: { type: "string", pattern: UUID_PATTERN },
+          },
         },
       },
     },
@@ -2273,6 +2562,15 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         if (document.rows[0].processing_status !== "NEEDS_REVIEW") {
           throw new ApiError(409, "REVIEW_NOT_REQUIRED", "El documento no requiere revisión.");
+        }
+        const latestRun = await client.query(
+          `SELECT id FROM extraction_runs
+            WHERE document_id = $1 AND user_id = $2 AND status = 'COMPLETED'
+            ORDER BY processing_version DESC LIMIT 1`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (!latestRun.rowCount || String(latestRun.rows[0].id) !== request.body.extractionRunId) {
+          throw new ApiError(409, "STALE_EXTRACTION_RUN", "La extracción cambió; recargá el documento antes de finalizar la revisión.");
         }
         const settlement = await client.query(
           `SELECT settlement.id, settlement.extraction_run_id, settlement.payroll_period,
@@ -2289,10 +2587,11 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 WHERE item.user_id = settlement.user_id AND item.settlement_id = settlement.id
                   AND item.item_type = 'DEDUCTION'
              ) breakdown ON true
-            WHERE settlement.document_id = $1 AND settlement.user_id = $2 AND run.status = 'COMPLETED'
-            ORDER BY run.processing_version DESC, settlement.settlement_ordinal LIMIT 1
+            WHERE settlement.document_id = $1 AND settlement.user_id = $2
+              AND settlement.extraction_run_id = $3 AND run.status = 'COMPLETED'
+            ORDER BY settlement.settlement_ordinal LIMIT 1
             FOR UPDATE OF settlement`,
-          [request.params.id, request.authUser!.id],
+          [request.params.id, request.authUser!.id, request.body.extractionRunId],
         );
         if (!settlement.rowCount || settlement.rows[0].payroll_period === null || settlement.rows[0].gross_amount === null
           || settlement.rows[0].net_amount === null || settlement.rows[0].deductions_amount === null) {
@@ -2355,6 +2654,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         await completeDocumentBatch(client, request.authUser!.id, request.params.id);
         await audit(client, request.authUser!.id, "DOCUMENT_REVIEW_COMPLETED", "DOCUMENT", request.params.id, {
           acceptedDeductionsMismatch,
+          extractionRunId: request.body.extractionRunId,
           originalDeletionScheduled: retentionDeletion.rowCount === 1,
         });
         return { processingStatus: "COMPLETED" };
@@ -2420,26 +2720,38 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     },
   );
 
-  app.get<{ Params: IdParams }>(
+  app.get<{ Params: IdParams; Querystring: OriginalQuery }>(
     "/api/v1/documents/:id/original",
-    { preHandler: requireStepUp, schema: { params: idParamsSchema } },
+    {
+      preHandler: requireStepUp,
+      schema: {
+        params: idParamsSchema,
+        querystring: {
+          type: "object",
+          additionalProperties: false,
+          properties: { disposition: { type: "string", enum: ["inline", "attachment"] } },
+        },
+      },
+    },
     async (request) => {
       const objectKey = await withTransaction(async (client) => {
         if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }
         const document = await client.query(
-          `SELECT object_key FROM documents
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-              AND original_deleted_at IS NULL AND security_status = 'CLEAN'
-            FOR UPDATE`,
+          `SELECT document.object_key FROM documents document
+            WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL
+              AND document.original_deleted_at IS NULL AND document.security_status = 'CLEAN'
+            FOR UPDATE OF document`,
           [request.params.id, request.authUser!.id],
         );
         if (document.rowCount !== 1) throw new ApiError(404, "ORIGINAL_NOT_FOUND", "El original no está disponible.");
         return String(document.rows[0].object_key);
       });
       try {
-        return { data: await storage.authorizeDownload(objectKey) };
+        return { data: await storage.authorizeDownload(objectKey, {
+          disposition: request.query.disposition ?? "attachment",
+        }) };
       } catch {
         throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente.");
       }

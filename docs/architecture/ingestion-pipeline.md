@@ -1,6 +1,6 @@
 # Pipeline de ingestión
 
-> Estado: corte vertical implementado para PDF salarial argentino, con progreso recuperable, cancelación de uploads pendientes y revisión manual. Pausa/reanudación, LLM y otros tipos siguen fuera del MVP.
+> Estado: corte vertical implementado para PDF salarial argentino, con progreso recuperable, cancelación de uploads pendientes, revisión manual y reproceso explícito versionado. Pausa/reanudación, LLM y otros tipos siguen fuera del MVP.
 
 ## Objetivo
 
@@ -65,6 +65,10 @@ stateDiagram-v2
     VALIDATION --> COMPLETED
     VALIDATION --> NEEDS_REVIEW
     NEEDS_REVIEW --> COMPLETED: usuario verifica
+    COMPLETED --> UPLOADED: reproceso explícito
+    NEEDS_REVIEW --> UPLOADED: reproceso explícito
+    FAILED_PERMANENT --> UPLOADED: reproceso explícito
+    CANCELLED --> UPLOADED: reproceso explícito
 
     SECURITY_VALIDATION --> FAILED_RETRYABLE
     SECURITY_VALIDATION --> FAILED_PERMANENT
@@ -116,8 +120,8 @@ Cada transición usa compare-and-set o transacción equivalente. Estados termina
 | 5 | malware scan | clean o QUARANTINED |
 | 6 | inspección activa | rechazar JavaScript, adjuntos y acciones no permitidas |
 | 7 | clasificación barata | texto mínimo o primera página limitada |
-| 8 | extracción directa | preferida si existe texto confiable |
-| 9 | OCR | sólo para páginas necesarias y con budget |
+| 8 | extracción directa | preferida si existe texto confiable; conserva página/región de coincidencias literales únicas |
+| 9 | OCR | sólo para páginas necesarias y con budget; conserva TSV espacial cuando existe |
 | 10 | parsing/normalización | determinístico y versionado |
 | 11 | IA futura | fallback mínimo, redactado y presupuestado |
 | 12 | validación | COMPLETED o NEEDS_REVIEW; el usuario puede completar montos ausentes y cerrar la revisión |
@@ -151,7 +155,7 @@ Contadores derivados:
 - FAILED;
 - CANCELLED.
 
-La implementación actual completa el lote automáticamente cuando todos sus items son terminales, admite un solo lote activo por usuario y permite cancelar items que aún no terminaron el upload. Pause, resume, cancelación de trabajo ya iniciado y retry operados por el usuario siguen siendo objetivo; no se describen como disponibles.
+La implementación actual completa el lote automáticamente cuando todos sus items son terminales, admite un solo lote activo por usuario y permite cancelar items que aún no terminaron el upload. El titular puede reprocesar después un documento elegible como una versión nueva; pause, resume y cancelación de trabajo ya iniciado siguen siendo objetivo y no se describen como disponibles.
 
 ## Idempotencia
 
@@ -160,10 +164,13 @@ Claves mínimas:
 - uploadSessionId + itemId para completar upload;
 - userId + checksum para advertir duplicado sólo dentro del usuario;
 - documentId + processingVersion + stage para jobs;
+- userId + documentId + clave de idempotencia del titular para pedir reproceso;
 - providerOperationId para OCR/IA facturable;
 - documentId + extractionRunId para materializar resultados.
 
 Restricciones de DB y transacciones son la última defensa. Un ack perdido o un mensaje duplicado no puede crear otra liquidación.
+
+El reproceso bloquea el Document, rechaza originales ausentes o no limpios y calcula processingVersion sobre jobs y corridas previas. Las corridas anteriores permanecen inmutables; la última corrección humana por fieldPath se copia con referencia a su raíz y se aplica a la nueva proyección.
 
 ## Backpressure y fairness
 

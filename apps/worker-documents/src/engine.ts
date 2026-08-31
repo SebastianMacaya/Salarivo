@@ -13,9 +13,39 @@ export type ExtractedField = {
   confidence: number;
   fieldPath: string;
   interpretedValue: unknown;
+  pageNumber?: number;
   rawValue: string;
   signals?: { missingReason: MissingFieldReason };
   source: FieldSource;
+  sourceRegion?: SourceRegion;
+};
+
+export type SourceRegion = {
+  version: 1;
+  space: 'PAGE_NORMALIZED';
+  origin: 'TOP_LEFT';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type TextEvidenceWord = {
+  height: number;
+  left: number;
+  lineKey: string;
+  text: string;
+  top: number;
+  width: number;
+};
+
+export type TextEvidencePage = {
+  height: number;
+  left: number;
+  pageNumber: number;
+  top: number;
+  width: number;
+  words: TextEvidenceWord[];
 };
 
 export type PayrollLineItem = {
@@ -51,7 +81,13 @@ export type PayrollExtraction = {
     | 'LIQUIDACION_FINAL'
     | 'INDEMNIZACION'
     | 'AJUSTE'
-    | 'REINTEGRO';
+    | 'REINTEGRO'
+    | 'OTRO_LABORAL';
+};
+
+export type EffectiveCorrection = {
+  correctedValue: unknown;
+  fieldPath: string;
 };
 
 const fold = (value: string) =>
@@ -59,6 +95,216 @@ const fold = (value: string) =>
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLocaleLowerCase('es-AR');
+
+const finite = (value: string | undefined): number | null => {
+  if (value === undefined || value.trim() === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+export function parseTextEvidenceTsv(tsv: string, forcedPageNumber?: number): TextEvidencePage[] {
+  const lines = tsv.replaceAll('\0', '').replace(/^\uFEFF/, '').split(/\r?\n/);
+  const header = lines.shift()?.split('\t') ?? [];
+  const column = new Map(header.map((name, index) => [name.trim(), index]));
+  const required = ['level', 'page_num', 'block_num', 'par_num', 'line_num', 'left', 'top', 'width', 'height', 'text'];
+  if (required.some((name) => !column.has(name))) return [];
+  const value = (cells: string[], name: string) => cells[column.get(name)!];
+  const pages = new Map<number, TextEvidencePage>();
+  const wordRows: Array<{ cells: string[]; pageNumber: number }> = [];
+
+  for (const line of lines) {
+    if (!line) continue;
+    const cells = line.split('\t');
+    const level = finite(value(cells, 'level'));
+    const parsedPage = finite(value(cells, 'page_num'));
+    const pageNumber = forcedPageNumber ?? parsedPage;
+    if (!Number.isInteger(pageNumber) || pageNumber! < 1) continue;
+    if (level === 1) {
+      const left = finite(value(cells, 'left'));
+      const top = finite(value(cells, 'top'));
+      const width = finite(value(cells, 'width'));
+      const height = finite(value(cells, 'height'));
+      if (left === null || top === null || width === null || height === null || width <= 0 || height <= 0) continue;
+      pages.set(pageNumber!, { height, left, pageNumber: pageNumber!, top, width, words: [] });
+    } else if (level === 5) {
+      wordRows.push({ cells, pageNumber: pageNumber! });
+    }
+  }
+
+  for (const { cells, pageNumber } of wordRows) {
+    const page = pages.get(pageNumber);
+    const text = value(cells, 'text')?.trim();
+    const left = finite(value(cells, 'left'));
+    const top = finite(value(cells, 'top'));
+    const width = finite(value(cells, 'width'));
+    const height = finite(value(cells, 'height'));
+    if (!page || !text || left === null || top === null || width === null || height === null || width <= 0 || height <= 0) continue;
+    page.words.push({
+      height,
+      left,
+      lineKey: `${pageNumber}:${value(cells, 'block_num') ?? ''}:${value(cells, 'par_num') ?? ''}:${value(cells, 'line_num') ?? ''}`,
+      text,
+      top,
+      width,
+    });
+  }
+
+  return [...pages.values()].sort((left, right) => left.pageNumber - right.pageNumber);
+}
+
+export function textFromEvidencePages(pages: readonly TextEvidencePage[]): string {
+  return pages.map((page) => {
+    const widths = page.words
+      .map((word) => word.width / Math.max(1, Array.from(word.text).length))
+      .filter((width) => Number.isFinite(width) && width > 0)
+      .sort((left, right) => left - right);
+    const characterWidth = widths[Math.floor(widths.length / 2)] ?? 1;
+    const lines = new Map<string, TextEvidenceWord[]>();
+    for (const word of page.words) {
+      const line = lines.get(word.lineKey) ?? [];
+      line.push(word);
+      lines.set(word.lineKey, line);
+    }
+    return [...lines.values()].map((words) => {
+      let output = '';
+      for (const word of words.sort((left, right) => left.left - right.left)) {
+        const physicalColumn = Math.min(1_000, Math.max(0, Math.round((word.left - page.left) / characterWidth)));
+        const column = Math.max(output.length ? output.length + 1 : 0, physicalColumn);
+        output += ' '.repeat(column - output.length) + word.text;
+      }
+      return output.trimEnd();
+    }).join('\n');
+  }).filter(Boolean).join('\n');
+}
+
+const literal = (value: string) => value.replace(/\s+/gu, ' ').trim();
+const rounded = (value: number) => Number(value.toFixed(6));
+const clamped = (value: number) => Math.max(0, Math.min(1, value));
+
+type LiteralMatch = { page: TextEvidencePage; words: TextEvidenceWord[] };
+
+function literalMatches(pages: readonly TextEvidencePage[], rawValue: string): LiteralMatch[] {
+  const target = literal(rawValue);
+  if (!target) return [];
+  const matches: LiteralMatch[] = [];
+  for (const page of pages) {
+    const lines = new Map<string, TextEvidenceWord[]>();
+    for (const word of page.words) {
+      const words = lines.get(word.lineKey) ?? [];
+      words.push(word);
+      lines.set(word.lineKey, words);
+    }
+    for (const words of lines.values()) {
+      let text = '';
+      const spans: Array<{ end: number; start: number; word: TextEvidenceWord }> = [];
+      for (const word of words) {
+        const normalized = literal(word.text);
+        if (!normalized) continue;
+        if (text) text += ' ';
+        const start = text.length;
+        text += normalized;
+        spans.push({ end: text.length, start, word });
+      }
+      let offset = 0;
+      while (offset <= text.length - target.length) {
+        const start = text.indexOf(target, offset);
+        if (start < 0) break;
+        const end = start + target.length;
+        const first = spans.findIndex((span) => span.start === start);
+        const last = spans.findIndex((span) => span.end === end);
+        if (first >= 0 && last >= first) matches.push({ page, words: spans.slice(first, last + 1).map(({ word }) => word) });
+        offset = start + 1;
+      }
+    }
+  }
+  return matches;
+}
+
+export function attachSpatialEvidence(
+  extraction: PayrollExtraction,
+  pages: readonly TextEvidencePage[],
+): PayrollExtraction {
+  return {
+    ...extraction,
+    fields: extraction.fields.map((field) => {
+      if (field.source === 'RULE' || field.interpretedValue === null || !literal(field.rawValue)) return field;
+      const matches = literalMatches(pages, field.rawValue);
+      if (matches.length !== 1) return field;
+      const match = matches[0];
+      if (!match?.words.length) return field;
+      const { page, words } = match;
+      const left = Math.min(...words.map((word) => word.left));
+      const top = Math.min(...words.map((word) => word.top));
+      const right = Math.max(...words.map((word) => word.left + word.width));
+      const bottom = Math.max(...words.map((word) => word.top + word.height));
+      const x = clamped((left - page.left) / page.width);
+      const y = clamped((top - page.top) / page.height);
+      const boundedRight = clamped((right - page.left) / page.width);
+      const boundedBottom = clamped((bottom - page.top) / page.height);
+      if (boundedRight <= x || boundedBottom <= y) return field;
+      return {
+        ...field,
+        pageNumber: page.pageNumber,
+        sourceRegion: {
+          version: 1,
+          space: 'PAGE_NORMALIZED',
+          origin: 'TOP_LEFT',
+          x: rounded(x),
+          y: rounded(y),
+          width: rounded(boundedRight - x),
+          height: rounded(boundedBottom - y),
+        },
+      };
+    }),
+  };
+}
+
+const settlementTypes = new Set<PayrollExtraction['settlementType']>([
+  'NORMAL', 'SAC', 'VACACIONES', 'BONO', 'RETROACTIVO', 'COMISION',
+  'HORAS_EXTRA', 'LIQUIDACION_FINAL', 'INDEMNIZACION', 'AJUSTE', 'REINTEGRO', 'OTRO_LABORAL',
+]);
+const amountCorrectionPaths = new Map<string, keyof Pick<PayrollExtraction,
+  'basicAmount' | 'grossAmount' | 'netAmount' | 'remunerativeAmount' | 'nonRemunerativeAmount' | 'deductionsAmount'>>([
+  ['settlement.basicAmount', 'basicAmount'],
+  ['settlement.grossAmount', 'grossAmount'],
+  ['settlement.netAmount', 'netAmount'],
+  ['settlement.remunerativeAmount', 'remunerativeAmount'],
+  ['settlement.nonRemunerativeAmount', 'nonRemunerativeAmount'],
+  ['settlement.deductionsAmount', 'deductionsAmount'],
+]);
+
+export function applySettlementCorrections(
+  extraction: PayrollExtraction,
+  corrections: readonly EffectiveCorrection[],
+): PayrollExtraction {
+  const effective = { ...extraction };
+  for (const { correctedValue, fieldPath } of corrections) {
+    const amountProperty = amountCorrectionPaths.get(fieldPath);
+    if (amountProperty) {
+      if (!correctedValue || typeof correctedValue !== 'object') throw new Error('INVALID_STORED_CORRECTION');
+      const { amount, currencyCode } = correctedValue as { amount?: unknown; currencyCode?: unknown };
+      const pattern = fieldPath === 'settlement.deductionsAmount'
+        ? /^-?\d{1,18}(?:\.\d{1,2})?$/
+        : /^\d{1,18}(?:\.\d{1,2})?$/;
+      if (typeof amount !== 'string' || !pattern.test(amount) || currencyCode !== 'ARS') {
+        throw new Error('INVALID_STORED_CORRECTION');
+      }
+      const [integer, fraction = ''] = amount.split('.');
+      effective[amountProperty] = `${integer}.${fraction.padEnd(2, '0')}`;
+    } else if (fieldPath === 'settlement.payrollPeriod') {
+      if (typeof correctedValue !== 'string' || !/^20\d{2}-(0[1-9]|1[0-2])$/.test(correctedValue)) {
+        throw new Error('INVALID_STORED_CORRECTION');
+      }
+      effective.payrollPeriod = correctedValue;
+    } else if (fieldPath === 'settlement.type') {
+      if (typeof correctedValue !== 'string' || !settlementTypes.has(correctedValue as PayrollExtraction['settlementType'])) {
+        throw new Error('INVALID_STORED_CORRECTION');
+      }
+      effective.settlementType = correctedValue as PayrollExtraction['settlementType'];
+    }
+  }
+  return effective;
+}
 
 const numericAmountPattern = String.raw`(?:\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)`;
 const amountPattern = String.raw`(?:(?:\(?-?\$\s*|\(?-?)${numericAmountPattern}\)?-?)`;
@@ -162,7 +408,9 @@ export function validateRenderPixels(output: string, dpi: number, maxPixels: num
     const width = Number(match[1]);
     const height = Number(match[2]);
     const pixels = (width / 72) * dpi * (height / 72) * dpi;
-    return Number.isFinite(pixels) && width > 0 && height > 0 && pixels <= maxPixels;
+    const aspectRatio = Math.max(width, height) / Math.min(width, height);
+    return Number.isFinite(pixels) && Number.isFinite(aspectRatio)
+      && width > 0 && height > 0 && aspectRatio <= 100 && pixels <= maxPixels;
   });
 }
 
@@ -242,15 +490,14 @@ export function classifyPayrollText(text: string, lowThreshold = 0.2, highThresh
 }
 
 function extractPeriod(text: string): { raw: string; value: string } | null {
-  const normalized = fold(text);
-  const numeric = /(?:periodo(?:\s+de\s+liquidacion)?|liquidacion|mes)\s*[:\-]?\s*(0?[1-9]|1[0-2])[\/-](20\d{2})/.exec(normalized);
+  const numeric = /(?:per[ií]odo(?:\s+de\s+liquidaci[oó]n)?|liquidaci[oó]n|mes)\s*[:\-]?\s*(0?[1-9]|1[0-2])[\/-](20\d{2})/iu.exec(text);
   if (numeric?.[1] && numeric[2]) {
     return { raw: numeric[0], value: `${numeric[2]}-${numeric[1].padStart(2, '0')}` };
   }
   const months = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
-  const named = new RegExp(`(?:periodo(?:\\s+de\\s+liquidacion)?|liquidacion|mes)?\\s*[:\\-]?\\s*(${months.join('|')})\\s+(20\\d{2})`).exec(normalized);
+  const named = new RegExp(`(?:per[ií]odo(?:\\s+de\\s+liquidaci[oó]n)?|liquidaci[oó]n|mes)?\\s*[:\\-]?\\s*(${months.join('|')})\\s+(20\\d{2})`, 'iu').exec(text);
   if (!named?.[1] || !named[2]) return null;
-  return { raw: named[0].trim(), value: `${named[2]}-${String(months.indexOf(named[1]) + 1).padStart(2, '0')}` };
+  return { raw: named[0].trim(), value: `${named[2]}-${String(months.indexOf(fold(named[1])) + 1).padStart(2, '0')}` };
 }
 
 function amountsInLine(line: string): PositionedAmount[] {
@@ -538,6 +785,21 @@ function deductionsMatchTotal(lineItems: PayrollLineItem[], deductions: Amount |
 
 function totalsBalance(gross: Amount | null, deductions: Amount | null, net: Amount | null): boolean {
   return Boolean(gross && deductions && net && subtractAmounts(gross.value, deductions.value) === net.value);
+}
+
+export function payrollExtractionNeedsReview(extraction: PayrollExtraction): boolean {
+  if (!extraction.payrollPeriod || !/^20\d{2}-(0[1-9]|1[0-2])$/.test(extraction.payrollPeriod)) return true;
+  const amount = (value: string | null, allowNegative = false): Amount | null => value
+    && new RegExp(`^${allowNegative ? '-?' : ''}\\d{1,18}\\.\\d{2}$`).test(value)
+    ? { raw: value, value }
+    : null;
+  const gross = amount(extraction.grossAmount);
+  const net = amount(extraction.netAmount);
+  const deductions = amount(extraction.deductionsAmount, true);
+  if (!gross || !net || !deductions || extraction.lineItems.some((item) => !/^-?\d{1,18}\.\d{2}$/.test(item.amount))) {
+    return true;
+  }
+  return !totalsBalance(gross, deductions, net) || !deductionsMatchTotal(extraction.lineItems, deductions);
 }
 
 function hasAmountLabel(lines: string[], labels: RegExp[]): boolean {

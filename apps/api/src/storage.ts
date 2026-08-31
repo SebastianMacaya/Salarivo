@@ -31,6 +31,15 @@ const R2_UPLOAD_CORS_HEADERS = [
   "x-amz-meta-upload-session",
   "x-amz-storage-class",
 ];
+const DOWNLOAD_CORS_HEADERS = ["Range"];
+const DOWNLOAD_EXPOSE_HEADERS = [
+  "Accept-Ranges",
+  "Content-Disposition",
+  "Content-Length",
+  "Content-Range",
+  "Content-Type",
+  "ETag",
+];
 
 export function copySource(bucket: string, key: string): string {
   return `/${encodeURIComponent(bucket)}/${key.split("/").map(encodeURIComponent).join("/")}`;
@@ -147,18 +156,31 @@ export async function assertR2BucketConfiguration(
     throw new Error("OBJECT_STORAGE_BUCKET must disable R2 on-demand migration");
   }
 
-  const corsRules = record(cors) ? cors.rules : undefined;
-  const corsRule = Array.isArray(corsRules) && corsRules.length === 1 ? corsRules[0] : null;
-  const allowed = record(corsRule) && record(corsRule.allowed) ? corsRule.allowed : null;
+  const corsRules = record(cors) && Array.isArray(cors.rules) ? cors.rules : [];
+  const uploadRule = corsRules.find((rule) => record(rule)
+    && record(rule.allowed)
+    && exactStrings(rule.allowed.methods, ["PUT"]));
+  const downloadRule = corsRules.find((rule) => record(rule)
+    && record(rule.allowed)
+    && exactStrings(rule.allowed.methods, ["GET", "HEAD"]));
+  const uploadAllowed = record(uploadRule) && record(uploadRule.allowed) ? uploadRule.allowed : null;
+  const downloadAllowed = record(downloadRule) && record(downloadRule.allowed) ? downloadRule.allowed : null;
   if (
-    !allowed
-    || !exactStrings(allowed.methods, ["PUT"])
-    || !exactStrings(allowed.origins, [config.publicOrigin])
-    || !exactStrings(allowed.headers, R2_UPLOAD_CORS_HEADERS, true)
-    || !exactStrings(corsRule.exposeHeaders, ["ETag"], true)
-    || corsRule.maxAgeSeconds !== 300
+    corsRules.length !== 2
+    || !record(uploadRule)
+    || !uploadAllowed
+    || !exactStrings(uploadAllowed.origins, [config.publicOrigin])
+    || !exactStrings(uploadAllowed.headers, R2_UPLOAD_CORS_HEADERS, true)
+    || !exactStrings(uploadRule.exposeHeaders, ["ETag"], true)
+    || uploadRule.maxAgeSeconds !== 300
+    || !record(downloadRule)
+    || !downloadAllowed
+    || !exactStrings(downloadAllowed.origins, [config.publicOrigin])
+    || !exactStrings(downloadAllowed.headers, DOWNLOAD_CORS_HEADERS, true)
+    || !exactStrings(downloadRule.exposeHeaders, DOWNLOAD_EXPOSE_HEADERS, true)
+    || downloadRule.maxAgeSeconds !== 300
   ) {
-    throw new Error("OBJECT_STORAGE_BUCKET must have the exact R2 upload CORS policy");
+    throw new Error("OBJECT_STORAGE_BUCKET must have the exact R2 upload and download CORS policies");
   }
 
   const lifecycleRules = record(lifecycle) ? lifecycle.rules : undefined;
@@ -318,6 +340,12 @@ export function createStorage(config: ApiConfig) {
               AllowedOrigins: [config.publicOrigin],
               ExposeHeaders: ["ETag"],
               MaxAgeSeconds: config.uploadTtlSeconds,
+            }, {
+              AllowedHeaders: DOWNLOAD_CORS_HEADERS,
+              AllowedMethods: ["GET", "HEAD"],
+              AllowedOrigins: [config.publicOrigin],
+              ExposeHeaders: DOWNLOAD_EXPOSE_HEADERS,
+              MaxAgeSeconds: 300,
             }],
           },
         }), requestOptions());
@@ -398,13 +426,17 @@ export function createStorage(config: ApiConfig) {
       return createOrRecoverMarker(sessionId, objectKey);
     },
 
-    async authorizeDownload(objectKey: string) {
+    async authorizeDownload(
+      objectKey: string,
+      options: { disposition?: "inline" | "attachment" } = {},
+    ) {
       const expiresIn = 120;
+      const disposition = options.disposition ?? "attachment";
       const url = await getSignedUrl(publicSigner, new GetObjectCommand({
         Bucket: config.storageBucket,
         Key: objectKey,
         ResponseCacheControl: "no-store, private, max-age=0",
-        ResponseContentDisposition: 'attachment; filename="salarivo-document.pdf"',
+        ResponseContentDisposition: `${disposition}; filename="salarivo-document.pdf"`,
         ResponseContentType: "application/pdf",
       }), { expiresIn });
       return { url, expiresAt: new Date(Date.now() + expiresIn * 1000).toISOString() };

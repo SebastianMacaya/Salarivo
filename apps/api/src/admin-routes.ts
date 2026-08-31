@@ -1642,7 +1642,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
         maxUserStorageBytes: config.maxUserStorageBytes, uploadTtlSeconds: config.uploadTtlSeconds,
       },
       storage: { provider: config.storageProvider, private: true, encryption: config.storageProvider === "r2" ? "PROVIDER_MANAGED" : "SSE_KMS" },
-      features: { roleManagement: true, documentQuarantine: true, sameVersionRetry: true, fullReprocessing: false, dynamicSettings: false, breakGlass: false },
+      features: { roleManagement: true, documentQuarantine: true, sameVersionRetry: true, fullReprocessing: true, dynamicSettings: false, breakGlass: false },
     } }),
   );
 

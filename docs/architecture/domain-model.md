@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–016. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–017. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -9,7 +9,7 @@
 3. Verificación: corrección/confirmación humana con precedencia.
 4. Proyección: datos estructurados actuales usados por analytics.
 
-Cada procesamiento completado conserva su ExtractionRun. El reproceso explícito y la precedencia de correcciones entre corridas siguen propuestos en el ADR 0004.
+Cada procesamiento completado conserva su ExtractionRun. El reproceso explícito crea otra versión y hereda las correcciones humanas con linaje append-only según el ADR 0004.
 
 ## Relaciones
 
@@ -172,13 +172,15 @@ Evidencia por campo dentro de una ExtractionRun. Puede materializarse como filas
 - page y región opcional;
 - extractor/version y señales sanitizadas.
 
+La región espacial implementada es `{version: 1, space: PAGE_NORMALIZED, origin: TOP_LEFT, x, y, width, height}` con coordenadas 0..1 y page positiva. Sólo se persiste para una coincidencia literal única del rawValue; no se fabrica para reglas, ausencias o ambigüedades.
+
 Empresa, período, básico, bruto, neto y total de descuentos pasan por esta representación. Los conceptos se conservan directamente como PayrollLineItem trazable dentro de la misma ExtractionRun. No alcanza con un confidence global de la corrida.
 
 Un campo esperado ausente puede conservarse como evidencia trazable con `interpretedValue` en `null` y un `signals.missingReason` sanitizado. Esa evidencia explica la ausencia; nunca autoriza a inventar un valor.
 
 ### UserCorrection
 
-Corrección append-only que conserva documentId, extractionRunId, fieldPath, extractedValue, correctedValue y timestamp. Puede referenciar un ExtractedField o completar un monto ausente sin fingir que fue extraído. La proyección actual elige la corrección vigente dentro de la ExtractionRun seleccionada; la precedencia entre corridas aún no está implementada.
+Corrección append-only que conserva documentId, extractionRunId, fieldPath, extractedValue, correctedValue y timestamp. Puede referenciar un ExtractedField o completar un campo ausente sin fingir que fue extraído. La proyección elige la última corrección dentro de la ExtractionRun vigente. Al reprocesar, el worker crea una corrección heredada por fieldPath que referencia la raíz humana anterior y materializa la nueva proyección con ese valor efectivo; no modifica ni elimina la historia previa.
 
 ### Timeline laboral (propuesto)
 
@@ -248,6 +250,7 @@ Las migraciones vigentes materializan:
 - confidence dentro de 0..1;
 - estados restringidos al vocabulario permitido; los servicios aplican las transiciones.
 - coherencia entre `role = ADMIN` y un `admin_role` válido; eventos administrativos append-only.
+- linaje raíz de correcciones heredadas restringido al mismo user, document y fieldPath.
 
 Índices:
 

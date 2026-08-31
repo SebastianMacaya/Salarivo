@@ -1,0 +1,74 @@
+.layer { background: #07111dd9; inset: 0; position: fixed; z-index: 60; }
+.workspace { background: #f7f8fa; color: #182230; display: flex; flex-direction: column; height: 100%; outline: none; width: 100%; }
+.header { align-items: center; background: #fff; border-bottom: 1px solid #dce1e8; display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr) auto auto; min-height: 4.5rem; padding: .65rem 1rem; }
+.heading { align-items: center; display: flex; min-width: 0; }
+.heading div { min-width: 0; }
+.heading p, .sectionHead p, .section > p { color: #64748b; font-size: .75rem; font-weight: 700; letter-spacing: .08em; margin: 0; text-transform: uppercase; }
+.heading h2 { font-size: 1rem; margin: .15rem 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fileIcon { background: #dc2626; border-radius: .4rem; color: #fff; font-size: .72rem; font-weight: 800; margin-right: .75rem; padding: .55rem .4rem; }
+.header nav { display: flex; gap: .25rem; }
+.header button, .section button, .actions button, .callout button, .metadata button { background: #fff; border: 1px solid #cbd5e1; border-radius: .45rem; color: inherit; cursor: pointer; min-height: 2.75rem; padding: .5rem .75rem; }
+.header button:disabled, .section button:disabled, .actions button:disabled, .callout button:disabled { cursor: default; opacity: .45; }
+.close { font-size: 1.4rem; min-width: 2.75rem; }
+.body { display: grid; flex: 1; grid-template-columns: minmax(0, 3fr) minmax(23rem, 2fr); min-height: 0; }
+.documentPane { display: flex; min-height: 0; min-width: 0; }
+.dataPane { background: #f8fafc; border-left: 1px solid #dce1e8; min-height: 0; overflow-y: auto; padding: 1rem; }
+.summary, .error, .callout { border-radius: .6rem; margin-bottom: 1rem; padding: .8rem; }
+.summary { background: #e8f0ff; border: 1px solid #bfd1f7; }
+.summary span { color: #1d4ed8; font-size: .75rem; font-weight: 800; }
+.summary p, .callout p { margin: .35rem 0 0; }
+.error { background: #fee2e2; border: 1px solid #fca5a5; color: #991b1b; }
+.callout { background: #fff7ed; border: 1px solid #fed7aa; }
+.callout h3 { margin: 0; }
+.callout div { display: flex; gap: .5rem; margin-top: .75rem; }
+.section { background: #fff; border: 1px solid #dce1e8; border-radius: .65rem; margin-bottom: 1rem; padding: .9rem; }
+.section h3 { font-size: 1rem; margin: .15rem 0 .75rem; }
+.sectionHead { align-items: center; display: flex; justify-content: space-between; }
+.sectionHead span { color: #2563eb; font-size: .8rem; font-weight: 700; }
+.settlementOverview { display: grid; gap: .6rem; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; }
+.settlementOverview div { min-width: 0; }
+.settlementOverview dt { color: #64748b; font-size: .72rem; }
+.settlementOverview dd { font-weight: 700; margin: .1rem 0 0; overflow-wrap: anywhere; }
+.fields { display: grid; gap: .65rem; }
+.field { border: 1px solid #e2e8f0; border-radius: .55rem; padding: .7rem; transition: border-color .15s, box-shadow .15s; }
+.selectedField { border-color: #16a34a; box-shadow: 0 0 0 2px #bbf7d0; }
+.field label > span { display: block; font-size: .78rem; font-weight: 700; margin-bottom: .25rem; }
+.field input, .field select { background: #fff; border: 1px solid #b8c2d0; border-radius: .4rem; color: #111827; font: inherit; min-height: 2.6rem; padding: .45rem .55rem; width: 100%; }
+.field input:disabled, .field select:disabled { background: #f8fafc; border-color: transparent; color: #273548; opacity: 1; }
+.provenance { align-items: center; color: #64748b; display: flex; flex-wrap: wrap; font-size: .75rem; gap: .45rem; margin-top: .4rem; }
+.provenance strong { background: #fef3c7; border-radius: 1rem; color: #92400e; padding: .15rem .4rem; }
+.provenance .low { background: #fee2e2; color: #991b1b; }
+.provenance button { border: 0; color: #1d4ed8; min-height: 1.75rem; padding: .1rem; text-decoration: underline; }
+.field > small { color: #9a3412; display: block; margin-top: .35rem; }
+.field details { font-size: .78rem; margin-top: .5rem; }
+.field details p { background: #f1f5f9; border-radius: .35rem; overflow-wrap: anywhere; padding: .5rem; }
+.field details small { display: block; margin-top: .25rem; }
+.editActions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: .75rem; }
+.editActions button:first-child, .actions button:first-child { background: #2563eb; border-color: #2563eb; color: #fff; }
+.lineItems { list-style: none; margin: 0; padding: 0; }
+.lineItems li { align-items: baseline; border-top: 1px solid #edf0f4; display: grid; gap: .25rem .5rem; grid-template-columns: 1fr auto; padding: .5rem 0; }
+.lineItems small { color: #64748b; grid-column: 1 / -1; }
+.metadata { background: #fff; border: 1px solid #dce1e8; border-radius: .65rem; margin-bottom: 1rem; padding: .9rem; }
+.metadata summary { cursor: pointer; font-weight: 700; }
+.metadata dl { display: grid; gap: .45rem; grid-template-columns: 1fr 1fr; }
+.metadata dl div { min-width: 0; }
+.metadata dt { color: #64748b; font-size: .72rem; }
+.metadata dd { margin: .1rem 0 0; overflow-wrap: anywhere; }
+.acceptance { align-items: flex-start; display: flex; gap: .5rem; margin: 1rem 0; }
+.acceptance input { margin-top: .2rem; }
+.actions { background: #f8fafc; border-top: 1px solid #dce1e8; bottom: 0; display: flex; flex-wrap: wrap; gap: .5rem; padding: .8rem 0; position: sticky; }
+.actions button:nth-last-child(-n+2) { color: #b91c1c; }
+.mobileTabs { display: none; }
+
+@media (max-width: 760px), (max-height: 500px) and (orientation: landscape) {
+  .header { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .body { display: block; overflow: hidden; }
+  .documentPane, .dataPane { height: 100%; }
+  .dataPane { border-left: 0; overflow-y: auto; }
+  .mobileTabs { background: #fff; border-bottom: 1px solid #dce1e8; display: grid; grid-template-columns: 1fr 1fr; }
+  .mobileTabs button { background: #fff; border: 0; border-bottom: 3px solid transparent; min-height: 2.75rem; }
+  .mobileTabs button[aria-selected='true'] { border-bottom-color: #2563eb; color: #1d4ed8; font-weight: 700; }
+  .mobileHidden { display: none; }
+  .metadata dl { grid-template-columns: 1fr; }
+  .settlementOverview { grid-template-columns: 1fr; }
+}

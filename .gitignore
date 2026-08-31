@@ -15,6 +15,7 @@ uploads/
 exports/
 tmp/
 temp/
+apps/web/public/pdfjs/
 
 # Evita subir recibos reales; sólo se permiten fixtures PDF sintéticos.
 *.pdf

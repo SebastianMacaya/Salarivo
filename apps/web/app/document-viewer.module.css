@@ -1,0 +1,61 @@
+.viewer {
+  background: #20252d;
+  color: #f8fafc;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.toolbar {
+  align-items: center;
+  background: #111827;
+  border-bottom: 1px solid #374151;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  justify-content: space-between;
+  padding: .5rem;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+}
+
+.controlGroup { align-items: center; display: flex; gap: .25rem; }
+.controlGroup button, .empty button {
+  background: #283343;
+  border: 1px solid #4b5563;
+  border-radius: .45rem;
+  color: inherit;
+  cursor: pointer;
+  min-height: 2.75rem;
+  padding: .45rem .65rem;
+}
+.controlGroup button:disabled, .empty button:disabled { cursor: default; opacity: .45; }
+.controlGroup label { align-items: center; display: flex; font-size: .82rem; gap: .25rem; white-space: nowrap; }
+.controlGroup input { background: #fff; border: 0; border-radius: .25rem; color: #111827; padding: .35rem; text-align: center; width: 3.5rem; }
+.controlGroup .active { background: #2563eb; border-color: #60a5fa; }
+.controlError { background: #7f1d1d; color: #fff; margin: 0; padding: .4rem .75rem; }
+
+.viewport {
+  align-items: flex-start;
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  min-height: 20rem;
+  overflow: auto;
+  padding: 1rem;
+}
+.viewer:fullscreen { background: #20252d; height: 100%; }
+.page { box-shadow: 0 12px 32px #0008; flex: 0 0 auto; position: relative; }
+.page canvas { background: #fff; display: block; }
+.loading { background: #111827df; border-radius: .35rem; left: 50%; padding: .5rem .75rem; position: absolute; top: 1rem; transform: translateX(-50%); }
+.evidence { background: #fbbf2444; border: 2px solid #f59e0b; cursor: pointer; min-height: 0; padding: 0; position: absolute; }
+.evidence:hover, .evidence:focus-visible, .evidence.selected { background: #22c55e55; border-color: #16a34a; outline: 3px solid #fff; outline-offset: 1px; }
+.empty { align-self: center; color: #e5e7eb; max-width: 32rem; padding: 2rem; text-align: center; }
+
+@media (max-width: 760px), (max-height: 500px) and (orientation: landscape) {
+  .toolbar { align-items: stretch; }
+  .controlGroup { overflow-x: auto; }
+  .viewport { min-height: 0; padding: .5rem; }
+}

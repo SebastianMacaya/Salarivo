@@ -66,6 +66,7 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
     "2026-07 - Empresa Sintética Norte.pdf",
   );
   assert.equal(derivedDocumentFilename("CON.pdf"), "document-CON.pdf");
+  assert.equal(derivedDocumentFilename("recibo\u202Efdp.pdf"), "recibo fdp.pdf");
   assert.ok(derivedDocumentFilename("document.pdf", "2026-07", "A".repeat(400)).length <= 250);
 
   const proxyApp = await buildApp({

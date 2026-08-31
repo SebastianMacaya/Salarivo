@@ -22,11 +22,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 16);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 16 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 17);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 17 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 16, name: "reimbursement_settlement_type" },
+    { version: 17, name: "cross_run_correction_lineage" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -133,4 +133,23 @@ test("reimbursement migration extends the settlement vocabulary without rewritin
   assert.match(migration.sql, /VALIDATE CONSTRAINT payroll_settlements_settlement_type_check_v2/);
   assert.match(migration.sql, /RENAME CONSTRAINT payroll_settlements_settlement_type_check_v2/);
   assert.doesNotMatch(migration.sql, /UPDATE payroll_settlements|basic_amount|gross_amount|net_amount/);
+});
+
+test("cross-run corrections keep an additive, same-field root lineage", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 17);
+  assert.ok(migration);
+  assert.equal(migration.name, "cross_run_correction_lineage");
+  assert.match(migration.sql, /ADD COLUMN inherited_from_correction_id uuid/);
+  assert.match(migration.sql, /ADD COLUMN previous_document_status text/);
+  for (const status of ["COMPLETED", "NEEDS_REVIEW", "FAILED_PERMANENT", "CANCELLED"]) {
+    assert.match(migration.sql, new RegExp(`'${status}'`));
+  }
+  assert.match(migration.sql, /UNIQUE \(id, user_id, document_id, field_path\)/);
+  assert.match(
+    migration.sql,
+    /FOREIGN KEY \(inherited_from_correction_id, user_id, document_id, field_path\)[\s\S]*REFERENCES user_corrections\(id, user_id, document_id, field_path\)/,
+  );
+  assert.match(migration.sql, /inherited_from_correction_id IS NULL OR inherited_from_correction_id <> id/);
+  assert.match(migration.sql, /WHERE inherited_from_correction_id IS NOT NULL/);
+  assert.doesNotMatch(migration.sql, /\b(?:DELETE FROM|UPDATE user_corrections|DROP (?:TABLE|COLUMN)|TRUNCATE)\b/);
 });

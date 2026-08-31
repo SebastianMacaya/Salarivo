@@ -12,7 +12,8 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - ownership, idempotencia, límites, expiración y cleanup;
 - validación PDF, ClamAV, rechazo de contenido activo, clasificación y OCR acotado;
 - extracción determinística de recibos argentinos, campos trazables, importes remunerativos/no remunerativos, liquidación, reintegros y conceptos;
-- confirmación de tipo, correcciones humanas y un historial salarial derivado con resumen, evolución, análisis anual y comparación por empleo y moneda;
+- visor PDF privado por página, evidencia espacial, confirmación de tipo, correcciones humanas y reproceso versionado;
+- historial salarial derivado con resumen, evolución, análisis anual y comparación por empleo y moneda;
 - detección no persistida de empleos a partir de recibos sin asociar, siempre sujeta a confirmación;
 - borrado separado de original o documento completo;
 - MFA TOTP, recovery codes y step-up de acciones sensibles; MFA obligatorio para administración;
@@ -53,7 +54,7 @@ Para desarrollo local, la web se ejecuta aparte:
 npm run dev:web
 ~~~
 
-Abrí `http://localhost:3000`. La web local llama a `http://localhost:3001/api/v1`; para otro entorno definí `NEXT_PUBLIC_API_BASE_URL` al compilar.
+Abrí `http://localhost:3000`. La web local llama a `http://localhost:3001/api/v1`; para otro entorno definí `NEXT_PUBLIC_API_BASE_URL` y el origen exacto de las URLs firmadas en `NEXT_PUBLIC_STORAGE_ORIGIN` al compilar.
 
 La configuración de Google usa `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` y `GOOGLE_OAUTH_REDIRECT_URI`.
 

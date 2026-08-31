@@ -1,9 +1,10 @@
 'use client';
 
-import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { DocumentReview, type DocumentDetail, type ExtractedFieldDetail } from './document-review';
+import { readDocumentLocation, writeDocumentLocation } from './document-evidence';
 import {
-  extractionSourceLabel,
   money,
   percentage,
   periodLabel,
@@ -13,6 +14,7 @@ import {
   type SalaryCategory,
 } from './format';
 import { mfaQrDataUrl } from './mfa-qr';
+import { createStepUpGate, type StepUpGate } from './sensitive-action';
 import { uploadFile, type AuthorizedUpload } from './storage-upload';
 
 const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
@@ -68,53 +70,6 @@ type DocumentItem = {
   originalAvailable?: boolean;
   needsReview?: boolean;
   errorCode?: string | null;
-};
-type ExtractedField = {
-  id: string | null;
-  fieldPath: string;
-  interpretedValue: string | null;
-  correctedValue?: string | null;
-  confidence: string;
-  source: string;
-  missingReason?: 'LABEL_OR_LAYOUT_NOT_RECOGNIZED' | 'VALUE_NOT_INTERPRETABLE';
-};
-type Settlement = {
-  id: string;
-  employmentId?: string | null;
-  payrollPeriod: string;
-  employerName?: string | null;
-  settlementType: string;
-  isRecurring: boolean;
-  currencyCode: string;
-  basicAmount?: string | null;
-  grossAmount?: string | null;
-  netAmount?: string | null;
-  remunerativeAmount?: string | null;
-  nonRemunerativeAmount?: string | null;
-  deductionsAmount?: string | null;
-  deductionsChargedAmount?: string | null;
-  reimbursementsAmount?: string | null;
-  deductionsPercentage?: string | null;
-  totalsBalance?: boolean;
-  deductionsMatchTotal?: boolean;
-  deductionsDifferenceAmount?: string | null;
-  deductionsDifferenceKind?: 'MATCHED' | 'TOTAL_MISSING' | 'MISSING_ITEMS' | 'ITEMS_EXCEED_TOTAL';
-  deductions?: Array<{
-    normalizedConceptCode?: string | null;
-    rawDescription: string;
-    amount: string;
-    grossPercentage?: string | null;
-    confidence?: string | null;
-  }>;
-  earnings?: Array<{
-    normalizedConceptCode?: string | null;
-    rawDescription: string;
-    amount: string;
-    isRecurring?: boolean | null;
-    confidence?: string | null;
-  }>;
-  confidence?: string | null;
-  documentId?: string | null;
 };
 type SalaryAmounts = {
   basicAmount: string | null;
@@ -225,7 +180,6 @@ type PeriodComparison = {
   driversComplete: boolean;
   conclusionCode: 'NET_UNAVAILABLE' | 'NET_UNCHANGED' | 'NET_VARIATION_RECONCILED_BY_EXTRAORDINARY' | 'NET_VARIATION_RECONCILED_BY_DEDUCTIONS' | 'NET_VARIATION_RECONCILED_BY_EXTRAORDINARY_AND_DEDUCTIONS' | 'NET_VARIATION_INSUFFICIENT_DATA' | 'NET_VARIATION_UNEXPLAINED';
 };
-type DocumentDetail = DocumentItem & { extractedFields: ExtractedField[]; settlement: Settlement | null };
 type ImportProgress = {
   key: string;
   name: string;
@@ -332,13 +286,15 @@ function documentName(document: DocumentItem) {
   return document.displayFilename || document.originalFilename;
 }
 
-const deductionLabels: Record<string, string> = {
-  RETIREMENT: 'Jubilación',
-  HEALTH_INSURANCE: 'Obra social',
-  PAMI: 'PAMI / Ley 19.032',
-  INCOME_TAX: 'Ganancias / Ingresos personales',
-  UNION_DUES: 'Cuota sindical',
-};
+function resolveDocumentItem(documents: DocumentItem[], documentId: string): DocumentItem {
+  return documents.find(({ id }) => id === documentId) ?? {
+    id: documentId,
+    originalFilename: 'Documento privado',
+    createdAt: '',
+    processingStatus: 'UNKNOWN',
+  };
+}
+
 const categoryLabels: Record<SalaryCategory, string> = {
   NORMAL: 'Sueldo regular',
   SAC: 'Aguinaldo',
@@ -374,31 +330,10 @@ const comparisonConclusionLabels: Record<NonNullable<PeriodComparison['conclusio
   NET_VARIATION_INSUFFICIENT_DATA: 'Faltan conceptos normalizados para explicar la variación del neto.',
   NET_VARIATION_UNEXPLAINED: 'Los datos disponibles no alcanzan para explicar la variación del neto.',
 };
-const reviewFieldLabels: Record<string, string> = {
-  'employer.name': 'Empresa detectada',
-  'settlement.type': 'Tipo de liquidación',
-  'settlement.payrollPeriod': 'Período',
-  'settlement.basicAmount': 'Sueldo básico',
-  'settlement.grossAmount': 'Bruto',
-  'settlement.remunerativeAmount': 'Remunerativo',
-  'settlement.nonRemunerativeAmount': 'No remunerativo',
-  'settlement.deductionsAmount': 'Descuentos',
-  'settlement.netAmount': 'Neto',
-};
-const missingReasonMessages: Record<NonNullable<ExtractedField['missingReason']>, string> = {
-  LABEL_OR_LAYOUT_NOT_RECOGNIZED: 'No reconocimos la etiqueta o la ubicación del dato.',
-  VALUE_NOT_INTERPRETABLE: 'Reconocimos el campo, pero no pudimos interpretar el valor.',
-};
-const editableCorrectionPaths = new Set([
-  'settlement.type', 'settlement.payrollPeriod', 'settlement.basicAmount',
-  'settlement.grossAmount', 'settlement.remunerativeAmount', 'settlement.nonRemunerativeAmount',
-  'settlement.deductionsAmount', 'settlement.netAmount',
-]);
 const settlementTypeOptions = [
   'NORMAL', 'SAC', 'VACACIONES', 'BONO', 'RETROACTIVO', 'COMISION', 'HORAS_EXTRA',
   'LIQUIDACION_FINAL', 'INDEMNIZACION', 'AJUSTE', 'REINTEGRO', 'OTRO_LABORAL',
 ];
-
 function handleDialogKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
   if (event.key === 'Escape') {
     event.preventDefault();
@@ -956,20 +891,41 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
   const [section, setSection] = useState<Section>('summary');
   const [menuOpen, setMenuOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [pendingSensitiveAction, setPendingSensitiveAction] = useState<(() => Promise<void>) | null>(null);
+  const stepUpGate = useRef<StepUpGate | null>(null);
+  const stepUpReturnFocus = useRef<HTMLElement | null>(null);
+  const [stepUpOpen, setStepUpOpen] = useState(false);
   const [logoutError, setLogoutError] = useState('');
   const [logoutBusy, setLogoutBusy] = useState(false);
   const visibleSections = sections;
 
+  useEffect(() => {
+    if (!readDocumentLocation(window.location.search)) return;
+    const timer = window.setTimeout(() => setSection('history'));
+    return () => window.clearTimeout(timer);
+  }, []);
+
   const runSensitive = useCallback<RunSensitive>(async (action) => {
-    try { await action(); }
-    catch (caught) {
-      if (caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
-        setPendingSensitiveAction(() => action);
-        return;
+    const callerFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    for (;;) {
+      try { await action(); return; }
+      catch (caught) {
+        if (!(caught instanceof ApiError) || caught.code !== 'STEP_UP_REQUIRED') throw caught;
+        if (document.fullscreenElement) await document.exitFullscreen().catch(() => undefined);
+        if (!stepUpGate.current) {
+          stepUpReturnFocus.current = callerFocus;
+          stepUpGate.current = createStepUpGate();
+          setStepUpOpen(true);
+        }
+        if (!await stepUpGate.current.promise) return;
       }
-      throw caught;
     }
+  }, []);
+
+  const finishStepUp = useCallback((approved: boolean) => {
+    const gate = stepUpGate.current;
+    stepUpGate.current = null;
+    setStepUpOpen(false);
+    gate?.complete(approved);
   }, []);
 
   async function logout() {
@@ -983,7 +939,7 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
 
   return (
     <div className="app-shell">
-      <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
+      <aside className={menuOpen ? 'sidebar open' : 'sidebar'} inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
         <div className="sidebar-head"><Brand /><button className="icon-button mobile-only" onClick={() => setMenuOpen(false)} aria-label="Cerrar menú">×</button></div>
         <nav aria-label="Navegación principal">
           {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
@@ -997,7 +953,7 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
         </div>
       </aside>
       {menuOpen && <button className="backdrop" aria-label="Cerrar menú" onClick={() => setMenuOpen(false)} />}
-      <main className="content">
+      <main className="content" inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
         <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú">☰</button><Brand /></header>
         {authNotice && <p className="message success" aria-live="polite">{authNotice}</p>}
         {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={setSection} />}
@@ -1006,14 +962,34 @@ function PrivateApp({ user, authNotice, onUserChanged, onLogout, onDeletionReque
         {section === 'history' && <History key={refreshKey} runSensitive={runSensitive} />}
         {section === 'privacy' && <Privacy user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
       </main>
-      {pendingSensitiveAction && <StepUpDialog mfaEnabled={Boolean(user.mfaEnabled)} action={pendingSensitiveAction} onClose={() => setPendingSensitiveAction(null)} />}
+      {stepUpOpen && <StepUpDialog
+        mfaEnabled={Boolean(user.mfaEnabled)}
+        onClose={() => finishStepUp(false)}
+        onComplete={() => finishStepUp(true)}
+        returnFocus={stepUpReturnFocus.current}
+      />}
     </div>
   );
 }
 
-function StepUpDialog({ mfaEnabled, action, onClose }: { mfaEnabled: boolean; action: () => Promise<void>; onClose: () => void }) {
+function StepUpDialog({ mfaEnabled, onClose, onComplete, returnFocus }: { mfaEnabled: boolean; onClose: () => void; onComplete: () => void; returnFocus: HTMLElement | null }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const returnTarget = useRef(returnFocus);
+
+  useEffect(() => () => {
+    window.requestAnimationFrame(() => {
+      const target = returnTarget.current;
+      let restored = false;
+      if (target && target !== document.body && target.isConnected && !target.matches(':disabled') && !target.closest('[inert]')) {
+        target.focus();
+        restored = document.activeElement === target;
+      }
+      if (!restored) {
+        document.querySelector<HTMLElement>('[role="dialog"] button:not([disabled]), [role="dialog"][tabindex], main button:not([disabled])')?.focus();
+      }
+    });
+  }, []);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError(''); setBusy(true);
@@ -1023,8 +999,7 @@ function StepUpDialog({ mfaEnabled, action, onClose }: { mfaEnabled: boolean; ac
       await api('/auth/step-up', {
         method: 'POST', body: JSON.stringify({ code: value }),
       });
-      await action();
-      onClose();
+      onComplete();
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos confirmar tu identidad.'); }
     finally { setBusy(false); }
   }
@@ -1037,17 +1012,17 @@ function StepUpDialog({ mfaEnabled, action, onClose }: { mfaEnabled: boolean; ac
   }
 
   return (
-    <div className="modal-layer" role="presentation" onMouseDown={onClose}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="step-up-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, onClose)} onMouseDown={(event) => event.stopPropagation()}>
-        <div className="modal-head"><div><p className="eyebrow">Acción sensible</p><h2 id="step-up-title">Confirmá tu identidad</h2></div><button className="icon-button" onClick={onClose} aria-label="Cerrar">×</button></div>
+    <div className="modal-layer" role="presentation" onMouseDown={() => { if (!busy) onClose(); }}>
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="step-up-title" tabIndex={-1} autoFocus onKeyDown={(event) => { if (!busy) handleDialogKey(event, onClose); }} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head"><div><p className="eyebrow">Acción sensible</p><h2 id="step-up-title">Confirmá tu identidad</h2></div><button className="icon-button" disabled={busy} onClick={onClose} aria-label="Cerrar">×</button></div>
         {!mfaEnabled ? <div className="stack-form">
           <p>Volvé a confirmar tu cuenta de Google para continuar.</p>
           {error && <p className="message error" role="alert">{error}</p>}
-          <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancelar</button><button type="button" className="button primary google-button" disabled={busy} onClick={startGoogleStepUp}><GoogleIcon />{busy ? 'Abriendo Google…' : 'Continuar con Google'}</button></div>
+          <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>Cancelar</button><button type="button" className="button primary google-button" disabled={busy} onClick={startGoogleStepUp}><GoogleIcon />{busy ? 'Abriendo Google…' : 'Continuar con Google'}</button></div>
         </div> : <form className="stack-form" onSubmit={submit}>
           <label>Código de la app o de recuperación<input name="credential" type="text" autoComplete="one-time-code" maxLength={39} required autoFocus /></label>
           {error && <p className="message error" role="alert">{error}</p>}
-          <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancelar</button><button className="button primary" disabled={busy}>{busy ? 'Confirmando…' : 'Continuar'}</button></div>
+          <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>Cancelar</button><button className="button primary" disabled={busy}>{busy ? 'Confirmando…' : 'Continuar'}</button></div>
         </form>}
       </section>
     </div>
@@ -1244,20 +1219,6 @@ function Status({ value }: { value: string }) {
   const risky = /FAILED|QUARANTINED|REJECTED|CANCELLED/.test(value);
   const pending = /UPLOADED|VALIDATION|PROCESSING|RETRY|CLASSIFICATION|EXTRACTION|OCR|PARSING|NORMALIZATION|NEEDS_REVIEW|NEEDS_TYPE_CONFIRMATION/.test(value);
   return <span className={`status ${risky ? 'danger' : pending ? 'pending' : 'ready'}`}>{statusLabels[value] ?? value}</span>;
-}
-
-function DeductionBreakdown({ settlement }: { settlement: Settlement }) {
-  const items = settlement.deductions ?? [];
-  if (settlement.reimbursementsAmount) return <div className="deduction-cell"><strong>Reintegro {money(settlement.reimbursementsAmount, settlement.currencyCode)}</strong><small>Crédito a favor</small></div>;
-  const difference = money(settlement.deductionsDifferenceAmount, settlement.currencyCode);
-  const mismatch = settlement.deductionsDifferenceKind === 'TOTAL_MISSING'
-    ? `Se detectaron conceptos por ${difference}, pero no el total.`
-    : settlement.deductionsDifferenceKind === 'MISSING_ITEMS'
-      ? `Falta identificar ${difference} del total.`
-      : settlement.deductionsDifferenceKind === 'ITEMS_EXCEED_TOTAL'
-        ? `Los conceptos superan el total por ${difference}.`
-        : null;
-  return <div className="deduction-cell"><strong>{money(settlement.deductionsChargedAmount ?? settlement.deductionsAmount, settlement.currencyCode)}</strong>{settlement.deductionsPercentage && <small>{percentage(settlement.deductionsPercentage)} del bruto</small>}{mismatch && <small className="deduction-warning">{mismatch}</small>}{items.length > 0 && <details><summary>Ver desglose ({items.length})</summary><ul>{items.map((item, index) => <li key={`${item.normalizedConceptCode ?? 'OTHER'}-${index}`}><span>{item.normalizedConceptCode ? deductionLabels[item.normalizedConceptCode] ?? item.rawDescription : item.rawDescription}{item.grossPercentage && <small>{percentage(item.grossPercentage)} del bruto</small>}</span><strong>{money(item.amount, settlement.currencyCode)}</strong></li>)}</ul></details>}</div>;
 }
 
 function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSensitive: RunSensitive }) {
@@ -1536,7 +1497,6 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const [associating, setAssociating] = useState(false);
   const [selected, setSelected] = useState<DocumentItem | null>(null);
   const [detail, setDetail] = useState<DocumentDetail | null>(null);
-  const [acceptDeductionsMismatch, setAcceptDeductionsMismatch] = useState(false);
   const [tab, setTab] = useState<'summary' | 'evolution' | 'annual' | 'concepts' | 'documents'>('summary');
   const [selectedScopeKey, setSelectedScopeKey] = useState('');
   const [yearFilter, setYearFilter] = useState('all');
@@ -1565,15 +1525,74 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const [hasMoreDocuments, setHasMoreDocuments] = useState(false);
   const [documentError, setDocumentError] = useState('');
   const [detailError, setDetailError] = useState('');
+  const [detailReload, setDetailReload] = useState(0);
+  const [preview, setPreview] = useState<{ documentId: string; expiresAt?: string; url: string } | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState('');
+  const previewRequested = useRef(false);
+  const previewGeneration = useRef(0);
+  const [openedFromList, setOpenedFromList] = useState(false);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewDirty, setReviewDirty] = useState(false);
+  const [locationSeed, setLocationSeed] = useState<{ evidenceId?: string; page?: number }>({});
+  const allowNextPop = useRef(false);
+  const opener = useRef<HTMLButtonElement | null>(null);
+  const reviewUrl = useRef('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const selectedId = selected?.id;
   const selectedStatus = selected?.processingStatus;
+  const activeDocumentId = useRef<string | undefined>(selectedId);
+
+  const invalidatePreview = useCallback(() => {
+    previewGeneration.current += 1;
+    previewRequested.current = false;
+    setPreview(null);
+    setPreviewBusy(false);
+    setPreviewError('');
+  }, []);
+  useEffect(() => { activeDocumentId.current = selectedId; }, [selectedId]);
+  useEffect(() => {
+    if (selected) return;
+    opener.current?.focus();
+    opener.current = null;
+  }, [selected]);
+
+  const authorizePreview = useCallback(() => {
+    if (!selectedId) return;
+    const documentId = selectedId;
+    if (activeDocumentId.current !== documentId) return;
+    const generation = ++previewGeneration.current;
+    previewRequested.current = true;
+    setPreviewBusy(true); setPreviewError(''); setError('');
+    void runSensitive(async () => {
+      try {
+        const signed = await api<{ expiresAt?: string; url: string }>(`/documents/${documentId}/original?disposition=inline`);
+        if (activeDocumentId.current === documentId && previewGeneration.current === generation) setPreview({ ...signed, documentId });
+      } finally {
+        if (activeDocumentId.current === documentId && previewGeneration.current === generation) setPreviewBusy(false);
+      }
+    }).catch((caught: unknown) => {
+      if (activeDocumentId.current !== documentId || previewGeneration.current !== generation) return;
+      setPreviewBusy(false);
+      setPreviewError(caught instanceof Error ? caught.message : 'No pudimos autorizar la vista privada.');
+    });
+  }, [runSensitive, selectedId]);
 
   const applyDocuments = useCallback((docs: DocumentItem[]) => {
     setDocuments(docs);
     setCheckedDocumentIds((current) => current.filter((id) => docs.some((document) => document.id === id && associationReadyStatuses.has(document.processingStatus))));
-    setSelected((current) => current ? docs.find((document) => document.id === current.id) ?? current : null);
+    const location = readDocumentLocation(window.location.search);
+    const linked = location ? resolveDocumentItem(docs, location.documentId) : undefined;
+    if (linked && location) {
+      reviewUrl.current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      setTab('documents');
+      setLocationSeed({ evidenceId: location.evidenceId, page: location.page });
+      activeDocumentId.current = linked.id;
+      setSelected(linked);
+    } else {
+      setSelected((current) => current ? docs.find((document) => document.id === current.id) ?? current : null);
+    }
   }, []);
   const fetchDocumentPage = useCallback((cursor?: DocumentItem, limit = 100) => {
     const query = new URLSearchParams({ limit: String(limit), documentType: documentKind });
@@ -1639,75 +1658,174 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
     }, 3_000);
     return () => window.clearTimeout(timer);
   }, [documents, applyDocuments, fetchDocumentPage, loadSalary]);
-  const loadDetail = useCallback(async (id: string) => {
-    setDetailError('');
-    setDetail(await api<DocumentDetail>(`/documents/${id}`));
-  }, []);
   useEffect(() => {
     if (!selectedId) return;
+    const documentId = selectedId;
     let stopped = false;
-    api<DocumentDetail>(`/documents/${selectedId}`)
-      .then((nextDetail) => { if (!stopped) { setDetailError(''); setDetail(nextDetail); } })
-      .catch((caught: unknown) => { if (!stopped) setDetailError(caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.'); });
-    return () => { stopped = true; };
-  }, [selectedId, selectedStatus]);
-
-  function openDocument(document: DocumentItem) {
-    setSelected(document); setDetail(null); setDetailError(''); setAcceptDeductionsMismatch(false); setError('');
-  }
-  async function correct(field: ExtractedField, value: string) {
-    if (!selected) return;
-    setDetailError('');
-    try {
-      await api(`/documents/${selected.id}/corrections`, {
-        method: 'POST',
-        body: JSON.stringify({ ...(field.id ? { extractedFieldId: field.id } : { fieldPath: field.fieldPath }), correctedValue: value }),
+    api<DocumentDetail>(`/documents/${documentId}`)
+      .then((nextDetail) => {
+        if (stopped || activeDocumentId.current !== documentId) return;
+        setDetailError('');
+        setDetail(nextDetail);
+        if (nextDetail.originalAvailable && nextDetail.securityStatus === 'CLEAN' && !previewRequested.current) authorizePreview();
+      })
+      .catch(async (caught: unknown) => {
+        if (stopped || activeDocumentId.current !== documentId) return;
+        if (document.fullscreenElement) await document.exitFullscreen().catch(() => undefined);
+        if (!stopped && activeDocumentId.current === documentId) setDetailError(caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.');
       });
-      await Promise.all([loadDetail(selected.id), loadSalary()]);
-    } catch (caught) { setDetailError(caught instanceof Error ? caught.message : 'No pudimos guardar la corrección.'); }
+    return () => { stopped = true; };
+  }, [authorizePreview, detailReload, selectedId, selectedStatus]);
+
+  const refreshDetail = useCallback(async () => {
+    if (!selectedId) return;
+    const documentId = selectedId;
+    const nextDetail = await api<DocumentDetail>(`/documents/${documentId}`);
+    if (activeDocumentId.current === documentId) setDetail(nextDetail);
+  }, [selectedId]);
+
+  useEffect(() => {
+    const syncFromHistory = () => {
+      const allowed = allowNextPop.current;
+      allowNextPop.current = false;
+      if (!allowed && reviewBusy) {
+        window.history.pushState(window.history.state, '', reviewUrl.current);
+        return;
+      }
+      if (!allowed && reviewDirty && !window.confirm('Hay cambios sin guardar. ¿Querés descartarlos?')) {
+        window.history.pushState(window.history.state, '', reviewUrl.current);
+        return;
+      }
+      const location = readDocumentLocation(window.location.search);
+      if (location?.documentId !== selectedId) {
+        invalidatePreview();
+        setDetail(null);
+        setDetailError('');
+      }
+      setOpenedFromList(false);
+      setLocationSeed(location ? { evidenceId: location.evidenceId, page: location.page } : {});
+      const next = location ? resolveDocumentItem(documents, location.documentId) : null;
+      activeDocumentId.current = next?.id;
+      setSelected(next);
+      if (location) reviewUrl.current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      if (!location) { setDetail(null); setPreview(null); }
+    };
+    window.addEventListener('popstate', syncFromHistory);
+    return () => window.removeEventListener('popstate', syncFromHistory);
+  }, [documents, invalidatePreview, reviewBusy, reviewDirty, selectedId]);
+
+  function openDocument(document: DocumentItem, trigger: HTMLButtonElement) {
+    if (selectedId === document.id) {
+      if (!detail) { setDetailError(''); setDetailReload((value) => value + 1); }
+      return;
+    }
+    invalidatePreview();
+    opener.current = trigger;
+    activeDocumentId.current = document.id;
+    setSelected(document); setDetail(null); setDetailError(''); setLocationSeed({}); setOpenedFromList(true); setError('');
+    reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: document.id })}${window.location.hash}`;
+    window.history.pushState(window.history.state, '', reviewUrl.current);
+  }
+  async function saveCorrections(changes: Array<{ field: ExtractedFieldDetail; value: string }>, extractionRunId: string) {
+    try {
+      const ordered = [...changes].sort((left, right) =>
+        Number(right.field.fieldPath === 'settlement.payrollPeriod') - Number(left.field.fieldPath === 'settlement.payrollPeriod'));
+      for (const { field, value } of ordered) {
+        await api(`/documents/${selected?.id}/corrections`, {
+          method: 'POST',
+          body: JSON.stringify({ ...(field.id ? { extractedFieldId: field.id } : { fieldPath: field.fieldPath }), correctedValue: value, extractionRunId }),
+        });
+      }
+    } finally {
+      await Promise.all([refreshDetail(), loadSalary(), reloadDocuments(true)]);
+    }
   }
   async function deleteOriginal() {
     if (!selected || !confirm('¿Eliminar el PDF original? Los datos estructurados se conservarán.')) return;
-    try { await runSensitive(async () => { await api(`/documents/${selected.id}/original`, { method: 'DELETE', body: '{}' }); setSelected({ ...selected, originalAvailable: false }); await load(); }); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminar el original.'); }
+    invalidatePreview();
+    await runSensitive(async () => {
+      await api(`/documents/${selected.id}/original`, { method: 'DELETE', body: '{}' });
+      await Promise.all([reloadDocuments(true), refreshDetail()]);
+    });
   }
   async function downloadOriginal() {
     if (!selected) return;
-    try {
-      await runSensitive(async () => {
-        const download = await api<{ url: string }>(`/documents/${selected.id}/original`);
-        const anchor = document.createElement('a');
-        anchor.href = download.url;
-        anchor.rel = 'noreferrer';
-        anchor.click();
-      });
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos descargar el original.'); }
+    await runSensitive(async () => {
+      const download = await api<{ url: string }>(`/documents/${selected.id}/original?disposition=attachment`);
+      const anchor = document.createElement('a');
+      anchor.href = download.url;
+      anchor.rel = 'noreferrer';
+      anchor.click();
+    });
   }
   async function deleteDocument() {
     if (!selected || !confirm('¿Eliminar el PDF y todos sus datos extraídos? Esta acción no se puede deshacer.')) return;
-    try { await runSensitive(async () => { await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' }); setSelected(null); await Promise.all([load(), reloadDocuments()]); }); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminar el documento.'); }
+    invalidatePreview();
+    await runSensitive(async () => {
+      await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' });
+      window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.hash}`);
+      activeDocumentId.current = undefined;
+      setSelected(null); setDetail(null);
+      await Promise.all([loadSalary(), reloadDocuments(true)]);
+    });
   }
   async function confirmType(documentType: 'PAYROLL' | 'UNSUPPORTED') {
     if (!selected) return;
-    try {
-      const result = await api<{ processingStatus: string }>(`/documents/${selected.id}/type-confirmation`, {
-        method: 'POST', body: JSON.stringify({ documentType }),
-      });
-      setSelected({ ...selected, processingStatus: result.processingStatus });
-      await Promise.all([load(), reloadDocuments()]);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar la confirmación.'); }
+    await api(`/documents/${selected.id}/type-confirmation`, { method: 'POST', body: JSON.stringify({ documentType }) });
+    await Promise.all([loadSalary(), reloadDocuments(true), refreshDetail()]);
   }
-  async function completeReview() {
+  async function completeReview(acceptDeductionsMismatch: boolean, extractionRunId: string) {
     if (!selected) return;
-    try {
-      const result = await api<{ processingStatus: string }>(`/documents/${selected.id}/review-complete`, {
-        method: 'POST',
-        body: JSON.stringify({ acceptDeductionsMismatch }),
-      });
-      setSelected({ ...selected, processingStatus: result.processingStatus });
-      await Promise.all([load(), reloadDocuments()]);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos finalizar la revisión.'); }
+    await api(`/documents/${selected.id}/review-complete`, { method: 'POST', body: JSON.stringify({ acceptDeductionsMismatch, extractionRunId }) });
+    await Promise.all([loadSalary(), reloadDocuments(true), refreshDetail()]);
+  }
+
+  const updateDocumentLocation = useCallback((page: number, evidenceId?: string) => {
+    if (!selectedId) return;
+    reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: selectedId, page, evidenceId })}${window.location.hash}`;
+    window.history.replaceState(window.history.state, '', reviewUrl.current);
+  }, [selectedId]);
+
+  function closeDocument() {
+    invalidatePreview();
+    if (openedFromList && readDocumentLocation(window.location.search)?.documentId === selectedId) {
+      allowNextPop.current = true;
+      window.history.back();
+      return;
+    }
+    window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.hash}`);
+    activeDocumentId.current = undefined;
+    setSelected(null); setDetail(null); setDetailError('');
+  }
+
+  function closeDetailState() {
+    if (reviewBusy || (reviewDirty && !window.confirm('Hay cambios sin guardar. ¿Querés descartarlos?'))) return;
+    closeDocument();
+  }
+
+  function navigateDocument(direction: -1 | 1) {
+    if (!selectedId) return;
+    const index = documents.findIndex(({ id }) => id === selectedId);
+    if (index < 0) return;
+    const next = documents[index + direction];
+    if (!next) return;
+    invalidatePreview();
+    activeDocumentId.current = next.id;
+    setSelected(next); setDetail(null); setDetailError(''); setLocationSeed({});
+    reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: next.id })}${window.location.hash}`;
+    window.history.replaceState(window.history.state, '', reviewUrl.current);
+  }
+
+  async function reprocessDocument() {
+    if (!selected || !confirm('¿Reprocesar este PDF con la versión actual? Tus correcciones se conservarán.')) return;
+    invalidatePreview();
+    await api(`/documents/${selected.id}/reprocess`, {
+      method: 'POST',
+      body: '{}',
+      headers: { 'Idempotency-Key': browserOpaqueToken() },
+    });
+    await reloadDocuments(true);
+    await refreshDetail();
   }
   async function associateDocuments() {
     if (!checkedDocumentIds.length || !employmentChoice || associating) return;
@@ -1720,7 +1838,7 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
           employmentId: employmentChoice === 'none' ? null : employmentChoice,
         }),
       });
-      setCheckedDocumentIds([]); setEmploymentChoice(''); await Promise.all([load(), reloadDocuments()]);
+      setCheckedDocumentIds([]); setEmploymentChoice(''); await Promise.all([loadSalary(), reloadDocuments(true)]);
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos asociar los documentos.'); }
     finally { setAssociating(false); }
   }
@@ -1835,9 +1953,6 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const assignableDocuments = documents.filter((document) => associationReadyStatuses.has(document.processingStatus));
   const allAssignableSelected = assignableDocuments.length > 0
     && assignableDocuments.every((document) => checkedDocumentIds.includes(document.id));
-  const fields = detail?.extractedFields ?? [];
-  const missingReviewFields = fields.filter((field) => field.source === 'MANUAL_REQUIRED' && !field.correctedValue);
-  const selectedSettlement = detail?.settlement ?? null;
   const documentGroups = useMemo(() => {
     const grouped = new Map<string, DocumentItem[]>();
     for (const document of documents) {
@@ -1849,8 +1964,9 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
 
   function documentRow(document: DocumentItem) {
     const assignable = documentKind === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus);
-    return <div className={`document-entry${documentKind === 'PAYROLL' ? '' : ' no-check'}`} key={document.id}>{documentKind === 'PAYROLL' && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${documentName(document)}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={() => openDocument(document)}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{document.employerName || 'Sin empresa asociada'} · {document.payrollPeriod ? periodLabel(document.payrollPeriod) : shortDate(document.createdAt)}{document.settlementType ? ` · ${settlementTypeLabel(document.settlementType)}` : ''}{document.errorCode ? ` · ${importErrorLabels[document.errorCode] ?? 'No procesado'}` : ''}</small></span><Status value={document.processingStatus} /><span aria-hidden="true">›</span></button></div>;
+    return <div className={`document-entry${documentKind === 'PAYROLL' ? '' : ' no-check'}`} key={document.id}>{documentKind === 'PAYROLL' && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${documentName(document)}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{document.employerName || 'Sin empresa asociada'} · {document.payrollPeriod ? periodLabel(document.payrollPeriod) : shortDate(document.createdAt)}{document.settlementType ? ` · ${settlementTypeLabel(document.settlementType)}` : ''}{document.errorCode ? ` · ${importErrorLabels[document.errorCode] ?? 'No procesado'}` : ''}</small></span><Status value={document.processingStatus} /><span aria-hidden="true">›</span></button></div>;
   }
+  const selectedDocumentIndex = documents.findIndex(({ id }) => id === selected?.id);
 
   return (
     <div className="page" aria-busy={loading || documentsLoading || comparisonLoading || conceptLoading || conceptLoadingMore}>
@@ -1891,25 +2007,33 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
         {documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-groups">{documentGroups.map(([year, items]) => <details className="document-year" key={year}><summary><strong>{year}</strong><span>{items.length} documento{items.length === 1 ? '' : 's'} cargado{items.length === 1 ? '' : 's'}</span></summary><div className="document-list">{items.map(documentRow)}</div></details>)}</div>{hasMoreDocuments && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title={documentKind === 'PAYROLL' ? 'No hay recibos para estos filtros' : 'No hay documentos no soportados'} body={documentKind === 'PAYROLL' ? 'Importá PDFs o limpiá los filtros para ver su estado.' : 'Los PDFs descartados o confirmados como no salariales aparecen separados acá.'} />}
       </section>}
 
-      {selected && <div className="modal-layer" role="presentation" onMouseDown={() => setSelected(null)}><section className="modal wide" role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setSelected(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Documento y extracción</p><h2 id="review-title">{documentName(selected)}</h2></div><button type="button" className="icon-button" onClick={() => setSelected(null)} aria-label="Cerrar">×</button></div><div className="review-summary"><Status value={selected.processingStatus} /><span>{selected.errorCode ? importErrorLabels[selected.errorCode] ?? 'El documento no pudo procesarse.' : missingReviewFields.length ? `Falta completar: ${missingReviewFields.map((field) => reviewFieldLabels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : selectedSettlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto; corregí uno de los importes.' : selectedSettlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total; revisá los valores y confirmá la diferencia.' : 'Tus correcciones quedan guardadas en esta extracción.'}</span></div>
-        {detailError && <p className="message error" role="alert">{detailError}</p>}
-        {selectedSettlement && <section className="settlement-detail" aria-labelledby="settlement-detail-title"><h3 id="settlement-detail-title">Liquidación extraída</h3><dl className="settlement-overview"><div><dt>Período</dt><dd>{periodLabel(selectedSettlement.payrollPeriod)}</dd></div><div><dt>Tipo</dt><dd>{settlementTypeLabel(selectedSettlement.settlementType)}</dd></div><div><dt>Básico</dt><dd>{salaryMoney(selectedSettlement.basicAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Bruto</dt><dd>{salaryMoney(selectedSettlement.grossAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Remunerativo</dt><dd>{salaryMoney(selectedSettlement.remunerativeAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>No remunerativo</dt><dd>{salaryMoney(selectedSettlement.nonRemunerativeAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Neto</dt><dd>{salaryMoney(selectedSettlement.netAmount, selectedSettlement.currencyCode)}</dd></div><div><dt>Descuentos / créditos</dt><dd><DeductionBreakdown settlement={selectedSettlement} /></dd></div></dl>{selectedSettlement.earnings && selectedSettlement.earnings.length > 0 && <details><summary>Ver ingresos detectados ({selectedSettlement.earnings.length})</summary><ul className="detail-earnings">{selectedSettlement.earnings.map((earning, index) => <li key={`${earning.normalizedConceptCode ?? 'OTHER'}-${index}`}><span>{earning.normalizedConceptCode ? earningLabels[earning.normalizedConceptCode] ?? earning.rawDescription : earning.rawDescription}</span><strong>{money(earning.amount, selectedSettlement.currencyCode)}</strong></li>)}</ul></details>}</section>}
-        {selected.processingStatus === 'NEEDS_TYPE_CONFIRMATION' ? <div className="type-confirmation"><h3>¿Este PDF es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente. Confirmalo para continuar con la extracción.</p><div><button type="button" className="button primary" onClick={() => void confirmType('PAYROLL')}>Sí, es un recibo</button><button type="button" className="button secondary" onClick={() => void confirmType('UNSUPPORTED')}>No corresponde</button></div></div> : !detail ? !detailError && <p role="status">Cargando detalle…</p> : fields.length ? <div className="field-list">{fields.map((field) => <FieldEditor key={field.fieldPath} field={field} onSave={(value) => correct(field, value)} />)}</div> : <EmptyState title="Sin campos disponibles" body="El documento todavía está procesándose o no produjo datos utilizables." />}
-        {selected.processingStatus === 'NEEDS_REVIEW' && selectedSettlement?.deductionsMatchTotal === false && <label className="review-acceptance"><input type="checkbox" checked={acceptDeductionsMismatch} onChange={(event) => setAcceptDeductionsMismatch(event.target.checked)} />Revisé los conceptos y acepto esta diferencia.</label>}<div className="modal-actions">{selected.processingStatus === 'NEEDS_REVIEW' && <button type="button" className="button primary" disabled={missingReviewFields.length > 0 || selectedSettlement?.totalsBalance === false || (selectedSettlement?.deductionsMatchTotal === false && !acceptDeductionsMismatch)} onClick={() => void completeReview()}>Finalizar revisión</button>}<button type="button" className="button secondary" disabled={selected.originalAvailable === false} onClick={() => void downloadOriginal()}>Descargar PDF</button><button type="button" className="button danger-button" disabled={selected.originalAvailable === false || !associationReadyStatuses.has(selected.processingStatus)} onClick={() => void deleteOriginal()}>{selected.originalAvailable === false ? 'Original eliminado' : 'Eliminar sólo el PDF'}</button><button type="button" className="button danger-button" onClick={() => void deleteDocument()}>Eliminar PDF y datos</button><button type="button" className="button secondary" onClick={() => setSelected(null)}>Cerrar</button></div></section></div>}
+      {selected && (!detail || detailError) && <div className="modal-layer" role="presentation" onMouseDown={closeDetailState}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="document-loading-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, closeDetailState)} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Documento privado</p><h2 id="document-loading-title">{documentName(selected)}</h2></div><button className="icon-button" disabled={reviewBusy} onClick={closeDetailState} aria-label="Cerrar">×</button></div>{detailError ? <><p className="message error" role="alert">{detailError}</p><div className="modal-actions"><button type="button" className="button secondary" disabled={reviewBusy} onClick={closeDetailState}>Cerrar</button><button type="button" className="button primary" disabled={reviewBusy} onClick={() => setDetailReload((value) => value + 1)}>Reintentar</button></div></> : <p aria-live="polite">Cargando metadatos y datos extraídos…</p>}</section></div>}
+      {selected && detail && <DocumentReview
+        key={selected.id}
+        detail={detail}
+        initialEvidenceId={locationSeed.evidenceId}
+        initialPage={locationSeed.page}
+        position={{ current: selectedDocumentIndex < 0 ? null : selectedDocumentIndex + 1, total: Math.max(1, documents.length) }}
+        settlement={detail.reviewSettlement ?? undefined}
+        source={preview?.documentId === selected.id ? preview : null}
+        sourceBusy={previewBusy}
+        sourceError={previewError}
+        onAuthorizePreview={authorizePreview}
+        onClose={closeDocument}
+        onCompleteReview={completeReview}
+        onConfirmType={confirmType}
+        onDeleteDocument={deleteDocument}
+        onDeleteOriginal={deleteOriginal}
+        onBusyChange={setReviewBusy}
+        onDirtyChange={setReviewDirty}
+        onDownload={downloadOriginal}
+        onLocationChange={updateDocumentLocation}
+        onNavigate={navigateDocument}
+        onReprocess={reprocessDocument}
+        onSave={saveCorrections}
+      />}
     </div>
   );
-}
-
-function FieldEditor({ field, onSave }: { field: ExtractedField; onSave: (value: string) => Promise<void> }) {
-  const [value, setValue] = useState(field.correctedValue ?? field.interpretedValue ?? '');
-  const [busy, setBusy] = useState(false);
-  const confidence = Math.round(Number(field.confidence) * 100);
-  const editable = editableCorrectionPaths.has(field.fieldPath);
-  const missingReasonMessage = field.missingReason ? missingReasonMessages[field.missingReason] : null;
-  const editor = field.fieldPath === 'settlement.type'
-    ? <select value={value} onChange={(event) => setValue(event.target.value)}>{settlementTypeOptions.map((type) => <option key={type} value={type}>{settlementTypeLabel(type)}</option>)}</select>
-    : <input disabled={!editable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={field.fieldPath.includes('Amount') ? 'decimal' : undefined} value={value} onChange={(event) => setValue(event.target.value)} />;
-  return <div className="field-editor"><label><span>{reviewFieldLabels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label><span className={`confidence ${confidence < 70 ? 'low' : ''}`}>{field.source === 'MANUAL_REQUIRED' ? field.correctedValue ? 'Manual' : 'Falta' : Number.isFinite(confidence) ? `${confidence}%` : '—'}</span><small>{field.correctedValue ? 'Corregido por vos' : missingReasonMessage ?? (!editable ? 'Sólo lectura' : field.source === 'MANUAL_REQUIRED' ? 'Completalo manualmente' : extractionSourceLabel(field.source))}</small>{editable && <button className="button compact" disabled={busy || !value.trim() || value === (field.correctedValue ?? field.interpretedValue ?? '')} onClick={async () => { setBusy(true); await onSave(value); setBusy(false); }}>Guardar</button>}</div>;
 }
 
 function MfaSettings({ onUserChanged, runSensitive }: { onUserChanged: (user: User) => void; runSensitive: RunSensitive }) {

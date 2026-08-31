@@ -32,6 +32,16 @@ function validR2Results(): Record<string, unknown> {
         },
         exposeHeaders: ["ETag"],
         maxAgeSeconds: 300,
+      }, {
+        allowed: {
+          methods: ["GET", "HEAD"],
+          origins: ["https://www.example.test"],
+          headers: ["Range"],
+        },
+        exposeHeaders: [
+          "Accept-Ranges", "Content-Disposition", "Content-Length", "Content-Range", "Content-Type", "ETag",
+        ],
+        maxAgeSeconds: 300,
       }],
     },
     [`${bucketPath}/domains/managed`]: { enabled: false },
@@ -103,6 +113,26 @@ test("R2 startup assertions are read-only and fail closed on unsafe bucket setti
       const cors = results[`/client/v4/accounts/${accountId}/r2/buckets/documents/cors`] as { rules: Array<{ maxAgeSeconds: number }> };
       cors.rules[0]!.maxAgeSeconds = 301;
     }, /CORS/],
+    ["download CORS methods", (results) => {
+      const cors = results[`/client/v4/accounts/${accountId}/r2/buckets/documents/cors`] as { rules: Array<{ allowed: { methods: string[] } }> };
+      cors.rules[1]!.allowed.methods = ["GET"];
+    }, /CORS/],
+    ["download CORS Range", (results) => {
+      const cors = results[`/client/v4/accounts/${accountId}/r2/buckets/documents/cors`] as { rules: Array<{ allowed: { headers: string[] } }> };
+      cors.rules[1]!.allowed.headers = [];
+    }, /CORS/],
+    ["download CORS origin", (results) => {
+      const cors = results[`/client/v4/accounts/${accountId}/r2/buckets/documents/cors`] as { rules: Array<{ allowed: { origins: string[] } }> };
+      cors.rules[1]!.allowed.origins.push("https://public.example.test");
+    }, /CORS/],
+    ["download CORS exposed headers", (results) => {
+      const cors = results[`/client/v4/accounts/${accountId}/r2/buckets/documents/cors`] as { rules: Array<{ exposeHeaders: string[] }> };
+      cors.rules[1]!.exposeHeaders = ["ETag"];
+    }, /CORS/],
+    ["extra CORS rule", (results) => {
+      const cors = results[`/client/v4/accounts/${accountId}/r2/buckets/documents/cors`] as { rules: unknown[] };
+      cors.rules.push({ allowed: { methods: ["DELETE"], origins: ["https://www.example.test"], headers: [] } });
+    }, /CORS/],
     ["lifecycle", (results) => {
       const lifecycle = results[`/client/v4/accounts/${accountId}/r2/buckets/documents/lifecycle`] as {
         rules: Array<{ deleteObjectsTransition: { condition: { maxAge: number } } }>;
@@ -167,6 +197,22 @@ test("R2 authorizes a size-, type- and metadata-bound PUT while AWS keeps POST",
       r2.authorizeUpload("session-id", "incoming/object.pdf", 12_345),
       /marker ETag is required/,
     );
+    const inlineDownload = await r2.authorizeDownload("documents/object.pdf", {
+      disposition: "inline",
+    });
+    const inlineUrl = new URL(inlineDownload.url);
+    assert.equal(inlineUrl.searchParams.get("X-Amz-Expires"), "120");
+    assert.equal(inlineUrl.searchParams.get("response-cache-control"), "no-store, private, max-age=0");
+    assert.equal(inlineUrl.searchParams.get("response-content-type"), "application/pdf");
+    assert.equal(
+      inlineUrl.searchParams.get("response-content-disposition"),
+      "inline; filename=\"salarivo-document.pdf\"",
+    );
+    const attachmentDownload = await r2.authorizeDownload("documents/object.pdf");
+    assert.match(
+      new URL(attachmentDownload.url).searchParams.get("response-content-disposition") ?? "",
+      /^attachment; filename="salarivo-document\.pdf"$/,
+    );
   } finally {
     r2.destroy();
   }
@@ -179,6 +225,44 @@ test("R2 authorizes a size-, type- and metadata-bound PUT while AWS keeps POST",
     assert.equal(upload.fields["Content-Type"], "application/pdf");
   } finally {
     aws.destroy();
+  }
+});
+
+test("AWS/local CORS preserves signed POST upload and adds ranged signed downloads", async () => {
+  type TestCommand = { constructor: { name: string }; input: Record<string, unknown> };
+  const clientPrototype = S3Client.prototype as unknown as {
+    send: (command: TestCommand) => Promise<Record<string, unknown>>;
+  };
+  const originalSend = clientPrototype.send;
+  let corsConfiguration: Record<string, unknown> | undefined;
+  clientPrototype.send = async (command) => {
+    if (command.constructor.name === "HeadBucketCommand") return {};
+    if (command.constructor.name === "PutBucketCorsCommand") {
+      corsConfiguration = command.input.CORSConfiguration as Record<string, unknown>;
+      return {};
+    }
+    if (command.constructor.name === "PutBucketLifecycleConfigurationCommand") return {};
+    throw new Error(`unexpected command: ${command.constructor.name}`);
+  };
+  const storage = createStorage(loadConfig({ APP_ENV: "test" }));
+  try {
+    await storage.ensureBucket();
+    const rules = corsConfiguration?.CORSRules as Array<Record<string, unknown>>;
+    assert.equal(rules.length, 2);
+    assert.deepEqual(rules[0]?.AllowedMethods, ["POST"]);
+    assert.deepEqual(rules[0]?.AllowedHeaders, ["*"]);
+    assert.deepEqual(rules[1], {
+      AllowedHeaders: ["Range"],
+      AllowedMethods: ["GET", "HEAD"],
+      AllowedOrigins: ["http://localhost:3000"],
+      ExposeHeaders: [
+        "Accept-Ranges", "Content-Disposition", "Content-Length", "Content-Range", "Content-Type", "ETag",
+      ],
+      MaxAgeSeconds: 300,
+    });
+  } finally {
+    storage.destroy();
+    clientPrototype.send = originalSend;
   }
 });
 
