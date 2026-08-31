@@ -47,6 +47,7 @@ import {
 const QUEUE_NAME = 'salarivo:processing-jobs:documents';
 const WORKER_VERSION = '6';
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
+let startupStage = 'configuration';
 
 type WorkerConfig = {
   appEnv: RuntimeEnvironment;
@@ -1730,6 +1731,7 @@ async function queueSupervisor(s3: S3Client, config: WorkerConfig, signal: Abort
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  startupStage = 'migrations';
   await migrate();
   const s3 = new S3Client({
     credentials: { accessKeyId: config.storageAccessKey, secretAccessKey: config.storageSecretKey },
@@ -1737,7 +1739,9 @@ async function main(): Promise<void> {
     forcePathStyle: true,
     region: config.storageRegion,
   });
+  startupStage = 'storage';
   await verifyProductionStorage(s3, config);
+  startupStage = 'runtime';
   const abort = new AbortController();
   const stop = () => abort.abort();
   process.once('SIGINT', stop);
@@ -1757,7 +1761,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   void main().catch(() => {
-    log('worker_start_failed');
+    log('worker_start_failed', { stage: startupStage });
     process.exitCode = 1;
   });
 }
