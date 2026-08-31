@@ -137,6 +137,221 @@ Líquido a percibir
   assert.equal(result.deductionsAmount, '250000.00');
   assert.equal(result.netAmount, '1000000.00');
   assert.equal(result.needsReview, true);
+
+  const netInPesos = extractArgentinePayroll(`
+RECIBO DE HABERES
+Período: julio 2026
+Total bruto $ 1.000,00
+Total descuentos $ 100,00
+Importe neto en pesos $ 900,00
+`, 'PDF_TEXT');
+  assert.equal(netInPesos.netAmount, '900.00');
+  assert.equal(
+    extractArgentinePayroll(`
+RECIBO DE HABERES
+Período: julio 2026
+Total bruto $ 1.000,00
+Total descuentos $ 100,00
+Importe neto de esta liquidación $ 900,00
+`, 'PDF_TEXT').netAmount,
+    '900.00',
+  );
+});
+
+test('extrae las dos grillas sintéticas de haberes y descuentos', () => {
+  const combinedRow = (description: string, earning = '', deduction = '') =>
+    `${description.padEnd(48)}${earning.padEnd(20)}${deduction}`;
+  const combined = [
+    'Tecnología Sintética S.A.',
+    'CUIT: 30-00000000-0',
+    combinedRow('CODIGO CONCEPTOS CANT.', 'HABERES', 'DESCUENTOS'),
+    combinedRow('1000 Básico convenio', '700.000,00'),
+    combinedRow('1001 Adicional sintético', '300.000,00'),
+    combinedRow('2000 Deducción sintética', '', '200.000,00'),
+    combinedRow('2001 Retención sintética', '', '50.000,00'),
+    combinedRow('TOTALES', '1.000.000,00', '250.000,00'),
+    'NETO A COBRAR(EN LETRAS)                         NETO A COBRAR',
+    'PESOS SINTÉTICOS                                   750.000,00',
+    'CONTRIBUCIONES Y APORTES DEL MES: 06/2026',
+  ].join('\n');
+
+  const splitRow = (description: string, units = '', earning = '', deduction = '') =>
+    `${description.padEnd(40)}${units.padEnd(16)}${earning.padEnd(18)}${deduction}`;
+  const summaryAmount = (amount: string) => amount.padStart(84);
+  const split = [
+    'Consultora Sintética S.R.L.',
+    'Fecha liquidación',
+    'Enero 2026',
+    'Banco depósito CS  Período CS  F. depósito CS  CUIL  Ingreso  Sueldo o Jornal',
+    splitRow('Concepto', 'Unidades', 'Haberes', 'Descuentos'),
+    splitRow('Salario Base', '30,00', '700.000,00'),
+    splitRow('Adicional sintético', '', '100.000,00'),
+    splitRow('Beneficio no remunerativo', '', '50.000,00'),
+    splitRow('Jubilación', '11,00', '', '90.000,00'),
+    splitRow('Deducción sintética', '', '', '60.000,00'),
+    'Haberes con Aportes',
+    'Fecha sintética 01-01-2026',
+    'Tipo de cambio sintético $ 999.99',
+    summaryAmount('800.000,00'),
+    'Haberes sin Aportes',
+    summaryAmount('50.000,00'),
+    'Recibí el importe neto de esta liquidación                 Total Descuentos',
+    'Texto sintético intermedio',
+    summaryAmount('150.000,00'),
+    'Neto a pagar',
+    summaryAmount('700.000,00'),
+  ].join('\n');
+
+  assert.equal(classifyPayrollText(combined).decision, 'SUPPORTED');
+  assert.equal(classifyPayrollText(combined.replace('CANT.', 'CANTIDAD')).decision, 'SUPPORTED');
+  const combinedResult = extractArgentinePayroll(combined, 'PDF_TEXT');
+  assert.deepEqual(
+    {
+      basic: combinedResult.basicAmount,
+      deductions: combinedResult.deductionsAmount,
+      gross: combinedResult.grossAmount,
+      items: combinedResult.lineItems.map(({ amount, itemType }) => [amount, itemType]),
+      needsReview: combinedResult.needsReview,
+      net: combinedResult.netAmount,
+      period: combinedResult.payrollPeriod,
+    },
+    {
+      basic: '700000.00',
+      deductions: '250000.00',
+      gross: '1000000.00',
+      items: [
+        ['700000.00', 'EARNING'],
+        ['300000.00', 'EARNING'],
+        ['200000.00', 'DEDUCTION'],
+        ['50000.00', 'DEDUCTION'],
+      ],
+      needsReview: false,
+      net: '750000.00',
+      period: '2026-06',
+    },
+  );
+  const inconsistentComponents = extractArgentinePayroll([
+    combined,
+    'Haberes con Aportes',
+    '700.000,00'.padStart(78),
+    'Haberes sin Aportes',
+    '50.000,00'.padStart(78),
+  ].join('\n'), 'PDF_TEXT');
+  assert.equal(inconsistentComponents.needsReview, true);
+
+  assert.equal(classifyPayrollText(split).decision, 'SUPPORTED');
+  const splitResult = extractArgentinePayroll(split, 'PDF_TEXT');
+  assert.deepEqual(
+    {
+      basic: splitResult.basicAmount,
+      deductions: splitResult.deductionsAmount,
+      employer: splitResult.employerName,
+      gross: splitResult.grossAmount,
+      itemCount: splitResult.lineItems.length,
+      needsReview: splitResult.needsReview,
+      net: splitResult.netAmount,
+      nonRemunerative: splitResult.nonRemunerativeAmount,
+      period: splitResult.payrollPeriod,
+      remunerative: splitResult.remunerativeAmount,
+    },
+    {
+      basic: '700000.00',
+      deductions: '150000.00',
+      employer: null,
+      gross: '850000.00',
+      itemCount: 5,
+      needsReview: false,
+      net: '700000.00',
+      nonRemunerative: '50000.00',
+      period: '2026-01',
+      remunerative: '800000.00',
+    },
+  );
+
+  const compactRow = (description: string, units = '', earning = '', deduction = '') =>
+    `${description.padEnd(9)}${units.padStart(5)}${earning.padStart(8)}${deduction.padStart(11)}`;
+  const compact = [
+    'RECIBO DE HABERES',
+    'Empleador: Empresa Sintética S.A.',
+    'Período: enero 2026',
+    'Salario básico $ 700,00',
+    compactRow('Concepto', 'Cant.', 'Haberes', 'Descuentos'),
+    compactRow('Adicional', '', '1.000,00'),
+    compactRow('Aporte', '', '', '100,00'),
+    compactRow('TOTALES', '', '1.000,00', '100,00'),
+    'Neto a pagar $ 900,00',
+  ].join('\n');
+  const compactResult = extractArgentinePayroll(compact, 'PDF_TEXT');
+  assert.equal(compactResult.basicAmount, '700.00');
+  assert.equal(compactResult.lineItems.some((item) => item.amount === '1000.00' && item.itemType === 'EARNING'), true);
+  assert.equal(compactResult.needsReview, false);
+});
+
+test('no confunde unidades, resúmenes sueltos ni entidades sin contexto con datos salariales', () => {
+  const row = (description: string, units = '', earning = '', deduction = '') =>
+    `${description.padEnd(40)}${units.padStart(16)}${earning.padStart(18)}${deduction.padStart(18)}`;
+  const leftAlignedHeader = `${'Concepto'.padEnd(40)}${'Unidades'.padEnd(16)}${'Haberes'.padEnd(18)}Descuentos`;
+  const unitOnly = [
+    'RECIBO DE HABERES',
+    'Empleador: Empresa Sintética S.A.',
+    'Período: enero 2026',
+    leftAlignedHeader,
+    row('Salario Base', '30,00'),
+    'Haberes con Aportes',
+    'Tipo de cambio sintético $ 999.99',
+    'Haberes sin Aportes',
+    '100,00'.padStart(92),
+    'Total Descuentos',
+    '20,00'.padStart(92),
+    'Neto a pagar',
+    '80,00'.padStart(92),
+  ].join('\n');
+  const unitOnlyResult = extractArgentinePayroll(unitOnly, 'PDF_TEXT');
+  assert.equal(unitOnlyResult.basicAmount, null);
+  assert.equal(unitOnlyResult.remunerativeAmount, null);
+  assert.equal(unitOnlyResult.needsReview, true);
+
+  const summariesWithoutTable = extractArgentinePayroll(`
+RECIBO DE HABERES
+Período: enero 2026
+Haberes con Aportes $ 800,00
+Haberes sin Aportes $ 50,00
+Jubilación $ 150,00
+Total Descuentos $ 150,00
+Neto a pagar $ 700,00
+`, 'PDF_TEXT');
+  assert.equal(summariesWithoutTable.grossAmount, null);
+  assert.equal(summariesWithoutTable.needsReview, true);
+
+  for (const heading of [
+    'CERTIFICADO DE INGRESOS',
+    'CERTIFICACIÓN DE INGRESOS',
+    'CERTIFICACIÓN DE SERVICIOS Y REMUNERACIONES',
+    'CERTIFICADO DE SUELDOS',
+    'CERTIFICADO DE INGRESOS Y RETENCIONES',
+    'CERTIFICACIÓN DE SERVICIOS Y REMUNERACIONES - FORMULARIO',
+  ]) {
+    const certificate = [
+      'Membrete sintético',
+      'Referencia sintética',
+      'Fecha sintética',
+      'Destinatario sintético',
+      'Metadata sintética',
+      heading,
+      'CUIL: 20-00000000-0',
+      'Se emite a partir del recibo de haberes presentado',
+      row('Concepto', 'Unidades', 'Haberes', 'Descuentos'),
+      row('Salario Base', '30,00', '1.000,00'),
+      'Neto a pagar 900,00',
+    ].join('\n');
+    assert.equal(classifyPayrollText(certificate).decision, 'UNSUPPORTED');
+  }
+
+  const unrelatedEntity = extractArgentinePayroll(unitOnly.replace(
+    'RECIBO DE HABERES\nEmpleador: Empresa Sintética S.A.',
+    'Banco Sintético S.A.\nRECIBO DE HABERES',
+  ), 'PDF_TEXT');
+  assert.equal(unrelatedEntity.employerName, null);
 });
 
 test('manda a revisión un desglose que no coincide con el total', () => {
@@ -264,6 +479,12 @@ test('lee tablas alineadas a derecha y deriva el neto sólo con evidencia sufici
   assert.equal(result.needsReview, false);
   assert.equal(result.fields.find(({ fieldPath }) => fieldPath === 'settlement.netAmount')?.source, 'RULE');
 
+  const basicBeforeTable = extractArgentinePayroll(
+    receipt.replace(header, `Salario básico $ 700,00\n${header}`),
+    'PDF_TEXT',
+  );
+  assert.equal(basicBeforeTable.basicAmount, '700.00');
+
   const withoutNetEvidence = extractArgentinePayroll(receipt.replace('\nSON PESOS UN MILLÓN NETO A', ''), 'PDF_TEXT');
   assert.equal(withoutNetEvidence.netAmount, null);
   assert.equal(withoutNetEvidence.needsReview, true);
@@ -279,6 +500,7 @@ test('lee tablas alineadas a derecha y deriva el neto sólo con evidencia sufici
   assert.equal(signed.grossAmount, '1150000.00');
   assert.equal(signed.netAmount, '900000.00');
   assert.equal(signed.needsReview, false);
+  assert.equal(payrollExtractionNeedsReview(signed), false);
 });
 
 test('separa descuentos del empleado de contribuciones y minimiza cada deducción', () => {
@@ -566,6 +788,11 @@ test('recalcula revisión sobre valores efectivos y conserva aritmética decimal
   ]);
   assert.equal(inconsistent.netAmount, '1000.00');
   assert.equal(payrollExtractionNeedsReview(inconsistent), true);
+  assert.equal(payrollExtractionNeedsReview({
+    ...corrected,
+    remunerativeAmount: '1000.00',
+    nonRemunerativeAmount: '1.00',
+  }), true);
 
   assert.equal(payrollExtractionNeedsReview({
     ...corrected,

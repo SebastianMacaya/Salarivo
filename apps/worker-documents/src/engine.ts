@@ -322,9 +322,12 @@ type Amount = {
 type PositionedAmount = Amount & { index: number };
 
 type PayrollTable = {
+  columnTolerance: number;
   columns: number[];
+  combinedEarnings: boolean;
   descriptionEnd: number;
   headerIndex: number;
+  mappingColumns: number[];
   totalIndex: number;
   totals: PositionedAmount[];
 };
@@ -455,7 +458,8 @@ export function classifyPayrollText(text: string, lowThreshold = 0.2, highThresh
   const rules: Array<[string, RegExp, number]> = [
     ['recibo_sueldo', /recibo\s+(?:de\s+)?(?:sueldo|haberes)/, 0.4],
     ['liquidacion_haberes', /liquidacion\s+(?:de\s+)?(?:haberes|sueldos?)/, 0.4],
-    ['sueldo_basico', /\b(?:sueldo|salario|haber|remuneracion)\s+basic[oa]\b/, 0.2],
+    ['sueldo_basico', /\b(?:(?:sueldo|salario|haber|remuneracion)\s+basic[oa]|salario\s+base|basic[oa]\s+convenio)\b/, 0.2],
+    ['tabla_haberes', /\bconceptos?\b[^\r\n]{0,120}\b(?:cant(?:idad)?|unidades)\b\.?[^\r\n]{0,120}\bhaberes\b[^\r\n]{0,120}\bdescuentos?\b/, 0.25],
     ['haberes', /\bhaberes\b/, 0.1],
     ['remunerativo', /\bremunerativ[oa]s?\b/, 0.12],
     ['descuentos', /\bdescuentos?\b/, 0.08],
@@ -467,6 +471,7 @@ export function classifyPayrollText(text: string, lowThreshold = 0.2, highThresh
   let confidence = 0;
   for (const [name, pattern, weight] of rules) {
     if (pattern.test(normalized)) {
+      if (signals.includes('tabla_haberes') && (name === 'haberes' || name === 'descuentos')) continue;
       signals.push(name);
       confidence += weight;
     }
@@ -476,6 +481,11 @@ export function classifyPayrollText(text: string, lowThreshold = 0.2, highThresh
     confidence -= 0.45;
   }
   const hasPayrollTitle = signals.includes('recibo_sueldo') || signals.includes('liquidacion_haberes');
+  const certificateHeading = /^certifica(?:do|cion)\s+(?:de\s+)?(?:(?:servicios?|trabajo)\s+y\s+)?(?:trabajo|haberes|ingresos|remuneraciones|sueldos?|laboral|servicios?)\b/;
+  if (normalized.split(/\r?\n/).some((line) => certificateHeading.test(line.trim()))) {
+    signals.push('certificado_laboral');
+    confidence = 0;
+  }
   if (!hasPayrollTitle && /\bliquidacion\s+de\s+(?:impuesto\s+a\s+las\s+)?ganancias\b/.test(normalized)) {
     signals.push('documento_fiscal');
     confidence -= 0.45;
@@ -508,6 +518,10 @@ function amountsInLine(line: string): PositionedAmount[] {
   });
 }
 
+function hasMoneyFormatting(raw: string): boolean {
+  return raw.includes('$') || /[.,]/.test(raw) || /\d[ \u00a0]\d{3}/.test(raw);
+}
+
 function cleanEmployerCandidate(raw: string): string | null {
   const value = raw
     .replace(/[\u0000-\u001f]/g, ' ')
@@ -526,9 +540,9 @@ function extractEmployer(lines: string[]): EmployerCandidate | null {
     if (raw && value) return { confidence: 0.82, raw: raw.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 160), value };
   }
 
+  const legalSuffix = /\b(?:s\.?\s*a\.?|s\.?\s*r\.?\s*l\.?|s\.?\s*a\.?\s*s\.?|sociedad\s+anonima|sociedad\s+de\s+responsabilidad\s+limitada)(?:\s|$)/;
   const cuitIndex = lines.slice(0, 16).findIndex((line) => /\bcuit\b/.test(fold(line)));
   if (cuitIndex < 1) return null;
-  const legalSuffix = /\b(?:s\.?\s*a\.?|s\.?\s*r\.?\s*l\.?|s\.?\s*a\.?\s*s\.?|sociedad\s+anonima|sociedad\s+de\s+responsabilidad\s+limitada)(?:\s|$)/;
   for (let index = cuitIndex - 1; index >= Math.max(0, cuitIndex - 5); index -= 1) {
     const segment = (lines[index] ?? '').trim().split(/\s{2,}/).find((part) => legalSuffix.test(fold(part)));
     const value = segment ? cleanEmployerCandidate(segment) : null;
@@ -540,10 +554,13 @@ function extractEmployer(lines: string[]): EmployerCandidate | null {
 const basicAmountLabels = [
   /^\s*(?:\d{1,8}\s+)?(?:sueldo|salario|haber|remuneracion)\s+basic[oa]\b/,
   /^\s*(?:\d{1,8}\s+)?basic[oa]\b/,
+  /^\s*(?:\d{1,8}\s+)?salario\s+base\b/,
 ];
 const grossAmountLabels = [/\b(?:total\s+(?:de\s+)?(?:haberes|remuneraciones)|haberes\s+totales|total\s+bruto|sueldo\s+bruto|remuneracion\s+bruta|importe\s+bruto)\b/];
 const netAmountLabels = [/\b(?:neto|liquido)\s+(?:a\s+)?(?:cobrar|pagar|percibir)\b/, /\b(?:total|importe|haber)\s+neto\b/, /\b(?:neto|liquido)\s+a\s*$/, /^\s*(?:neto|liquido)\s*$/];
 const deductionAmountLabels = [/\b(?:total\s+(?:de\s+)?(?:descuentos|deducciones|retenciones)|(?:descuentos|deducciones|retenciones)\s+totales)\b/];
+const remunerativeAmountLabels = [/\bhaberes\s+con\s+aportes\b/];
+const nonRemunerativeAmountLabels = [/\bhaberes\s+sin\s+aportes\b/];
 const settlementAmountLabels = [...basicAmountLabels, ...grossAmountLabels, ...netAmountLabels, ...deductionAmountLabels];
 
 function extractAmount(lines: string[], labels: RegExp[]): Amount | null {
@@ -553,15 +570,18 @@ function extractAmount(lines: string[], labels: RegExp[]): Amount | null {
     for (const label of labels) {
       const match = label.exec(normalized);
       if (!match) continue;
+      const narrativeNet = /\bimporte\s+neto\s+de\s+(?:esta\s+)?liquidacion\b/.exec(normalized);
+      const hasExplicitAmount = amountsInLine(line.slice(match.index + match[0].length))
+        .some(({ raw }) => hasMoneyFormatting(raw));
+      if (narrativeNet && match.index <= narrativeNet.index && !hasExplicitAmount) continue;
       const inlineNumber = /\d/.test(line.slice(match.index + match[0].length));
       for (const [offset, candidate] of [line, lines[index + 1] ?? '', lines[index + 2] ?? ''].entries()) {
         if (offset && (inlineNumber || settlementAmountLabels.some((candidateLabel) => candidateLabel.test(fold(candidate))))) break;
-        const formattedAmounts = amountsInLine(candidate).filter(({ raw }) =>
-          raw.includes('$') || /[.,]/.test(raw) || /\d[ \u00a0]\d{3}/.test(raw));
+        const formattedAmounts = amountsInLine(candidate).filter(({ raw }) => hasMoneyFormatting(raw));
         if (formattedAmounts.length > 1) break;
         const raw = amountAtEnd.exec(candidate)?.[0]?.trim();
         const value = raw ? parseArgentineAmount(raw) : null;
-        const formatted = raw && (raw.includes('$') || /[.,]/.test(raw) || /\d[ \u00a0]\d{3}/.test(raw));
+        const formatted = raw && hasMoneyFormatting(raw);
         if (raw && value && formatted) return offset ? { confidence: 0.82, raw, value } : { raw, value };
       }
     }
@@ -593,17 +613,22 @@ function headerColumn(lines: string[], patterns: RegExp[]): number | null {
   return null;
 }
 
-function mapAmountsToColumns(amounts: PositionedAmount[], columns: number[]): Array<PositionedAmount | null> {
+function mapAmountsToColumns(
+  amounts: PositionedAmount[],
+  columns: number[],
+  tolerance = 32,
+): Array<PositionedAmount | null> {
   const mapped: Array<PositionedAmount | null> = columns.map(() => null);
   for (const amount of amounts) {
-    const amountEnd = amount.index + amount.raw.length;
+    const amountPosition = amount.index + amount.raw.length;
     let nearest = 0;
     for (let position = 1; position < columns.length; position += 1) {
-      if (Math.abs(amountEnd - columns[position]!) < Math.abs(amountEnd - columns[nearest]!)) nearest = position;
+      if (Math.abs(amountPosition - columns[position]!) < Math.abs(amountPosition - columns[nearest]!)) nearest = position;
     }
-    if (Math.abs(amountEnd - columns[nearest]!) > 32) continue;
+    if (Math.abs(amountPosition - columns[nearest]!) > tolerance) continue;
     const current = mapped[nearest];
-    if (!current || Math.abs(amountEnd - columns[nearest]!) < Math.abs(current.index + current.raw.length - columns[nearest]!)) {
+    const currentPosition = current && current.index + current.raw.length;
+    if (!current || Math.abs(amountPosition - columns[nearest]!) < Math.abs(currentPosition! - columns[nearest]!)) {
       mapped[nearest] = amount;
     }
   }
@@ -628,25 +653,91 @@ function findPayrollTable(lines: string[]): PayrollTable | null {
       const amounts = amountsInLine(lines[row] ?? '');
       if (amounts.length !== columns.length) continue;
       if (amounts.some((amount, position) => Math.abs(amount.index - columns[position]!) > (position ? 32 : 64))) continue;
+      const actualHeaderIndex = index + Math.max(0, headerLines.findIndex((line) =>
+        /\b(?:haberes?\s+(?:con|sin)|no\s+remunerativ[oa]s?|remunerativ[oa]s?|descuentos?|deducciones?|retenciones?)\b/.test(fold(line))));
       return {
+        columnTolerance: 32,
         columns: amounts.map((amount) => amount.index + amount.raw.length),
+        combinedEarnings: false,
         descriptionEnd: requiredColumns[0]!,
-        headerIndex: index,
+        headerIndex: actualHeaderIndex,
+        mappingColumns: amounts.map((amount) => amount.index + amount.raw.length),
         totalIndex: row,
         totals: amounts,
       };
     }
   }
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = fold(lines[index] ?? '');
+    const description = /\bconceptos?\b/.exec(header);
+    const quantity = /\b(?:cant(?:idad)?|unidades)\b\.?/.exec(header);
+    const earnings = /\bhaberes\b/.exec(header);
+    const deductions = /\bdescuentos?\b/.exec(header);
+    if (!description || !quantity || !earnings || !deductions
+      || description.index >= quantity.index || quantity.index >= earnings.index || earnings.index >= deductions.index) continue;
+    const headerColumns = [earnings.index + earnings[0].length, deductions.index + deductions[0].length];
+    let totalIndex = -1;
+    let totals: PositionedAmount[] = [];
+    for (let row = index + 1; row < Math.min(lines.length, index + 64); row += 1) {
+      if (!/^\s*totales?\b/.test(fold(lines[row] ?? ''))) continue;
+      const amounts = amountsInLine(lines[row] ?? '').filter(({ raw }) => hasMoneyFormatting(raw));
+      if (amounts.length !== 2 || amounts.some((amount, position) =>
+        Math.abs(amount.index + amount.raw.length - headerColumns[position]!) > 16)) continue;
+      totalIndex = row;
+      totals = amounts;
+      break;
+    }
+    if (totalIndex < 0) {
+      totalIndex = lines.findIndex((line, row) => row > index
+        && /\b(?:haberes\s+con\s+aportes|total\s+descuentos|neto\s+(?:a\s+)?(?:cobrar|pagar))\b/.test(fold(line)));
+    }
+    if (totalIndex < 0) continue;
+    return {
+      columnTolerance: 8,
+      columns: totals.length ? totals.map((amount) => amount.index + amount.raw.length) : headerColumns,
+      combinedEarnings: true,
+      descriptionEnd: quantity.index,
+      headerIndex: index,
+      mappingColumns: [quantity.index, earnings.index, deductions.index],
+      totalIndex,
+      totals,
+    };
+  }
   return null;
+}
+
+function mapTableAmounts(line: string, table: PayrollTable): Array<PositionedAmount | null> {
+  const amounts = amountsInLine(line).filter(({ raw }) => !table.combinedEarnings || hasMoneyFormatting(raw));
+  if (!table.combinedEarnings) return mapAmountsToColumns(amounts, table.mappingColumns, table.columnTolerance);
+  const [, earningsStart, deductionsStart] = table.mappingColumns;
+  const mapped: Array<PositionedAmount | null> = [null, null];
+  for (const amount of amounts) {
+    const amountEnd = amount.index + amount.raw.length;
+    const position = amountEnd <= earningsStart! ? -1 : amountEnd <= deductionsStart! ? 0 : 1;
+    if (position < 0 || Math.abs(amountEnd - table.columns[position]!) > 16) continue;
+    const current = mapped[position];
+    if (!current || Math.abs(amountEnd - table.columns[position]!)
+      < Math.abs(current.index + current.raw.length - table.columns[position]!)) mapped[position] = amount;
+  }
+  return mapped;
 }
 
 function extractTotalsTable(table: PayrollTable | null): {
   deductions: Amount;
   gross: Amount;
-  nonRemunerative: Amount;
-  remunerative: Amount;
+  nonRemunerative?: Amount;
+  remunerative?: Amount;
 } | null {
   if (!table) return null;
+  if (table.combinedEarnings) {
+    const [gross, deductions] = table.totals;
+    if (!gross || !deductions || gross.value.startsWith('-')) return null;
+    return {
+      deductions: { ...deductions, confidence: 0.84 },
+      gross: { ...gross, confidence: 0.84 },
+    };
+  }
   const [remunerative, nonRemunerative, deductions] = table.totals;
   if (!remunerative || !nonRemunerative || !deductions) return null;
   const gross = addAmounts(remunerative.value, nonRemunerative.value);
@@ -662,6 +753,36 @@ function extractTotalsTable(table: PayrollTable | null): {
     nonRemunerative: { ...nonRemunerative, confidence: 0.84 },
     remunerative: { ...remunerative, confidence: 0.84 },
   };
+}
+
+function extractTableBasic(lines: string[], table: PayrollTable | null): Amount | null {
+  if (!table) return null;
+  for (let index = table.headerIndex + 1; index < table.totalIndex; index += 1) {
+    const line = lines[index] ?? '';
+    if (!basicAmountLabels.some((label) => label.test(fold(line)))) continue;
+    const mapped = mapTableAmounts(line, table);
+    const basic = table.combinedEarnings ? mapped[0] : mapped[0] ?? mapped[1];
+    if (basic) return { ...basic, confidence: 0.86 };
+  }
+  return null;
+}
+
+function extractStackedAmount(lines: string[], labels: RegExp[], table: PayrollTable | null): Amount | null {
+  if (!table?.combinedEarnings) return null;
+  const anchor = table.columns.at(-1)!;
+  const boundaries = [...remunerativeAmountLabels, ...nonRemunerativeAmountLabels, ...deductionAmountLabels, ...netAmountLabels];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!labels.some((label) => label.test(fold(lines[index] ?? '')))) continue;
+    for (let row = index; row < Math.min(lines.length, index + 6); row += 1) {
+      const line = lines[row] ?? '';
+      if (row > index && boundaries.some((label) => label.test(fold(line)))) break;
+      const amounts = amountsInLine(line).filter((amount) =>
+        hasMoneyFormatting(amount.raw)
+        && Math.abs(amount.index + amount.raw.length - anchor) <= table.columnTolerance);
+      if (amounts.length === 1) return { ...amounts[0]!, confidence: 0.82 };
+    }
+  }
+  return null;
 }
 
 function settlementType(text: string): PayrollExtraction['settlementType'] {
@@ -703,7 +824,7 @@ const concepts: Array<{
   { code: 'REIMBURSEMENT', pattern: /\b(?:reintegros?|devoluciones?|creditos?|ajustes?\s+a\s+favor)\b/, recurring: false, type: 'EARNING' },
   { code: 'SENIORITY', pattern: /antiguedad/, recurring: true, type: 'EARNING' },
   { code: 'ATTENDANCE', pattern: /presentismo/, recurring: true, type: 'EARNING' },
-  { code: 'BASIC_SALARY', pattern: /sueldo\s+basico/, recurring: true, type: 'EARNING' },
+  { code: 'BASIC_SALARY', pattern: /(?:sueldo\s+basico|salario\s+base|basico\s+convenio)/, recurring: true, type: 'EARNING' },
 ];
 
 function lineDescription(line: string, end: number): string | null {
@@ -717,12 +838,11 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
     for (let index = table.headerIndex; index < table.totalIndex; index += 1) {
       const line = lines[index] ?? '';
       const normalized = fold(line);
-      const amounts = amountsInLine(line);
-      const mapped = mapAmountsToColumns(amounts, table.columns);
+      const mapped = mapTableAmounts(line, table);
       const rawDescription = lineDescription(line, table.descriptionEnd);
       if (!rawDescription) continue;
       const concept = concepts.find(({ pattern }) => pattern.test(normalized));
-      const deduction = mapped[2];
+      const deduction = mapped[table.combinedEarnings ? 1 : 2];
       if (deduction) {
         items.push({
           amount: deduction.value,
@@ -735,7 +855,7 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
         continue;
       }
       if (concept?.type === 'DEDUCTION') continue;
-      const earning = mapped[0] ?? mapped[1];
+      const earning = table.combinedEarnings ? mapped[0] : mapped[0] ?? mapped[1];
       if (!earning) continue;
       items.push({
         amount: earning.value,
@@ -787,6 +907,12 @@ function totalsBalance(gross: Amount | null, deductions: Amount | null, net: Amo
   return Boolean(gross && deductions && net && subtractAmounts(gross.value, deductions.value) === net.value);
 }
 
+function componentsBalance(gross: Amount | null, remunerative: Amount | null, nonRemunerative: Amount | null): boolean {
+  if (!remunerative && !nonRemunerative) return true;
+  return Boolean(gross && remunerative && nonRemunerative
+    && addAmounts(remunerative.value, nonRemunerative.value) === gross.value);
+}
+
 export function payrollExtractionNeedsReview(extraction: PayrollExtraction): boolean {
   if (!extraction.payrollPeriod || !/^20\d{2}-(0[1-9]|1[0-2])$/.test(extraction.payrollPeriod)) return true;
   const amount = (value: string | null, allowNegative = false): Amount | null => value
@@ -796,10 +922,14 @@ export function payrollExtractionNeedsReview(extraction: PayrollExtraction): boo
   const gross = amount(extraction.grossAmount);
   const net = amount(extraction.netAmount);
   const deductions = amount(extraction.deductionsAmount, true);
+  const remunerative = amount(extraction.remunerativeAmount, true);
+  const nonRemunerative = amount(extraction.nonRemunerativeAmount, true);
   if (!gross || !net || !deductions || extraction.lineItems.some((item) => !/^-?\d{1,18}\.\d{2}$/.test(item.amount))) {
     return true;
   }
-  return !totalsBalance(gross, deductions, net) || !deductionsMatchTotal(extraction.lineItems, deductions);
+  return !totalsBalance(gross, deductions, net)
+    || !componentsBalance(gross, remunerative, nonRemunerative)
+    || !deductionsMatchTotal(extraction.lineItems, deductions);
 }
 
 function hasAmountLabel(lines: string[], labels: RegExp[]): boolean {
@@ -821,17 +951,33 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
   const period = extractPeriod(text);
   const payrollTable = findPayrollTable(lines);
-  const table = extractTotalsTable(payrollTable);
-  const basic = extractAmount(lines, basicAmountLabels);
-  const gross = table?.gross ?? extractAmount(lines, grossAmountLabels) ?? null;
-  const remunerative = table?.remunerative ?? null;
-  const nonRemunerative = table?.nonRemunerative ?? null;
-  const deductions = table?.deductions ?? extractAmount(lines, deductionAmountLabels) ?? null;
+  const tableTotals = extractTotalsTable(payrollTable);
+  const linesOutsideTable = payrollTable
+    ? lines.map((line, index) => index >= payrollTable.headerIndex && index < payrollTable.totalIndex ? '' : line)
+    : lines;
+  const basic = extractTableBasic(lines, payrollTable) ?? extractAmount(linesOutsideTable, basicAmountLabels);
+  const remunerative = tableTotals?.remunerative
+    ?? extractStackedAmount(lines, remunerativeAmountLabels, payrollTable);
+  const nonRemunerative = tableTotals?.nonRemunerative
+    ?? extractStackedAmount(lines, nonRemunerativeAmountLabels, payrollTable);
+  const summarizedGrossValue = remunerative && nonRemunerative
+    ? addAmounts(remunerative.value, nonRemunerative.value)
+    : null;
+  const summarizedGross = summarizedGrossValue && !summarizedGrossValue.startsWith('-') ? {
+    confidence: 0.8,
+    raw: `${remunerative!.raw} + ${nonRemunerative!.raw}`,
+    source: 'RULE' as const,
+    value: summarizedGrossValue,
+  } : null;
+  const gross = tableTotals?.gross ?? extractAmount(lines, grossAmountLabels) ?? summarizedGross;
+  const deductions = tableTotals?.deductions ?? extractAmount(lines, deductionAmountLabels) ?? null;
   const netLabelFound = hasAmountLabel(lines, netAmountLabels);
-  const derivedNet = table && netLabelFound ? subtractAmounts(table.gross.value, table.deductions.value) : null;
+  const derivedNet = payrollTable && gross && deductions && netLabelFound
+    ? subtractAmounts(gross.value, deductions.value)
+    : null;
   const net = extractAmount(lines, netAmountLabels) ?? (derivedNet ? {
     confidence: 0.8,
-    raw: `${table!.gross.raw} - ${table!.deductions.raw}`,
+    raw: `${gross!.raw} - ${deductions!.raw}`,
     source: 'RULE' as const,
     value: derivedNet,
   } : null);
@@ -850,13 +996,15 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
   else fields.push(missingField('settlement.payrollPeriod', /\b(?:periodo(?:\s+de\s+liquidacion)?|mes)\b/.test(fold(text))));
   if (employer) fields.push({ confidence: employer.confidence, fieldPath: 'employer.name', interpretedValue: employer.value, rawValue: employer.raw, source });
   else fields.push(missingField('employer.name', lines.some((line) => /^\s*(?:empleador|razon\s+social|empresa)\s*[:\-]/.test(fold(line)))));
+  const splitTable = Boolean(payrollTable && !payrollTable.combinedEarnings);
   for (const [fieldPath, amount, labelFound] of [
     ['settlement.basicAmount', basic, hasAmountLabel(lines, basicAmountLabels)],
-    ['settlement.grossAmount', gross, Boolean(payrollTable) || hasAmountLabel(lines, grossAmountLabels)],
+    ['settlement.grossAmount', gross, Boolean(tableTotals?.gross) || hasAmountLabel(lines, grossAmountLabels)
+      || (hasAmountLabel(lines, remunerativeAmountLabels) && hasAmountLabel(lines, nonRemunerativeAmountLabels))],
     ['settlement.netAmount', net, netLabelFound],
-    ['settlement.remunerativeAmount', remunerative, Boolean(payrollTable)],
-    ['settlement.nonRemunerativeAmount', nonRemunerative, Boolean(payrollTable)],
-    ['settlement.deductionsAmount', deductions, Boolean(payrollTable) || hasAmountLabel(lines, deductionAmountLabels)],
+    ['settlement.remunerativeAmount', remunerative, splitTable || hasAmountLabel(lines, remunerativeAmountLabels)],
+    ['settlement.nonRemunerativeAmount', nonRemunerative, splitTable || hasAmountLabel(lines, nonRemunerativeAmountLabels)],
+    ['settlement.deductionsAmount', deductions, Boolean(tableTotals?.deductions) || hasAmountLabel(lines, deductionAmountLabels)],
   ] as const) {
     if (amount) {
       fields.push({
@@ -882,6 +1030,7 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
     grossAmount: gross?.value ?? null,
     lineItems,
     needsReview: !period || !gross || !net || !deductions || !totalsBalance(gross, deductions, net)
+      || !componentsBalance(gross, remunerative, nonRemunerative)
       || !deductionsMatchTotal(lineItems, deductions),
     netAmount: net?.value ?? null,
     nonRemunerativeAmount: nonRemunerative?.value ?? null,

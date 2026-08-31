@@ -45,7 +45,7 @@ import {
 } from './storage.ts';
 
 const QUEUE_NAME = 'salarivo:processing-jobs:documents';
-const WORKER_VERSION = '5';
+const WORKER_VERSION = '6';
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
 
 type WorkerConfig = {
