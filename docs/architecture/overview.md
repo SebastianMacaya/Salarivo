@@ -66,7 +66,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 
 ## Módulos de dominio
 
-- identity: usuarios internos, cuentas de autenticación, sesiones opacas, Google OIDC, MFA TOTP, step-up y recuperación;
+- identity: usuarios internos, cuentas de autenticación, sesiones opacas, actividad y cliente coarse de sesión, Google OIDC, MFA TOTP, step-up y recuperación;
 - employment: empleadores, relaciones laborales y eventos;
 - imports: sesiones, batches, items y progreso;
 - documents: metadata, lifecycle, seguridad y retención;
@@ -124,7 +124,7 @@ Recursos iniciales:
 
 | Recurso | Operaciones MVP |
 | --- | --- |
-| auth | alta e inicio/callback Google, onboarding, logout, revocación de otras sesiones, MFA y step-up |
+| auth | alta e inicio/callback Google, onboarding, logout, listado y revocación owner-only de sesiones, MFA y step-up |
 | upload-sessions | crear y confirmar upload |
 | imports | crear, consultar, recuperar el lote activo y cancelar uploads pendientes; pausa/reanudación quedan pendientes |
 | documents | listar, consultar, asociar masivamente a un empleo, corregir, cerrar revisión, eliminar y confirmar tipo; reproceso queda pendiente |
@@ -143,7 +143,7 @@ Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se 
 
 El comparable inicial es únicamente basicAmount de una liquidación `NORMAL` recurrente verificada; falta o ambigüedad devuelven N/D. Dinero y porcentajes se calculan con BigInt/decimal exacto y variación compuesta, no con FLOAT ni suma de porcentajes. El agregado incluye remunerativo/no remunerativo, categorías anuales, totales normalizados y posibles duplicados sujetos a confirmación; nunca expone categorías ni descripciones crudas de deducciones minimizadas.
 
-La cobertura usa los límites confirmados del empleo cuando existen y, en una detección, sólo el rango observado; los huecos son siempre `possibleMissingPeriods`. Sin un contexto laboral determinable no inventa rango ni faltantes. La lista de documentos se pagina con cursor estable y admite filtros owner-only por búsqueda, año, empleo, estado, clase y tipo de liquidación.
+La cobertura usa los límites confirmados del empleo cuando existen y, en una detección, sólo el rango observado; los huecos son siempre `possibleMissingPeriods`. Sin un contexto laboral determinable no inventa rango ni faltantes. La lista de documentos devuelve total y revisión pendiente bajo los mismos filtros owner-only, se pagina con cursor opaco que conserva la precisión del timestamp y admite búsqueda, año/período, empleo, estado/grupo, clase y tipo de liquidación. `UNSUPPORTED` es una categoría de consulta sobre clasificación/estado, no un `document_type` persistido.
 
 La decisión, sus alternativas y el límite deliberado de IPC están en el [ADR 0013](../adr/0013-derived-salary-history-analytics.md).
 
@@ -154,6 +154,8 @@ Google usa OIDC Authorization Code con PKCE, `state` y `nonce`; el callback es `
 La respuesta válida se resuelve por `(provider, sub)` en `auth_accounts`. El email recibido es un atributo verificable del perfil, no una clave de login ni de vinculación: una colisión nunca auto-vincula una cuenta. No se persisten access, refresh ni ID tokens. Google termina en el UUID y la sesión opaca interna ya usados por los guards y por ownership.
 
 Para una identidad nueva, el callback deja un onboarding pendiente, pero no crea una cuenta activa. El segundo paso crea usuario, aceptación legal, `auth_account`, sesión y auditoría en una única transacción. `BLOCKED` y `SUSPENDED` fallan cerrados. En una cuenta Google-only, el step-up inicia otra autorización con selección explícita de la misma cuenta, ligada a la sesión actual, y rota esa sesión cuando termina; la persona también puede revocar el resto de sus sesiones. [ADR 0010](../adr/0010-google-oidc-and-external-identities.md) conserva sin cambios el modelo de ownership.
+
+El titular puede listar sus sesiones activas y revocar una distinta de la actual o todas las demás. La API determina la sesión actual desde el token opaco ya autenticado y vuelve a validar ownership y step-up al revocar; nunca acepta un `userId` del navegador. La metadata visible se reduce a categorías allowlisted de dispositivo, navegador y sistema operativo, sin guardar user-agent crudo, versiones, IP, ubicación o fingerprint.
 
 ## Ports principales
 

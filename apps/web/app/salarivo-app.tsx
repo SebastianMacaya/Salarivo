@@ -1,16 +1,19 @@
 'use client';
 
-import { FormEvent, type KeyboardEvent, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, type KeyboardEvent, type MouseEvent, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { DocumentReview, type DocumentDetail, type ExtractedFieldDetail } from './document-review';
-import { readDocumentLocation, writeDocumentLocation } from './document-evidence';
+import { fetchDocumentPrefix, readDocumentLocation, writeDocumentLocation, type CursorDocumentPage } from './document-evidence';
 import {
+  dateLabel,
+  documentStatusLabel,
   money,
   percentage,
   periodLabel,
   recentPeriodRange,
   salaryCategories,
   settlementTypeLabel,
+  timestampLabel,
   type SalaryCategory,
 } from './format';
 import { mfaQrDataUrl } from './mfa-qr';
@@ -32,7 +35,13 @@ type User = {
   onboardingCompleted: boolean;
   authMethods: 'GOOGLE'[];
 };
-type MfaStatus = { enabled: boolean; pendingEnrollment: boolean; recoveryCodesRemaining: number };
+type MfaStatus = {
+  enabled: boolean;
+  enabledAt: string | null;
+  method: string | null;
+  pendingEnrollment: boolean;
+  recoveryCodesRemaining: number;
+};
 type MfaEnrollmentResult = { secret: string; otpauthUri: string; expiresAt: string };
 type DeletionReceipt = { id: string; status: 'PENDING' | 'COMPLETED'; requestedAt: string; completedAt: string | null };
 type DeletionReceiptEntry = { token: string; source: 'accepted' | 'ambiguous' | 'lookup' };
@@ -70,6 +79,26 @@ type DocumentItem = {
   originalAvailable?: boolean;
   needsReview?: boolean;
   errorCode?: string | null;
+};
+type DocumentPage = CursorDocumentPage<DocumentItem>;
+type AuthSession = {
+  browser: string;
+  createdAt: string;
+  current: boolean;
+  deviceType: string;
+  expiresAt: string;
+  id: string;
+  lastSeenAt: string;
+  operatingSystem: string;
+};
+type ExportJob = {
+  completedAt: string | null;
+  createdAt: string;
+  downloadUrl?: string | null;
+  expiresAt: string | null;
+  id: string;
+  startedAt: string | null;
+  status: string;
 };
 type SalaryAmounts = {
   basicAmount: string | null;
@@ -267,13 +296,6 @@ async function downloadApiFile(path: string, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-function shortDate(value?: string | null) {
-  if (!value) return 'Actualidad';
-  return new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium' }).format(
-    new Date(`${value.slice(0, 10)}T12:00:00`),
-  );
-}
-
 function apiUrl(path: string) {
   return path.startsWith('/api/v1/') ? `${API_ROOT}${path.slice('/api/v1'.length)}` : path;
 }
@@ -357,28 +379,6 @@ function handleDialogKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
   }
 }
 
-const statusLabels: Record<string, string> = {
-  UPLOADED: 'Recibido',
-  SECURITY_VALIDATION: 'Validando seguridad',
-  DOCUMENT_CLASSIFICATION: 'Clasificando',
-  TEXT_EXTRACTION: 'Extrayendo texto',
-  OCR: 'Leyendo imagen',
-  PARSING: 'Interpretando',
-  NORMALIZATION: 'Normalizando',
-  VALIDATION: 'Validando datos',
-  PROCESSING: 'Procesando',
-  NEEDS_REVIEW: 'Requiere revisión',
-  NEEDS_TYPE_CONFIRMATION: 'Confirmar tipo',
-  COMPLETED: 'Listo',
-  DUPLICATE: 'Duplicado',
-  QUARANTINED: 'En cuarentena',
-  FAILED_RETRYABLE: 'Reintentando',
-  FAILED_PERMANENT: 'No procesado',
-  REJECTED_UNSUPPORTED: 'Tipo no soportado',
-  RETRY_SCHEDULED: 'Reintento programado',
-  CANCELLED: 'Cancelado',
-  DELETED: 'Eliminado',
-};
 const associationReadyStatuses = new Set([
   'COMPLETED', 'NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION', 'REJECTED_UNSUPPORTED',
   'QUARANTINED', 'FAILED_PERMANENT', 'CANCELLED',
@@ -391,12 +391,18 @@ const historyTabs = [
   ['concepts', 'Conceptos'],
   ['documents', 'Documentos'],
 ] as const;
-const documentFilterStatuses = [
-  ['COMPLETED', 'Listos'],
-  ['NEEDS_REVIEW', 'Requieren revisión'],
-  ['NEEDS_TYPE_CONFIRMATION', 'Requieren confirmar tipo'],
-  ['REJECTED_UNSUPPORTED', 'No soportados'],
-  ['FAILED_PERMANENT', 'Con error'],
+type HistoryTab = (typeof historyTabs)[number][0];
+const documentStatusGroups = [
+  ['ALL', 'Todos'],
+  ['READY', 'Listos'],
+  ['REVIEW', 'Para revisar'],
+  ['PROCESSING', 'Procesando'],
+  ['ERROR', 'Con error'],
+] as const;
+const documentKinds = [
+  ['ALL', 'Todos'],
+  ['PAYROLL', 'Recibos'],
+  ['UNSUPPORTED', 'No soportados'],
 ] as const;
 const evolutionRanges = [
   ['6', '6 meses', 6],
@@ -596,7 +602,7 @@ function DeletionReceiptScreen({ entry, onDone }: { entry: DeletionReceiptEntry;
         <h2 id="deletion-receipt-title">Comprobante de eliminación</h2>
         <p>Guardá este token hasta que el estado figure como completado. Se muestra una sola vez.</p>
         <code>{token}</code>
-        <p className={receipt?.status === 'COMPLETED' ? 'message success' : 'message'}>Estado: <strong>{receipt ? receipt.status === 'COMPLETED' ? 'Completado' : 'Pendiente' : 'Sin confirmar'}</strong>{receipt?.completedAt ? ` · ${shortDate(receipt.completedAt)}` : ''}</p>
+        <p className={receipt?.status === 'COMPLETED' ? 'message success' : 'message'}>Estado: <strong>{receipt ? receipt.status === 'COMPLETED' ? 'Completado' : 'Pendiente' : 'Sin confirmar'}</strong>{receipt?.completedAt ? ` · ${timestampLabel(receipt.completedAt)}` : ''}</p>
         {error && <p className="message error" role="alert">{error}</p>}
         {!receipt && entry.source !== 'accepted' && <p>Si el token sigue sin aparecer, el pedido puede no haber llegado. Volvé al ingreso y solicitá la baja nuevamente.</p>}
         <button className="button primary" disabled={busy} onClick={refresh}>{busy ? 'Consultando…' : 'Actualizar estado'}</button>
@@ -675,7 +681,7 @@ function MfaEnrollment({ pending = false, onComplete }: { pending?: boolean; onC
         <img className="mfa-qr" src={mfaQrDataUrl(enrollment.otpauthUri)} alt="Código QR para agregar Salarivo a una aplicación autenticadora" width={220} height={220} />
         <p>También podés ingresar la clave manualmente:</p>
         <div className="mfa-secret"><code>{enrollment.secret}</code><button type="button" className="button compact" onClick={() => void copySecret()} aria-live="polite">{secretCopied ? 'Copiada' : 'Copiar clave'}</button></div>
-        <p><small>La configuración vence el {new Intl.DateTimeFormat('es-AR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(enrollment.expiresAt))}.</small></p>
+        <p><small>La configuración vence el {timestampLabel(enrollment.expiresAt)}.</small></p>
         <form className="stack-form" onSubmit={confirmEnrollment}>
           <label>Código de 6 dígitos<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required autoFocus /></label>
           {error && <p className="message error" role="alert">{error}</p>}
@@ -884,13 +890,13 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
   );
 }
 
-type Section = 'summary' | 'jobs' | 'import' | 'history' | 'privacy';
+type Section = 'summary' | 'jobs' | 'import' | 'history' | 'settings';
 const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'summary', label: 'Resumen', icon: '⌂' },
   { id: 'jobs', label: 'Empleos', icon: '▣' },
   { id: 'import', label: 'Importar', icon: '↑' },
   { id: 'history', label: 'Historial', icon: '≋' },
-  { id: 'privacy', label: 'Privacidad', icon: '◇' },
+  { id: 'settings', label: 'Configuración', icon: '⚙' },
 ];
 
 function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLogout, onDeletionRequested }: {
@@ -904,6 +910,7 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
   const [section, setSection] = useState<Section>('summary');
   const [menuOpen, setMenuOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [historyInitialTab, setHistoryInitialTab] = useState<HistoryTab>('summary');
   const stepUpGate = useRef<StepUpGate | null>(null);
   const stepUpReturnFocus = useRef<HTMLElement | null>(null);
   const [stepUpOpen, setStepUpOpen] = useState(false);
@@ -914,7 +921,10 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
 
   useEffect(() => {
     if (!readDocumentLocation(window.location.search)) return;
-    const timer = window.setTimeout(() => setSection('history'));
+    const timer = window.setTimeout(() => {
+      setHistoryInitialTab('documents');
+      setSection('history');
+    });
     return () => window.clearTimeout(timer);
   }, []);
 
@@ -924,6 +934,11 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
     window.addEventListener('beforeunload', protect);
     return () => window.removeEventListener('beforeunload', protect);
   }, [importBusy]);
+
+  const navigate = useCallback((nextSection: Section, initialTab: HistoryTab = 'summary') => {
+    if (nextSection === 'history') setHistoryInitialTab(initialTab);
+    setSection(nextSection);
+  }, []);
 
   const runSensitive = useCallback<RunSensitive>(async (action) => {
     const callerFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -963,7 +978,7 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
       <aside className={menuOpen ? 'sidebar open' : 'sidebar'} inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
         <div className="sidebar-head"><Brand /><button className="icon-button mobile-only" onClick={() => setMenuOpen(false)} aria-label="Cerrar menú">×</button></div>
         <nav aria-label="Navegación principal">
-          {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} disabled={importBusy} onClick={() => { setSection(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
+          {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} disabled={importBusy} onClick={() => { navigate(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
           {user.role === 'ADMIN' && <Link className="nav-item" href="/admin" aria-disabled={importBusy} tabIndex={importBusy ? -1 : undefined} onClick={(event: MouseEvent<HTMLAnchorElement>) => { if (importBusy) event.preventDefault(); }}><span aria-hidden="true">⚙</span>Administración</Link>}
         </nav>
         {logoutError && <p className="message error" role="alert">{logoutError}</p>}
@@ -977,11 +992,11 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
       <main className="content" inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
         <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú">☰</button><Brand /></header>
         {authNotice && <p className="message success" aria-live="polite">{authNotice} <button type="button" className="text-button" onClick={onAuthNoticeDismiss}>Cerrar</button></p>}
-        {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={setSection} />}
+        {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={navigate} />}
         {section === 'jobs' && <Employments key={refreshKey} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={runSensitive} />}
         {section === 'import' && <Importer onBusyChange={setImportBusy} onDone={() => setRefreshKey((n) => n + 1)} />}
-        {section === 'history' && <History key={refreshKey} runSensitive={runSensitive} />}
-        {section === 'privacy' && <Privacy user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
+        {section === 'history' && <History key={refreshKey} initialTab={historyInitialTab} runSensitive={runSensitive} />}
+        {section === 'settings' && <Settings user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
       </main>
       {stepUpOpen && <StepUpDialog
         mfaEnabled={Boolean(user.mfaEnabled)}
@@ -1192,54 +1207,80 @@ function AnnualHistory({ rows, scope, category }: { rows: AnnualSalarySummary[];
   })}</div>;
 }
 
-function Summary({ user, onNavigate }: { user: User; onNavigate: (section: Section) => void }) {
+function Summary({ user, onNavigate }: { user: User; onNavigate: (section: Section, initialTab?: HistoryTab) => void }) {
   const [history, setHistory] = useState<SalaryHistory | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [documentTotal, setDocumentTotal] = useState(0);
+  const [pendingReview, setPendingReview] = useState(0);
   const [selectedScopeKey, setSelectedScopeKey] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [documentsLoading, setDocumentsLoading] = useState(true);
+  const [historyError, setHistoryError] = useState('');
+  const [documentError, setDocumentError] = useState('');
 
-  const load = useCallback(async () => {
-    setLoading(true); setError('');
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true); setHistoryError('');
     try {
-      const [salaryHistory, recent] = await Promise.all([
-        api<SalaryHistory>('/salary-history'),
-        api<DocumentItem[]>('/documents?limit=5'),
-      ]);
-      setHistory(salaryHistory); setDocuments(recent);
+      const salaryHistory = await api<SalaryHistory>('/salary-history');
+      setHistory(salaryHistory);
       setSelectedScopeKey((current) => retainedSalaryScopeKey(current, salaryHistory));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'No pudimos cargar el resumen.');
-    } finally { setLoading(false); }
+      setHistoryError(caught instanceof Error ? caught.message : 'No pudimos cargar el análisis salarial.');
+    } finally { setHistoryLoading(false); }
   }, []);
-  useEffect(() => { void Promise.resolve().then(load); }, [load]);
+  const loadDocuments = useCallback(async () => {
+    setDocumentsLoading(true); setDocumentError('');
+    try {
+      const page = await api<DocumentPage>('/documents?limit=5');
+      setDocuments(page.items); setDocumentTotal(page.total); setPendingReview(page.pendingReview);
+    } catch (caught) {
+      setDocumentError(caught instanceof Error ? caught.message : 'No pudimos cargar los documentos recientes.');
+    } finally { setDocumentsLoading(false); }
+  }, []);
+  useEffect(() => { void Promise.resolve().then(loadHistory); }, [loadHistory]);
+  useEffect(() => { void Promise.resolve().then(loadDocuments); }, [loadDocuments]);
 
   const selectedScopeIndex = history?.contexts.findIndex((context) => salaryScopeKey(context) === selectedScopeKey) ?? -1;
   const context = history?.contexts[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
   const scope = history?.analytics.scopes[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
 
   return (
-    <div className="page" aria-busy={loading}>
+    <div className="page" aria-busy={historyLoading || documentsLoading}>
       <PageHeader eyebrow="Resumen personal" title={`Hola, ${user.displayName?.split(' ')[0] || 'bienvenido'}`} action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />
-      {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
-      {loading && !history && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando tu historial salarial…</p></div>}
+      {historyError && <p className="message error" role="alert">{historyError} <button type="button" className="text-button" disabled={historyLoading} onClick={() => void loadHistory()}>{historyLoading ? 'Reintentando…' : 'Reintentar análisis'}</button></p>}
+      {historyLoading && !history && <div className="empty-state salary-loading" role="status"><div className="loader" aria-hidden="true" /><p>Cargando tu historial salarial…</p></div>}
       {history && context && scope ? <>
         <SalaryScopeControl history={history} selectedKey={selectedScopeKey} onChange={setSelectedScopeKey} id="summary-salary-scope" />
         <SalaryContextNotice context={context} />
         <SalaryMetricGrid scope={scope} context={context} />
-        <div className="dashboard-grid">
-          <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto reciente</h2></div><button className="text-button" onClick={() => onNavigate('history')}>Analizar historial</button></div><SalaryEvolution scope={scope} limit={12} /></section>
-          <section className="panel recent-panel"><div className="panel-heading"><div><p className="eyebrow">Actividad</p><h2>Documentos recientes</h2></div><button className="text-button" onClick={() => onNavigate('history')}>Ver todos</button></div><p className="coverage-note">{history.coverage.documents} documentos · {history.coverage.pendingReviewDocuments} para revisar · {history.coverage.activeEmployments} empleos activos</p>{documents.length ? <ul className="recent-list">{documents.map((document) => <li key={document.id}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{document.payrollPeriod ? periodLabel(document.payrollPeriod) : shortDate(document.createdAt)}</small></span><Status value={document.processingStatus} /></li>)}</ul> : <EmptyState title="Sin documentos" body="Tus recibos importados aparecerán acá." />}</section>
-        </div>
-      </> : history && !loading && <EmptyState title="Todavía no hay datos salariales" body="Importá un recibo soportado y completá su revisión para construir el historial." action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />}
+      </> : history && !historyLoading && <EmptyState title="Todavía no hay datos salariales" body="Importá un recibo soportado y completá su revisión para construir el historial." action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />}
+      <div className="dashboard-grid summary-documents-grid">
+        {history && context && scope && <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto reciente</h2></div><button className="text-button" onClick={() => onNavigate('history', 'summary')}>Analizar historial</button></div><SalaryEvolution scope={scope} limit={12} /></section>}
+        <section className="panel recent-panel" aria-busy={documentsLoading}>
+          <div className="panel-heading"><h2>Documentos recientes</h2><button className="text-button" onClick={() => onNavigate('history', 'documents')}>Ver todos</button></div>
+          {!documentsLoading && !documentError && <p className="coverage-note">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {pendingReview} para revisar</p>}
+          {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void loadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
+          {documentsLoading && !documents.length ? <div className="compact-loading" role="status"><div className="loader" aria-hidden="true" /><span>Cargando documentos…</span></div> : documents.length ? <>
+            <ul className="recent-list">{documents.map((document) => {
+              const name = documentName(document);
+              return <li key={document.id}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{document.payrollPeriod ? `${document.employerName || 'Sin empresa asociada'} · Período: ${periodLabel(document.payrollPeriod)}` : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED' ? 'Documento no soportado' : 'Tipo pendiente de clasificación'}</small><small>Subido {timestampLabel(document.createdAt)}</small></span><DocumentStatusBadges document={document} /></li>;
+            })}</ul>
+            <p className="recent-count">Mostrando últimos {documents.length} de {documentTotal}</p>
+          </> : !documentError && <EmptyState title="Sin documentos" body="Todavía no importaste ningún documento." action={<button className="button secondary" onClick={() => onNavigate('import')}>Importar</button>} />}
+        </section>
+      </div>
     </div>
   );
 }
 
 function Status({ value }: { value: string }) {
   const risky = /FAILED|QUARANTINED|REJECTED|CANCELLED/.test(value);
-  const pending = /UPLOADED|VALIDATION|PROCESSING|RETRY|CLASSIFICATION|EXTRACTION|OCR|PARSING|NORMALIZATION|NEEDS_REVIEW|NEEDS_TYPE_CONFIRMATION/.test(value);
-  return <span className={`status ${risky ? 'danger' : pending ? 'pending' : 'ready'}`}>{statusLabels[value] ?? value}</span>;
+  const pending = /CREATED|UPLOADED|VALIDATION|PROCESSING|RETRY|CLASSIFICATION|EXTRACTION|OCR|PARSING|NORMALIZATION|NEEDS_REVIEW|NEEDS_TYPE_CONFIRMATION/.test(value);
+  return <span className={`status ${value === 'DUPLICATE' ? 'duplicate' : risky ? 'danger' : pending ? 'pending' : 'ready'}`}>{documentStatusLabel(value)}</span>;
+}
+
+function DocumentStatusBadges({ document }: { document: DocumentItem }) {
+  return <span className="document-badges"><Status value={document.processingStatus} />{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
 }
 
 function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSensitive: RunSensitive }) {
@@ -1357,7 +1398,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
         </section>}
         <section aria-label="Empleos confirmados">
           {detections.length > 0 && <div className="panel-heading"><div><p className="eyebrow">Trayectoria confirmada</p><h2>Empleos confirmados</h2></div></div>}
-          {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p></div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{shortDate(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{shortDate(item.endDate)}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />}
+          {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p></div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" onClick={() => setEditing('new')}>Agregar empleo</button>} />}
         </section>
       </div>
       {editing && <div className="modal-layer" role="presentation" onMouseDown={() => setEditing(null)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => setEditing(null))} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" onClick={() => setEditing(null)} aria-label="Cerrar">×</button></div><form className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><label>Moneda<select name="currencyCode" defaultValue={editing === 'new' ? 'ARS' : editing.currencyCode}><option value="ARS">ARS — Peso argentino</option><option value="USD">USD — Dólar</option><option value="EUR">EUR — Euro</option></select></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setEditing(null)}>Cancelar</button><button className="button primary">Guardar</button></div></form></section></div>}
@@ -1368,7 +1409,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
             <label>Empresa<input value={confirmation.employerName} readOnly /></label>
             <div className="field-row"><label>Moneda<input value={confirmation.currencyCode} readOnly /></label><label>Documentos detectados<input value={confirmation.documentCount} readOnly /></label></div>
             <p id="employment-confirmation-description">Detectamos recibos entre {periodLabel(confirmation.firstPeriod)} y {periodLabel(confirmation.lastPeriod)}. El último recibo no implica que el empleo haya finalizado.</p>
-            {matchingEmployments.length > 0 && <label>Asociar a<select name="employmentId" defaultValue={matchingEmployments.length === 1 ? matchingEmployments[0]!.id : ''} required autoFocus><option value="" disabled>Elegí un empleo</option>{matchingEmployments.map((item) => <option key={item.id} value={item.id}>{item.employerName}{item.role ? ` · ${item.role}` : ''} · desde {shortDate(item.startDate)}</option>)}<option value="new">Crear otro empleo</option></select><small>Al elegir uno existente se conservan sus fechas y datos.</small></label>}
+            {matchingEmployments.length > 0 && <label>Asociar a<select name="employmentId" defaultValue={matchingEmployments.length === 1 ? matchingEmployments[0]!.id : ''} required autoFocus><option value="" disabled>Elegí un empleo</option>{matchingEmployments.map((item) => <option key={item.id} value={item.id}>{item.employerName}{item.role ? ` · ${item.role}` : ''} · desde {dateLabel(item.startDate)}</option>)}<option value="new">Crear otro empleo</option></select><small>Al elegir uno existente se conservan sus fechas y datos.</small></label>}
             <div className="field-row"><label>{matchingEmployments.length ? 'Inicio (si creás otro)' : 'Inicio'}<input name="startDate" type="date" defaultValue={`${confirmation.firstPeriod}-01`} required autoFocus={!matchingEmployments.length} /></label><label>Fin (opcional)<input name="endDate" type="date" /></label></div>
             {confirmationError && <p className="message error" role="alert">{confirmationError}</p>}
             <div className="modal-actions"><button type="button" className="button secondary" disabled={confirming} onClick={closeConfirmation}>Cancelar</button><button className="button primary" disabled={confirming}>{confirming ? 'Confirmando…' : matchingEmployments.length ? 'Asociar recibos' : 'Confirmar empleo'}</button></div>
@@ -1518,7 +1559,7 @@ function Importer({ onBusyChange, onDone }: { onBusyChange: (busy: boolean) => v
   );
 }
 
-function History({ runSensitive }: { runSensitive: RunSensitive }) {
+function History({ initialTab = 'summary', runSensitive }: { initialTab?: HistoryTab; runSensitive: RunSensitive }) {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [history, setHistory] = useState<SalaryHistory | null>(null);
   const [employments, setEmployments] = useState<Employment[]>([]);
@@ -1527,7 +1568,7 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const [associating, setAssociating] = useState(false);
   const [selected, setSelected] = useState<DocumentItem | null>(null);
   const [detail, setDetail] = useState<DocumentDetail | null>(null);
-  const [tab, setTab] = useState<'summary' | 'evolution' | 'annual' | 'concepts' | 'documents'>('summary');
+  const [tab, setTab] = useState<HistoryTab>(initialTab);
   const [selectedScopeKey, setSelectedScopeKey] = useState('');
   const [yearFilter, setYearFilter] = useState('all');
   const [evolutionRange, setEvolutionRange] = useState<(typeof evolutionRanges)[number][0]>('12');
@@ -1543,17 +1584,22 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const [conceptLoadingMore, setConceptLoadingMore] = useState(false);
   const [conceptError, setConceptError] = useState('');
   const [conceptReloadKey, setConceptReloadKey] = useState(0);
-  const [documentKind, setDocumentKind] = useState<'PAYROLL' | 'UNSUPPORTED'>('PAYROLL');
+  const [documentKind, setDocumentKind] = useState<'ALL' | 'PAYROLL' | 'UNSUPPORTED'>('ALL');
   const [documentSearchDraft, setDocumentSearchDraft] = useState('');
   const [documentSearch, setDocumentSearch] = useState('');
   const [documentYearDraft, setDocumentYearDraft] = useState('');
   const [documentYear, setDocumentYear] = useState('all');
-  const [documentStatus, setDocumentStatus] = useState('all');
+  const [documentPeriod, setDocumentPeriod] = useState('');
   const [documentSettlementType, setDocumentSettlementType] = useState('all');
+  const [documentEmploymentId, setDocumentEmploymentId] = useState('all');
+  const [documentStatusGroup, setDocumentStatusGroup] = useState<(typeof documentStatusGroups)[number][0]>('ALL');
   const [documentsLoading, setDocumentsLoading] = useState(true);
   const [loadingMoreDocuments, setLoadingMoreDocuments] = useState(false);
-  const [hasMoreDocuments, setHasMoreDocuments] = useState(false);
+  const [documentCursor, setDocumentCursor] = useState<string | null>(null);
+  const [documentTotal, setDocumentTotal] = useState(0);
+  const [documentPendingReview, setDocumentPendingReview] = useState(0);
   const [documentError, setDocumentError] = useState('');
+  const [documentNavigationError, setDocumentNavigationError] = useState('');
   const [detailError, setDetailError] = useState('');
   const [detailReload, setDetailReload] = useState(0);
   const [preview, setPreview] = useState<{ documentId: string; expiresAt?: string; url: string } | null>(null);
@@ -1561,6 +1607,8 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   const [previewError, setPreviewError] = useState('');
   const previewRequested = useRef(false);
   const previewGeneration = useRef(0);
+  const documentRequestGeneration = useRef(0);
+  const loadedDocumentCount = useRef(0);
   const [openedFromList, setOpenedFromList] = useState(false);
   const [reviewBusy, setReviewBusy] = useState(false);
   const [reviewDirty, setReviewDirty] = useState(false);
@@ -1582,6 +1630,7 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
     setPreviewError('');
   }, []);
   useEffect(() => { activeDocumentId.current = selectedId; }, [selectedId]);
+  useEffect(() => { loadedDocumentCount.current = documents.length; }, [documents.length]);
   useEffect(() => {
     if (selected) return;
     opener.current?.focus();
@@ -1624,24 +1673,35 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
       setSelected((current) => current ? docs.find((document) => document.id === current.id) ?? current : null);
     }
   }, []);
-  const fetchDocumentPage = useCallback((cursor?: DocumentItem, limit = 100) => {
-    const query = new URLSearchParams({ limit: String(limit), documentType: documentKind });
+  const fetchDocumentPage = useCallback((cursor?: string, limit = 100) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (documentKind !== 'ALL') query.set('documentType', documentKind);
     if (documentSearch) query.set('search', documentSearch);
-    if (documentYear !== 'all' && documentKind === 'PAYROLL') query.set('year', documentYear);
-    if (documentStatus !== 'all') query.set('processingStatus', documentStatus);
-    if (documentSettlementType !== 'all' && documentKind === 'PAYROLL') query.set('settlementType', documentSettlementType);
-    if (cursor) { query.set('before', cursor.createdAt); query.set('beforeId', cursor.id); }
-    return api<DocumentItem[]>(`/documents?${query}`);
-  }, [documentKind, documentSearch, documentYear, documentStatus, documentSettlementType]);
+    if (documentYear !== 'all') query.set('year', documentYear);
+    if (documentPeriod) query.set('period', documentPeriod);
+    if (documentSettlementType !== 'all' && documentKind !== 'UNSUPPORTED') query.set('settlementType', documentSettlementType);
+    if (documentEmploymentId !== 'all') query.set('employmentId', documentEmploymentId);
+    if (documentStatusGroup !== 'ALL') query.set('statusGroup', documentStatusGroup);
+    if (cursor) query.set('cursor', cursor);
+    return api<DocumentPage>(`/documents?${query}`);
+  }, [documentEmploymentId, documentKind, documentPeriod, documentSearch, documentSettlementType, documentStatusGroup, documentYear]);
   const reloadDocuments = useCallback(async (silent = false) => {
-    if (!silent) setDocumentsLoading(true);
+    const generation = ++documentRequestGeneration.current;
+    setLoadingMoreDocuments(false);
+    setDocumentNavigationError('');
+    if (!silent) {
+      setDocumentsLoading(true); setDocuments([]); setDocumentCursor(null);
+    }
     setDocumentError('');
     try {
-      const docs = await fetchDocumentPage();
-      applyDocuments(docs); setHasMoreDocuments(docs.length === 100);
+      const page = await fetchDocumentPrefix(fetchDocumentPage, silent ? Math.max(100, loadedDocumentCount.current) : 100);
+      if (generation !== documentRequestGeneration.current) return;
+      applyDocuments(page.items);
+      setDocumentCursor(page.nextCursor); setDocumentTotal(page.total); setDocumentPendingReview(page.pendingReview);
     } catch (caught) {
+      if (generation !== documentRequestGeneration.current) return;
       setDocumentError(caught instanceof Error ? caught.message : 'No pudimos cargar los documentos.');
-    } finally { if (!silent) setDocumentsLoading(false); }
+    } finally { if (!silent && generation === documentRequestGeneration.current) setDocumentsLoading(false); }
   }, [applyDocuments, fetchDocumentPage]);
   const loadSalary = useCallback(async () => {
     const next = await api<SalaryHistory>('/salary-history');
@@ -1652,42 +1712,56 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   }, []);
   const load = useCallback(async () => {
     setLoading(true); setError('');
-    try {
-      const [nextHistory, jobs] = await Promise.all([
-        api<SalaryHistory>('/salary-history'),
-        api<Employment[]>('/employments'),
-      ]);
-      setHistory(nextHistory); setEmployments(jobs);
+    const [historyResult, jobsResult] = await Promise.allSettled([
+      api<SalaryHistory>('/salary-history'),
+      api<Employment[]>('/employments'),
+    ]);
+    if (historyResult.status === 'fulfilled') {
+      const nextHistory = historyResult.value;
+      setHistory(nextHistory);
       setSelectedScopeKey((current) => retainedSalaryScopeKey(current, nextHistory));
       setComparison(null); setComparisonLoaded(false);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'No pudimos cargar el historial.');
-    } finally { setLoading(false); }
+    }
+    if (jobsResult.status === 'fulfilled') setEmployments(jobsResult.value);
+    const failure = historyResult.status === 'rejected' ? historyResult.reason : jobsResult.status === 'rejected' ? jobsResult.reason : null;
+    if (failure) setError(failure instanceof Error ? failure.message : 'No pudimos cargar todo el historial.');
+    setLoading(false);
   }, []);
   useEffect(() => { void Promise.resolve().then(load); }, [load]);
   useEffect(() => { void Promise.resolve().then(() => reloadDocuments()); }, [reloadDocuments]);
   useEffect(() => {
-    if (!documents.some((document) => processingDocumentPattern.test(document.processingStatus))) return;
+    if (loadingMoreDocuments || !documents.some((document) => processingDocumentPattern.test(document.processingStatus))) return;
     const timer = window.setTimeout(async () => {
+      const generation = ++documentRequestGeneration.current;
       try {
         const docs: DocumentItem[] = [];
         const targetCount = Math.max(100, documents.length);
-        let cursor: DocumentItem | undefined;
+        let cursor: string | undefined;
+        let nextCursor: string | null = null;
+        let total = documentTotal;
+        let pendingReview = documentPendingReview;
         while (docs.length < targetCount) {
-          const pageLimit = Math.min(500, targetCount - docs.length);
+          const pageLimit = Math.min(100, targetCount - docs.length);
           const page = await fetchDocumentPage(cursor, pageLimit);
-          docs.push(...page);
-          cursor = page.at(-1);
-          if (!cursor || page.length < pageLimit) break;
+          if (generation !== documentRequestGeneration.current) return;
+          docs.push(...page.items);
+          total = page.total; pendingReview = page.pendingReview; nextCursor = page.nextCursor;
+          if (!page.nextCursor) break;
+          cursor = page.nextCursor;
         }
-        const refreshedIds = new Set(docs.map(({ id }) => id));
-        const visible = [...docs, ...documents.filter(({ id }) => !refreshedIds.has(id))];
+        const visible = docs;
+        if (generation !== documentRequestGeneration.current) return;
         applyDocuments(visible);
-        if (!visible.some((document) => processingDocumentPattern.test(document.processingStatus))) await loadSalary();
-      } catch (caught) { setDocumentError(caught instanceof Error ? caught.message : 'No pudimos actualizar el procesamiento.'); }
+        setDocumentCursor(nextCursor); setDocumentTotal(total); setDocumentPendingReview(pendingReview);
+        if (selectedId) setDetailReload((value) => value + 1);
+        if (!visible.some((document) => processingDocumentPattern.test(document.processingStatus))) {
+          try { await loadSalary(); }
+          catch (caught) { setError(caught instanceof Error ? caught.message : 'Los documentos se actualizaron, pero no el análisis salarial.'); }
+        }
+      } catch (caught) { if (generation === documentRequestGeneration.current) setDocumentError(caught instanceof Error ? caught.message : 'No pudimos actualizar el procesamiento.'); }
     }, 3_000);
     return () => window.clearTimeout(timer);
-  }, [documents, applyDocuments, fetchDocumentPage, loadSalary]);
+  }, [documents, applyDocuments, documentPendingReview, documentTotal, fetchDocumentPage, loadSalary, loadingMoreDocuments, selectedId]);
   useEffect(() => {
     if (!selectedId) return;
     const documentId = selectedId;
@@ -1697,6 +1771,13 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
         if (stopped || activeDocumentId.current !== documentId) return;
         setDetailError('');
         setDetail(nextDetail);
+        setSelected((current) => current?.id === documentId ? {
+          ...current,
+          documentType: nextDetail.documentType,
+          errorCode: nextDetail.errorCode,
+          originalAvailable: nextDetail.originalAvailable,
+          processingStatus: nextDetail.processingStatus,
+        } : current);
         if (nextDetail.originalAvailable && nextDetail.securityStatus === 'CLEAN' && !previewRequested.current) authorizePreview();
       })
       .catch(async (caught: unknown) => {
@@ -1833,11 +1914,29 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
     closeDocument();
   }
 
-  function navigateDocument(direction: -1 | 1) {
+  async function navigateDocument(direction: -1 | 1) {
     if (!selectedId) return;
+    setDocumentNavigationError('');
     const index = documents.findIndex(({ id }) => id === selectedId);
     if (index < 0) return;
-    const next = documents[index + direction];
+    let next = documents[index + direction];
+    if (!next && direction === 1 && documentCursor && !loadingMoreDocuments) {
+      const generation = ++documentRequestGeneration.current;
+      setLoadingMoreDocuments(true); setDocumentError('');
+      try {
+        const page = await fetchDocumentPage(documentCursor);
+        if (generation !== documentRequestGeneration.current || activeDocumentId.current !== selectedId) return;
+        next = page.items[0];
+        setDocuments((current) => [...current, ...page.items.filter((item) => !current.some(({ id }) => id === item.id))]);
+        setDocumentCursor(page.nextCursor); setDocumentTotal(page.total); setDocumentPendingReview(page.pendingReview);
+      } catch (caught) {
+        if (generation === documentRequestGeneration.current && activeDocumentId.current === selectedId) {
+          setDocumentNavigationError(caught instanceof Error ? caught.message : 'No pudimos cargar el siguiente documento.');
+        }
+      } finally {
+        if (generation === documentRequestGeneration.current) setLoadingMoreDocuments(false);
+      }
+    }
     if (!next) return;
     invalidatePreview();
     activeDocumentId.current = next.id;
@@ -1925,6 +2024,11 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
     setFromPeriod(''); setToPeriod(''); setComparison(null); setComparisonLoaded(false);
   }
 
+  function selectDocumentKind(kind: (typeof documentKinds)[number][0]) {
+    setDocumentKind(kind); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod('');
+    setDocumentSettlementType('all'); setDocumentEmploymentId('all'); setCheckedDocumentIds([]); setSelected(null);
+  }
+
   function moveHistoryTab(event: KeyboardEvent<HTMLButtonElement>, index: number) {
     const last = historyTabs.length - 1;
     const nextIndex = event.key === 'ArrowRight' ? (index === last ? 0 : index + 1)
@@ -1969,32 +2073,34 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   }
 
   async function loadMoreDocuments() {
-    const cursor = documents.at(-1);
-    if (!cursor || loadingMoreDocuments) return;
+    if (!documentCursor || loadingMoreDocuments) return;
+    const generation = ++documentRequestGeneration.current;
     setLoadingMoreDocuments(true); setDocumentError('');
     try {
-      const next = await fetchDocumentPage(cursor);
-      setDocuments((current) => [...current, ...next.filter((item) => !current.some(({ id }) => id === item.id))]);
-      setHasMoreDocuments(next.length === 100);
-    } catch (caught) { setDocumentError(caught instanceof Error ? caught.message : 'No pudimos cargar más documentos.'); }
-    finally { setLoadingMoreDocuments(false); }
+      const page = await fetchDocumentPage(documentCursor);
+      if (generation !== documentRequestGeneration.current) return;
+      setDocuments((current) => [...current, ...page.items.filter((item) => !current.some(({ id }) => id === item.id))]);
+      setDocumentCursor(page.nextCursor); setDocumentTotal(page.total); setDocumentPendingReview(page.pendingReview);
+    } catch (caught) {
+      if (generation === documentRequestGeneration.current) setDocumentError(caught instanceof Error ? caught.message : 'No pudimos cargar más documentos.');
+    } finally {
+      if (generation === documentRequestGeneration.current) setLoadingMoreDocuments(false);
+    }
   }
 
-  const assignableDocuments = documents.filter((document) => associationReadyStatuses.has(document.processingStatus));
+  const assignableDocuments = documents.filter((document) => document.documentType === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus));
   const allAssignableSelected = assignableDocuments.length > 0
     && assignableDocuments.every((document) => checkedDocumentIds.includes(document.id));
-  const documentGroups = useMemo(() => {
-    const grouped = new Map<string, DocumentItem[]>();
-    for (const document of documents) {
-      const year = document.payrollPeriod?.slice(0, 4) || document.createdAt.slice(0, 4) || 'Sin año';
-      grouped.set(year, [...(grouped.get(year) ?? []), document]);
-    }
-    return [...grouped].sort(([left], [right]) => left === 'Sin año' ? 1 : right === 'Sin año' ? -1 : right.localeCompare(left));
-  }, [documents]);
-
   function documentRow(document: DocumentItem) {
-    const assignable = documentKind === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus);
-    return <div className={`document-entry${documentKind === 'PAYROLL' ? '' : ' no-check'}`} key={document.id}>{documentKind === 'PAYROLL' && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${documentName(document)}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span><strong>{documentName(document)}</strong><small>{document.employerName || 'Sin empresa asociada'} · {document.payrollPeriod ? periodLabel(document.payrollPeriod) : shortDate(document.createdAt)}{document.settlementType ? ` · ${settlementTypeLabel(document.settlementType)}` : ''}{document.errorCode ? ` · ${importErrorLabels[document.errorCode] ?? 'No procesado'}` : ''}</small></span><Status value={document.processingStatus} /><span aria-hidden="true">›</span></button></div>;
+    const showCheckbox = documentKind === 'PAYROLL';
+    const assignable = document.documentType === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus);
+    const name = documentName(document);
+    const metadata = document.documentType === 'PAYROLL'
+      ? [document.employerName || 'Sin empresa asociada', document.payrollPeriod ? `Período: ${periodLabel(document.payrollPeriod)}` : 'Período sin detectar', document.settlementType ? settlementTypeLabel(document.settlementType) : null].filter(Boolean).join(' · ')
+      : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED'
+        ? 'Documento no soportado'
+        : 'Tipo pendiente de clasificación';
+    return <div className={`document-entry${showCheckbox ? '' : ' no-check'}`} key={document.id}>{showCheckbox && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${name}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{metadata}</small><small>Subido {timestampLabel(document.createdAt)}</small>{document.errorCode && document.errorCode !== 'DOCUMENT_DUPLICATE' && <small className="document-reason">{importErrorLabels[document.errorCode] ?? 'El documento no pudo procesarse.'}</small>}</span><DocumentStatusBadges document={document} /><span aria-hidden="true">›</span></button></div>;
   }
   const selectedDocumentIndex = documents.findIndex(({ id }) => id === selected?.id);
 
@@ -2030,11 +2136,12 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
       </section>}
 
       {tab === 'documents' && <section id="history-panel-documents" role="tabpanel" aria-labelledby="history-tab-documents" tabIndex={0}>
-        <div className="document-kind" role="group" aria-label="Clase de documento"><button type="button" className={documentKind === 'PAYROLL' ? 'active' : ''} aria-pressed={documentKind === 'PAYROLL'} onClick={() => { setDocumentKind('PAYROLL'); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentSettlementType('all'); setCheckedDocumentIds([]); setSelected(null); }}>Recibos salariales</button><button type="button" className={documentKind === 'UNSUPPORTED' ? 'active' : ''} aria-pressed={documentKind === 'UNSUPPORTED'} onClick={() => { setDocumentKind('UNSUPPORTED'); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentSettlementType('all'); setCheckedDocumentIds([]); setSelected(null); }}>No soportados / descartados</button></div>
-        <form className="document-filters" role="search" onSubmit={(event) => { event.preventDefault(); setDocumentSearch(documentSearchDraft.trim()); setDocumentYear(documentYearDraft || 'all'); }}><label>Buscar<input type="search" value={documentSearchDraft} maxLength={100} placeholder="Archivo o empresa" onChange={(event) => setDocumentSearchDraft(event.target.value)} /></label>{documentKind === 'PAYROLL' && <label>Año<input type="text" inputMode="numeric" pattern="20[0-9]{2}" maxLength={4} value={documentYearDraft} placeholder="Todos" title="Ingresá un año entre 2000 y 2099" onChange={(event) => setDocumentYearDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label>}<label>Estado<select value={documentStatus} onChange={(event) => setDocumentStatus(event.target.value)}><option value="all">Todos</option>{documentFilterStatuses.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>{documentKind === 'PAYROLL' && <label>Tipo de liquidación<select value={documentSettlementType} onChange={(event) => setDocumentSettlementType(event.target.value)}><option value="all">Todos</option>{settlementTypeOptions.map((value) => <option value={value} key={value}>{settlementTypeLabel(value)}</option>)}</select></label>}<button type="submit" className="button secondary compact">Buscar</button>{(documentSearch || documentYear !== 'all' || documentStatus !== 'all' || documentSettlementType !== 'all') && <button type="button" className="text-button" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentStatus('all'); setDocumentSettlementType('all'); }}>Limpiar filtros</button>}</form>
+        <div className="document-kind" role="group" aria-label="Tipo de documento">{documentKinds.map(([value, label]) => <button type="button" aria-pressed={documentKind === value} className={documentKind === value ? 'active' : ''} onClick={() => selectDocumentKind(value)} key={value}>{label}</button>)}</div>
+        <form className="document-filters" role="search" onSubmit={(event) => { event.preventDefault(); setDocumentSearch(documentSearchDraft.trim()); setDocumentYear(documentYearDraft || 'all'); }}><label>Buscar<input type="search" value={documentSearchDraft} maxLength={100} placeholder="Archivo o empresa" onChange={(event) => setDocumentSearchDraft(event.target.value)} /></label><label>Empleo<select value={documentEmploymentId} onChange={(event) => setDocumentEmploymentId(event.target.value)}><option value="all">Todos</option><option value="unassociated">Sin empleo asociado</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}</select></label><label>Año<input type="text" inputMode="numeric" pattern="20[0-9]{2}" maxLength={4} value={documentYearDraft} placeholder="Todos" title="Ingresá un año entre 2000 y 2099" onChange={(event) => setDocumentYearDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label><label>Período<input type="month" value={documentPeriod} onChange={(event) => setDocumentPeriod(event.target.value)} /></label>{documentKind !== 'UNSUPPORTED' && <label>Tipo de liquidación<select value={documentSettlementType} onChange={(event) => setDocumentSettlementType(event.target.value)}><option value="all">Todos</option>{settlementTypeOptions.map((value) => <option value={value} key={value}>{settlementTypeLabel(value)}</option>)}</select></label>}<label>Estado<select value={documentStatusGroup} onChange={(event) => setDocumentStatusGroup(event.target.value as (typeof documentStatusGroups)[number][0])}>{documentStatusGroups.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><button type="submit" className="button secondary compact">Buscar</button>{(documentSearch || documentYear !== 'all' || documentPeriod || documentSettlementType !== 'all' || documentEmploymentId !== 'all' || documentStatusGroup !== 'ALL') && <button type="button" className="text-button" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all'); setDocumentEmploymentId('all'); setDocumentStatusGroup('ALL'); }}>Limpiar filtros</button>}</form>
         {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void reloadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
+        {!documentsLoading && !documentError && <p className="document-count">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {documentPendingReview} para revisar · mostrando {documents.length}</p>}
         {documentKind === 'PAYROLL' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employment.employerName}{employment.role ? ` · ${employment.role}` : ''}</option>)}<option value="none">Quitar asociación</option></select><button type="button" className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={() => void associateDocuments()}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
-        {documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-groups">{documentGroups.map(([year, items]) => <details className="document-year" key={year}><summary><strong>{year}</strong><span>{items.length} documento{items.length === 1 ? '' : 's'} cargado{items.length === 1 ? '' : 's'}</span></summary><div className="document-list">{items.map(documentRow)}</div></details>)}</div>{hasMoreDocuments && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title={documentKind === 'PAYROLL' ? 'No hay recibos para estos filtros' : 'No hay documentos no soportados'} body={documentKind === 'PAYROLL' ? 'Importá PDFs o limpiá los filtros para ver su estado.' : 'Los PDFs descartados o confirmados como no salariales aparecen separados acá.'} />}
+        <div id="document-results">{documentError ? null : documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-list">{documents.map(documentRow)}</div>{documentCursor && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title="No encontramos documentos con estos filtros" body="Probá limpiar los filtros o importá un PDF nuevo." />}</div>
       </section>}
 
       {selected && (!detail || detailError) && <div className="modal-layer" role="presentation" onMouseDown={closeDetailState}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="document-loading-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, closeDetailState)} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Documento privado</p><h2 id="document-loading-title">{documentName(selected)}</h2></div><button className="icon-button" disabled={reviewBusy} onClick={closeDetailState} aria-label="Cerrar">×</button></div>{detailError ? <><p className="message error" role="alert">{detailError}</p><div className="modal-actions"><button type="button" className="button secondary" disabled={reviewBusy} onClick={closeDetailState}>Cerrar</button><button type="button" className="button primary" disabled={reviewBusy} onClick={() => setDetailReload((value) => value + 1)}>Reintentar</button></div></> : <p aria-live="polite">Cargando metadatos y datos extraídos…</p>}</section></div>}
@@ -2043,11 +2150,13 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
         detail={detail}
         initialEvidenceId={locationSeed.evidenceId}
         initialPage={locationSeed.page}
-        position={{ current: selectedDocumentIndex < 0 ? null : selectedDocumentIndex + 1, total: Math.max(1, documents.length) }}
+        position={{ canNext: selectedDocumentIndex >= 0 && (selectedDocumentIndex < documents.length - 1 || Boolean(documentCursor)), current: selectedDocumentIndex < 0 ? null : selectedDocumentIndex + 1, total: Math.max(1, documentTotal) }}
         settlement={detail.reviewSettlement ?? undefined}
         source={preview?.documentId === selected.id ? preview : null}
         sourceBusy={previewBusy}
         sourceError={previewError}
+        navigationBusy={loadingMoreDocuments}
+        navigationError={documentNavigationError}
         onAuthorizePreview={authorizePreview}
         onClose={closeDocument}
         onCompleteReview={completeReview}
@@ -2066,92 +2175,232 @@ function History({ runSensitive }: { runSensitive: RunSensitive }) {
   );
 }
 
-function MfaSettings({ onUserChanged, runSensitive }: { onUserChanged: (user: User) => void; runSensitive: RunSensitive }) {
+function MfaSettings({ onSessionsChanged, onUserChanged, runSensitive }: { onSessionsChanged: () => void; onUserChanged: (user: User) => void; runSensitive: RunSensitive }) {
   const [status, setStatus] = useState<MfaStatus | null>(null);
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     const [nextStatus, nextUser] = await Promise.all([api<MfaStatus>('/auth/mfa'), api<User>('/auth/me')]);
     setStatus(nextStatus);
     onUserChanged(nextUser);
   }, [onUserChanged]);
+  const completeEnrollment = useCallback(async () => {
+    await refresh();
+    onSessionsChanged();
+  }, [onSessionsChanged, refresh]);
 
   useEffect(() => {
     api<MfaStatus>('/auth/mfa').then(setStatus).catch((caught) => setError(caught instanceof Error ? caught.message : 'No pudimos consultar el segundo factor.'));
   }, []);
 
   async function regenerateRecoveryCodes() {
+    if (!confirm('¿Generar códigos nuevos? Los códigos de recuperación anteriores dejarán de funcionar.')) return;
     setError(''); setMessage('');
+    setBusy(true);
     try {
       await runSensitive(async () => {
         const result = await api<{ recoveryCodes: string[] }>('/auth/mfa/recovery-codes', { method: 'POST', body: '{}' });
         setRecoveryCodes(result.recoveryCodes);
         setStatus((current) => current ? { ...current, recoveryCodesRemaining: result.recoveryCodes.length } : current);
+        onSessionsChanged();
       });
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos renovar los códigos.'); }
+    finally { setBusy(false); }
   }
 
   async function disable() {
     if (!confirm('¿Desactivar el segundo factor? Tu cuenta quedará protegida sólo por tu acceso principal.')) return;
     setError(''); setMessage('');
+    setBusy(true);
     try {
       await runSensitive(async () => {
         await api('/auth/mfa', { method: 'DELETE' });
         setRecoveryCodes(null);
         await refresh();
+        onSessionsChanged();
         setMessage('Segundo factor desactivado.');
       });
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos desactivar el segundo factor.'); }
+    finally { setBusy(false); }
   }
 
   return (
-    <section className="settings-card"><div className="setting-icon">2</div><div><h2>Segundo factor</h2>
+    <section className="settings-card setting-wide"><div className="setting-icon" aria-hidden="true">2</div><div><div className="setting-heading"><h2>Segundo factor</h2>{status && <span className={`status ${status.enabled ? 'ready' : 'pending'}`}>{status.enabled ? 'Activo' : 'Inactivo'}</span>}</div>
       {!status && !error && <p>Cargando estado…</p>}
-      {error && <p className="message error" role="alert">{error}</p>}
+      {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" onClick={() => { setError(''); void refresh().catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'No pudimos consultar el segundo factor.')); }}>Reintentar</button></p>}
       {message && <p className="message success" aria-live="polite">{message}</p>}
       {recoveryCodes ? <RecoveryCodes codes={recoveryCodes} onDone={() => setRecoveryCodes(null)} /> : status?.enabled ? <>
-        <p>Activo. Además de tu acceso principal, Salarivo pedirá un código para ingresar y proteger acciones sensibles.</p>
-        <p>Te quedan <strong>{status.recoveryCodesRemaining}</strong> códigos de recuperación.</p>
-        <div className="setting-actions"><button className="button secondary" onClick={regenerateRecoveryCodes}>Generar códigos nuevos</button><button className="button danger-button" onClick={disable}>Desactivar</button></div>
-      </> : status ? <><p>Si no activás TOTP, las acciones sensibles te pedirán volver a confirmar tu cuenta de Google.</p><MfaEnrollment pending={status.pendingEnrollment} onComplete={refresh} /></> : null}
+        <p>Tu cuenta usa un segundo factor para nuevos inicios de sesión y acciones sensibles.</p>
+        <dl className="security-details"><div><dt>Método</dt><dd>{status.method === 'TOTP' ? 'Aplicación autenticadora' : status.method || 'Aplicación autenticadora'}</dd></div><div><dt>Configurado</dt><dd>{timestampLabel(status.enabledAt)}</dd></div><div><dt>Códigos de recuperación</dt><dd>{status.recoveryCodesRemaining} disponible{status.recoveryCodesRemaining === 1 ? '' : 's'}</dd></div></dl>
+        <p className="setting-note">Generar códigos nuevos invalida todos los anteriores. Desactivar esta protección reduce la seguridad de la cuenta. Ambas acciones vuelven a confirmar tu identidad.</p>
+        <div className="setting-actions inline-actions"><button className="button secondary" disabled={busy} onClick={regenerateRecoveryCodes}>{busy ? 'Confirmando…' : 'Generar códigos nuevos'}</button><button className="button danger-button" disabled={busy} onClick={disable}>Desactivar segundo factor</button></div>
+      </> : status ? <><p>Usá una app autenticadora compatible con códigos TOTP. Si no la activás, las acciones sensibles te pedirán volver a confirmar tu cuenta de Google.</p><MfaEnrollment pending={status.pendingEnrollment} onComplete={completeEnrollment} /></> : null}
     </div></section>
   );
 }
 
-function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
-  user: User;
-  onUserChanged: (user: User) => void;
-  runSensitive: RunSensitive;
-  onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
-}) {
-  const [exportJob, setExportJob] = useState<{ id: string; status: string; downloadUrl?: string | null } | null>(null);
-  const [confirmation, setConfirmation] = useState('');
+function sessionDeviceLabel(session: AuthSession) {
+  const device = ({ DESKTOP: 'Computadora', MOBILE: 'Teléfono', TABLET: 'Tablet' } as Record<string, string>)[session.deviceType];
+  const browser = ({ CHROME: 'Chrome', EDGE: 'Edge', FIREFOX: 'Firefox', SAFARI: 'Safari' } as Record<string, string>)[session.browser];
+  const operatingSystem = ({ ANDROID: 'Android', IOS: 'iOS', LINUX: 'Linux', MACOS: 'macOS', WINDOWS: 'Windows' } as Record<string, string>)[session.operatingSystem];
+  const details = [device, browser, operatingSystem].filter(Boolean);
+  return details.length ? details.join(' · ') : 'Dispositivo no identificado';
+}
+
+function SessionsSettings({ refreshKey, runSensitive }: { refreshKey: number; runSensitive: RunSensitive }) {
+  const [sessions, setSessions] = useState<AuthSession[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true); setError('');
+    try { setSessions(await api<AuthSession[]>('/auth/sessions')); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos cargar tus sesiones.'); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { void Promise.resolve().then(load); }, [load, refreshKey]);
+
+  async function revoke(session: AuthSession) {
+    if (!confirm(`¿Finalizar la sesión de ${sessionDeviceLabel(session)}?`)) return;
+    setBusyId(session.id); setError(''); setMessage('');
+    try {
+      await runSensitive(async () => {
+        const result = await api<{ revoked: boolean }>(`/auth/sessions/${encodeURIComponent(session.id)}`, { method: 'DELETE' });
+        setSessions((current) => current.filter(({ id }) => id !== session.id));
+        setMessage(result.revoked ? 'Sesión finalizada.' : 'Esa sesión ya no estaba activa.');
+      });
+    } catch (caught) {
+      const nextError = caught instanceof Error ? caught.message : 'No pudimos finalizar la sesión.';
+      await load();
+      setError(nextError);
+    } finally { setBusyId(null); }
+  }
+
+  async function revokeOthers() {
+    if (!confirm('¿Cerrar todas las otras sesiones? Esta sesión seguirá activa.')) return;
+    setBusyId('others'); setError(''); setMessage('');
+    try {
+      await runSensitive(async () => {
+        const result = await api<{ revokedSessions: number }>('/auth/sessions/revoke-others', { method: 'POST', body: '{}' });
+        setSessions((current) => current.filter(({ current: isCurrent }) => isCurrent));
+        setMessage(result.revokedSessions ? `Cerramos ${result.revokedSessions} ${result.revokedSessions === 1 ? 'sesión' : 'sesiones'}.` : 'No había otras sesiones activas.');
+      });
+    } catch (caught) {
+      const nextError = caught instanceof Error ? caught.message : 'No pudimos cerrar las otras sesiones.';
+      await load();
+      setError(nextError);
+    } finally { setBusyId(null); }
+  }
+
+  const ordered = [...sessions].sort((left, right) => Number(right.current) - Number(left.current));
+  const others = sessions.filter(({ current }) => !current);
+  return <section className="settings-card setting-wide sessions-card"><div className="setting-icon" aria-hidden="true">↪</div><div><div className="setting-heading"><h2>Sesiones activas</h2>{!loading && <span className="status">{sessions.length}</span>}</div><p>Revisá en qué navegadores y dispositivos está abierta tu cuenta. No usamos ubicación ni fingerprinting para identificarlos.</p>
+    {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>Reintentar</button></p>}
+    {message && <p className="message success" aria-live="polite">{message}</p>}
+    {loading ? <div className="compact-loading" role="status"><div className="loader" aria-hidden="true" /><span>Cargando sesiones…</span></div> : <div className="session-list">{ordered.map((session) => <article className="session-row" key={session.id}><div className="session-main"><div className="session-title"><strong>{sessionDeviceLabel(session)}</strong>{session.current && <span className="status ready">Esta sesión</span>}</div><dl><div><dt>Iniciada</dt><dd>{timestampLabel(session.createdAt)}</dd></div><div><dt>Última actividad</dt><dd>{timestampLabel(session.lastSeenAt)}</dd></div><div><dt>Vence</dt><dd>{timestampLabel(session.expiresAt)}</dd></div></dl></div>{!session.current && <button type="button" className="button secondary" disabled={busyId !== null} onClick={() => void revoke(session)}>{busyId === session.id ? 'Finalizando…' : 'Finalizar sesión'}</button>}</article>)}{!others.length && <p className="session-empty">No tenés otras sesiones activas.</p>}</div>}
+    {!loading && others.length > 0 && <div className="session-footer"><button type="button" className="button secondary" disabled={busyId !== null} onClick={() => void revokeOthers()}>{busyId === 'others' ? 'Cerrando…' : 'Cerrar las otras sesiones'}</button></div>}
+  </div></section>;
+}
+
+const exportStatusLabels: Record<string, string> = {
+  PENDING: 'Solicitada', RUNNING: 'Descargando', READY: 'Disponible', COMPLETED: 'Descargada',
+  FAILED: 'No se pudo descargar', CANCELLED: 'Cancelada', EXPIRED: 'Vencida',
+};
+
+function PrivacySettings({ runSensitive }: { runSensitive: RunSensitive }) {
+  const [exportJob, setExportJob] = useState<ExportJob | null>(null);
+  const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+
   async function requestExport() {
-    setError(''); setMessage('');
-    try { await runSensitive(async () => {
-      const next = await api<{ id: string; status: string; downloadUrl?: string | null }>('/privacy/exports', { method: 'POST', body: '{}' });
-      setExportJob(next);
-      setMessage(next.status === 'READY'
-        ? 'Tu exportación quedó lista para descargar.'
-        : next.status === 'RUNNING'
-          ? 'Tu exportación se está descargando en otra sesión.'
-          : 'Tu exportación se está preparando.');
-    }); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la exportación.'); }
+    setBusy(true); setError(''); setMessage('');
+    try {
+      await runSensitive(async () => {
+        const next = await api<ExportJob>('/privacy/exports', { method: 'POST', body: '{}' });
+        setExportJob(next);
+        setMessage(next.status === 'READY' ? 'Tu exportación está disponible.' : 'Solicitamos tu exportación.');
+      });
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos iniciar la exportación.'); }
+    finally { setBusy(false); }
   }
   async function refreshExport() {
     if (!exportJob) return;
-    setError('');
-    try { setExportJob(await api(`/privacy/exports/${exportJob.id}`)); }
+    setBusy(true); setError('');
+    try { setExportJob(await api<ExportJob>(`/privacy/exports/${exportJob.id}`)); }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos consultar la exportación.'); }
+    finally { setBusy(false); }
+  }
+  async function downloadExport() {
+    if (!exportJob?.downloadUrl) return;
+    setBusy(true); setError('');
+    try {
+      await runSensitive(() => downloadApiFile(exportJob.downloadUrl!, 'salarivo-export.json'));
+      setExportJob(await api<ExportJob>(`/privacy/exports/${exportJob.id}`));
+    }
+    catch (caught) {
+      const nextError = caught instanceof Error ? caught.message : 'No pudimos descargar la exportación.';
+      try { setExportJob(await api<ExportJob>(`/privacy/exports/${exportJob.id}`)); }
+      catch { /* Keep the actionable download error when the status refresh also fails. */ }
+      setError(nextError);
+    }
+    finally { setBusy(false); }
+  }
+
+  const canRefresh = exportJob && ['PENDING', 'RUNNING', 'READY'].includes(exportJob.status);
+  const canRequestAgain = !exportJob || ['COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(exportJob.status);
+  const completedLabel = exportJob?.status === 'COMPLETED' ? 'Descarga completada'
+    : exportJob?.status === 'FAILED' ? 'Finalizada con error'
+      : exportJob?.status === 'CANCELLED' ? 'Cancelada'
+        : exportJob?.status === 'EXPIRED' ? 'Marcada como vencida'
+          : null;
+  const expiryLabel = exportJob?.status === 'READY' ? 'Disponible hasta'
+    : exportJob && ['PENDING', 'RUNNING'].includes(exportJob.status) ? 'Vence'
+      : exportJob?.status === 'EXPIRED' ? 'Venció'
+        : null;
+  return <>
+    {error && <p className="message error" role="alert">{error}</p>}{message && <p className="message success" aria-live="polite">{message}</p>}
+    <section className="settings-card setting-wide"><div className="setting-icon" aria-hidden="true">⇩</div><div><div className="setting-heading"><h2>Exportar mis datos</h2>{exportJob && <span className={`status ${exportJob.status === 'READY' || exportJob.status === 'COMPLETED' ? 'ready' : ['FAILED', 'CANCELLED', 'EXPIRED'].includes(exportJob.status) ? 'danger' : 'pending'}`}>{exportStatusLabels[exportJob.status] ?? 'Estado desconocido'}</span>}</div><p>Generá un JSON legible con tu cuenta, métodos de acceso, empleos, importaciones, metadatos de documentos, liquidaciones, conceptos, correcciones, sesiones y solicitudes de privacidad. No incluye PDFs originales, IDs internos, datos técnicos de procesamiento, secretos ni credenciales.</p>{exportJob && <dl className="export-details"><div><dt>Solicitada</dt><dd>{timestampLabel(exportJob.createdAt)}</dd></div>{exportJob.startedAt && <div><dt>Descarga iniciada</dt><dd>{timestampLabel(exportJob.startedAt)}</dd></div>}{exportJob.completedAt && completedLabel && <div><dt>{completedLabel}</dt><dd>{timestampLabel(exportJob.completedAt)}</dd></div>}{exportJob.expiresAt && expiryLabel && <div><dt>{expiryLabel}</dt><dd>{timestampLabel(exportJob.expiresAt)}</dd></div>}</dl>}<div className="setting-actions inline-actions">{exportJob?.status === 'READY' && exportJob.downloadUrl && <button type="button" className="button primary" disabled={busy} onClick={() => void downloadExport()}>{busy ? 'Preparando…' : 'Descargar exportación'}</button>}{canRefresh && <button type="button" className="button secondary" disabled={busy} onClick={() => void refreshExport()}>{busy ? 'Actualizando…' : 'Actualizar estado'}</button>}{canRequestAgain && <button type="button" className="button secondary" disabled={busy} onClick={() => void requestExport()}>{busy ? 'Solicitando…' : exportJob ? 'Solicitar una nueva' : 'Solicitar exportación'}</button>}</div></div></section>
+    <section className="settings-card setting-wide"><div className="setting-icon" aria-hidden="true">◇</div><div><h2>Originales y datos estructurados</h2><p>El PDF original y los datos de la liquidación tienen ciclos separados.</p><div className="data-lifecycle"><article><strong>Eliminar sólo el PDF</strong><p>El archivo deja de estar disponible para ver, descargar o reprocesar. Conservás los datos estructurados y las correcciones que ya revisaste.</p></article><article><strong>Eliminar PDF y datos</strong><p>Se eliminan también la extracción, la liquidación, sus conceptos y correcciones. Ambas opciones están en el detalle del documento, dentro de Historial.</p></article></div></div></section>
+    <section className="settings-card setting-wide"><div className="setting-icon" aria-hidden="true">§</div><div><h2>Documentos legales</h2><p>Consultá la versión vigente de los <a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> y el <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a>.</p></div></section>
+  </>;
+}
+
+function AccountSettings({ user, runSensitive, onDeletionRequested }: {
+  user: User;
+  runSensitive: RunSensitive;
+  onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [confirmation, setConfirmation] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const opener = useRef<HTMLButtonElement | null>(null);
+  const dialog = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const current = dialog.current;
+    if (current && !current.open) current.showModal();
+    return () => { if (current?.open) current.close(); };
+  }, [open]);
+
+  function showDialog(trigger: HTMLButtonElement) {
+    opener.current = trigger; setConfirmation(''); setError(''); setOpen(true);
+  }
+  function closeDialog() {
+    if (busy) return;
+    setOpen(false);
+    window.requestAnimationFrame(() => opener.current?.focus());
   }
   async function deleteAccount() {
     if (confirmation !== 'ELIMINAR') return;
-    setError('');
+    setError(''); setBusy(true);
     const receiptToken = browserOpaqueToken();
     try {
       await runSensitive(async () => {
@@ -2167,43 +2416,47 @@ function Privacy({ user, onUserChanged, runSensitive, onDeletionRequested }: {
       });
     }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos solicitar la baja.'); }
+    finally { setBusy(false); }
   }
 
-  async function downloadExport() {
-    if (!exportJob?.downloadUrl) return;
-    setError(''); setMessage('');
-    try { await runSensitive(async () => {
-      await downloadApiFile(exportJob.downloadUrl!, 'salarivo-export.json');
-      setExportJob(null);
-      setMessage('La exportación se descargó. Podés solicitar una nueva.');
-    }); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos descargar la exportación.'); }
-  }
+  if (user.role === 'ADMIN') return <section className="settings-card setting-wide"><div className="setting-icon" aria-hidden="true">!</div><div><h2>Baja de una cuenta administrativa</h2><p>Para preservar el último acceso de gobierno, otra persona con permiso debe retirar primero tu rol administrativo. Después podés solicitar la eliminación como usuario.</p></div></section>;
+  return <>
+    <section className="danger-zone"><div><p className="eyebrow">Zona de peligro</p><h2>Eliminar cuenta</h2><p>Inicia el borrado irreversible de tu cuenta, documentos, liquidaciones, sesiones y datos asociados.</p><strong>Esta acción no se puede deshacer.</strong></div><button type="button" className="button danger-button" onClick={(event) => showDialog(event.currentTarget)}>Eliminar cuenta</button></section>
+    {open && <dialog ref={dialog} className="modal-layer" aria-labelledby="delete-account-title" aria-describedby="delete-account-description" onCancel={(event) => { event.preventDefault(); if (!busy) closeDialog(); }} onKeyDown={(event) => { if (!busy) handleDialogKey(event, closeDialog); }} onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}><section className="modal danger-dialog"><div className="modal-head"><div><p className="eyebrow">Acción irreversible</p><h2 id="delete-account-title">Eliminar tu cuenta</h2></div><button type="button" className="icon-button" disabled={busy} onClick={closeDialog} aria-label="Cerrar">×</button></div><div id="delete-account-description"><p>Se iniciará el borrado de:</p><ul><li>documentos originales y archivos temporales;</li><li>información estructurada, liquidaciones y correcciones;</li><li>empleos e importaciones;</li><li>sesiones, segundo factor y acceso vinculado con Google;</li><li>exportaciones y configuración de la cuenta.</li></ul><p>La solicitud es irreversible. El borrado puede quedar pendiente mientras terminan cargas o procesos activos; recibirás una constancia para consultar su estado.</p></div><label className="delete-confirmation" htmlFor="delete-account-confirmation">Escribí <strong>ELIMINAR</strong> para continuar<input id="delete-account-confirmation" value={confirmation} autoComplete="off" disabled={busy} autoFocus onChange={(event) => setConfirmation(event.target.value)} /></label>{error && <p className="message error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={closeDialog}>Cancelar</button><button type="button" className="button danger-button" disabled={busy || confirmation !== 'ELIMINAR'} onClick={() => void deleteAccount()}>{busy ? 'Solicitando eliminación…' : 'Eliminar mi cuenta'}</button></div></section></dialog>}
+  </>;
+}
 
-  async function revokeOtherSessions() {
-    setError(''); setMessage('');
-    try {
-      await runSensitive(async () => {
-        const result = await api<{ revokedSessions: number }>('/auth/sessions/revoke-others', { method: 'POST', body: '{}' });
-        setMessage(result.revokedSessions === 0
-          ? 'No había otras sesiones activas.'
-          : `Cerramos ${result.revokedSessions} ${result.revokedSessions === 1 ? 'sesión' : 'sesiones'} en otros dispositivos.`);
-      });
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos cerrar las otras sesiones.'); }
-  }
+const settingsTabs = [
+  ['security', 'Seguridad'],
+  ['privacy', 'Privacidad y datos'],
+  ['account', 'Cuenta'],
+] as const;
+type SettingsTab = (typeof settingsTabs)[number][0];
 
-  return (
-    <div className="page narrow-page">
-      <PageHeader eyebrow="Tus datos" title="Privacidad y seguridad" />
-      {error && <p className="message error" role="alert">{error}</p>}{message && <p className="message success" aria-live="polite">{message} <button type="button" className="text-button" onClick={() => setMessage('')}>Cerrar</button></p>}
-      <MfaSettings key={String(user.mfaEnabled)} onUserChanged={onUserChanged} runSensitive={runSensitive} />
-      <section className="settings-card"><div className="setting-icon">↪</div><div><h2>Sesiones activas</h2><p>Cerrá las sesiones abiertas en otros navegadores o dispositivos. Esta sesión seguirá activa.</p></div><div className="setting-actions"><button className="button secondary" onClick={revokeOtherSessions}>Cerrar otras sesiones</button></div></section>
-      <section className="settings-card"><div className="setting-icon">⇩</div><div><h2>Exportar mis datos</h2><p>Generá un JSON legible con tu cuenta, empleos, importaciones, documentos, liquidaciones, conceptos, correcciones, accesos y solicitudes de privacidad. No incluye IDs internos, datos técnicos del procesamiento, PDFs ni secretos.</p>{exportJob && <p className="job-status">Estado: <strong>{exportJob.status}</strong></p>}</div><div className="setting-actions">{exportJob?.downloadUrl ? <button className="button primary" onClick={downloadExport}>Descargar</button> : exportJob && !['COMPLETED', 'EXPIRED', 'FAILED', 'CANCELLED'].includes(exportJob.status) ? <button className="button secondary" onClick={refreshExport}>Actualizar estado</button> : <button className="button secondary" onClick={requestExport}>Solicitar exportación</button>}</div></section>
-      <section className="settings-card"><div className="setting-icon">◇</div><div><h2>Originales y datos estructurados</h2><p>Desde Historial podés borrar un PDF y conservar la liquidación revisada. Cada lifecycle es independiente.</p></div></section>
-      <section className="settings-card"><div className="setting-icon">§</div><div><h2>Documentos legales</h2><p>Consultá la versión vigente de los <a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> y el <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a>.</p></div></section>
-      {user.role === 'ADMIN'
-        ? <section className="settings-card"><div className="setting-icon">!</div><div><h2>Baja de una cuenta administrativa</h2><p>Para preservar el último acceso de gobierno, otra persona con permiso debe retirar primero tu rol administrativo. Después podés solicitar la eliminación como usuario.</p></div></section>
-        : <section className="settings-card danger-zone"><div className="setting-icon">!</div><div><h2>Eliminar mi cuenta</h2><p>Inicia el borrado irreversible de documentos, datos estructurados, sesiones y exportaciones.</p><label>Escribí <strong>ELIMINAR</strong> para confirmar<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label></div><div className="setting-actions"><button className="button danger-button" disabled={confirmation !== 'ELIMINAR'} onClick={deleteAccount}>Eliminar cuenta</button></div></section>}
-    </div>
-  );
+function Settings({ user, onUserChanged, runSensitive, onDeletionRequested }: {
+  user: User;
+  onUserChanged: (user: User) => void;
+  runSensitive: RunSensitive;
+  onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
+}) {
+  const [tab, setTab] = useState<SettingsTab>('security');
+  const [sessionsRefreshKey, setSessionsRefreshKey] = useState(0);
+  function moveTab(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    const last = settingsTabs.length - 1;
+    const nextIndex = event.key === 'ArrowRight' ? (index === last ? 0 : index + 1)
+      : event.key === 'ArrowLeft' ? (index === 0 ? last : index - 1)
+        : event.key === 'Home' ? 0
+          : event.key === 'End' ? last
+            : null;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const next = settingsTabs[nextIndex]![0];
+    setTab(next);
+    document.getElementById(`settings-tab-${next}`)?.focus();
+  }
+  return <div className="page narrow-page settings-page"><PageHeader eyebrow="Tu cuenta" title="Configuración" /><div className="tabs settings-tabs" role="tablist" aria-label="Secciones de configuración">{settingsTabs.map(([value, label], index) => <button type="button" id={`settings-tab-${value}`} role="tab" aria-controls={`settings-panel-${value}`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className={tab === value ? 'active' : ''} onKeyDown={(event) => moveTab(event, index)} onClick={() => setTab(value)} key={value}>{label}</button>)}</div>
+    <section id="settings-panel-security" role="tabpanel" aria-labelledby="settings-tab-security" tabIndex={0} hidden={tab !== 'security'}><MfaSettings key={String(user.mfaEnabled)} onSessionsChanged={() => setSessionsRefreshKey((value) => value + 1)} onUserChanged={onUserChanged} runSensitive={runSensitive} /><SessionsSettings refreshKey={sessionsRefreshKey} runSensitive={runSensitive} /></section>
+    <section id="settings-panel-privacy" role="tabpanel" aria-labelledby="settings-tab-privacy" tabIndex={0} hidden={tab !== 'privacy'}><PrivacySettings runSensitive={runSensitive} /></section>
+    <section id="settings-panel-account" role="tabpanel" aria-labelledby="settings-tab-account" tabIndex={0} hidden={tab !== 'account'}><AccountSettings user={user} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} /></section>
+  </div>;
 }

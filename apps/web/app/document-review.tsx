@@ -1,9 +1,9 @@
 'use client';
 
-import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { evidenceIdForPage, extractionRunChanged, reviewValueChanged } from './document-evidence';
 import { DocumentViewer } from './document-viewer';
-import { money, periodLabel, settlementTypeLabel } from './format';
+import { documentStatusLabel, money, periodLabel, settlementTypeLabel, timestampLabel } from './format';
 import styles from './document-review.module.css';
 
 export type ExtractedFieldDetail = {
@@ -84,6 +84,7 @@ export type DocumentDetail = {
 };
 
 export type ReviewSettlement = {
+  componentsBalance?: boolean;
   deductionsMatchTotal?: boolean;
   totalsBalance?: boolean;
 };
@@ -110,9 +111,6 @@ const missingReasons = {
 };
 
 function filename(detail: DocumentDetail) { return detail.displayFilename || detail.originalFilename; }
-function shortDate(value?: string | null) {
-  return value ? new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—';
-}
 function bytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
@@ -162,6 +160,8 @@ export function DocumentReview({
   source,
   sourceBusy,
   sourceError,
+  navigationBusy = false,
+  navigationError,
   onAuthorizePreview,
   onClose,
   onCompleteReview,
@@ -179,11 +179,13 @@ export function DocumentReview({
   detail: DocumentDetail;
   initialEvidenceId?: string;
   initialPage?: number;
-  position: { current: number | null; total: number };
+  position: { canNext?: boolean; current: number | null; total: number };
   settlement?: ReviewSettlement;
   source: { expiresAt?: string; url: string } | null;
   sourceBusy: boolean;
   sourceError?: string;
+  navigationBusy?: boolean;
+  navigationError?: string;
   onAuthorizePreview: () => void;
   onClose: () => void;
   onCompleteReview: (acceptDeductionsMismatch: boolean, extractionRunId: string) => Promise<void>;
@@ -209,6 +211,7 @@ export function DocumentReview({
   const [acceptedMismatchRunId, setAcceptedMismatchRunId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const pendingMobileFocus = useRef<'data' | 'document' | null>(null);
 
   const changes = useMemo(() => detail.extractedFields.flatMap((field) => {
     const draft = drafts[field.fieldPath] ?? savedValue(field);
@@ -238,6 +241,18 @@ export function DocumentReview({
       document.getElementById(`field-${selectedEvidenceId}`)?.scrollIntoView({ block: 'center' });
     }
   }, [mobileTab, selectedEvidenceId]);
+  useEffect(() => {
+    const target = pendingMobileFocus.current;
+    if (target !== mobileTab || !window.matchMedia('(max-width: 760px), (max-height: 500px) and (orientation: landscape)').matches) return;
+    pendingMobileFocus.current = null;
+    const frame = window.requestAnimationFrame(() => {
+      const element = target === 'data' && selectedEvidenceId
+        ? document.getElementById(`field-${selectedEvidenceId}`)
+        : document.getElementById('review-document-panel');
+      element?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [mobileTab, selectedEvidenceId]);
 
   function confirmDiscard() { return !dirty || window.confirm('Hay cambios sin guardar. ¿Querés descartarlos?'); }
   function close() { if (!busy && confirmDiscard()) onClose(); }
@@ -252,14 +267,28 @@ export function DocumentReview({
     finally { setBusy(false); }
   }
   function selectEvidence(id: string) {
+    pendingMobileFocus.current = 'data';
     setSelectedEvidenceId(id);
     setMobileTab('data');
   }
   function showSource(field: ExtractedFieldDetail) {
     if (!field.id || !field.pageNumber) return;
+    pendingMobileFocus.current = 'document';
     setSelectedEvidenceId(field.id);
     setPage(field.pageNumber);
     setMobileTab('document');
+  }
+  function moveMobileTab(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    const nextIndex = event.key === 'ArrowRight' ? (index + 1) % 2
+      : event.key === 'ArrowLeft' ? (index + 1) % 2
+        : event.key === 'Home' ? 0
+          : event.key === 'End' ? 1
+            : null;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const next = nextIndex === 0 ? 'document' : 'data';
+    setMobileTab(next);
+    document.getElementById(`review-tab-${next}`)?.focus();
   }
   function changePage(nextPage: number) {
     setPage(nextPage);
@@ -267,6 +296,7 @@ export function DocumentReview({
   }
 
   const reviewBlocked = missing.length > 0 || settlement?.totalsBalance === false
+    || settlement?.componentsBalance === false
     || (settlement?.deductionsMatchTotal === false && !acceptMismatch);
   const canReprocess = detail.originalAvailable
     && detail.securityStatus === 'CLEAN'
@@ -276,20 +306,26 @@ export function DocumentReview({
     && ['COMPLETED', 'NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION', 'REJECTED_UNSUPPORTED', 'QUARANTINED', 'FAILED_PERMANENT', 'CANCELLED'].includes(detail.processingStatus);
   const canEdit = ['COMPLETED', 'NEEDS_REVIEW'].includes(detail.processingStatus) && currentRunId !== null;
   const originalViewable = detail.originalAvailable && detail.securityStatus === 'CLEAN';
+  const unsupported = detail.documentType === 'UNSUPPORTED' || detail.processingStatus === 'REJECTED_UNSUPPORTED';
+  const unsupportedReason = detail.errorCode === 'DOCUMENT_UNSUPPORTED'
+    ? 'Salarivo detectó que este PDF no parece ser un recibo de sueldo, aguinaldo ni otro documento salarial compatible.'
+    : 'Este PDF fue confirmado como un tipo de documento que Salarivo todavía no procesa.';
 
   return (
     <div className={styles.layer} role="presentation">
       <section className={styles.workspace} role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleReviewKey(event, close)}>
         <header className={styles.header}>
-          <div className={styles.heading}><span className={styles.fileIcon}>PDF</span><div><p>{position.current === null ? 'Documento fuera del listado actual' : `Documento ${position.current} de ${position.total}`}</p><h2 id="review-title">{filename(detail)}</h2></div></div>
-          <nav aria-label="Navegar documentos"><button type="button" onClick={() => navigate(-1)} disabled={busy || position.current === null || position.current <= 1} aria-label="Documento anterior">‹</button><button type="button" onClick={() => navigate(1)} disabled={busy || position.current === null || position.current >= position.total} aria-label="Documento siguiente">›</button></nav>
+          <div className={styles.heading}><span className={styles.fileIcon}>PDF</span><div><p>{position.current === null ? 'Documento fuera del listado actual' : `Documento ${position.current} de ${position.total}`}</p><h2 id="review-title" title={detail.originalFilename}>{filename(detail)}</h2></div></div>
+          <nav aria-label="Navegar documentos"><button type="button" onClick={() => navigate(-1)} disabled={busy || navigationBusy || position.current === null || position.current <= 1} aria-label="Documento anterior">‹</button><button type="button" onClick={() => navigate(1)} disabled={busy || navigationBusy || position.current === null || position.canNext === false || (position.canNext === undefined && position.current >= position.total)} aria-label="Documento siguiente">›</button></nav>
           <button className={styles.close} type="button" onClick={close} disabled={busy} aria-label="Cerrar revisión">×</button>
         </header>
 
-        <div className={styles.mobileTabs} role="tablist"><button type="button" role="tab" aria-selected={mobileTab === 'document'} onClick={() => setMobileTab('document')}>Documento</button><button type="button" role="tab" aria-selected={mobileTab === 'data'} onClick={() => setMobileTab('data')}>Datos</button></div>
+        {navigationError && <p className={styles.error} role="alert">{navigationError} <button type="button" className="text-button" disabled={busy || navigationBusy} onClick={() => navigate(1)}>Reintentar</button></p>}
+
+        <nav className={styles.mobileTabs} aria-label="Vista del documento"><button type="button" id="review-tab-document" aria-controls="review-document-panel" aria-pressed={mobileTab === 'document'} onKeyDown={(event) => moveMobileTab(event, 0)} onClick={() => setMobileTab('document')}>Documento</button><button type="button" id="review-tab-data" aria-controls="review-data-panel" aria-pressed={mobileTab === 'data'} onKeyDown={(event) => moveMobileTab(event, 1)} onClick={() => setMobileTab('data')}>Datos</button></nav>
 
         <div className={styles.body}>
-          <div className={`${styles.documentPane}${mobileTab === 'data' ? ` ${styles.mobileHidden}` : ''}`}>
+          <div id="review-document-panel" role="region" aria-label="Documento" tabIndex={-1} className={`${styles.documentPane}${mobileTab === 'data' ? ` ${styles.mobileHidden}` : ''}`}>
             <DocumentViewer
               evidence={detail.extractedFields.map((field) => ({ id: field.id, fieldPath: field.fieldPath, label: labels[field.fieldPath] ?? field.fieldPath, pageNumber: field.pageNumber, sourceRegion: field.sourceRegion }))}
               originalAvailable={detail.originalAvailable}
@@ -306,11 +342,12 @@ export function DocumentReview({
             />
           </div>
 
-          <aside className={`${styles.dataPane}${mobileTab === 'document' ? ` ${styles.mobileHidden}` : ''}`} aria-label="Datos extraídos">
+          <aside id="review-data-panel" tabIndex={-1} className={`${styles.dataPane}${mobileTab === 'document' ? ` ${styles.mobileHidden}` : ''}`} aria-label="Datos extraídos">
             {error && <p className={styles.error} role="alert">{error}</p>}
-            <div className={styles.summary}><span>{detail.processingStatus.replaceAll('_', ' ')}</span><p>{detail.errorCode ? 'El procesamiento terminó con un error controlado.' : detail.lastReprocessError ? 'El último reprocesamiento no pudo completarse; conservamos la versión anterior.' : missing.length ? `Falta completar: ${missing.map((field) => labels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : settlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto.' : settlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total.' : 'Los cambios humanos quedan versionados y no se reemplazan en silencio.'}</p></div>
+            <div className={styles.summary}><span>{documentStatusLabel(detail.processingStatus)}</span><p>{unsupported ? 'El documento quedó separado del historial salarial.' : detail.errorCode ? 'El procesamiento terminó con un error controlado.' : detail.lastReprocessError ? 'El último reprocesamiento no pudo completarse; conservamos la versión anterior.' : missing.length ? `Falta completar: ${missing.map((field) => labels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : settlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto.' : settlement?.componentsBalance === false ? 'Remunerativo más no remunerativo no coincide con el bruto.' : settlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total.' : 'Los cambios humanos quedan versionados y no se reemplazan en silencio.'}</p></div>
 
             {detail.processingStatus === 'NEEDS_TYPE_CONFIRMATION' && <section className={styles.callout}><h3>¿Es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente.</p><div><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('PAYROLL'))}>Sí, continuar</button><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('UNSUPPORTED'))}>No corresponde</button></div></section>}
+            {unsupported && <section className={styles.callout}><h3>Tipo de documento no soportado</h3><p>{unsupportedReason} No volveremos a procesarlo automáticamente.</p></section>}
 
             {detail.settlement && <section className={styles.section}><p>Liquidación extraída</p><h3>{periodLabel(detail.settlement.payrollPeriod)} · {settlementTypeLabel(detail.settlement.settlementType)}</h3><dl className={styles.settlementOverview}><div><dt>Sueldo básico</dt><dd>{money(detail.settlement.basicAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Bruto</dt><dd>{money(detail.settlement.grossAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Remunerativo</dt><dd>{money(detail.settlement.remunerativeAmount, detail.settlement.currencyCode)}</dd></div><div><dt>No remunerativo</dt><dd>{money(detail.settlement.nonRemunerativeAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Neto</dt><dd>{money(detail.settlement.netAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Descuentos / créditos</dt><dd>{money(detail.settlement.deductionsAmount, detail.settlement.currencyCode)}</dd></div>{detail.settlement.deductionsChargedAmount && <div><dt>Descuentos cobrados</dt><dd>{money(detail.settlement.deductionsChargedAmount, detail.settlement.currencyCode)}</dd></div>}{detail.settlement.reimbursementsAmount && <div><dt>Reintegros</dt><dd>{money(detail.settlement.reimbursementsAmount, detail.settlement.currencyCode)}</dd></div>}</dl></section>}
 
@@ -324,11 +361,11 @@ export function DocumentReview({
                 const editor = field.fieldPath === 'settlement.type'
                   ? <select disabled={!editing || !isEditable} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))}>{settlementTypes.map((type) => <option key={type}>{type}</option>)}</select>
                   : <input disabled={!editing || !isEditable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={field.fieldPath.includes('Amount') ? 'decimal' : undefined} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))} />;
-                return <article id={field.id ? `field-${field.id}` : undefined} key={field.fieldPath} className={`${styles.field}${selectedEvidenceId === field.id ? ` ${styles.selectedField}` : ''}`} onMouseEnter={() => { if (field.id && field.pageNumber === page) setSelectedEvidenceId(field.id); }}>
+                return <article id={field.id ? `field-${field.id}` : undefined} tabIndex={-1} key={field.fieldPath} className={`${styles.field}${selectedEvidenceId === field.id ? ` ${styles.selectedField}` : ''}`} onMouseEnter={() => { if (field.id && field.pageNumber === page) setSelectedEvidenceId(field.id); }}>
                   <label><span>{labels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label>
                   <div className={styles.provenance}><span>{provenance(field)}</span>{field.source !== 'MANUAL_REQUIRED' && Number.isFinite(percent) && confidence < .9 && <strong className={confidence < .7 ? styles.low : ''}>{confidence < .7 ? 'Confianza baja' : 'Confianza media'} · {percent}%</strong>}{field.pageNumber && <button type="button" onClick={() => showSource(field)}>Ver fuente · pág. {field.pageNumber}</button>}</div>
                   {field.missingReason && <small>{missingReasons[field.missingReason]}</small>}
-                  {(field.rawValue || field.correction) && (editing || field.correction) && <details><summary>Comparar con dato detectado</summary>{field.rawValue && <p>Texto fuente: {field.rawValue}</p>}{field.correction && <><small>Interpretado: {field.interpretedValue ?? 'No disponible'}</small><small>Corrección v{field.correction.version} · {shortDate(field.correction.correctedAt)}</small></>}</details>}
+                  {(field.rawValue || field.correction) && (editing || field.correction) && <details><summary>Comparar con dato detectado</summary>{field.rawValue && <p>Texto fuente: {field.rawValue}</p>}{field.correction && <><small>Interpretado: {field.interpretedValue ?? 'No disponible'}</small><small>Corrección v{field.correction.version} · {timestampLabel(field.correction.correctedAt)}</small></>}</details>}
                 </article>;
               })}</div>
               {editingStale && <p className={styles.error} role="alert">El documento fue reprocesado durante la edición. Cancelá y revisá la nueva extracción antes de volver a guardar.</p>}
@@ -337,7 +374,7 @@ export function DocumentReview({
 
             {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li key={item.id}><span>{item.rawDescription}</span><strong>{item.amount} {item.currencyCode}</strong>{item.sourcePage && <small>Pág. {item.sourcePage}</small>}</li>)}</ul></section>}
 
-            <details className={styles.metadata}><summary>Metadatos y trazabilidad</summary><dl><div><dt>Tipo</dt><dd>{detail.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Importado</dt><dd>{shortDate(detail.createdAt)}</dd></div><div><dt>Páginas</dt><dd>{detail.pageCount ?? '—'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(detail.sizeBytes)}</dd></div><div><dt>Seguridad</dt><dd>{detail.securityStatus}</dd></div><div><dt>Clasificación</dt><dd>{detail.classificationStatus ?? '—'}</dd></div><div><dt>Extracción</dt><dd>{detail.extractionRun?.processingVersion ?? '—'}</dd></div><div><dt>Método</dt><dd>{detail.extractionRun?.ocrProvider ? `OCR · ${detail.extractionRun.ocrProvider}` : detail.extractionRun?.extractorName ?? '—'}</dd></div><div><dt>Procesado</dt><dd>{shortDate(detail.processedAt)}</dd></div><div><dt>Retención</dt><dd>{detail.retentionPolicy}</dd></div></dl></details>
+            <details className={styles.metadata}><summary>Metadatos y trazabilidad</summary><dl><div><dt>Archivo original</dt><dd>{detail.originalFilename}</dd></div><div><dt>Tipo</dt><dd>{detail.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Importado</dt><dd>{timestampLabel(detail.createdAt)}</dd></div><div><dt>Páginas</dt><dd>{detail.pageCount ?? '—'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(detail.sizeBytes)}</dd></div><div><dt>Seguridad</dt><dd>{detail.securityStatus}</dd></div><div><dt>Clasificación</dt><dd>{detail.classificationStatus ?? '—'}</dd></div><div><dt>Extracción</dt><dd>{detail.extractionRun?.processingVersion ?? '—'}</dd></div><div><dt>Método</dt><dd>{detail.extractionRun?.ocrProvider ? `OCR · ${detail.extractionRun.ocrProvider}` : detail.extractionRun?.extractorName ?? '—'}</dd></div><div><dt>Procesado</dt><dd>{timestampLabel(detail.processedAt)}</dd></div><div><dt>Retención</dt><dd>{detail.retentionPolicy}</dd></div></dl></details>
 
             {detail.processingStatus === 'NEEDS_REVIEW' && settlement?.deductionsMatchTotal === false && <label className={styles.acceptance}><input type="checkbox" checked={acceptMismatch} onChange={(event) => setAcceptedMismatchRunId(event.target.checked ? currentRunId : null)} />Revisé los conceptos y acepto esta diferencia.</label>}
 

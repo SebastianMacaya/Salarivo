@@ -13,6 +13,13 @@ export function percentage(value?: string | null) {
 }
 
 const periodFormatter = new Intl.DateTimeFormat('es-AR', { month: 'long', timeZone: 'UTC' });
+const dateFormatter = new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium', timeZone: 'UTC' });
+const timestampFormatter = new Intl.DateTimeFormat('es-AR', {
+  dateStyle: 'medium',
+  timeStyle: 'short',
+  hourCycle: 'h23',
+  timeZone: 'America/Argentina/Buenos_Aires',
+});
 
 export function periodLabel(value?: string | null) {
   const match = /^(\d{4})-(0[1-9]|1[0-2])(?:-(\d{2}))?$/.exec(value ?? '');
@@ -22,6 +29,49 @@ export function periodLabel(value?: string | null) {
   if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== isoDate) return '—';
   const month = periodFormatter.format(date);
   return `${month.charAt(0).toLocaleUpperCase('es-AR')}${month.slice(1)} ${match[1]}`;
+}
+
+export function dateLabel(value?: string | null) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value ?? '');
+  if (!match) return '—';
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value
+    ? '—'
+    : dateFormatter.format(date);
+}
+
+export function timestampLabel(value?: string | null) {
+  if (!value || !value.includes('T')) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : timestampFormatter.format(date);
+}
+
+const documentStatusLabels: Record<string, string> = {
+  CREATED: 'Preparando',
+  UPLOADED: 'Recibido',
+  SECURITY_VALIDATION: 'Validando seguridad',
+  DOCUMENT_CLASSIFICATION: 'Clasificando',
+  TEXT_EXTRACTION: 'Extrayendo texto',
+  OCR: 'Leyendo imagen',
+  PARSING: 'Interpretando',
+  NORMALIZATION: 'Normalizando',
+  VALIDATION: 'Validando datos',
+  PROCESSING: 'Procesando',
+  NEEDS_REVIEW: 'Requiere revisión',
+  NEEDS_TYPE_CONFIRMATION: 'Confirmar tipo',
+  COMPLETED: 'Listo',
+  DUPLICATE: 'Duplicado',
+  QUARANTINED: 'En cuarentena',
+  FAILED_RETRYABLE: 'Reintentando',
+  FAILED_PERMANENT: 'No procesado',
+  REJECTED_UNSUPPORTED: 'Tipo no soportado',
+  RETRY_SCHEDULED: 'Reintento programado',
+  CANCELLED: 'Cancelado',
+  DELETED: 'Eliminado',
+};
+
+export function documentStatusLabel(value?: string | null) {
+  return value ? documentStatusLabels[value] ?? 'Estado desconocido' : '—';
 }
 
 export function recentPeriodRange<T extends { period: string }>(items: T[], months?: number) {

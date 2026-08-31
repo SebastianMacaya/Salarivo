@@ -16,6 +16,8 @@ Una sesión robada no debe bastar para administrar Salarivo ni para exportar, de
 - El secreto se cifra con AES-256-GCM, nonce aleatorio, AAD ligada a usuario/factor y keyring versionado. Producción falla al arrancar sin una clave válida.
 - Los diez recovery codes aleatorios se muestran una vez y persisten sólo como hashes de un uso.
 - Elevar garantía, regenerar códigos, reemplazar o desactivar MFA rota el token de la sesión; los cambios de seguridad revocan las otras sesiones. Cambios MFA, acciones destructivas, claim de export y autorización de descarga de original vuelven a bloquear y validar esa sesión dentro de su transacción.
+- El titular puede listar sus sesiones activas, revocar individualmente una sesión distinta de la actual o cerrar todas las demás. Listar no expone token ni hash; revocar exige step-up y ownership server-side, y una carrera sobre una sesión propia ya terminada es idempotente.
+- La sesión registra última actividad con escritura acotada y sólo categorías coarse allowlisted de dispositivo, navegador y sistema operativo inferidas al crearla. No se guardan user-agent crudo, versiones, IP, ubicación, fingerprint ni nombre de dispositivo.
 - Una verificación exitosa vuelve a cifrar el secreto con la clave activa si todavía usa una versión anterior.
 - No se implementan SMS, dispositivos recordados, preguntas de seguridad ni bypass administrativo.
 
@@ -25,7 +27,7 @@ Las acciones sensibles requieren una verificación reciente y una sesión robada
 
 ## Evidencia
 
-- Migraciones `006_mfa_and_session_assurance.sql` y `010_bind_mfa_enrollment_to_session.sql`.
+- Migraciones `006_mfa_and_session_assurance.sql`, `010_bind_mfa_enrollment_to_session.sql` y `018_session_management.sql`.
 - `apps/api/src/mfa.ts` y `apps/api/src/mfa-routes.ts`.
 - Tests unitarios de vectores TOTP, replay, cifrado/AAD y recovery codes.
 - Integración de enrolamiento, desafío de login, bloqueo de admin, rotación de cookie, revocación de otra sesión y step-up.

@@ -149,9 +149,11 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
           200: envelope({
             type: "object",
             additionalProperties: false,
-            required: ["enabled", "pendingEnrollment", "recoveryCodesRemaining"],
+            required: ["enabled", "method", "enabledAt", "pendingEnrollment", "recoveryCodesRemaining"],
             properties: {
               enabled: { type: "boolean" },
+              method: { anyOf: [{ type: "string", const: "TOTP" }, { type: "null" }] },
+              enabledAt: { anyOf: [{ type: "string" }, { type: "null" }] },
               pendingEnrollment: { type: "boolean" },
               recoveryCodesRemaining: { type: "integer", minimum: 0 },
             },
@@ -161,18 +163,21 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
     },
     async (request) => {
       const result = await pool.query(
-        `SELECT
-           EXISTS (SELECT 1 FROM mfa_factors WHERE user_id = $1 AND status = 'ACTIVE') AS enabled,
+        `SELECT active.id IS NOT NULL AS enabled, active.factor_type AS method, active.enabled_at,
            EXISTS (SELECT 1 FROM mfa_factors WHERE user_id = $1 AND status = 'PENDING' AND pending_expires_at > now()) AS pending,
            (SELECT count(*)::integer
               FROM mfa_recovery_codes code
               JOIN mfa_factors factor ON factor.id = code.factor_id AND factor.user_id = code.user_id
-             WHERE code.user_id = $1 AND factor.status = 'ACTIVE' AND code.used_at IS NULL) AS remaining`,
+             WHERE code.user_id = $1 AND factor.status = 'ACTIVE' AND code.used_at IS NULL) AS remaining
+           FROM (SELECT $1::uuid AS user_id) owner
+           LEFT JOIN mfa_factors active ON active.user_id = owner.user_id AND active.status = 'ACTIVE'`,
         [request.authUser!.id],
       );
       return {
         data: {
           enabled: Boolean(result.rows[0].enabled),
+          method: result.rows[0].method === "TOTP" ? "TOTP" : null,
+          enabledAt: result.rows[0].enabled_at === null ? null : new Date(result.rows[0].enabled_at).toISOString(),
           pendingEnrollment: Boolean(result.rows[0].pending),
           recoveryCodesRemaining: Number(result.rows[0].remaining),
         },

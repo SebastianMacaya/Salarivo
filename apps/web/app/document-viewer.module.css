@@ -5,6 +5,7 @@
   flex: 1;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
 .toolbar {
@@ -53,9 +54,12 @@
 .evidence { background: #fbbf2444; border: 2px solid #f59e0b; cursor: pointer; min-height: 0; padding: 0; position: absolute; }
 .evidence:hover, .evidence:focus-visible, .evidence.selected { background: #22c55e55; border-color: #16a34a; outline: 3px solid #fff; outline-offset: 1px; }
 .empty { align-self: center; color: #e5e7eb; max-width: 32rem; padding: 2rem; text-align: center; }
+.empty > div { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: center; }
 
 @media (max-width: 760px), (max-height: 500px) and (orientation: landscape) {
-  .toolbar { align-items: stretch; }
-  .controlGroup { overflow-x: auto; }
+  .toolbar { align-items: stretch; display: grid; grid-template-columns: minmax(0, 1fr); }
+  .controlGroup { flex-wrap: wrap; min-width: 0; }
+  .controlGroup button, .controlGroup label { flex: 0 0 auto; }
   .viewport { min-height: 0; padding: .5rem; }
+  .empty { width: 100%; padding: 1rem; }
 }

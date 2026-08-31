@@ -60,12 +60,13 @@ type SalaryConceptQuery = {
 };
 type DocumentListQuery = {
   limit?: string;
-  before?: string;
-  beforeId?: string;
+  cursor?: string;
   search?: string;
   year?: string;
+  period?: string;
   employmentId?: string;
   processingStatus?: string;
+  statusGroup?: "ALL" | "READY" | "REVIEW" | "PROCESSING" | "ERROR";
   documentType?: string;
   settlementType?: string;
 };
@@ -101,12 +102,20 @@ const manualCorrectionPaths = new Set([
 const reprocessableDocumentStatuses = new Set([
   "COMPLETED", "NEEDS_REVIEW", "FAILED_PERMANENT", "CANCELLED",
 ]);
+const documentProcessingStatuses = new Set([
+  "CREATED", "UPLOADED", "SECURITY_VALIDATION", "DOCUMENT_CLASSIFICATION",
+  "NEEDS_TYPE_CONFIRMATION", "TEXT_EXTRACTION", "OCR", "PARSING", "NORMALIZATION",
+  "VALIDATION", "COMPLETED", "NEEDS_REVIEW", "REJECTED_UNSUPPORTED", "QUARANTINED",
+  "FAILED_RETRYABLE", "RETRY_SCHEDULED", "FAILED_PERMANENT", "CANCELLED", "DELETED",
+]);
+const documentStatusGroups = new Set(["ALL", "READY", "REVIEW", "PROCESSING", "ERROR"]);
 const requiredPayrollReviewPaths = [
   "settlement.payrollPeriod",
   "settlement.grossAmount",
   "settlement.netAmount",
   "settlement.deductionsAmount",
 ];
+const componentReviewPaths = ["settlement.remunerativeAmount", "settlement.nonRemunerativeAmount"];
 const missingFieldReasons = ["LABEL_OR_LAYOUT_NOT_RECOGNIZED", "VALUE_NOT_INTERPRETABLE"] as const;
 type MissingFieldReason = (typeof missingFieldReasons)[number];
 const exportSections = [
@@ -214,7 +223,8 @@ const exportSections = [
         ELSE 'ACTIVE'
       END AS status, created_at AS "createdAt", last_seen_at AS "lastSeenAt",
       expires_at AS "expiresAt", revoked_at AS "revokedAt",
-      mfa_verified_at AS "secondFactorVerifiedAt"
+      mfa_verified_at AS "secondFactorVerifiedAt", device_type AS "deviceType",
+      browser_family AS browser, os_family AS "operatingSystem"
       FROM sessions WHERE user_id = $1 ORDER BY created_at, id`],
   ["privacyRequests", `SELECT operation_type AS "type", status,
       created_at AS "requestedAt", started_at AS "startedAt", completed_at AS "completedAt"
@@ -234,6 +244,20 @@ function value(row: Record<string, unknown>, key: string): string | null {
 
 function timestamp(current: unknown): string {
   return current instanceof Date ? current.toISOString() : new Date(String(current)).toISOString();
+}
+
+function exportOperationView(row: Record<string, unknown>) {
+  const id = String(row.id);
+  const status = String(row.status);
+  return {
+    id,
+    status,
+    createdAt: timestamp(row.created_at),
+    startedAt: row.started_at === null ? null : timestamp(row.started_at),
+    expiresAt: row.output_expires_at === null ? null : timestamp(row.output_expires_at),
+    completedAt: row.completed_at === null ? null : timestamp(row.completed_at),
+    downloadUrl: status === "READY" ? `/api/v1/privacy/exports/${id}/download` : null,
+  };
 }
 
 function cleanFilename(input: string): string {
@@ -524,6 +548,25 @@ function earningViews(input: unknown) {
     if (!code || !amount) return [];
     return [{ code, amount, isRecurring: typeof row.isRecurring === "boolean" ? row.isRecurring : null }];
   });
+}
+
+type DocumentCursor = { createdAtMicros: string; id: string };
+
+function documentCursor(cursor: DocumentCursor): string {
+  return Buffer.from(JSON.stringify([cursor.createdAtMicros, cursor.id])).toString("base64url");
+}
+
+function parseDocumentCursor(input: string): DocumentCursor | null {
+  if (!/^[A-Za-z0-9_-]{1,512}$/.test(input)) return null;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(input, "base64url").toString("utf8"));
+    if (!Array.isArray(parsed) || parsed.length !== 2
+      || typeof parsed[0] !== "string" || !/^\d{1,30}$/.test(parsed[0])
+      || typeof parsed[1] !== "string" || !uuid.test(parsed[1])) return null;
+    return { createdAtMicros: parsed[0], id: parsed[1] };
+  } catch {
+    return null;
+  }
 }
 
 type SalaryConceptCursor = {
@@ -1706,23 +1749,27 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   app.get<{ Querystring: DocumentListQuery }>(
     "/api/v1/documents",
     { preHandler: requireAuth },
-    async (request) => {
+    async (request) => withTransaction(async (client) => {
+      await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      if (Object.values(request.query as Record<string, unknown>)
+        .some((queryValue) => typeof queryValue !== "string")) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Los filtros no son válidos.");
+      }
       const limit = request.query.limit === undefined ? 100 : Number(request.query.limit);
-      if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
         throw new ApiError(400, "VALIDATION_ERROR", "El límite no es válido.");
       }
-      if ((request.query.before === undefined) !== (request.query.beforeId === undefined)) {
-        throw new ApiError(400, "VALIDATION_ERROR", "El cursor no es válido.");
-      }
-      const before = request.query.before === undefined ? null : new Date(request.query.before);
-      if (before && Number.isNaN(before.getTime())) throw new ApiError(400, "VALIDATION_ERROR", "El cursor no es válido.");
-      if (request.query.beforeId !== undefined && !uuid.test(request.query.beforeId)) {
+      const cursor = request.query.cursor === undefined ? null : parseDocumentCursor(request.query.cursor);
+      if (request.query.cursor !== undefined && cursor === null) {
         throw new ApiError(400, "VALIDATION_ERROR", "El cursor no es válido.");
       }
       const search = request.query.search?.trim();
       if (search && search.length > 100) throw new ApiError(400, "VALIDATION_ERROR", "La búsqueda es demasiado larga.");
       if (request.query.year !== undefined && !/^20\d{2}$/.test(request.query.year)) {
         throw new ApiError(400, "VALIDATION_ERROR", "El año no es válido.");
+      }
+      if (request.query.period !== undefined && !/^20\d{2}-(0[1-9]|1[0-2])$/.test(request.query.period)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El período no es válido.");
       }
       if (request.query.employmentId !== undefined
         && request.query.employmentId !== "unassociated"
@@ -1735,8 +1782,12 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       if (request.query.settlementType !== undefined && !settlementTypes.has(request.query.settlementType)) {
         throw new ApiError(400, "VALIDATION_ERROR", "El tipo de liquidación no es válido.");
       }
-      if (request.query.processingStatus !== undefined && !/^[A-Z_]{2,40}$/.test(request.query.processingStatus)) {
+      if (request.query.processingStatus !== undefined
+        && !documentProcessingStatuses.has(request.query.processingStatus)) {
         throw new ApiError(400, "VALIDATION_ERROR", "El estado no es válido.");
+      }
+      if (request.query.statusGroup !== undefined && !documentStatusGroups.has(request.query.statusGroup)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El grupo de estado no es válido.");
       }
       const parameters: unknown[] = [request.authUser!.id];
       const conditions = ["document.user_id = $1", "document.deleted_at IS NULL"];
@@ -1744,11 +1795,6 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         parameters.push(input);
         return `$${parameters.length}`;
       };
-      if (before && request.query.beforeId) {
-        const beforeParameter = parameter(before.toISOString());
-        const idParameter = parameter(request.query.beforeId);
-        conditions.push(`(document.created_at, document.id) < (${beforeParameter}::timestamptz, ${idParameter}::uuid)`);
-      }
       if (search) {
         const searchParameter = parameter(`%${search.replace(/[\\%_]/g, "\\$&")}%`);
         conditions.push(`(document.original_filename ILIKE ${searchParameter} ESCAPE '\\'
@@ -1756,33 +1802,83 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
              ILIKE ${searchParameter} ESCAPE '\\')`);
       }
       if (request.query.year) conditions.push(`projection.payroll_period LIKE ${parameter(`${request.query.year}-%`)}`);
+      if (request.query.period) conditions.push(`projection.payroll_period = ${parameter(request.query.period)}`);
       if (request.query.employmentId === "unassociated") conditions.push("document.employment_id IS NULL");
       else if (request.query.employmentId) conditions.push(`document.employment_id = ${parameter(request.query.employmentId)}::uuid`);
       if (request.query.processingStatus) conditions.push(`document.processing_status = ${parameter(request.query.processingStatus)}`);
-      if (request.query.documentType) conditions.push(`document.document_type = ${parameter(request.query.documentType)}`);
+      if (request.query.statusGroup === "READY") conditions.push("document.processing_status = 'COMPLETED'");
+      if (request.query.statusGroup === "REVIEW") {
+        conditions.push("document.processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION')");
+      }
+      if (request.query.statusGroup === "PROCESSING") {
+        conditions.push(`document.processing_status IN (
+          'CREATED', 'UPLOADED', 'SECURITY_VALIDATION', 'DOCUMENT_CLASSIFICATION',
+          'TEXT_EXTRACTION', 'OCR', 'PARSING', 'NORMALIZATION', 'VALIDATION',
+          'FAILED_RETRYABLE', 'RETRY_SCHEDULED'
+        )`);
+      }
+      if (request.query.statusGroup === "ERROR") {
+        conditions.push("document.processing_status IN ('QUARANTINED', 'FAILED_PERMANENT', 'CANCELLED')");
+      }
+      if (request.query.documentType === "PAYROLL") conditions.push("document.document_type = 'PAYROLL'");
+      if (request.query.documentType === "UNSUPPORTED") conditions.push("document.processing_status = 'REJECTED_UNSUPPORTED'");
       if (request.query.settlementType) conditions.push(`projection.settlement_type = ${parameter(request.query.settlementType)}`);
-      parameters.push(limit);
-      const result = await pool.query(
+      const from = `FROM documents document
+            JOIN import_batch_items item
+              ON item.id = document.import_batch_item_id AND item.user_id = document.user_id
+            LEFT JOIN employments employment
+              ON employment.id = document.employment_id AND employment.user_id = document.user_id
+            LEFT JOIN employers employer
+              ON employer.id = employment.employer_id AND employer.user_id = document.user_id
+            ${documentProjectionJoin}`;
+      const countFrom = search || request.query.year || request.query.period || request.query.settlementType
+        ? from
+        : "FROM documents document";
+      const pageParameters = [...parameters];
+      const pageConditions = [...conditions];
+      if (cursor) {
+        pageParameters.push(cursor.createdAtMicros, cursor.id);
+        pageConditions.push(`(
+          floor(extract(epoch FROM document.created_at) * 1000000),
+          document.id
+        ) < ($${pageParameters.length - 1}::numeric, $${pageParameters.length}::uuid)`);
+      }
+      pageParameters.push(limit + 1);
+      const result = await client.query(
         `SELECT document.id, document.employment_id, document.original_filename, document.created_at,
+                floor(extract(epoch FROM document.created_at) * 1000000)::bigint::text AS created_at_micros,
                 document.processing_status, document.document_type,
                 document.classification_confidence, document.original_deleted_at,
                 document.deleted_at, item.error_code, projection.payroll_period, projection.settlement_type,
                 COALESCE(employer.name, projection.corrected_employer_name,
                          projection.extracted_employer_name) AS employer_name
-           FROM documents document
-           JOIN import_batch_items item
-             ON item.id = document.import_batch_item_id AND item.user_id = document.user_id
-           LEFT JOIN employments employment
-             ON employment.id = document.employment_id AND employment.user_id = document.user_id
-            LEFT JOIN employers employer
-              ON employer.id = employment.employer_id AND employer.user_id = document.user_id
-           ${documentProjectionJoin}
-          WHERE ${conditions.join(" AND ")}
-          ORDER BY document.created_at DESC, document.id DESC LIMIT $${parameters.length}`,
+           ${from}
+          WHERE ${pageConditions.join(" AND ")}
+          ORDER BY document.created_at DESC, document.id DESC LIMIT $${pageParameters.length}`,
+        pageParameters,
+      );
+      const counts = await client.query(
+        `SELECT count(*)::integer AS total,
+                count(*) FILTER (WHERE document.processing_status IN (
+                  'NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION'
+                ))::integer AS pending_review
+           ${countFrom}
+          WHERE ${conditions.join(" AND ")}`,
         parameters,
       );
-      return { data: result.rows.map(documentView) };
-    },
+      const rows = result.rows.slice(0, limit);
+      const last = rows.at(-1);
+      return {
+        data: {
+          items: rows.map(documentView),
+          total: Number(counts.rows[0].total),
+          pendingReview: Number(counts.rows[0].pending_review),
+          nextCursor: last && result.rows.length > limit
+            ? documentCursor({ createdAtMicros: String(last.created_at_micros), id: String(last.id) })
+            : null,
+        },
+      };
+    }),
   );
 
   app.get<{ Params: IdParams }>(
@@ -1881,6 +1977,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 settlement.gross_amount IS NOT NULL AND settlement.net_amount IS NOT NULL
                   AND settlement.deductions_amount IS NOT NULL
                   AND settlement.gross_amount - settlement.deductions_amount = settlement.net_amount AS totals_balance,
+                CASE
+                  WHEN settlement.remunerative_amount IS NULL AND settlement.non_remunerative_amount IS NULL THEN true
+                  ELSE settlement.gross_amount IS NOT NULL
+                    AND settlement.remunerative_amount IS NOT NULL
+                    AND settlement.non_remunerative_amount IS NOT NULL
+                    AND settlement.remunerative_amount + settlement.non_remunerative_amount = settlement.gross_amount
+                END AS components_balance,
                 CASE WHEN settlement.gross_amount > 0 AND settlement.deductions_amount > 0
                   THEN round(settlement.deductions_amount * 100 / settlement.gross_amount, 2)::text
                   ELSE NULL END AS deductions_percentage,
@@ -1937,12 +2040,23 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       ) : { rows: [] as Record<string, unknown>[] };
       const manualValues = new Map(manual.rows.map((row) => [String(row.field_path), row]));
       const effectiveSettlement = settlement.rows[0] ?? {};
+      const componentReviewRequired = (effectiveSettlement.remunerative_amount !== null
+        && effectiveSettlement.remunerative_amount !== undefined)
+        || (effectiveSettlement.non_remunerative_amount !== null
+          && effectiveSettlement.non_remunerative_amount !== undefined);
+      const effectiveReviewPaths = componentReviewRequired
+        ? [...requiredPayrollReviewPaths, ...componentReviewPaths]
+        : requiredPayrollReviewPaths;
       const missingEffectivePaths = new Set([
         ...(!effectiveSettlement.payroll_period ? ["settlement.payrollPeriod"] : []),
         ...(!effectiveSettlement.gross_amount ? ["settlement.grossAmount"] : []),
         ...(!effectiveSettlement.net_amount ? ["settlement.netAmount"] : []),
         ...(!effectiveSettlement.deductions_amount && effectiveSettlement.deductions_amount !== "0.00"
           ? ["settlement.deductionsAmount"] : []),
+        ...(componentReviewRequired && effectiveSettlement.remunerative_amount === null
+          ? ["settlement.remunerativeAmount"] : []),
+        ...(componentReviewRequired && effectiveSettlement.non_remunerative_amount === null
+          ? ["settlement.nonRemunerativeAmount"] : []),
       ]);
       const extractedFields: Array<{
         id: string | null;
@@ -1980,7 +2094,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       });
       if (document.rows[0].document_type === "PAYROLL") {
         const existingPaths = new Set(extractedFields.map(({ fieldPath }) => fieldPath));
-        for (const fieldPath of requiredPayrollReviewPaths) {
+        for (const fieldPath of effectiveReviewPaths) {
           const existing = extractedFields.find((field) => field.fieldPath === fieldPath);
           if (existing && missingEffectivePaths.has(fieldPath)) existing.source = "MANUAL_REQUIRED";
           if (!existingPaths.has(fieldPath)) {
@@ -2040,6 +2154,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         } : null,
         reviewSettlement: settlement.rows.length ? {
           totalsBalance: settlement.rows[0].totals_balance === true,
+          componentsBalance: settlement.rows[0].components_balance === true,
           deductionsMatchTotal: settlement.rows[0].deductions_match_total === true,
         } : null,
         extractionRun: latestRun.rowCount ? {
@@ -2646,6 +2761,13 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                   settlement.gross_amount IS NOT NULL AND settlement.net_amount IS NOT NULL
                     AND settlement.deductions_amount IS NOT NULL
                     AND settlement.gross_amount - settlement.deductions_amount = settlement.net_amount AS totals_balance,
+                  CASE
+                    WHEN settlement.remunerative_amount IS NULL AND settlement.non_remunerative_amount IS NULL THEN true
+                    ELSE settlement.gross_amount IS NOT NULL
+                      AND settlement.remunerative_amount IS NOT NULL
+                      AND settlement.non_remunerative_amount IS NOT NULL
+                      AND settlement.remunerative_amount + settlement.non_remunerative_amount = settlement.gross_amount
+                  END AS components_balance,
                   settlement.deductions_amount IS NOT NULL
                     AND COALESCE(breakdown.total_amount, 0) = settlement.deductions_amount AS deductions_match_total
              FROM payroll_settlements settlement
@@ -2680,6 +2802,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         }
         if (settlement.rows[0].totals_balance !== true) {
           throw new ApiError(409, "TOTALS_MISMATCH_REQUIRES_CORRECTION", "Corregí bruto, descuentos o neto para que los totales coincidan.");
+        }
+        if (settlement.rows[0].components_balance !== true) {
+          throw new ApiError(409, "COMPONENTS_MISMATCH_REQUIRES_CORRECTION", "Corregí remunerativo, no remunerativo o bruto para que los componentes coincidan.");
         }
         const acceptedDeductionsMismatch = settlement.rows[0].deductions_match_total !== true;
         if (acceptedDeductionsMismatch && request.body?.acceptDeductionsMismatch !== true) {
@@ -2956,7 +3081,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [request.authUser!.id],
         );
         const existing = await client.query(
-          `SELECT id, status, output_expires_at
+          `SELECT id, status, output_expires_at, created_at, started_at, completed_at
              FROM privacy_operations
             WHERE user_id = $1 AND operation_type = 'DATA_EXPORT'
               AND status IN ('PENDING', 'RUNNING', 'READY')
@@ -2964,29 +3089,23 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [request.authUser!.id],
         );
         if (existing.rowCount) {
-          const row = existing.rows[0];
-          return {
-            created: false,
-            id: String(row.id),
-            status: String(row.status),
-            expiresAt: row.output_expires_at ? timestamp(row.output_expires_at) : null,
-          };
+          return { created: false, operation: existing.rows[0] };
         }
         const id = randomUUID();
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-        await client.query(
+        const created = await client.query(
           `INSERT INTO privacy_operations (
              id, user_id, operation_type, idempotency_key, status, output_expires_at
-           ) VALUES ($1, $2, 'DATA_EXPORT', $3, 'READY', $4)`,
+           ) VALUES ($1, $2, 'DATA_EXPORT', $3, 'READY', $4)
+           RETURNING id, status, output_expires_at, created_at, started_at, completed_at`,
           [id, request.authUser!.id, `export:${id}`, expiresAt],
         );
         await audit(client, request.authUser!.id, "DATA_EXPORT_CREATED", "PRIVACY_OPERATION", id);
-        return { created: true, id, status: "READY", expiresAt: expiresAt.toISOString() };
+        return { created: true, operation: created.rows[0] };
       });
-      const downloadUrl = result.status === "READY"
-        ? `/api/v1/privacy/exports/${result.id}/download`
-        : null;
-      return reply.code(result.created ? 201 : 200).send({ data: { ...result, downloadUrl } });
+      return reply.code(result.created ? 201 : 200).send({
+        data: { created: result.created, ...exportOperationView(result.operation) },
+      });
     },
   );
 
@@ -2994,35 +3113,46 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     "/api/v1/privacy/exports/:id",
     { preHandler: requireAuth, schema: { params: idParamsSchema } },
     async (request) => {
-      const result = await pool.query(
-        `SELECT id, status, output_expires_at, updated_at FROM privacy_operations
+      let result = await pool.query(
+        `SELECT id, status, output_expires_at, created_at, updated_at, started_at, completed_at
+           FROM privacy_operations
           WHERE id = $1 AND user_id = $2 AND operation_type = 'DATA_EXPORT'`,
         [request.params.id, request.authUser!.id],
       );
       if (!result.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      let status = String(result.rows[0].status);
-      if (
-        status === "RUNNING" &&
-        new Date(result.rows[0].updated_at).valueOf() < Date.now() - 15 * 60 * 1000 &&
-        new Date(result.rows[0].output_expires_at).valueOf() > Date.now()
-      ) {
-        const recovered = await pool.query(
-          `UPDATE privacy_operations SET status = 'READY', updated_at = now()
-            WHERE id = $1 AND user_id = $2 AND status = 'RUNNING'
-              AND updated_at < now() - interval '15 minutes'
-            RETURNING status`,
+      const row = result.rows[0];
+      const status = String(row.status);
+      if (["READY", "RUNNING"].includes(status)
+        && new Date(row.output_expires_at).valueOf() <= Date.now()) {
+        result = await pool.query(
+          `UPDATE privacy_operations
+              SET status = 'EXPIRED', completed_at = COALESCE(completed_at, now()), updated_at = now()
+            WHERE id = $1 AND user_id = $2 AND operation_type = 'DATA_EXPORT'
+              AND status IN ('READY', 'RUNNING') AND output_expires_at <= now()
+            RETURNING id, status, output_expires_at, created_at, started_at, completed_at`,
           [request.params.id, request.authUser!.id],
         );
-        if (recovered.rowCount) status = "READY";
-      }
-      if (status === "READY" && new Date(result.rows[0].output_expires_at).valueOf() <= Date.now()) {
-        status = "EXPIRED";
-        await pool.query(
-          "UPDATE privacy_operations SET status = 'EXPIRED', completed_at = now(), updated_at = now() WHERE id = $1 AND status = 'READY'",
-          [request.params.id],
+      } else if (status === "RUNNING"
+        && new Date(row.updated_at).valueOf() < Date.now() - 15 * 60 * 1000) {
+        result = await pool.query(
+          `UPDATE privacy_operations SET status = 'READY', completed_at = NULL, updated_at = now()
+            WHERE id = $1 AND user_id = $2 AND operation_type = 'DATA_EXPORT'
+              AND status = 'RUNNING' AND updated_at < now() - interval '15 minutes'
+              AND output_expires_at > now()
+            RETURNING id, status, output_expires_at, created_at, started_at, completed_at`,
+          [request.params.id, request.authUser!.id],
         );
       }
-      return { data: { id: request.params.id, status, downloadUrl: status === "READY" ? `/api/v1/privacy/exports/${request.params.id}/download` : null } };
+      if (!result.rowCount) {
+        result = await pool.query(
+          `SELECT id, status, output_expires_at, created_at, started_at, completed_at
+             FROM privacy_operations
+            WHERE id = $1 AND user_id = $2 AND operation_type = 'DATA_EXPORT'`,
+          [request.params.id, request.authUser!.id],
+        );
+      }
+      if (!result.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: exportOperationView(result.rows[0]) };
     },
   );
 

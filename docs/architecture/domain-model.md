@@ -209,6 +209,8 @@ Registro append-only separado del AuditEvent del titular. Conserva UUID del acto
 
 MFAFactor conserva un secreto TOTP cifrado y versionado, estado pendiente/activo, contador anti-replay y lock temporal. Los recovery codes se guardan sólo como hashes. `mfaVerifiedAt` y `stepUpExpiresAt` pertenecen a la sesión exacta; elevar garantía rota su token. Si la cuenta no tiene un factor activo, el step-up usa otra autorización de la misma cuenta Google, ligada al ID de la sesión original y con la misma rotación al completarse.
 
+Session conserva UUID, hash irreversible del token, creación, última actividad, vencimiento, revocación y garantía. Para que el titular reconozca accesos sin fingerprinting, agrega sólo `deviceType`, `browserFamily` y `osFamily` dentro de vocabularios cerrados inferidos al crearla; no persiste user-agent crudo, versión, IP, geolocalización ni nombre del dispositivo. El listado devuelve sólo sesiones activas del owner e identifica la actual en servidor. La revocación individual exige step-up, no permite cerrar la actual por ese endpoint y es idempotente para una sesión propia ya terminada.
+
 StorageDeletionTombstone sobrevive a cascades y conserva únicamente las dos keys opacas necesarias para reconciliar un borrado físico. AccountDeletionReceipt conserva el hash de una constancia opaca y el estado de la baja sin email, nombre, userId ni FK personal después de completarse.
 
 ## Dinero

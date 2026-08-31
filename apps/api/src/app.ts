@@ -149,6 +149,24 @@ const userSchema = {
   },
 };
 
+const sessionSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "id", "current", "deviceType", "browser", "operatingSystem", "createdAt", "lastSeenAt", "expiresAt",
+  ],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN },
+    current: { type: "boolean" },
+    deviceType: { type: "string", enum: ["DESKTOP", "MOBILE", "TABLET", "UNKNOWN"] },
+    browser: { type: "string", enum: ["CHROME", "EDGE", "FIREFOX", "SAFARI", "OTHER"] },
+    operatingSystem: { type: "string", enum: ["WINDOWS", "MACOS", "IOS", "ANDROID", "LINUX", "OTHER"] },
+    createdAt: { type: "string" },
+    lastSeenAt: { type: "string" },
+    expiresAt: { type: "string" },
+  },
+};
+
 const legalDocumentSchema = {
   type: "object",
   additionalProperties: false,
@@ -284,6 +302,19 @@ function userFrom(row: Record<string, unknown>): AuthUser {
     mfaEnabled,
     onboardingCompleted: row.onboarding_completed_at !== null && row.onboarding_completed_at !== undefined,
     authMethods,
+  };
+}
+
+function sessionFrom(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    current: Boolean(row.current),
+    deviceType: String(row.device_type),
+    browser: String(row.browser_family),
+    operatingSystem: String(row.os_family),
+    createdAt: timestamp(row.created_at as Date | string),
+    lastSeenAt: timestamp(row.last_seen_at as Date | string),
+    expiresAt: timestamp(row.expires_at as Date | string),
   };
 }
 
@@ -571,6 +602,7 @@ export async function buildApp(
                  WHERE account.user_id = u.id AND account.provider = 'GOOGLE'
               ) AS google_enabled,
               s.mfa_verified_at, s.step_up_expires_at,
+              s.last_seen_at <= now() - interval '5 minutes' AS activity_touch_due,
               EXISTS (
                 SELECT 1 FROM mfa_factors factor
                  WHERE factor.user_id = u.id AND factor.status = 'ACTIVE'
@@ -590,6 +622,14 @@ export async function buildApp(
     );
     if (result.rowCount !== 1) {
       throw new ApiError(401, "AUTHENTICATION_REQUIRED", "Iniciá sesión para continuar.");
+    }
+    if (result.rows[0].activity_touch_due === true) {
+      await pool.query(
+        `UPDATE sessions SET last_seen_at = clock_timestamp()
+          WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
+            AND last_seen_at <= now() - interval '5 minutes'`,
+        [digest],
+      );
     }
     request.authUser = userFrom(result.rows[0]);
     request.authSessionHash = digest;
@@ -753,6 +793,78 @@ export async function buildApp(
         return updated.rowCount === 1;
       });
       return { data: completed ? { ...request.authUser!, onboardingCompleted: true } : request.authUser! };
+    },
+  );
+
+  app.get(
+    "/api/v1/auth/sessions",
+    {
+      preHandler: requireAuth,
+      schema: { response: responses(200, { type: "array", items: sessionSchema }) },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `SELECT id, token_hash = $2 AS current, device_type, browser_family, os_family,
+                created_at, last_seen_at, expires_at
+           FROM sessions
+          WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
+          ORDER BY (token_hash = $2) DESC, last_seen_at DESC, created_at DESC, id`,
+        [request.authUser!.id, request.authSessionHash],
+      );
+      return { data: result.rows.map(sessionFrom) };
+    },
+  );
+
+  app.delete<{ Params: IdParams }>(
+    "/api/v1/auth/sessions/:id",
+    {
+      preHandler: requireStepUp,
+      schema: {
+        params: idParamsSchema,
+        response: responses(200, {
+          type: "object",
+          additionalProperties: false,
+          required: ["revoked"],
+          properties: { revoked: { type: "boolean" } },
+        }),
+      },
+    },
+    async (request) => {
+      const revoked = await withTransaction(async (client) => {
+        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+          throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
+        }
+        const target = await client.query(
+          `SELECT token_hash = $3 AS current,
+                  revoked_at IS NULL AND expires_at > now() AS active
+             FROM sessions
+            WHERE id = $1 AND user_id = $2
+            FOR UPDATE`,
+          [request.params.id, request.authUser!.id, request.authSessionHash],
+        );
+        if (target.rowCount !== 1) {
+          throw new ApiError(404, "SESSION_NOT_FOUND", "Sesión no encontrada.");
+        }
+        if (target.rows[0].current === true) {
+          throw new ApiError(409, "CURRENT_SESSION", "La sesión actual no se puede finalizar desde esta acción.");
+        }
+        if (target.rows[0].active !== true) return false;
+        const updated = await client.query(
+          `UPDATE sessions SET revoked_at = clock_timestamp()
+            WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now()
+            RETURNING id`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (updated.rowCount !== 1) return false;
+        await client.query(
+          `INSERT INTO audit_events (
+             id, user_id, actor_user_id, action, resource_type, resource_id, result, metadata_no_sensitive
+           ) VALUES ($1, $2, $2, 'SESSION_REVOKED', 'SESSION', $3, 'SUCCESS', '{}'::jsonb)`,
+          [randomUUID(), request.authUser!.id, request.params.id],
+        );
+        return true;
+      });
+      return { data: { revoked } };
     },
   );
 

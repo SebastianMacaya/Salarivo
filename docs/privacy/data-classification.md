@@ -7,7 +7,7 @@
 | Clase | Ejemplos | Manejo |
 | --- | --- | --- |
 | Restricted | PDFs, OCR, salarios, salud/obra social, afiliación sindical, futura contribución/mapping de benchmark, DNI/CUIL, banco, email, correcciones, exports, cookies/tokens, códigos OIDC, PKCE verifier, `state`, `nonce`, URLs firmadas, claves | cifrado, acceso mínimo, no logs, no fixtures reales, sharing explícito |
-| Confidential | userId interno, documentId, relación `(provider, sub)`, rol admin, aceptación legal, employment metadata, audit events sanitizados, configuración no secreta | acceso por rol/servicio, logs limitados, retención definida |
+| Confidential | userId interno, documentId, relación `(provider, sub)`, categorías coarse de dispositivo/navegador/SO y timestamps de sesión, rol admin, aceptación legal, employment metadata, audit events sanitizados, configuración no secreta | acceso por rol/servicio, logs limitados, retención definida |
 | Internal | métricas agregadas sin cardinalidad sensible, health, versiones, error codes | uso operativo, sin vínculo innecesario a persona |
 | Public | documentación pública aprobada y contenido de marketing | sin datos derivados de usuarios |
 
@@ -25,6 +25,8 @@ Antes de persistir un campo:
 No se guarda una dirección, banco, familiar u otro dato sólo porque aparece en el PDF. Toda línea individual de tipo deducción se materializa únicamente con su importe y la etiqueta genérica `Deducción`: no conserva descripción, código, recurrencia ni campo de origen. El PDF original continúa siendo Restricted y puede contener señales de salud, afiliación sindical u otros datos incidentales.
 
 Para Google se conserva sólo la relación necesaria entre el UUID interno y `(provider, sub)`, junto con el perfil mínimo requerido por el producto. El email puede mostrarse o usarse como dato de contacto, pero no identifica ni vincula cuentas. Access, refresh e ID tokens nunca se persisten.
+
+Para reconocer sesiones se persisten únicamente categorías allowlisted de dispositivo, navegador y sistema operativo. El user-agent se trata como entrada no confiable y se reduce antes de persistir; se descartan valor crudo, versiones, IP, ubicación, fingerprint y nombre de dispositivo.
 
 ## Reglas por sistema
 

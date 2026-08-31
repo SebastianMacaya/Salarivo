@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   evidenceIdForPage,
   extractionRunChanged,
+  fetchDocumentPrefix,
   parseNormalizedRegion,
   readDocumentLocation,
   regionPixels,
@@ -34,6 +35,20 @@ test('deep-link conserva sólo ids y página válidos', () => {
   assert.equal(writeDocumentLocation('?auth=ok&salary=100', { documentId, page: 1, evidenceId }), `?document=${documentId}&evidence=${evidenceId}`);
   assert.equal(writeDocumentLocation('', { documentId: 'salary=100', page: 999, evidenceId: 'ocr text' }), '');
   assert.equal(writeDocumentLocation(`?document=${documentId}&page=2`, null), '');
+});
+
+test('un refresh silencioso conserva las páginas ya cargadas y su próximo cursor', async () => {
+  const calls: Array<[string | undefined, number]> = [];
+  const page = await fetchDocumentPrefix(async (cursor, limit) => {
+    calls.push([cursor, limit]);
+    const start = cursor ? Number(cursor) : 0;
+    const items = Array.from({ length: limit }, (_, index) => start + index);
+    return { items, nextCursor: String(start + limit), pendingReview: 3, total: 250 };
+  }, 150);
+  assert.deepEqual(calls, [[undefined, 100], ['100', 50]]);
+  assert.equal(page.items.length, 150);
+  assert.equal(page.nextCursor, '150');
+  assert.equal(page.total, 250);
 });
 
 test('la evidencia no sobrevive a una página o documento incompatibles', () => {

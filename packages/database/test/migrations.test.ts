@@ -22,11 +22,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 17);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 17 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 18);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 18 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 17, name: "cross_run_correction_lineage" },
+    { version: 18, name: "session_management" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -152,4 +152,17 @@ test("cross-run corrections keep an additive, same-field root lineage", async ()
   assert.match(migration.sql, /inherited_from_correction_id IS NULL OR inherited_from_correction_id <> id/);
   assert.match(migration.sql, /WHERE inherited_from_correction_id IS NOT NULL/);
   assert.doesNotMatch(migration.sql, /\b(?:DELETE FROM|UPDATE user_corrections|DROP (?:TABLE|COLUMN)|TRUNCATE)\b/);
+});
+
+test("session management stores only coarse client metadata and initializes activity", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 18);
+  assert.ok(migration);
+  assert.equal(migration.name, "session_management");
+  assert.match(migration.sql, /device_type IN \('DESKTOP', 'MOBILE', 'TABLET', 'UNKNOWN'\)/);
+  assert.match(migration.sql, /browser_family IN \('CHROME', 'EDGE', 'FIREFOX', 'SAFARI', 'OTHER'\)/);
+  assert.match(migration.sql, /os_family IN \('WINDOWS', 'MACOS', 'IOS', 'ANDROID', 'LINUX', 'OTHER'\)/);
+  assert.match(migration.sql, /UPDATE sessions SET last_seen_at = created_at WHERE last_seen_at IS NULL/);
+  assert.match(migration.sql, /ALTER COLUMN last_seen_at SET DEFAULT now\(\)/);
+  assert.match(migration.sql, /ALTER COLUMN last_seen_at SET NOT NULL/);
+  assert.doesNotMatch(migration.sql, /\b(?:user_agent|ip_address|geolocation|latitude|longitude)\b/i);
 });

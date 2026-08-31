@@ -6,7 +6,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 
 ## Qué funciona
 
-- alta e inicio de sesión exclusivamente con Google y aceptación legal versionada, onboarding, logout y revocación de otras sesiones;
+- alta e inicio de sesión exclusivamente con Google y aceptación legal versionada, onboarding, logout y gestión owner-only de sesiones activas con revocación individual o masiva;
 - empleadores y empleos;
 - lotes persistentes de uno o muchos PDFs con upload directo privado;
 - ownership, idempotencia, límites, expiración y cleanup;
@@ -26,6 +26,8 @@ El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argenti
 El historial `salary-analytics-v1` usa únicamente documentos `COMPLETED`; los `NEEDS_REVIEW` quedan informados pero fuera de los cálculos. El salario comparable inicial es sólo el básico de una liquidación `NORMAL` recurrente dentro de un contexto laboral y una moneda; ante falta o ambigüedad devuelve N/D. Los posibles duplicados estructurados son advertencias para revisión, nunca borrados automáticos.
 
 Google se integra mediante OIDC Authorization Code con PKCE, `state` y `nonce`. La cuenta conserva su UUID y sus sesiones opacas internas: `auth_accounts` relaciona `(provider, sub)` con ese usuario, el email de Google no identifica ni auto-vincula cuentas y no se persisten access, refresh ni ID tokens. El callback es `GET`, sólo admite redirects internos allowlisted y completa el alta en un segundo paso atómico junto con la aceptación legal. No existen rutas de login, registro o recuperación por contraseña. El primer factor TOTP se inicia desde una sesión primaria creada en los últimos 15 minutos, sin otro redirect; el step-up sin MFA usa otra autorización Google con selección explícita de la misma cuenta, ligada a la sesión original, y rota esa sesión al completarse. Ver [ADR 0010](docs/adr/0010-google-oidc-and-external-identities.md).
+
+La gestión de sesiones muestra únicamente categoría de dispositivo, navegador y sistema operativo inferidos en forma gruesa al iniciar sesión, junto con creación, última actividad y vencimiento. No persiste user-agent crudo, versión, IP, ubicación, fingerprint ni nombre del dispositivo.
 
 ## Estructura
 

@@ -7,6 +7,7 @@
 .heading h2 { font-size: 1rem; margin: .15rem 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fileIcon { background: #dc2626; border-radius: .4rem; color: #fff; font-size: .72rem; font-weight: 800; margin-right: .75rem; padding: .55rem .4rem; }
 .header nav { display: flex; gap: .25rem; }
+.header nav button { min-width: 2.75rem; }
 .header button, .section button, .actions button, .callout button, .metadata button { background: #fff; border: 1px solid #cbd5e1; border-radius: .45rem; color: inherit; cursor: pointer; min-height: 2.75rem; padding: .5rem .75rem; }
 .header button:disabled, .section button:disabled, .actions button:disabled, .callout button:disabled { cursor: default; opacity: .45; }
 .close { font-size: 1.4rem; min-width: 2.75rem; }
@@ -67,7 +68,7 @@
   .dataPane { border-left: 0; overflow-y: auto; }
   .mobileTabs { background: #fff; border-bottom: 1px solid #dce1e8; display: grid; grid-template-columns: 1fr 1fr; }
   .mobileTabs button { background: #fff; border: 0; border-bottom: 3px solid transparent; min-height: 2.75rem; }
-  .mobileTabs button[aria-selected='true'] { border-bottom-color: #2563eb; color: #1d4ed8; font-weight: 700; }
+  .mobileTabs button[aria-pressed='true'] { border-bottom-color: #2563eb; color: #1d4ed8; font-weight: 700; }
   .mobileHidden { display: none; }
   .metadata dl { grid-template-columns: 1fr; }
   .settlementOverview { grid-template-columns: 1fr; }

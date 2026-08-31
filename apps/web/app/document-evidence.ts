@@ -4,6 +4,13 @@ export type DocumentLocation = {
   page?: number;
 };
 
+export type CursorDocumentPage<T> = {
+  items: T[];
+  nextCursor: string | null;
+  pendingReview: number;
+  total: number;
+};
+
 export type NormalizedRegion = {
   height: number;
   origin: 'TOP_LEFT';
@@ -16,6 +23,25 @@ export type NormalizedRegion = {
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const amountField = /^settlement\..+Amount$/;
+
+export async function fetchDocumentPrefix<T>(
+  fetchPage: (cursor: string | undefined, limit: number) => Promise<CursorDocumentPage<T>>,
+  targetCount: number,
+  pageSize = 100,
+): Promise<CursorDocumentPage<T>> {
+  const items: T[] = [];
+  let cursor: string | undefined;
+  let lastPage: CursorDocumentPage<T> | undefined;
+  while (items.length < Math.max(1, targetCount)) {
+    const page = await fetchPage(cursor, Math.min(pageSize, Math.max(1, targetCount - items.length)));
+    items.push(...page.items);
+    lastPage = page;
+    if (!page.nextCursor || page.nextCursor === cursor || page.items.length === 0) break;
+    cursor = page.nextCursor;
+  }
+  if (!lastPage) throw new Error('DOCUMENT_PAGE_MISSING');
+  return { ...lastPage, items };
+}
 
 function finiteUnit(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;

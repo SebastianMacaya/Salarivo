@@ -3,7 +3,7 @@ import { pool, withTransaction, type PoolClient } from "@salarivo/database";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
 import type { GoogleIdentity, GoogleOidcClient } from "./google-oidc.ts";
-import { oauthCookieName, opaqueToken, sessionCookieName, tokenHash } from "./security.ts";
+import { oauthCookieName, opaqueToken, parseUserAgent, sessionCookieName, tokenHash } from "./security.ts";
 import { rotateSession } from "./session-assurance.ts";
 
 type ErrorConstructor = new (statusCode: number, code: string, message: string) => Error;
@@ -234,6 +234,7 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
       },
     },
     async (request, reply) => {
+      const sessionClient = parseUserAgent(request.headers["user-agent"]);
       const browserToken = request.cookies[cookieName];
       const state = request.query.state;
       if (!google || !browserToken || !TOKEN_PATTERN.test(browserToken) || !state || !TOKEN_PATTERN.test(state)) {
@@ -372,9 +373,18 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
           }
           const token = opaqueToken();
           await client.query(
-            `INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at)
-             VALUES ($1, $2, $3, $4, clock_timestamp())`,
-            [randomUUID(), user.id, tokenHash(token), new Date(Date.now() + config.sessionTtlSeconds * 1000)],
+            `INSERT INTO sessions (
+               id, user_id, token_hash, expires_at, device_type, browser_family, os_family
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              randomUUID(),
+              user.id,
+              tokenHash(token),
+              new Date(Date.now() + config.sessionTtlSeconds * 1000),
+              sessionClient.deviceType,
+              sessionClient.browserFamily,
+              sessionClient.osFamily,
+            ],
           );
           await client.query(
             `UPDATE users
@@ -442,6 +452,7 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
       },
     },
     async (request, reply) => {
+      const sessionClient = parseUserAgent(request.headers["user-agent"]);
       const browserToken = request.cookies[cookieName];
       if (!browserToken || !TOKEN_PATTERN.test(browserToken)) {
         throw new ApiError(409, "GOOGLE_REGISTRATION_EXPIRED", "El alta con Google venció. Iniciá el acceso nuevamente.");
@@ -535,9 +546,18 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
         }
 
         await client.query(
-          `INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at)
-           VALUES ($1, $2, $3, $4, clock_timestamp())`,
-          [randomUUID(), row.id, tokenHash(token), new Date(Date.now() + config.sessionTtlSeconds * 1000)],
+          `INSERT INTO sessions (
+             id, user_id, token_hash, expires_at, device_type, browser_family, os_family
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            randomUUID(),
+            row.id,
+            tokenHash(token),
+            new Date(Date.now() + config.sessionTtlSeconds * 1000),
+            sessionClient.deviceType,
+            sessionClient.browserFamily,
+            sessionClient.osFamily,
+          ],
         );
         await client.query(
           `UPDATE users
