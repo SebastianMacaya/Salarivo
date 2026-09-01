@@ -7,7 +7,7 @@
     "start": "node --experimental-strip-types src/server.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "test:integration": "node --env-file=../../.env.example --env-file-if-exists=../../.env --experimental-strip-types --test --test-concurrency=1 test/integration/*.integration.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "node --stack_size=16384 ../../node_modules/typescript/bin/tsc --noEmit"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1120.0",
