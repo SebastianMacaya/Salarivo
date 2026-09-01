@@ -78,7 +78,7 @@ Las credenciales de `.env.example` son exclusivamente locales. Antes de cualquie
 
 ## Despliegue
 
-Producción se construye desde `main` en tres aplicaciones separadas de Coolify: `salarivo-main`, `salarivo-api` y `salarivo-worker-documents`. Cada una debe tener su propio webhook de GitHub para eventos `push`; CI valida el código, pero no reemplaza esos despliegues. Las URLs y los secretos de webhook se configuran sólo en Coolify y GitHub, nunca en este repositorio.
+Producción se construye desde `main` en tres aplicaciones separadas de Coolify: `salarivo-main`, `salarivo-api` y `salarivo-worker-documents`. El repositorio usa un único webhook manual de GitHub para eventos `push`; las tres aplicaciones comparten su secreto en Coolify y tienen Auto Deploy habilitado. CI valida el código, pero no reemplaza esos despliegues. Las URLs y los secretos de webhook se configuran sólo en Coolify y GitHub, nunca en este repositorio.
 
 La API usa en Coolify un healthcheck de tipo `Container command`: `curl --fail --silent --show-error http://127.0.0.1:3001/health`. La API y el worker ejecutan las migraciones y validan la política privada de R2 al iniciar; su CORS y lifecycle deben conservar el contrato de [seguridad de upload](docs/security/file-upload.md).
 

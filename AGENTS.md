@@ -76,7 +76,7 @@ Una tarea termina cuando:
 Para cambios que deban llegar a producción:
 
 - un `push` o CI verde no demuestra que el despliegue terminó;
-- `salarivo-main`, `salarivo-api` y `salarivo-worker-documents` deben tener habilitado su webhook de `push` a `main` y converger en el mismo commit completo;
+- el repositorio mantiene un único webhook manual de GitHub para eventos `push`; `salarivo-main`, `salarivo-api` y `salarivo-worker-documents` deben compartir su secreto en Coolify, tener Auto Deploy habilitado y converger en el mismo commit completo;
 - la API y el worker aplican las migraciones al iniciar; no dupliques esa ejecución en comandos de ciclo de vida de la plataforma;
 - verificá la última migración aplicada, la salud de la API, el worker y un smoke test autenticado de la web;
 - una ruta autenticada sin sesión debe responder el rechazo de autenticación esperado, no `404`;
