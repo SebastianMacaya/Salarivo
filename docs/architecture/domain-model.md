@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–021. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–023. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -47,6 +47,8 @@ erDiagram
     USER ||--o{ MFA_FACTOR : protects
     MFA_FACTOR ||--o{ MFA_RECOVERY_CODE : issues
     USER ||--o{ AUDIT_EVENT : scopes
+    ECONOMIC_SERIES ||--o{ ECONOMIC_OBSERVATION : records
+    ECONOMIC_SERIES ||--o{ ECONOMIC_SYNC_JOB : synchronizes
 ~~~
 
 ## Agregados
@@ -103,6 +105,16 @@ Registro durable que funciona como intent/outbox del trabajo asíncrono:
 - errorCode sanitizado.
 
 Se inserta en la misma transacción que la transición que requiere trabajo. Un dispatcher publica su ID en Redis y un reconciliador recupera PENDING/PUBLISHED vencidos. El worker aplica compare-and-set/lease y sigue siendo idempotente ante delivery duplicado.
+
+### EconomicSeries, EconomicObservation y EconomicSyncJob
+
+EconomicSeries identifica una fuente económica global por código interno estable. Distingue `EXCHANGE_RATE` y `PRICE_INDEX`, frecuencia diaria o mensual, país, variante, proveedor, identificador externo, fuente, metodología y vigencia. Una serie FX declara moneda base y quote; un índice de precios no las usa.
+
+EconomicObservation conserva fecha, valor decimal positivo, revisión, hash del payload, timestamps y metadata no sensible. Es append-only: una corrección agrega otra revisión para la misma serie/fecha y la consulta elige la mayor sin borrar evidencia anterior.
+
+EconomicSyncJob representa un rango global con estado `PENDING`, `RUNNING`, `RETRYABLE`, `COMPLETED`, `FAILED` o `CANCELLED`, disponibilidad, attempts, lease y errorCode sanitizado. No referencia User, Employment, Document, PayrollSettlement ni montos. Como máximo existe un job activo por serie.
+
+Las tres entidades son compartidas entre cuentas. Sólo al derivar una perspectiva salarial se combinan con datos owner-scoped; no existe una entidad persistida `SalaryEconomicValuation`. Ver [Datos económicos](economic-data.md).
 
 ### ReprocessingBatch
 
@@ -248,6 +260,7 @@ StorageDeletionTombstone sobrevive a cascades y conserva las keys opacas del ori
 - currencyCode ISO explícito por monto/agregado.
 - Las operaciones redondean sólo en un límite definido y testeado.
 - Analytics distingue suma de ingresos del salario mensual recurrente.
+- Economic Data orienta cada cotización como `1 base = value quote`, ajusta IPC mediante `nominal × targetIndex ÷ sourceIndex` y usa razones `BigInt`; el dinero redondea a dos decimales a la mitad alejándose de cero.
 
 ## Fechas
 
@@ -256,14 +269,15 @@ Se modelan por separado:
 - payrollPeriod, como mes/año de negocio;
 - paymentDate;
 - issueDate;
+- fecha FX objetivo/observada y método de selección;
 - employment start/end;
 - uploadedAt y processedAt.
 
-No se infiere que sean equivalentes. Timestamps técnicos se almacenan en UTC.
+No se infiere que sean equivalentes. Para FX se priorizan paymentDate, issueDate y fin de payrollPeriod; la observación previa tiene un lookback máximo de siete días. IPC exige el mes exacto y no interpola. Timestamps técnicos se almacenan en UTC.
 
 ## País
 
-countryCode es explícito. Un adapter de nómina contiene reglas locales; AR es el primero. Identificadores fiscales se representan como tipo + valor protegido, no como una columna CUIT universal.
+countryCode es explícito y no se deriva de currencyCode. Un adapter de nómina contiene reglas locales; AR es el primero. Identificadores fiscales se representan como tipo + valor protegido, no como una columna CUIT universal. El único perfil económico V1 combina `AR` + `ARS` y referencia `USD`; admitir campos genéricos no habilita otro país o moneda.
 
 ## Integridad e índices
 
@@ -284,6 +298,7 @@ Las migraciones vigentes materializan:
 - estados restringidos al vocabulario permitido; los servicios aplican las transiciones.
 - coherencia entre `role = ADMIN` y un `admin_role` válido; eventos administrativos append-only.
 - linaje raíz de correcciones heredadas restringido al mismo user, document y fieldPath.
+- series económicas con códigos y provider/externalId únicos; observaciones positivas y append-only por serie/fecha/revisión; jobs con rango/lease coherentes y uno activo por serie.
 
 Índices:
 
@@ -295,6 +310,7 @@ Las migraciones vigentes materializan:
 - ExtractionRun por document/version y parser/status; issues por code/recoverability;
 - AuditEvent por userId + timestamp.
 - recorridos admin por estado/fecha de User, Document, ProcessingJob y PrivacyOperation; AdminAuditEvent por fecha, actor, sujeto y recurso.
+- EconomicSeries por tipo/país/estado; EconomicObservation por serie/rango/revisión descendente; EconomicSyncJob por vencimiento, lease y rango.
 
 Las políticas de row-level security pueden ser defensa adicional, nunca reemplazo de autorización en servicios.
 
@@ -305,6 +321,7 @@ Original y estructura tienen lifecycle separado:
 - borrar original elimina object storage y derivados, pero puede conservar settlements;
 - borrar documento elimina o anonimiza toda relación según elección/política;
 - borrar cuenta coordina hoy sesiones, cuentas externas, intentos OIDC, DB, storage, cola, exports y temporales; cualquier cache externa, share o índice futuro deberá sumarse a esa orquestación antes de habilitarse.
+- series, observaciones y jobs económicos son globales y no se borran con una cuenta o documento; no contienen IDs ni importes de la persona.
 
 Los detalles están en [Retención](../privacy/data-retention.md).
 
@@ -315,3 +332,5 @@ Analytics selecciona únicamente `Document.activeExtractionRunId` y exige que el
 La proyección derivada declara `calculationVersion = salary-analytics-v1` y no persiste agregados. Segmenta estrictamente por contexto laboral y currencyCode. `comparableSalary` usa exclusivamente basicAmount cuando el período tiene una liquidación `NORMAL` recurrente verificada y un básico único; falta o ambigüedad producen N/D, sin fallback a bruto o neto. Las operaciones monetarias usan BigInt sobre centavos y los porcentajes se obtienen por variación compuesta `(final / inicial) - 1`, nunca sumando porcentajes; cada resultado conserva período inicial y final.
 
 La proyección conserva múltiples liquidaciones de un mes, calcula situación actual, YTD, ventana móvil de doce meses, interanual exacto, evolución, totales/promedios anuales y separación `NORMAL`, `SAC`, `BONO`, `RETROACTIVO`, `VACACIONES`, `HORAS_EXTRA`, `AJUSTE`, `REINTEGRO` y otros. Los haberes normalizados permiten separar extraordinarios incluidos dentro de una liquidación normal. Una firma estructural sólo marca un posible duplicado entre documentos distintos; requiere confirmación humana y nunca elimina datos.
+
+`economic-analytics-v1` toma la proyección nominal y, sólo cuando existe un perfil para countryCode + currencyCode, resuelve en batch la última revisión aplicable de FX e IPC. Devuelve equivalente USD histórico, poder adquisitivo contra el último índice disponible e inflación entre períodos con procedencia completa. Los estados `PARTIAL`, `PENDING` y `UNAVAILABLE` no eliminan ni modifican el nominal. No persiste agregados ni valuaciones económicas.

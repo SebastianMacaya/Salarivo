@@ -23,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 21);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 21 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 23);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 23 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 21, name: "discard_unsupported_and_exact_duplicates" },
+    { version: 23, name: "economic_observation_payload_hash" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -251,6 +251,58 @@ test("unsupported originals are scheduled for deletion and exact duplicates reta
   assert.match(sql, /SET retention_policy = 'DELETE_AFTER_PROCESSING'/);
   assert.match(sql, /canonical_object_key = document\.object_key/);
   assert.doesNotMatch(sql, /DELETE_AFTER_[0-9]+_DAYS|interval '\d+ days'/i);
+});
+
+test("economic data is global, revisioned and synchronized without private salary context", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 22);
+  assert.ok(migration);
+  assert.equal(migration.name, "economic_data");
+  const { sql } = migration;
+
+  for (const table of ["economic_series", "economic_observations", "economic_sync_jobs"]) {
+    assert.match(sql, new RegExp(`CREATE TABLE ${table}`));
+  }
+  assert.match(sql, /series_type IN \('EXCHANGE_RATE', 'PRICE_INDEX'\)/);
+  assert.match(sql, /frequency IN \('DAILY', 'MONTHLY'\)/);
+  assert.match(sql, /base_currency_code IS NOT NULL/);
+  assert.match(sql, /quote_currency_code IS NOT NULL/);
+  assert.match(sql, /base_currency_code <> quote_currency_code/);
+  for (const column of [
+    "provider_code", "external_series_id", "source_url", "methodology",
+    "provider_observation_id", "source_updated_at", "fetched_at",
+  ]) assert.match(sql, new RegExp(`\\b${column}\\b`));
+  assert.equal(sql.match(/metadata_no_sensitive jsonb/g)?.length, 2);
+  assert.match(sql, /value numeric\(30,12\) NOT NULL CHECK \(value > 0\)/);
+  assert.match(sql, /UNIQUE \(series_id, observation_date, revision\)/);
+  assert.match(sql, /economic_observations_series_range_latest_idx[\s\S]*revision DESC/);
+  assert.match(sql, /BEFORE UPDATE OR DELETE ON economic_observations/);
+  assert.match(sql, /BEFORE TRUNCATE ON economic_observations/);
+
+  assert.match(sql, /range_end >= range_start/);
+  assert.match(sql, /attempt <= max_attempts/);
+  assert.match(sql, /\(state = 'RUNNING'\) = \(lease_owner IS NOT NULL\)/);
+  assert.match(sql, /economic_sync_jobs_due_idx/);
+  assert.match(sql, /economic_sync_jobs_lease_idx/);
+  assert.match(sql, /CREATE UNIQUE INDEX economic_sync_jobs_one_active_series_uidx/);
+  assert.match(sql, /WHERE state IN \('PENDING', 'RUNNING', 'RETRYABLE'\)/);
+
+  assert.doesNotMatch(sql, /\b(?:user_id|document_id|employment_id|settlement_id|salary|gross_amount|net_amount)\b/i);
+  assert.doesNotMatch(sql, /\b(?:real|float|double precision)\b/i);
+  assert.doesNotMatch(sql, /INSERT INTO economic_/i);
+  assert.doesNotMatch(sql, /https:\/\/[^']+\//i);
+});
+
+test("economic provider payload hashes are mandatory for new rows without rewriting append-only history", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 23);
+  assert.ok(migration);
+  assert.equal(migration.name, "economic_observation_payload_hash");
+  assert.match(migration.sql, /ADD COLUMN provider_payload_sha256 text/);
+  assert.match(migration.sql, /provider_payload_sha256 IS NOT NULL/);
+  assert.match(migration.sql, /provider_payload_sha256 ~ '\^\[0-9a-f\]\{64\}\$'/);
+  assert.match(migration.sql, /NOT VALID/);
+  assert.doesNotMatch(migration.sql, /ALTER COLUMN provider_payload_sha256 SET NOT NULL/);
+  assert.doesNotMatch(migration.sql, /UPDATE economic_observations/);
+  assert.doesNotMatch(migration.sql, /DROP TRIGGER|DISABLE TRIGGER/i);
 });
 
 test("employer normalization aligns legal suffix punctuation without retaining punctuation-only input", () => {

@@ -16,6 +16,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - extracción determinística de recibos argentinos, campos trazables, importes remunerativos/no remunerativos, liquidación, reintegros y conceptos;
 - visor PDF privado por página, evidencia espacial, confirmación de tipo, correcciones humanas y recuperación versionada con comparación/promoción segura;
 - historial salarial derivado con resumen, evolución, análisis anual y comparación por empleo y moneda;
+- contexto económico derivado para `AR` + `ARS`, con equivalente USD histórico, poder adquisitivo, inflación del período y fuente/metodología trazables;
 - navegación contextual entre cada empleo, su historial y sus documentos, con el contexto recuperable desde la URL;
 - modo privacidad visual global para enmascarar importes y porcentajes en la interfaz autenticada, con advertencia antes de abrir el PDF original sin censurar;
 - detección no persistida de empleos a partir de recibos sin asociar, siempre sujeta a confirmación;
@@ -29,6 +30,8 @@ El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argenti
 
 El historial `salary-analytics-v1` usa únicamente la corrida activa explícita de documentos `COMPLETED`; un resultado pendiente de revisión y un reproceso pendiente, fallido o dudoso no alteran los cálculos. El salario comparable inicial es sólo el básico de una liquidación `NORMAL` recurrente dentro de un contexto laboral y una moneda; ante falta o ambigüedad devuelve N/D y, si existe una recuperación compatible, la UI lo informa sin inventar un monto. Un segundo upload con el mismo SHA-256 del mismo titular se descarta por completo; los posibles duplicados estructurales siguen siendo advertencias para revisión, nunca borrados automáticos.
 
+`economic-analytics-v1` mantiene intacto ese nominal y agrega perspectivas derivadas sólo para el perfil `AR` + `ARS`. Reutiliza series globales revisionadas de Datos Argentina —referencia USD/ARS con fuente primaria BCRA e IPC con fuente INDEC—, muestra estados parciales cuando falta cobertura y no persiste una cache de valuaciones salariales. Ver [Datos económicos](docs/architecture/economic-data.md). Esta capacidad está implementada en el código actual; esta documentación no acredita por sí sola su despliegue productivo.
+
 Google se integra mediante OIDC Authorization Code con PKCE, `state` y `nonce`. La cuenta conserva su UUID y sus sesiones opacas internas: `auth_accounts` relaciona `(provider, sub)` con ese usuario, el email de Google no identifica ni auto-vincula cuentas y no se persisten access, refresh ni ID tokens. El callback es `GET`, sólo admite redirects internos allowlisted y completa el alta en un segundo paso atómico junto con la aceptación legal. No existen rutas de login, registro o recuperación por contraseña. El primer factor TOTP se inicia desde una sesión primaria creada en los últimos 15 minutos, sin otro redirect; el step-up sin MFA usa otra autorización Google con selección explícita de la misma cuenta, ligada a la sesión original, y rota esa sesión al completarse. Ver [ADR 0010](docs/adr/0010-google-oidc-and-external-identities.md).
 
 La gestión de sesiones muestra únicamente categoría de dispositivo, navegador y sistema operativo inferidos en forma gruesa al iniciar sesión, junto con creación, última actividad y vencimiento. No persiste user-agent crudo, versión, IP, ubicación, fingerprint ni nombre del dispositivo.
@@ -39,6 +42,7 @@ La gestión de sesiones muestra únicamente categoría de dispositivo, navegador
 - `apps/api`: API Fastify bajo `/api/v1`.
 - `apps/worker-documents`: dispatcher, reconciliadores y pipeline pesado.
 - `packages/database`: migración PostgreSQL y transacciones compartidas.
+- `packages/economic-data`: contratos, perfiles, resolución y aritmética económica exacta.
 - `docs`: alcance, arquitectura, seguridad, privacidad y ADR.
 
 ## Preparación local
@@ -119,6 +123,7 @@ npm run test:integration
 - [Arquitectura](docs/architecture/overview.md)
 - [Pipeline de ingestión](docs/architecture/ingestion-pipeline.md)
 - [Modelo de dominio](docs/architecture/domain-model.md)
+- [Datos económicos](docs/architecture/economic-data.md)
 - [Consola administrativa](docs/architecture/admin-console.md)
 - [Threat model](docs/security/threat-model.md)
 - [Auditoría de privacidad y seguridad 2026-08-30](docs/security/privacy-security-audit-2026-08-30.md)
@@ -128,4 +133,5 @@ npm run test:integration
 - [Políticas legales](docs/legal/policies.md)
 - [Google OIDC e identidades externas](docs/adr/0010-google-oidc-and-external-identities.md)
 - [Consola administrativa granular](docs/adr/0012-granular-admin-console.md)
+- [Datos económicos globales y contexto salarial derivado](docs/adr/0016-global-economic-data-and-derived-context.md)
 - [ADRs](docs/adr/README.md)

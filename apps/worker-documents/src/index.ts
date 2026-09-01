@@ -61,6 +61,7 @@ import {
   verifyProductionStorage,
   type StorageProvider,
 } from './storage.ts';
+import { maintainEconomicData } from './economic-sync.ts';
 
 const QUEUE_NAME = 'salarivo:processing-jobs:documents';
 const STORAGE_REQUEST_TIMEOUT_MS = 30_000;
@@ -3046,6 +3047,7 @@ async function dispatcherLoop(
 }
 
 async function maintenanceLoop(s3: S3Client, config: WorkerConfig, signal: AbortSignal): Promise<void> {
+  const economicWorkerId = `economic:${randomUUID()}`;
   while (!signal.aborted) {
     try {
       const reconciled = await reconcileDatabaseState(config);
@@ -3088,6 +3090,25 @@ async function maintenanceLoop(s3: S3Client, config: WorkerConfig, signal: Abort
       if (accounts) log('accounts_deleted', { count: accounts });
     } catch {
       log('maintenance_error');
+    }
+    try {
+      const economic = await maintainEconomicData(
+        economicWorkerId,
+        config.jobLeaseMs,
+        signal,
+      );
+      if (economic.planned) log('economic_sync_jobs_planned', { count: economic.planned });
+      if (economic.recovered) log('economic_sync_leases_recovered', { count: economic.recovered });
+      if (economic.completed) {
+        log('economic_sync_completed', {
+          count: economic.completed,
+          observations: economic.insertedObservations,
+        });
+      }
+      if (economic.retried) log('economic_sync_retry_scheduled', { count: economic.retried });
+      if (economic.failed) log('economic_sync_failed', { count: economic.failed });
+    } catch {
+      log('economic_sync_maintenance_error');
     }
     try {
       await sleep(60_000, undefined, { signal });

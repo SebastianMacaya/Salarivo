@@ -4,12 +4,14 @@
 
 ## Alcance
 
-Web, consola administrativa, API, Google OIDC, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, observabilidad, exports y operaciones de borrado.
+Web, consola administrativa, API, Google OIDC, PostgreSQL, cola, workers, object storage, scanner, OCR/IA externa, proveedor económico, observabilidad, exports y operaciones de borrado.
 
 ## Activos
 
 - PDFs y derivados;
 - salarios, conceptos y timeline;
+- equivalentes USD, poder adquisitivo y variaciones salariales derivadas;
+- integridad, revisión, metodología y atribución de series económicas globales;
 - PII e identificadores fiscales;
 - sesiones, credenciales, secretos MFA y recovery codes;
 - relaciones `(provider, sub)`, intentos OIDC y códigos/tokens transitorios;
@@ -47,12 +49,13 @@ flowchart LR
     Storage --> Worker
     Worker --> DB
     Worker --> Sandbox[Parsers / OCR aislados]
-    Worker -. datos mínimos .-> Vendor[Proveedor externo]
+    Worker -. fragmento minimizado .-> Vendor[OCR / IA externa]
+    Worker -. serie pública + rango .-> Economic[Datos Argentina]
     API --> Telemetry[Logs / métricas sanitizados]
     Worker --> Telemetry
 ~~~
 
-Nada que cruce desde Internet, navegador, storage o documento se considera confiable. Un resultado OCR o LLM tampoco es una instrucción ni un dato verificado.
+Nada que cruce desde Internet, navegador, storage, documento o proveedor económico se considera confiable. Un resultado OCR o LLM tampoco es una instrucción ni un dato verificado.
 
 ## Amenazas y controles
 
@@ -65,6 +68,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 | JavaScript, adjuntos o acciones PDF | inspección estructural y política deny-active sobre allowlist PDF | fixture activo se rechaza |
 | Path traversal | object key generada por servidor, filename sólo metadata, paths temporales internos | filenames con rutas no escapan del sandbox |
 | SSRF | worker sin red por defecto, destinos externos allowlisted, no seguir URLs del documento | URLs embebidas nunca se solicitan |
+| Proveedor económico manipulado, indisponible o usado para exfiltrar | origen/path/series allowlisted, sin redirects, timeout y body acotados, AbortSignal, validación de status/content-type/schema/metadata/fecha/valor/frecuencia, hash del payload y revisiones append-only; el request contiene sólo identificador de serie, rango y opciones técnicas fijas | host o serie no esperados, redirect, body excesivo, metadata/valor inválidos y timeout fallan sin enviar usuario, salario, documento u OCR; last-known-good permanece |
 | Bucket público, cifrado o policy en drift | proveedor explícito; R2 Standard con AES-256-GCM administrado por Cloudflare, `r2.dev` y custom domains deshabilitados, CORS/lifecycle exactos y comprobación read-only fail-closed al arrancar; AWS conserva SSE-KMS, versioning ausente y Public Access Block | API y worker rechazan storage class, dominio, CORS o lifecycle R2 divergente y configuración AWS insegura |
 | Artefacto textual reutilizado por otro owner, alterado o confirmado tarde tras timeout | key opaca server-side, metadata owner-scoped `PENDING` antes del PUT, checksum antes de parsear, sin URL/API pública; tombstone conserva writes inciertos a través de cascades y exige DELETE + HEAD ausente | artefacto ajeno, parcial o con checksum distinto falla cerrado; un write incierto bloquea el cierre del borrado |
 | URL firmada filtrada/reutilizada | TTL breve, método/key/tamaño limitados, autorización previa, no loguear URL | expiración, método incorrecto y otra key fallan |
@@ -100,6 +104,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 - El original contiene más datos que los necesarios para analytics.
 - Un error puede incluir OCR o metadata sensible.
 - Un proveedor externo puede retener payload.
+- Datos Argentina conoce los identificadores de series públicas y los rangos solicitados sin contexto de cuenta; no debe recibir PII, salarios, empleos ni documentos.
 - El IdP conoce cada autenticación Google; Salarivo minimiza scopes y no usa el email para correlacionar cuentas locales.
 - Una métrica con labels libres puede filtrar salario o identidad.
 - Un export o share puede sobrevivir a una revocación si no se coordina el cleanup.
@@ -115,6 +120,7 @@ Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle de
 - retries y timeouts crecientes;
 - profundidad de cola sostenida;
 - OCR/proveedor degradado;
+- gaps, retries, leases vencidos o fallos sostenidos de sincronización económica;
 - cuota o storage cerca del límite;
 - Budget Alerts account-wide a USD 1 y USD 3; se procesan diariamente y sólo informan, no frenan gasto;
 - fallos de eliminación;
@@ -136,6 +142,7 @@ Las alertas sólo incluyen IDs internos y códigos.
 - SLA, budgets y límites numéricos.
 - Plazos legales de retención y backup.
 - Condiciones contractuales de OCR/IA.
+- Cambios de disponibilidad, licencia o metodología en Datos Argentina/BCRA/INDEC; un adapter BCRA directo permanece bloqueado hasta confirmar autorización de reutilización comercial.
 
 Ninguno puede marcarse como mitigado hasta existir configuración, test y evidencia operativa.
 

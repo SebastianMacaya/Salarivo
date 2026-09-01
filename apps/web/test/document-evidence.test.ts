@@ -43,7 +43,7 @@ test('deep-link conserva sólo ids y página válidos', () => {
 
 test('la ubicación owner lee sólo navegación y filtros válidos', () => {
   assert.deepEqual(readOwnerLocation(
-    `?currencyCode=ARS&section=history&employmentContext=${employmentContext}&employmentId=${employmentId}&tab=documents&range=24&year=2026&period=2026-08`
+    `?currencyCode=ARS&section=history&employmentContext=${employmentContext}&employmentId=${employmentId}&tab=purchasing-power&perspective=purchasing-power&range=24&year=2026&period=2026-08`
       + '&documentType=PAYROLL&settlementType=OTRO_LABORAL&status=REVIEW'
       + '&privacy=blur&search=sebastian&filename=recibo.pdf&ocr=texto&salary=100&amount=200&unknown=value',
   ), {
@@ -51,7 +51,8 @@ test('la ubicación owner lee sólo navegación y filtros válidos', () => {
     section: 'history',
     employmentContext,
     employmentId,
-    tab: 'documents',
+    tab: 'purchasing-power',
+    perspective: 'purchasing-power',
     range: '24',
     year: '2026',
     period: '2026-08',
@@ -61,7 +62,7 @@ test('la ubicación owner lee sólo navegación y filtros válidos', () => {
   });
 
   assert.deepEqual(readOwnerLocation(
-    '?currencyCode=ARS1&section=admin&employmentContext=detected%3Aempresa&employmentId=all&tab=raw&range=365&year=1999&period=2026-13'
+    '?currencyCode=ARS1&section=admin&employmentContext=detected%3Aempresa&employmentId=all&tab=raw&perspective=real&range=365&year=1999&period=2026-13'
       + '&documentType=PDF&settlementType=neto%20100&status=DELETED',
   ), {});
 });
@@ -70,8 +71,8 @@ test('la ubicación owner aplica patches, permite borrar y conserva el documento
   const search = `?section=summary&employmentContext=${employmentContext}&employmentId=${employmentId}&tab=summary&document=${documentId}`
     + `&page=3&evidence=${evidenceId}&auth=secret&salary=999&unknown=value`;
   assert.equal(
-    writeOwnerLocation(search, { section: 'history', tab: 'documents', year: '2026', status: 'READY' }),
-    `?section=history&employmentContext=${encodeURIComponent(employmentContext)}&employmentId=${employmentId}&tab=documents&year=2026&status=READY`
+    writeOwnerLocation(search, { section: 'history', tab: 'documents', perspective: 'historical-usd', year: '2026', status: 'READY' }),
+    `?section=history&employmentContext=${encodeURIComponent(employmentContext)}&employmentId=${employmentId}&tab=documents&perspective=historical-usd&year=2026&status=READY`
       + `&document=${documentId}&page=3&evidence=${evidenceId}`,
   );
   assert.equal(
@@ -96,12 +97,12 @@ test('la ubicación owner aplica patches, permite borrar y conserva el documento
 test('el deep-link documental conserva sólo el estado owner permitido', () => {
   assert.equal(
     writeDocumentLocation(
-      `?section=history&employmentId=${employmentId}&tab=documents&range=all&year=all`
+      `?section=history&employmentId=${employmentId}&tab=documents&perspective=historical-usd&range=all&year=all`
         + '&documentType=ALL&settlementType=SAC&status=ALL&privacy=on&search=empresa'
         + `&filename=recibo.pdf&ocr=texto&amount=100&auth=secret&salary=999&unknown=value&document=${evidenceId}`,
       { documentId, page: 2, evidenceId },
     ),
-    `?section=history&employmentId=${employmentId}&tab=documents&range=all&year=all`
+    `?section=history&employmentId=${employmentId}&tab=documents&perspective=historical-usd&range=all&year=all`
       + '&documentType=ALL&settlementType=SAC&status=ALL'
       + `&document=${documentId}&page=2&evidence=${evidenceId}`,
   );

@@ -1,13 +1,13 @@
 # Arquitectura general
 
-> Estado operativo (2026-09-01): el MVP está implementado y desplegado en producción con múltiples cuentas activas. Las capacidades futuras del diagrama siguen siendo objetivo, no comportamiento actual; los riesgos abiertos se distinguen de las garantías ya demostradas.
+> Estado operativo (2026-09-01): el corte previo del MVP está desplegado en producción con múltiples cuentas activas. La capa económica está implementada en el código actual, pero este documento no acredita todavía su despliegue productivo. Las capacidades futuras del diagrama siguen siendo objetivo, no comportamiento actual; los riesgos abiertos se distinguen de las garantías ya demostradas.
 
 ## Estilo
 
 La arquitectura objetivo es un monolito modular TypeScript con dos unidades de ejecución iniciales:
 
 - web/API para interacción síncrona y coordinación;
-- worker de documentos para seguridad, clasificación, extracción, OCR, parsing y normalización.
+- worker de documentos para seguridad, clasificación, extracción, OCR, parsing, normalización y sincronización económica desacoplada.
 
 Comparten dominio y contratos. Separar el proceso pesado protege latencia y memoria de la API; no convierte cada etapa en un microservicio.
 
@@ -31,6 +31,7 @@ flowchart TB
     K --> D[Clasificación + extracción]
     D -. sólo si hace falta .-> R[OCR]
     D -. último fallback minimizado .-> I[Proveedor IA]
+    K -. serie pública + rango .-> X[Datos Argentina]
     K --> P
 ~~~
 
@@ -47,8 +48,8 @@ El proveedor se selecciona explícitamente. La instancia productiva usa Cloudfla
 | PostgreSQL | metadata, dominio estructurado, estados, job/outbox durable, auditoría e idempotencia | almacenar binarios |
 | Redis/cola | scheduling, backpressure, retries y fairness | ser la única fuente de verdad del batch |
 | Object storage | originales, cuarentena y objetos temporales controlados | exposición pública |
-| Worker | pipeline pesado aislado, por documento y con budgets | confiar en metadata del upload |
-| Proveedores | capacidades externas detrás de ports | gobernar reglas del dominio |
+| Worker | pipeline pesado aislado y sincronización económica global con leases/retries | confiar en metadata del upload o enviar salarios al proveedor económico |
+| Proveedores | capacidades externas detrás de ports y payload mínimo | gobernar reglas del dominio |
 
 PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma transacción crea un ProcessingJob pendiente. Un dispatcher lo publica en Redis después del commit y un reconciliador republica pendientes; la cola entrega trabajo, pero no es la única copia del intent.
 
@@ -59,7 +60,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 3. Navegador a storage: autorización por objeto, método, tamaño y expiración.
 4. Storage a worker: el objeto sigue siendo hostil hasta completar seguridad.
 5. Worker a parser/OCR: ejecución con CPU, RAM, tiempo, filesystem y red limitados.
-6. Aplicación a proveedor externo: salida mínima, redactada y autorizada.
+6. Aplicación a proveedor externo: salida mínima, redactada y autorizada; Economic Data envía sólo identificador de serie, rango y opciones técnicas fijas.
 7. Aplicación a observabilidad: sólo IDs internos, códigos y métricas no sensibles.
 8. Navegador/API a Google OIDC: `state`, `nonce` y PKCE por intento; callback, issuer, audience y redirects validados server-side.
 9. Administrador a API: MFA y capacidad explícita por request; un rol administrativo nunca reemplaza ownership ni habilita payload Restricted.
@@ -72,6 +73,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 - documents: metadata, lifecycle, seguridad y retención;
 - payroll: liquidaciones, conceptos y correcciones;
 - analytics: proyecciones `salary-analytics-v1` sobre liquidaciones estructuradas y verificadas, separadas por empleo y moneda;
+- economic-data: series y observaciones globales revisionadas, perfiles por país/moneda, sincronización y `economic-analytics-v1` derivado;
 - privacy: preferencias, exportación y eliminación;
 - audit: eventos sensibles sin payload salarial.
 - admin: consultas transversales de metadata, capacidades fijas y comandos operativos auditados.
@@ -100,6 +102,7 @@ packages/
   domain/
   contracts/
   database/
+  economic-data/
   config/
   document-engine/
   payroll-engine/
@@ -131,7 +134,7 @@ Recursos iniciales:
 | reprocessing | candidatos owner-only, batch asincrónico, progreso y resumen |
 | employments | listar, crear y editar/finalizar mediante el resolver global de Employer; confirmar detecciones inequívocas |
 | payroll-settlements | listar la proyección; las correcciones se aplican desde documents |
-| salary-history | resumen, evolución y anual agregados; comparación y conceptos paginados owner-only; posibles duplicados sólo como advertencia |
+| salary-history | resumen, evolución y anual agregados; comparación y conceptos paginados owner-only; perspectivas nominal, USD histórico y poder adquisitivo cuando el perfil económico aplica |
 | exports | solicitar y consultar export privado |
 | privacy | eliminar cuenta; preferencias editables quedan pendientes |
 | admin | dashboard, metadata paginada, salud del pipeline, reproceso/rollback auditados, revisión/merge de Employer y comandos acotados por capacidad; sin acceso a contenido privado |
@@ -146,7 +149,7 @@ El comparable inicial es únicamente basicAmount de una liquidación `NORMAL` re
 
 La cobertura usa los límites confirmados del empleo cuando existen y, en una detección, sólo el rango observado; los huecos son siempre `possibleMissingPeriods`. Sin un contexto laboral determinable no inventa rango ni faltantes. La lista de documentos devuelve total y revisión pendiente bajo los mismos filtros owner-only, se pagina con cursor opaco que conserva la precisión del timestamp y admite búsqueda, año/período, empleo, estado/grupo, clase y tipo de liquidación. `UNSUPPORTED` es una categoría de consulta sobre clasificación/estado, no un `document_type` persistido.
 
-La decisión, sus alternativas y el límite deliberado de IPC están en el [ADR 0013](../adr/0013-derived-salary-history-analytics.md).
+`economic-analytics-v1` extiende esa proyección sólo para `AR` + `ARS`: resuelve FX e IPC globales en una consulta batched, conserva procedencia/revisión y devuelve estados parciales sin alterar el nominal. No persiste valuaciones ni una cache de analytics. La metodología está en [Datos económicos](economic-data.md); [ADR 0016](../adr/0016-global-economic-data-and-derived-context.md) reemplaza únicamente el límite provisional de IPC del [ADR 0013](../adr/0013-derived-salary-history-analytics.md).
 
 ### Identidad externa y sesión interna
 
@@ -172,7 +175,8 @@ Los siguientes son límites reales de infraestructura. Sus tipos exactos se defi
 | PayrollExtractor | producir 0..N liquidaciones candidatas y campos trazables |
 | AIProvider | fallback minimizado con purpose, budget, versión y auditoría |
 | EncryptionProvider | cifrar/descifrar datos permitidos y exponer key version, nunca material de clave |
-| EconomicIndexProvider | valor, período, fuente y versión; fuera del MVP |
+| ExchangeRateProvider | observaciones por serie/rango con `AbortSignal`; par y orientación explícitos |
+| PriceIndexProvider | observaciones por serie/rango con `AbortSignal`; frecuencia y período explícitos |
 | MarketCalibrationProvider | referencia externa versionada y opcional para calibración; futuro, no fuente principal |
 
 Cada llamada externa acepta idempotency key, timeout y contexto mínimo. Los SDK concretos viven en adapters.
@@ -210,15 +214,15 @@ El benchmark futuro agregará, fuera del historial privado, sólo contribuciones
 - OCR caído: API disponible; jobs quedan retryable.
 - Cola caída: uploads ya confirmados permanecen en DB/storage y se reconcilian.
 - Worker caído: el lease lógico expira, pero el marcador de ejecución queda fail-closed y bloquea retry y baja hasta verificar que el proceso y su temporal terminaron; la recuperación operativa segura sigue pendiente.
-- Proveedor externo caído: no tumba el dominio; se usa fallback permitido o estado visible.
+- Proveedor económico caído: upload y nominal siguen disponibles; se conserva last-known-good y lo faltante queda `PARTIAL`, `PENDING` o `UNAVAILABLE`.
 - Google caído: no se abre ni eleva una sesión mediante ese proveedor; las sesiones internas ya válidas conservan sus controles normales.
 - Storage caído: no se marca upload como completo.
 - Malware scanner no disponible: fail closed; el objeto no avanza.
 
 ## Estrategia de verificación
 
-- Unit: invariantes de dominio, estados, dinero y precedencia de correcciones.
-- Integration: PostgreSQL, cola, storage, idempotencia y cleanup.
+- Unit: invariantes de dominio, estados, dinero, fechas, FX/IPC exactos y precedencia de correcciones.
+- Integration: PostgreSQL, cola, storage, observaciones revisionadas, jobs económicos, idempotencia y cleanup.
 - Security: ownership/IDOR por cada método de login, colisiones de identidad OIDC, replay/callback/redirect, MIME falso, magic bytes, malware, PDF corrupto/cifrado, límites y URLs firmadas.
 - Admin: deny-by-default, capacidad por endpoint, MFA/step-up, DTO mínimos, IDOR transversal, concurrencia de comandos y auditoría atómica.
 - Load: un usuario con 500 documentos y varios usuarios simultáneos; la memoria API debe mantenerse acotada.

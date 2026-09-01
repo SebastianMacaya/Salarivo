@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  amountFromCents,
   dateLabel,
   documentStatusLabel,
   employmentOptionLabel,
   extractionSourceLabel,
   money,
   percentage,
+  percentageFromBasisPoints,
   periodLabel,
   recentPeriodRange,
   relevantEvolutionRanges,
@@ -22,6 +24,16 @@ test('formatea dinero sin perder precisión decimal', () => {
   assert.equal(money('-0.5', 'USD'), 'USD -0,50');
   assert.equal(percentage('12.34'), '12,34%');
   assert.equal(percentage(null), '—');
+});
+
+test('convierte centavos y puntos básicos sin pasar por punto flotante', () => {
+  assert.equal(amountFromCents('12345678901234567890'), '123456789012345678.90');
+  assert.equal(amountFromCents('-5'), '-0.05');
+  assert.equal(amountFromCents('-0'), '0.00');
+  assert.equal(percentageFromBasisPoints('1234'), '12.34');
+  assert.equal(percentageFromBasisPoints('-25'), '-0.25');
+  assert.equal(amountFromCents('1.5'), null);
+  assert.equal(percentageFromBasisPoints(null), null);
 });
 
 test('formatea períodos válidos en español', () => {

@@ -21,8 +21,13 @@ import {
   salaryCategoryForEarning,
   SALARY_CATEGORIES,
   type SalaryCategory,
-  type SalarySettlement,
 } from "./salary-analytics.ts";
+import {
+  buildEconomicAnalytics,
+  compareEconomicPeriods,
+  scopePeriodKey,
+  type EconomicSalarySettlement,
+} from "./economic-analytics.ts";
 import { sessionCookieName, tokenHash } from "./security.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 import { lockR2UploadCapacity } from "./r2-capacity.ts";
@@ -778,11 +783,14 @@ const detectedEmployerNameJoin = `LEFT JOIN LATERAL (
              WHERE field.user_id = settlement.user_id
                AND field.extraction_run_id = settlement.extraction_run_id
                AND field.field_path = 'employer.name'
-             LIMIT 1)
-         ) AS name
+              LIMIT 1)
+         ) AS name,
+         (SELECT employer.country_code
+            FROM employers employer
+           WHERE employer.id = document.detected_employer_id) AS country_code
 ) detected_employer ON true`;
 
-async function loadSalaryHistory(userId: string) {
+async function loadSalaryHistory(userId: string, includeEconomic = true) {
   const candidatePredicate = reprocessingCandidateExistsSql("document", "$2", "$3", "$4");
   const [result, coverageResult, reprocessingCandidateCount] = await Promise.all([
     pool.query(
@@ -790,12 +798,15 @@ async function loadSalaryHistory(userId: string) {
               document.detected_employer_id,
               to_char(settlement.payroll_period, 'YYYY-MM') AS payroll_period,
               settlement.settlement_type, settlement.is_recurring, settlement.currency_code,
+              to_char(settlement.payment_date, 'YYYY-MM-DD') AS payment_date,
+              to_char(settlement.issue_date, 'YYYY-MM-DD') AS issue_date,
               settlement.basic_amount, settlement.gross_amount, settlement.net_amount,
               settlement.deductions_amount, settlement.remunerative_amount,
               settlement.non_remunerative_amount, employment.status AS employment_status,
               to_char(employment.start_date, 'YYYY-MM-DD') AS employment_start_date,
               to_char(employment.end_date, 'YYYY-MM-DD') AS employment_end_date,
               COALESCE(employer.name, detected_employer.name) AS employer_name,
+              COALESCE(employment.country_code, detected_employer.country_code) AS country_code,
               COALESCE(earnings.items, '[]'::jsonb) AS earnings,
               COALESCE(earnings.earning_count, 0)::integer AS earning_count,
               COALESCE(earnings.unknown_count, 0)::integer AS unknown_earning_count,
@@ -873,13 +884,14 @@ async function loadSalaryHistory(userId: string) {
     employmentId: string | null;
     employerName: string | null;
     state: "CONFIRMED" | "DETECTED" | "UNCONFIRMED";
+    countryCode: string | null;
     currencyCode: string;
     employmentStatus: string | null;
     startDate: string | null;
     endDate: string | null;
   }>();
   const qualityByScopePeriod = new Map<string, { incomplete: Set<string>; reprocessable: Set<string> }>();
-  const settlements: SalarySettlement[] = result.rows.map((row) => {
+  const settlements: EconomicSalarySettlement[] = result.rows.map((row) => {
     const employmentId = value(row, "employment_id");
     const detectedEmployerId = value(row, "detected_employer_id");
     const employerName = value(row, "employer_name")?.trim() || null;
@@ -898,6 +910,7 @@ async function loadSalaryHistory(userId: string) {
         employmentId,
         employerName,
         state: employmentId ? "CONFIRMED" : employerName ? "DETECTED" : "UNCONFIRMED",
+        countryCode: value(row, "country_code"),
         currencyCode: currency,
         employmentStatus: value(row, "employment_status"),
         startDate: value(row, "employment_start_date"),
@@ -919,8 +932,11 @@ async function loadSalaryHistory(userId: string) {
       employmentStartPeriod: value(row, "employment_start_date")?.slice(0, 7) ?? null,
       employmentEndPeriod: value(row, "employment_end_date")?.slice(0, 7) ?? null,
       employmentStatus: value(row, "employment_status"),
+      countryCode: value(row, "country_code"),
       currencyCode: currency,
       payrollPeriod: String(row.payroll_period),
+      paymentDate: value(row, "payment_date"),
+      issueDate: value(row, "issue_date"),
       settlementType: String(row.settlement_type),
       isRecurring: row.is_recurring === true,
       basicAmount: value(row, "basic_amount"),
@@ -935,6 +951,7 @@ async function loadSalaryHistory(userId: string) {
     };
   });
   const analytics = analyzeSalaryHistory(settlements);
+  const economics = includeEconomic ? await buildEconomicAnalytics(pool, settlements) : null;
   const publicAnalytics = {
     ...analytics,
     scopes: analytics.scopes.map((scope) => ({
@@ -944,6 +961,13 @@ async function loadSalaryHistory(userId: string) {
         totals: point.totals,
         regular: point.regular,
         comparableSalary: point.comparableSalary,
+        ...(economics ? {
+          economic: economics.byScopePeriod.get(scopePeriodKey(
+            scope.employmentContext,
+            scope.currencyCode,
+            point.period,
+          ))?.public,
+        } : {}),
         quality: (() => {
           const quality = qualityByScopePeriod.get(JSON.stringify([
             scope.employmentContext,
@@ -962,6 +986,7 @@ async function loadSalaryHistory(userId: string) {
   return {
     response: {
       calculationVersion: "salary-analytics-v1",
+      economicCalculationVersion: "economic-analytics-v1",
       contexts: analytics.scopes.map((scope) => {
         const metadata = contextMetadata.get(JSON.stringify([scope.employmentContext, scope.currencyCode]));
         if (!metadata) throw new Error("SALARY_CONTEXT_METADATA_MISSING");
@@ -988,6 +1013,7 @@ async function loadSalaryHistory(userId: string) {
       analytics: publicAnalytics,
     },
     analytics,
+    economics,
     settlements,
   };
 }
@@ -1733,7 +1759,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 AND processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION')) AS pending_review`,
           [userId],
         ),
-        loadSalaryHistory(userId),
+        loadSalaryHistory(userId, false),
       ]);
       const row = counts.rows[0];
       const eligibleScopes = history.response.analytics.scopes.filter((_, index) => (
@@ -1924,7 +1950,10 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     async (request) => {
       const history = await loadSalaryHistory(request.authUser!.id);
       const comparison = compareSalaryPeriods(history.settlements, request.query);
-      return { data: comparison };
+      return { data: comparison === null ? null : {
+        ...comparison,
+        economic: history.economics ? compareEconomicPeriods(history.economics, request.query) : null,
+      } };
     },
   );
 

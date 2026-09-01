@@ -1,6 +1,6 @@
 # Alcance del producto
 
-> Estado operativo (2026-09-01): el alcance MVP listado abajo está implementado para recibos argentinos y desplegado en producción en [www.salarivo.cloud](https://www.salarivo.cloud/) con múltiples cuentas activas de personas reales; visión, V2 y V3 siguen siendo objetivos. La disponibilidad productiva es un hecho actual, no evidencia de que estén cerrados los pendientes legales, de privacidad, backups, aislamiento y operación documentados en [Políticas legales](legal/policies.md) y la [auditoría de privacidad y seguridad](security/privacy-security-audit-2026-08-30.md).
+> Estado operativo (2026-09-01): el corte previo del MVP está desplegado en producción en [www.salarivo.cloud](https://www.salarivo.cloud/) con múltiples cuentas activas de personas reales. La capa de contexto económico está implementada en el código actual, pero esta fuente no acredita todavía su despliegue productivo; visión, V2 y V3 siguen siendo objetivos. La disponibilidad productiva no demuestra que estén cerrados los pendientes legales, de privacidad, backups, aislamiento y operación documentados en [Políticas legales](legal/policies.md) y la [auditoría de privacidad y seguridad](security/privacy-security-audit-2026-08-30.md).
 
 ## Visión
 
@@ -32,6 +32,7 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - detección persistida del empleador de un documento y autoasociación sólo cuando existe un único empleo propio del mismo empleador y moneda que cubre el período; los casos sin coincidencia o ambiguos requieren confirmación explícita;
 - confidence por campo, carga manual de montos ausentes y cierre explícito de revisión;
 - historial `salary-analytics-v1` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
+- contexto `economic-analytics-v1` derivado para `AR` + `ARS`, con nominal intacto, equivalente USD histórico, poder adquisitivo a precios del último IPC disponible, inflación del período y procedencia inspeccionable;
 - navegación contextual y recuperable desde la URL entre un empleo, su historial salarial, períodos, conceptos y documentos asociados;
 - modo privacidad visual global en la interfaz autenticada para enmascarar importes, porcentajes y gráficos financieros durante la navegación, sin modificar datos ni crear copias censuradas, y con advertencia antes de abrir un PDF original;
 - visor privado del PDF por página con evidencia espacial cuando es inequívoca, datos extraídos y procedencia lado a lado;
@@ -47,13 +48,14 @@ La identidad del dominio sigue siendo el UUID interno. Google OIDC agrega una cu
 
 Analytics usa sólo `activeExtractionRunId` de documentos `COMPLETED`; corridas candidatas, fallidas o dudosas y resultados todavía en revisión no afectan la proyección. Un dato ausente sigue como N/D y añade contexto únicamente cuando existe una recuperación compatible. El salario comparable inicial es el sueldo básico verificado de una liquidación `NORMAL` recurrente: no usa neto ni bruto como fallback y devuelve N/D si falta o el período es ambiguo. Los porcentajes se calculan con decimal exacto mediante `(final / inicial) - 1`, nunca sumando variaciones mensuales ni cruzando contextos laborales o monedas.
 
+El contexto económico usa series globales de Datos Argentina con fuentes primarias BCRA e INDEC y nunca envía salarios, PII ni documentos al proveedor. La fecha FX prioriza pago, emisión y fin de período, con fallback anterior máximo de siete días; el IPC exige el mes exacto, sin interpolación, y ajusta contra el último índice disponible. Una falta o caída produce `PARTIAL`, `PENDING` o `UNAVAILABLE` sin afectar la perspectiva nominal. Sólo está habilitado el perfil `AR` + `ARS`; país y moneda permanecen separados. Ver [Datos económicos](architecture/economic-data.md) y [ADR 0016](adr/0016-global-economic-data-and-derived-context.md).
+
 Las deducciones individuales siguen minimizadas a etiqueta genérica e importe: no se conserva ni expone obra social, sindicato, descripción original, código normalizado, recurrencia ni campo fuente. Un total de descuentos negativo se presenta como crédito/reintegro, conservando el signo para el cálculo. Un duplicado binario exacto del mismo titular se descarta sin conservar documento, item ni metadata del archivo; una firma estructural parecida sólo advierte y requiere revisión humana. Un tipo no soportado elimina siempre el PDF original y puede conservar un comentario owner-only opcional para evaluar demanda futura, sin habilitar OCR genérico.
 
 ### No incluye
 
 - documentos arbitrarios o un OCR genérico;
 - contratos, ofertas o certificados;
-- comparación con inflación;
 - comparación salarial con el mercado;
 - billing, suscripciones o capacidades pagas;
 - Income Passport o enlaces públicos;
@@ -68,7 +70,7 @@ La arquitectura puede dejar una salida limpia para esas capacidades, pero no deb
 
 ### V2
 
-IPC, poder adquisitivo, períodos de puesto y timeline, templates por empresa, más monedas y mejor importación. También se evaluarán entitlements server-side y un benchmark privado basado en cohortes amplias de usuarios que den consentimiento específico; ver [ADR 0006](adr/0006-entitlements-and-market-benchmarking.md).
+Períodos de puesto y timeline, templates por empresa, más monedas, más perfiles económicos y mejor importación. También se evaluarán entitlements server-side y un benchmark privado basado en cohortes amplias de usuarios que den consentimiento específico; ver [ADR 0006](adr/0006-entitlements-and-market-benchmarking.md).
 
 ### V3
 
@@ -90,6 +92,7 @@ Contratos y adendas en allowlist, sin OCR inicial y siempre asociados a un emple
 - El usuario puede eliminar originales sin perder datos estructurados cuando elige conservarlos.
 - Una colisión de email entre una cuenta existente y Google nunca vincula, modifica ni expone detalles de la cuenta existente.
 - El callback OIDC no crea una cuenta activa antes de que el navegador ligado al intento complete el registro y la aceptación legal; el onboarding permanece pendiente después del alta.
+- Una observación económica faltante o un proveedor caído deja estado parcial/pendiente, pero no modifica ni oculta el salario nominal ni bloquea la ingestión.
 
 ## Invariantes del modelo mental
 
@@ -97,4 +100,5 @@ Contratos y adendas en allowlist, sin OCR inicial y siempre asociados a un emple
 - Salario recurrente e ingreso extraordinario no se agregan como si fueran equivalentes.
 - Período salarial, fecha de pago, emisión e ingestión son fechas diferentes.
 - País, moneda e identificador fiscal son explícitos; Argentina es el primer adapter, no una condición global.
+- Serie económica global, dato salarial privado y valuación derivada son capas distintas; sólo la última combina ownership con observaciones públicas.
 - Preparar un tipo documental no habilita su procesamiento.

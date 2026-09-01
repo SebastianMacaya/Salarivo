@@ -16,6 +16,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "3.1120.0",
     "@salarivo/database": "0.1.0",
+    "@salarivo/economic-data": "0.1.0",
     "pg": "8.23.0",
     "redis": "6.2.1"
   }

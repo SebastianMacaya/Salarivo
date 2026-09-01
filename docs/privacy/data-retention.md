@@ -39,6 +39,8 @@ El esquema conserva una política por cuenta y la copia al documento; el product
 | sesión y cliente coarse | PostgreSQL | mientras exista la cuenta; las activas se muestran owner-only y las revocadas/expiradas permanecen hasta una política de purge aprobada |
 | access, refresh e ID tokens Google | no se persisten | sólo memoria durante canje y validación; se descartan en la misma operación |
 | contribución de benchmark | no implementada | futura: hasta revocación/borrado; retirar mapping y recomputar agregados afectados |
+| serie/observación económica global | PostgreSQL | observaciones append-only mientras la serie sea necesaria para reproducir cálculos; plazo de archivo/purge aún no aprobado |
+| job de sincronización económica | PostgreSQL | estado operativo y retries; retención de jobs terminales pendiente de política numérica |
 | export | PostgreSQL + respuesta HTTPS autenticada | autorización breve; JSON generado bajo demanda |
 | tombstone de storage | PostgreSQL sin FK | hasta confirmar borrado canónico y temporal; luego se elimina |
 | constancia de baja | PostgreSQL sin FK ni PII | estado operativo `PENDING`/`COMPLETED`; plazo definitivo pendiente |
@@ -47,6 +49,8 @@ El esquema conserva una política por cuenta y la copia al documento; el product
 Uploads vencidos y tombstones se reconcilian fuera del happy path. Producción debe garantizar que ninguna carga iniciada antes del vencimiento termine después de la ventana de gracia o, en su defecto, inventariar y reborrar posteriormente antes de cerrar la baja. Un inventario genérico de objetos huérfanos contra storage sigue pendiente en producción.
 
 El artefacto reutilizable contiene texto Restricted derivado del documento. Usa una key opaca, checksum y el mismo boundary privado/cifrado del original; no tiene URL de descarga, no se devuelve en exportaciones técnicas y nunca se incluye en logs, métricas, traces o herramientas externas. La metadata se crea como `writeState=PENDING` antes del `PUT`. Sólo permite omitir extracción/OCR después de marcar el write `COMPLETED` y demostrar compatibilidad. `DELETE_AFTER_PROCESSING` lo elimina junto con el original.
+
+Series, observaciones y jobs económicos son datos globales sin vínculo a una cuenta. Eliminar un original, documento o usuario no los borra. No se persisten equivalentes USD, salarios ajustados ni otra cache materializada por liquidación; esas proyecciones desaparecen al eliminar su fuente salarial.
 
 ## Eliminar original
 
@@ -72,7 +76,7 @@ Además del original:
 - registra y reconcilia el borrado de las keys de storage;
 - conserva sólo lo exigido por una política aprobada y sin payload salarial cuando sea posible.
 
-Cache externas, shares e índices de búsqueda no existen en el MVP. Si se incorporan, deberán entrar en la misma orquestación y sus pruebas antes de habilitarse.
+Cache externas, valuaciones económicas materializadas, shares e índices de búsqueda no existen en el MVP. Si se incorporan, deberán entrar en la misma orquestación y sus pruebas antes de habilitarse.
 
 La UI distingue claramente “eliminar original” de “eliminar documento y datos”.
 
@@ -86,6 +90,8 @@ La orquestación actual recorre:
 - object storage;
 - temporales;
 - exports.
+
+Las tablas económicas globales quedan fuera de esa cascada porque no contienen datos de la cuenta. La proyección económica privada no necesita purge separado porque no se materializa.
 
 No existen shares, cache externa ni índice de búsqueda en el MVP. Backups y lista de supresiones son un P0 abierto en la operación productiva y deben incorporarse al procedimiento antes de poder afirmar borrado recuperable sin resurrección de datos.
 
@@ -110,7 +116,7 @@ Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se 
 
 ## Decisiones pendientes
 
-- valores numéricos de TTL y retención;
+- valores numéricos de TTL y retención, incluidos jobs económicos terminales;
 - retención legal de auditoría;
 - semántica exacta de borrado de ExtractionRun;
 - proveedor y lifecycle de backups;

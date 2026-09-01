@@ -126,12 +126,13 @@ export function MoneyValue({
   </span>;
 }
 
-export type PercentageValueProps = { className?: string; value?: string | null };
+export type PercentageValueProps = { className?: string; sensitive?: boolean; value?: string | null };
 
-export function PercentageValue({ className, value }: PercentageValueProps) {
+export function PercentageValue({ className, sensitive = true, value }: PercentageValueProps) {
   const { enabled } = usePrivacyMode();
-  const rendered = privatePercentage(value, enabled);
-  if (!enabled || !value) return <span className={className}>{rendered}</span>;
+  const hidden = enabled && sensitive;
+  const rendered = privatePercentage(value, hidden);
+  if (!hidden || !value) return <span className={className}>{rendered}</span>;
   return <span className={className}>
     <span aria-hidden="true">{rendered}</span>
     <span className={styles.srOnly}>Porcentaje oculto por modo privacidad</span>

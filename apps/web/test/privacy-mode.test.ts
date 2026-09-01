@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { amountFromCents, percentageFromBasisPoints } from '../app/format.ts';
 import {
   PRIVACY_MODE_STORAGE_KEY,
   privateMoney,
@@ -22,6 +23,12 @@ test('privacy helpers mask values without retaining the raw amount', () => {
   assert.equal(privateMoney('-120.00', 'ARS', true, 'salary', true), 'Crédito ARS ••••••••');
   assert.equal(privateMoney(null, 'ARS', true, 'salary'), 'N/D');
   assert.equal(privateText('recibo-$5327075.42.pdf', true, 'Nombre de archivo oculto'), 'Nombre de archivo oculto');
+  const economicAmount = amountFromCents('12345678');
+  const economicChange = percentageFromBasisPoints('1875');
+  assert.equal(privateMoney(economicAmount, 'USD', true, 'salary'), 'USD ••••••••');
+  assert.equal(privatePercentage(economicChange, true), '••,••%');
+  assert.equal(privatePercentage(economicChange, false), '18,75%');
+  assert.doesNotMatch(`${privateMoney(economicAmount, 'USD', true, 'salary')} ${privatePercentage(economicChange, true)}`, /123456|1875|18,75/);
 });
 
 test('privacy preference is local, explicit and tolerant of blocked storage', () => {

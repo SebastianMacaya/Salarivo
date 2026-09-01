@@ -10,11 +10,12 @@ export type OwnerLocation = {
   employmentContext?: string;
   employmentId?: string;
   period?: string;
+  perspective?: 'nominal' | 'historical-usd' | 'purchasing-power';
   range?: '6' | '12' | '24' | '60' | 'all';
   section?: 'summary' | 'jobs' | 'import' | 'history' | 'settings';
   settlementType?: string;
   status?: 'ALL' | 'READY' | 'REVIEW' | 'PROCESSING' | 'ERROR';
-  tab?: 'summary' | 'evolution' | 'annual' | 'concepts' | 'documents';
+  tab?: 'summary' | 'evolution' | 'purchasing-power' | 'annual' | 'concepts' | 'documents';
   year?: string;
 };
 
@@ -42,7 +43,8 @@ export type NormalizedRegion = {
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const amountField = /^settlement\..+Amount$/;
 const ownerSections = ['summary', 'jobs', 'import', 'history', 'settings'] as const;
-const ownerTabs = ['summary', 'evolution', 'annual', 'concepts', 'documents'] as const;
+const ownerTabs = ['summary', 'evolution', 'purchasing-power', 'annual', 'concepts', 'documents'] as const;
+const ownerPerspectives = ['nominal', 'historical-usd', 'purchasing-power'] as const;
 const ownerRanges = ['6', '12', '24', '60', 'all'] as const;
 const ownerDocumentTypes = ['PAYROLL', 'UNSUPPORTED', 'ALL'] as const;
 const ownerStatuses = ['ALL', 'READY', 'REVIEW', 'PROCESSING', 'ERROR'] as const;
@@ -163,6 +165,7 @@ export function readOwnerLocation(search: string): OwnerLocation {
   const employmentContext = params.get('employmentContext');
   const employmentId = params.get('employmentId');
   const tab = params.get('tab');
+  const perspective = params.get('perspective');
   const range = params.get('range');
   const selectedYear = params.get('year');
   const selectedPeriod = params.get('period');
@@ -175,6 +178,7 @@ export function readOwnerLocation(search: string): OwnerLocation {
   if (safeEmploymentContext(employmentContext)) location.employmentContext = employmentContext;
   if (employmentId && uuid.test(employmentId)) location.employmentId = employmentId;
   if (listed(ownerTabs, tab)) location.tab = tab;
+  if (listed(ownerPerspectives, perspective)) location.perspective = perspective;
   if (listed(ownerRanges, range)) location.range = range;
   if (selectedYear && year.test(selectedYear)) location.year = selectedYear;
   if (selectedPeriod && period.test(selectedPeriod)) location.period = selectedPeriod;
@@ -191,6 +195,7 @@ function locationSearch(owner: OwnerLocation, documentLocation: DocumentLocation
   if (safeEmploymentContext(owner.employmentContext ?? null)) params.set('employmentContext', owner.employmentContext!);
   if (owner.employmentId && uuid.test(owner.employmentId)) params.set('employmentId', owner.employmentId);
   if (listed(ownerTabs, owner.tab ?? null)) params.set('tab', owner.tab!);
+  if (listed(ownerPerspectives, owner.perspective ?? null)) params.set('perspective', owner.perspective!);
   if (listed(ownerRanges, owner.range ?? null)) params.set('range', owner.range!);
   if (owner.year && year.test(owner.year)) params.set('year', owner.year);
   if (owner.period && period.test(owner.period)) params.set('period', owner.period);

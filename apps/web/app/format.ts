@@ -12,6 +12,22 @@ export function percentage(value?: string | null) {
   return match ? `${match[1]},${(match[2] ?? '00').padEnd(2, '0')}%` : `${value}%`;
 }
 
+function decimalHundredths(value?: string | null) {
+  const match = /^(-?)(\d+)$/.exec(value ?? '');
+  if (!match?.[2]) return null;
+  const digits = match[2].replace(/^0+(?=\d)/, '').padStart(3, '0');
+  const sign = match[1] && /[1-9]/.test(digits) ? '-' : '';
+  return `${sign}${digits.slice(0, -2)}.${digits.slice(-2)}`;
+}
+
+export function amountFromCents(value?: string | null) {
+  return decimalHundredths(value);
+}
+
+export function percentageFromBasisPoints(value?: string | null) {
+  return decimalHundredths(value);
+}
+
 const periodFormatter = new Intl.DateTimeFormat('es-AR', { month: 'long', timeZone: 'UTC' });
 const dateFormatter = new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium', timeZone: 'UTC' });
 const timestampFormatter = new Intl.DateTimeFormat('es-AR', {

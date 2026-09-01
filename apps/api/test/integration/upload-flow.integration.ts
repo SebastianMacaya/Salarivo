@@ -3074,9 +3074,24 @@ test("upload privado crea un único documento y un único intent durable", async
   const salaryHistory = await app.inject({ method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA } });
   assert.equal(salaryHistory.statusCode, 200, salaryHistory.body);
   assert.equal(salaryHistory.json().data.calculationVersion, "salary-analytics-v1");
+  assert.equal(salaryHistory.json().data.economicCalculationVersion, "economic-analytics-v1");
   assert.equal(salaryHistory.json().data.contexts[0].state, "DETECTED");
+  assert.equal(salaryHistory.json().data.contexts[0].countryCode, "AR");
   assert.equal(salaryHistory.json().data.analytics.scopes[0].currencyCode, "ARS");
   assert.equal(salaryHistory.json().data.analytics.scopes[0].current.comparableSalary, "1000.00");
+  assert.deepEqual(
+    salaryHistory.json().data.analytics.scopes[0].evolution[0].economic,
+    {
+      historicalUsd: {
+        status: "PENDING", reason: "SYNC_PENDING", currencyCode: "USD", referencePeriod: null,
+        amounts: null, comparableSalary: null, observations: [],
+      },
+      purchasingPower: {
+        status: "PENDING", reason: "SYNC_PENDING", currencyCode: "ARS", referencePeriod: null,
+        amounts: null, comparableSalary: null, observations: [],
+      },
+    },
+  );
   assert.equal("settlements" in salaryHistory.json().data.analytics.scopes[0].evolution[0], false);
   assert.doesNotMatch(salaryHistory.body, /Sueldo básico sintético|Bono sintético|Haber desconocido sintético/);
   const employmentContext = salaryHistory.json().data.contexts[0].employmentContext as string;
