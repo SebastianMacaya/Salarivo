@@ -55,16 +55,19 @@ function syntheticPayrollPdf(): Uint8Array<ArrayBuffer> {
 type DuplicateDiscardHarness = {
   app: { inject(options: unknown): Promise<{ body: string; json(): { data: Record<string, unknown> }; statusCode: number }> };
   cookie: string;
+  discardExactDuplicate(job: IntegrationJobRow, checksum: string): Promise<boolean>;
   documentId: string;
   objectExists(key: string): Promise<boolean>;
   pdfBytes: Uint8Array<ArrayBuffer>;
   pool: { query(sql: string, values?: unknown[]): Promise<{ rowCount: number | null; rows: Array<Record<string, unknown>> }> };
   runWorkerUntil(event: string): Promise<void>;
+  setDocumentStage(job: IntegrationJobRow, processingStatus: string, values?: Record<string, unknown>): Promise<void>;
   userId: string;
 };
 
 async function verifyExactDuplicateDiscard({
-  app, cookie, documentId, objectExists, pdfBytes, pool, runWorkerUntil, userId,
+  app, cookie, discardExactDuplicate, documentId, objectExists, pdfBytes, pool, runWorkerUntil,
+  setDocumentStage, userId,
 }: DuplicateDiscardHarness): Promise<void> {
   const duplicateChecksum = createHash("sha256").update(pdfBytes).digest("hex");
   await pool.query("UPDATE documents SET sha256 = $2 WHERE id = $1", [documentId, duplicateChecksum]);
@@ -124,7 +127,31 @@ async function verifyExactDuplicateDiscard({
   )).rows[0]!;
   assert.equal(await objectExists(String(duplicateBeforeDiscard.canonical_object_key)), true);
 
-  await runWorkerUntil("document_duplicate_discarded");
+  const duplicateLeaseOwner = `integration-duplicate-${crypto.randomUUID()}`;
+  const duplicateJob = await pool.query(
+    `UPDATE processing_jobs
+        SET state = 'RUNNING', attempt = attempt + 1, lease_owner = $2,
+            lease_expires_at = now() + interval '5 minutes', execution_owner = NULL,
+            started_at = COALESCE(started_at, now()), updated_at = now()
+      WHERE document_id = $1 AND state = 'PENDING'
+      RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
+    [duplicateDocumentId, duplicateLeaseOwner],
+  );
+  assert.equal(duplicateJob.rowCount, 1);
+  await assert.rejects(
+    setDocumentStage(
+      duplicateJob.rows[0] as unknown as IntegrationJobRow,
+      "DOCUMENT_CLASSIFICATION",
+      { sha256: duplicateChecksum },
+    ),
+    /DOCUMENT_DUPLICATE/,
+  );
+  assert.equal(
+    await discardExactDuplicate(duplicateJob.rows[0] as unknown as IntegrationJobRow, duplicateChecksum),
+    true,
+  );
 
   assert.deepEqual(
     (await pool.query(
@@ -208,6 +235,23 @@ async function verifyExactDuplicateDiscard({
   );
   assert.equal(await objectExists(String(duplicateBeforeDiscard.canonical_object_key)), false);
 }
+
+type IntegrationJobRow = {
+  attempt: number;
+  base_extraction_run_id: string | null;
+  document_id: string;
+  id: string;
+  lease_owner: string;
+  max_attempts: number;
+  pipeline_fingerprint: string | null;
+  previous_document_status: "COMPLETED" | "NEEDS_REVIEW" | "FAILED_PERMANENT" | "CANCELLED" | null;
+  processing_version: number;
+  reprocessing_batch_id: string | null;
+  requested_by_user_id: string | null;
+  stage: "SECURITY_VALIDATION" | "TEXT_EXTRACTION" | "PARSING" | "DOCUMENT_PIPELINE_V2";
+  trigger_kind: "INITIAL_UPLOAD" | "USER_TYPE_CONFIRMATION" | "USER_REPROCESS" | "ADMIN_REPROCESS" | "PARSER_UPGRADE" | "AUTOMATIC_RECOVERY";
+  user_id: string;
+};
 
 async function verifyLegacyExactDuplicateCleanup({
   cleanupLegacyExactDuplicate,
@@ -401,22 +445,6 @@ test("upload privado crea un único documento y un único intent durable", async
     fields: Array<Record<string, unknown> & { fieldPath: string }>;
     [key: string]: unknown;
   };
-  type IntegrationJobRow = {
-    attempt: number;
-    base_extraction_run_id: string | null;
-    document_id: string;
-    id: string;
-    lease_owner: string;
-    max_attempts: number;
-    pipeline_fingerprint: string | null;
-    previous_document_status: "COMPLETED" | "NEEDS_REVIEW" | "FAILED_PERMANENT" | "CANCELLED" | null;
-    processing_version: number;
-    reprocessing_batch_id: string | null;
-    requested_by_user_id: string | null;
-    stage: "SECURITY_VALIDATION" | "TEXT_EXTRACTION" | "PARSING" | "DOCUMENT_PIPELINE_V2";
-    trigger_kind: "INITIAL_UPLOAD" | "USER_TYPE_CONFIRMATION" | "USER_REPROCESS" | "ADMIN_REPROCESS" | "PARSER_UPGRADE" | "AUTOMATIC_RECOVERY";
-    user_id: string;
-  };
   const workerModuleUrl = new URL("../../../worker-documents/src/index.ts", import.meta.url).href;
   const extractionEngineModuleUrl = new URL("../../../worker-documents/src/engine.ts", import.meta.url).href;
   const [
@@ -438,6 +466,7 @@ test("upload privado crea un único documento y un único intent durable", async
   ]);
   const {
     cleanupLegacyExactDuplicate,
+    discardExactDuplicate,
     failJob,
     persistExtraction,
     reconcileDatabaseState,
@@ -446,6 +475,7 @@ test("upload privado crea un único documento y un único intent durable", async
   } = workerModule as {
     WorkerError: new (code: string, retryable: boolean) => Error;
     cleanupLegacyExactDuplicate: () => Promise<number>;
+    discardExactDuplicate: (job: IntegrationJobRow, checksum: string) => Promise<boolean>;
     failJob: (job: IntegrationJobRow, error: unknown) => Promise<void>;
     persistExtraction: (
       job: IntegrationJobRow,
@@ -2535,11 +2565,13 @@ test("upload privado crea un único documento y un único intent durable", async
   await verifyExactDuplicateDiscard({
     app: app as unknown as DuplicateDiscardHarness["app"],
     cookie: cookieA,
+    discardExactDuplicate,
     documentId,
     objectExists,
     pdfBytes,
     pool: pool as unknown as DuplicateDiscardHarness["pool"],
     runWorkerUntil,
+    setDocumentStage,
     userId: userIdA,
   });
 
@@ -5495,7 +5527,7 @@ test("upload privado crea un único documento y un único intent durable", async
     skipped: 0,
   });
 
-  const raceDocumentId = listFixtures[1]!.id;
+  const raceDocumentId = listFixtures[2]!.id;
   const raceBaselineRunId = crypto.randomUUID();
   await pool.query(
     `INSERT INTO extraction_runs (
@@ -5504,7 +5536,7 @@ test("upload privado crea un único documento y un único intent durable", async
        parser_version, normalizer_version, result_schema_version,
        pipeline_fingerprint, trigger_kind, promotion_outcome, promoted_at,
        finished_at, confidence
-     ) VALUES ($1, $2, $3, 1, 'COMPLETED_WITH_WARNINGS',
+     ) VALUES ($1, $2, $3, 2, 'COMPLETED_WITH_WARNINGS',
        'heuristic-ar-payroll', '6', 'deterministic-ar-payroll', '6',
        '5', '6', '1', $4, 'INITIAL_UPLOAD', 'PROMOTED', now(), now(), 0.7)`,
     [raceBaselineRunId, userId, raceDocumentId, "e".repeat(64)],
@@ -5548,7 +5580,7 @@ test("upload privado crea un único documento y un único intent durable", async
     [userId, raceDocumentId],
   );
   assert.equal(raceJob.rowCount, 1);
-  assert.equal(raceJob.rows[0].processing_version, 2);
+  assert.equal(raceJob.rows[0].processing_version, 3);
   assert.equal(raceJob.rows[0].stage, "DOCUMENT_PIPELINE_V2");
   await pool.query(
     `UPDATE processing_jobs
@@ -5920,7 +5952,7 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal((await pool.query("SELECT 1 FROM upload_sessions WHERE item_id = $1", [batchData.items[0]!.id])).rowCount, 0);
   assert.equal(
     (await pool.query("SELECT count(*)::integer AS count FROM storage_deletion_tombstones WHERE user_id = $1", [userIdA])).rows[0].count,
-    1,
+    2,
   );
 
   const legacyPasswordPayload = await app.inject({

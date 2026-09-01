@@ -1733,7 +1733,7 @@ async function discardDuplicateRecord(db: PoolClient, duplicate: DiscardableDupl
   );
 }
 
-async function discardExactDuplicate(job: JobRow, checksum: string): Promise<boolean> {
+export async function discardExactDuplicate(job: JobRow, checksum: string): Promise<boolean> {
   return await withTransaction(async (db: PoolClient) => {
     const activeUser = await db.query(
       `SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE`,
