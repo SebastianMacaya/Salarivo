@@ -68,7 +68,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 ## Módulos de dominio
 
 - identity: usuarios internos, cuentas de autenticación, sesiones opacas, actividad y cliente coarse de sesión, Google OIDC, MFA TOTP, step-up y recuperación;
-- employment: empleadores, relaciones laborales y eventos;
+- employment: empleadores, relaciones laborales, empresas favoritas owner-scoped y eventos;
 - imports: sesiones, batches, items y progreso;
 - documents: metadata, lifecycle, seguridad y retención;
 - payroll: liquidaciones, conceptos y correcciones;
@@ -132,11 +132,11 @@ Recursos iniciales:
 | imports | crear, consultar, recuperar el lote activo y cancelar uploads pendientes; pausa/reanudación quedan pendientes |
 | documents | listar, consultar, asociar masivamente a un empleo, corregir, cerrar revisión, eliminar, confirmar tipo, reprocesar y consultar/decidir historial de corridas |
 | reprocessing | candidatos owner-only, batch asincrónico, progreso y resumen |
-| employments | listar, crear y editar/finalizar mediante el resolver global de Employer; confirmar detecciones inequívocas |
+| employments | listar, crear y editar/finalizar mediante el resolver global de Employer; marcar una empresa propia como favorita; confirmar detecciones inequívocas |
 | payroll-settlements | listar la proyección; las correcciones se aplican desde documents |
 | salary-history | resumen, evolución y anual agregados; comparación y conceptos paginados owner-only; perspectivas nominal, USD histórico y poder adquisitivo cuando el perfil económico aplica |
 | exports | solicitar y consultar export privado |
-| privacy | eliminar cuenta; preferencias editables quedan pendientes |
+| privacy | eliminar cuenta; preferencias de retención editables quedan pendientes |
 | admin | dashboard, metadata paginada, salud del pipeline, reproceso/rollback auditados, revisión/merge de Employer y comandos acotados por capacidad; sin acceso a contenido privado |
 
 Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se incorpore OpenAPI describirá auth, schemas, límites y respuestas; los detalles de proveedor quedarán fuera del contrato HTTP.
@@ -144,6 +144,8 @@ Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se 
 ### Analytics salarial
 
 `GET /api/v1/salary-history` deriva `salary-analytics-v1` exclusivamente desde `Document.active_extraction_run_id` de documentos `COMPLETED`; una corrida candidata, fallida o pendiente nunca desplaza el resultado publicado y un baseline `NEEDS_REVIEW` queda fuera hasta su cierre. Su payload es agregado, añade contexto de completitud/reproceso y no envía conceptos históricos. `GET /api/v1/salary-history/concepts` aplica el mismo gate y pagina directamente en SQL sólo los haberes normalizados de un contexto y moneda owner-scoped, con páginas de hasta 100 filas y filtros por año/categoría; no expone descripciones originales y un concepto desconocido no oculta los normalizados del mismo recibo. `GET /api/v1/salary-history/comparison` exige contexto laboral, currencyCode y dos períodos. Ningún cálculo cruza empleos o monedas, y varias liquidaciones del mismo mes se conservan. Una explicación sólo atribuye la variación neta cuando los conceptos están completos, la porción regular permanece estable y extraordinarios menos descuentos reconcilian exactamente; de lo contrario declara evidencia insuficiente o variación no explicada.
+
+La respuesta ordena juntos contexto y scope: empresa favorita primero, luego `lastPeriod` descendente derivado de esas mismas liquidaciones elegibles, contexto confirmado y empleo activo como desempates, y finalmente claves estables. La selección explícita de la URL o de la sesión visual prevalece sobre ese fallback. La preferencia nunca participa en resolución ni autoasociación.
 
 El comparable inicial es únicamente basicAmount de una liquidación `NORMAL` recurrente verificada; falta o ambigüedad devuelven N/D. Cuando ese N/D proviene de un issue recuperable, la respuesta lo señala sin inferir un monto y ofrece el mismo batch centralizado que el detalle del documento. Dinero y porcentajes se calculan con BigInt/decimal exacto y variación compuesta, no con FLOAT ni suma de porcentajes. El agregado incluye remunerativo/no remunerativo, categorías anuales, totales normalizados y posibles duplicados sujetos a confirmación; nunca expone categorías ni descripciones crudas de deducciones minimizadas.
 

@@ -9,13 +9,13 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 ## Qué funciona
 
 - alta e inicio de sesión exclusivamente con Google y aceptación legal versionada, onboarding, logout y gestión owner-only de sesiones activas con revocación individual o masiva;
-- empleadores y empleos;
+- empleadores y empleos, con empresas favoritas owner-only;
 - lotes persistentes de uno o muchos PDFs con upload directo privado;
 - ownership, idempotencia, límites, expiración y cleanup;
 - validación PDF, ClamAV, rechazo de contenido activo, clasificación y OCR acotado;
 - extracción determinística de recibos argentinos, campos trazables, importes remunerativos/no remunerativos, liquidación, reintegros y conceptos;
 - visor PDF privado por página, evidencia espacial, confirmación de tipo, correcciones humanas y recuperación versionada con comparación/promoción segura;
-- historial salarial derivado con resumen, evolución, análisis anual y comparación por empleo y moneda;
+- historial salarial derivado con resumen, evolución, análisis anual y comparación por empleo y moneda; el contexto inicial prioriza empresas favoritas y luego el período salarial más reciente;
 - contexto económico derivado para `AR` + `ARS`, con equivalente USD histórico, poder adquisitivo, inflación del período y fuente/metodología trazables;
 - navegación contextual entre cada empleo, su historial y sus documentos, con el contexto recuperable desde la URL;
 - modo privacidad visual global para enmascarar importes y porcentajes en la interfaz autenticada, con advertencia antes de abrir el PDF original sin censurar;

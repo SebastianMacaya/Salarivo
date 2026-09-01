@@ -204,6 +204,10 @@ const exportSections = [
   ["employers", `SELECT employer.name, employer.country_code AS "countryCode",
       CASE WHEN employer.created_by_user_id = $1 THEN employer.status ELSE NULL END AS status,
       CASE WHEN employer.created_by_user_id = $1 THEN employer.created_at ELSE NULL END AS "createdAt",
+      EXISTS (
+        SELECT 1 FROM user_favorite_employers favorite
+         WHERE favorite.user_id = $1 AND favorite.employer_id = employer.id
+      ) AS "isFavorite",
       min(employment.created_at) AS "firstLinkedAt"
       FROM employers employer
       LEFT JOIN employments employment
@@ -755,6 +759,31 @@ function detectedEmploymentIdentity(employerName: string) {
   };
 }
 
+type RankedSalaryContext = Readonly<{
+  isFavorite: boolean;
+  lastPeriod: string | null;
+  employerName: string | null;
+  employmentContext: string;
+  currencyCode: string;
+  state: "CONFIRMED" | "DETECTED" | "UNCONFIRMED";
+  employmentStatus: string | null;
+}>;
+
+export function rankedSalaryContextIndexes(contexts: readonly RankedSalaryContext[]): number[] {
+  const stateRank = { CONFIRMED: 2, DETECTED: 1, UNCONFIRMED: 0 } as const;
+  return contexts.map((_, index) => index).sort((leftIndex, rightIndex) => {
+    const left = contexts[leftIndex]!;
+    const right = contexts[rightIndex]!;
+    return Number(right.isFavorite) - Number(left.isFavorite)
+      || (right.lastPeriod ?? "").localeCompare(left.lastPeriod ?? "")
+      || stateRank[right.state] - stateRank[left.state]
+      || Number(right.employmentStatus === "ACTIVE") - Number(left.employmentStatus === "ACTIVE")
+      || (left.employerName ?? "").localeCompare(right.employerName ?? "")
+      || left.employmentContext.localeCompare(right.employmentContext)
+      || left.currencyCode.localeCompare(right.currencyCode);
+  });
+}
+
 const salaryConceptCategorySql = `CASE
   WHEN item.normalized_concept_code = 'NORMAL' THEN 'NORMAL'
   WHEN item.normalized_concept_code = 'SAC' THEN 'SAC'
@@ -805,6 +834,11 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
               settlement.basic_amount, settlement.gross_amount, settlement.net_amount,
               settlement.deductions_amount, settlement.remunerative_amount,
               settlement.non_remunerative_amount, employment.status AS employment_status,
+              EXISTS (
+                SELECT 1 FROM user_favorite_employers favorite
+                 WHERE favorite.user_id = settlement.user_id
+                   AND favorite.employer_id = employment.employer_id
+              ) AS is_favorite,
               to_char(employment.start_date, 'YYYY-MM-DD') AS employment_start_date,
               to_char(employment.end_date, 'YYYY-MM-DD') AS employment_end_date,
               COALESCE(employer.name, detected_employer.name) AS employer_name,
@@ -889,6 +923,7 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
     countryCode: string | null;
     currencyCode: string;
     employmentStatus: string | null;
+    isFavorite: boolean;
     startDate: string | null;
     endDate: string | null;
   }>();
@@ -915,6 +950,7 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
         countryCode: value(row, "country_code"),
         currencyCode: currency,
         employmentStatus: value(row, "employment_status"),
+        isFavorite: row.is_favorite === true,
         startDate: value(row, "employment_start_date"),
         endDate: value(row, "employment_end_date"),
       });
@@ -982,19 +1018,21 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
     })),
   };
   const coverage = coverageResult.rows[0] ?? {};
+  const contexts = analytics.scopes.map((scope) => {
+    const metadata = contextMetadata.get(JSON.stringify([scope.employmentContext, scope.currencyCode]));
+    if (!metadata) throw new Error("SALARY_CONTEXT_METADATA_MISSING");
+    return {
+      ...metadata,
+      firstPeriod: scope.evolution[0]?.period ?? null,
+      lastPeriod: scope.evolution.at(-1)?.period ?? null,
+    };
+  });
+  const rankedIndexes = rankedSalaryContextIndexes(contexts);
   return {
     response: {
       calculationVersion: "salary-analytics-v1",
       economicCalculationVersion: "economic-analytics-v1",
-      contexts: analytics.scopes.map((scope) => {
-        const metadata = contextMetadata.get(JSON.stringify([scope.employmentContext, scope.currencyCode]));
-        if (!metadata) throw new Error("SALARY_CONTEXT_METADATA_MISSING");
-        return {
-          ...metadata,
-          firstPeriod: scope.evolution[0]?.period ?? null,
-          lastPeriod: scope.evolution.at(-1)?.period ?? null,
-        };
-      }),
+      contexts: rankedIndexes.map((index) => contexts[index]!),
       coverage: {
         documents: Number(coverage.documents ?? 0),
         completedDocuments: Number(coverage.completed_documents ?? 0),
@@ -1009,7 +1047,10 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
           reviewRequiredDocuments: Number(coverage.reprocessing_review_required_documents ?? 0),
         },
       },
-      analytics: publicAnalytics,
+      analytics: {
+        ...publicAnalytics,
+        scopes: rankedIndexes.map((index) => publicAnalytics.scopes[index]!),
+      },
     },
     analytics,
     economics,
@@ -1082,7 +1123,7 @@ function privacyExportStream(
       if (account.rowCount !== 1) throw new Error("EXPORT_ACCOUNT_NOT_FOUND");
       const row = account.rows[0];
       yield JSON.stringify({
-        format: "salarivo-user-export-v4",
+        format: "salarivo-user-export-v5",
         exportedAt: new Date().toISOString(),
         account: {
           email: row.email,

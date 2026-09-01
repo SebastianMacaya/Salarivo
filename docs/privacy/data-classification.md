@@ -7,7 +7,7 @@
 | Clase | Ejemplos | Manejo |
 | --- | --- | --- |
 | Restricted | PDFs, OCR, salarios, equivalentes USD y valores/variaciones reales derivados, feedback libre sobre tipos no soportados, salud/obra social, afiliación sindical, futura contribución/mapping de benchmark, CUIT/CUIL/DNI, banco, email, correcciones, exports, cookies/tokens, códigos OIDC, PKCE verifier, `state`, `nonce`, URLs firmadas, claves | cifrado, acceso mínimo, no logs, no fixtures reales, sharing explícito |
-| Confidential | userId interno, documentId, relación `(provider, sub)`, categorías coarse de dispositivo/navegador/SO y timestamps de sesión, rol admin, aceptación legal, employment metadata, audit events sanitizados, configuración no secreta | acceso por rol/servicio, logs limitados, retención definida |
+| Confidential | userId interno, documentId, relación `(provider, sub)`, categorías coarse de dispositivo/navegador/SO y timestamps de sesión, rol admin, aceptación legal, employment metadata y empresas favoritas, audit events sanitizados, configuración no secreta | acceso por rol/servicio, logs limitados, retención definida |
 | Internal | métricas agregadas sin cardinalidad sensible, health, versiones, error codes | uso operativo, sin vínculo innecesario a persona |
 | Public | documentación pública aprobada, contenido de marketing y series/observaciones económicas oficiales globales con atribución | sin datos derivados de usuarios |
 

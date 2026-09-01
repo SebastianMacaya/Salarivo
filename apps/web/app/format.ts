@@ -82,6 +82,7 @@ export function dateLabel(value?: string | null) {
 
 export function employmentOptionLabel(employment: {
   employerName: string;
+  isFavorite?: boolean;
   role?: string | null;
   startDate: string;
   endDate?: string | null;
@@ -94,6 +95,7 @@ export function employmentOptionLabel(employment: {
   const range = `${dateLabel(employment.startDate)} a ${employment.endDate ? dateLabel(employment.endDate) : 'actualidad'}`;
   return [
     employment.employerName,
+    employment.isFavorite ? 'Favorita' : null,
     employment.role || 'Puesto sin especificar',
     status,
     range,
@@ -103,6 +105,7 @@ export function employmentOptionLabel(employment: {
 
 export function salaryContextOptionLabel(context: {
   employerName?: string | null;
+  isFavorite?: boolean;
   state: 'CONFIRMED' | 'DETECTED' | 'UNCONFIRMED';
   currencyCode: string;
   employmentStatus?: string | null;
@@ -129,6 +132,7 @@ export function salaryContextOptionLabel(context: {
       : null;
   return [
     context.employerName || 'Empleo sin confirmar',
+    context.isFavorite ? 'Favorita' : null,
     state,
     context.state === 'CONFIRMED' ? employmentStatus : null,
     employmentRange ?? observedRange ?? 'Período no disponible',
@@ -160,6 +164,16 @@ export function salaryContextIdentityMatches(
   return Boolean(requested.employmentContext)
     && context.employmentContext === requested.employmentContext
     && (!requested.currencyCode || context.currencyCode === requested.currencyCode);
+}
+
+export function salaryContextForEmployment<T extends {
+  employmentContext: string; employmentId?: string | null; currencyCode: string;
+}>(
+  contexts: T[],
+  employmentId: string,
+  requested: { employmentContext?: string | null; currencyCode?: string | null } = {},
+) {
+  return contexts.find((context) => salaryContextIdentityMatches(context, { employmentId, ...requested }));
 }
 
 export function timestampLabel(value?: string | null) {

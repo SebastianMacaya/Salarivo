@@ -22,6 +22,8 @@ La escritura de CUIT se habilita sólo en la consola administrativa. El worker t
 
 `Employment` sigue siendo owner-scoped. Documentos y liquidaciones conservan `user_id` como autoridad primaria; cuando tienen `employment_id`, el servidor valida además que pertenezca al mismo usuario. Analytics y operaciones de privacidad mantienen ese mismo boundary. Conocer un `employer_id` global no concede acceso a ninguna persona ni a su historia.
 
+Una empresa favorita se representa mediante la relación owner-scoped `(user_id, employer_id)`, no con estado mutable en `Employer`. Sólo un usuario con un `Employment` propio puede crearla o quitarla. La preferencia abarca sus episodios confirmados de esa organización y afecta únicamente orden y selección inicial; no desambigua identidad ni asociación de recibos.
+
 ### Resolución
 
 Toda creación de un empleo y toda detección del worker pasan por un único resolver transaccional e idempotente. Bajo un advisory lock derivado de país y nombre normalizado, aplica este orden:
@@ -51,6 +53,8 @@ La asociación manual y la reparación de datos actualizan en una transacción `
 
 Un merge bloquea origen y destino, sigue la cadena canónica, mueve referencias y conserva el origen como `MERGED`. Identificadores iguales se deduplican; valores diferentes del mismo país/tipo o un identificador legacy sin fingerprint bloquean la operación para revisión. Si produce dos `Employment` exactamente equivalentes del mismo usuario, primero mueve items, documentos y liquidaciones al destino y recién entonces elimina la relación redundante. No toca montos, OCR ni originales.
 
+Las preferencias de empresa favorita del origen se trasladan al destino y se deduplican dentro de la misma transacción. Nunca se exponen en los DTO administrativos.
+
 Los DTO administrativos exponen sólo UUID, estados, país, nombres, aliases, procedencia mínima y conteos. Nunca serializan identificadores completos, documentos, OCR, salarios ni conceptos.
 
 ## Alternativas consideradas
@@ -66,6 +70,7 @@ Los DTO administrativos exponen sólo UUID, estados, país, nombres, aliases, pr
 - El nombre deja de ser autoridad y pasa a ser una señal de resolución.
 - Un recibo inequívoco deja de crear un contexto duplicado; un caso ambiguo permanece visible y requiere decisión humana.
 - El merge es recuperable por evidencia porque la fila origen y la auditoría permanecen.
+- Una empresa favorita acompaña al Employer canónico a través de merges sin convertirlo en dato global compartido.
 - Nuevos países o tipos requieren su propio validador; sólo AR/CUIT está habilitado.
 - Cambiar reglas de normalización o asociación exige fixtures sintéticos, pruebas de concurrencia, aislamiento entre usuarios y ambigüedad.
 - La migración 019 no es compatible con un rolling deploy junto a procesos antiguos: producción requiere comprobar que no haya jobs `RUNNING`, detener temporalmente API y worker, respaldar, iniciar la API nueva para migrar y recién después converger API, worker y web al mismo commit.

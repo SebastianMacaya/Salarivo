@@ -253,6 +253,16 @@ const employerSchema = {
   },
 };
 
+const employerFavoriteSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["employerId", "isFavorite"],
+  properties: {
+    employerId: { type: "string", pattern: UUID_PATTERN },
+    isFavorite: { type: "boolean" },
+  },
+};
+
 const employmentSchema = {
   type: "object",
   additionalProperties: false,
@@ -269,6 +279,7 @@ const employmentSchema = {
     "modality",
     "countryCode",
     "currencyCode",
+    "isFavorite",
     "createdAt",
     "updatedAt",
   ],
@@ -285,6 +296,7 @@ const employmentSchema = {
     modality: nullableText(80),
     countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
     currencyCode: { type: "string", pattern: "^[A-Z]{3}$" },
+    isFavorite: { type: "boolean" },
     createdAt: { type: "string" },
     updatedAt: { type: "string" },
   },
@@ -421,6 +433,7 @@ function employmentFrom(row: Record<string, unknown>) {
     modality: row.modality === null ? null : String(row.modality),
     countryCode: String(row.country_code),
     currencyCode: String(row.currency_code),
+    isFavorite: row.is_favorite === true,
     createdAt: timestamp(row.created_at as Date | string),
     updatedAt: timestamp(row.updated_at as Date | string),
   };
@@ -488,6 +501,7 @@ function isDatabaseError(error: unknown): error is { code: string } {
 
 type EmployerBody = { name: string; countryCode: string };
 type EmployerPatch = { name?: string; countryCode?: string };
+type EmployerFavoriteBody = { isFavorite: boolean };
 type EmploymentBody = {
   employerId?: string;
   employerName?: string;
@@ -1184,6 +1198,54 @@ export async function buildApp(
     },
   );
 
+  app.put<{ Params: IdParams; Body: EmployerFavoriteBody }>(
+    "/api/v1/employers/:id/favorite",
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["isFavorite"],
+          properties: { isFavorite: { type: "boolean" } },
+        },
+        response: responses(200, employerFavoriteSchema),
+      },
+    },
+    async (request) => {
+      const employerId = await withTransaction(async (client) => {
+        await lockEmployerMutation(client);
+        const canonical = await followMergedEmployer(client, request.params.id);
+        if (!canonical) return null;
+        const owned = await client.query(
+          `SELECT id FROM employments
+            WHERE user_id = $1 AND employer_id = $2
+            ORDER BY id
+            FOR KEY SHARE`,
+          [request.authUser!.id, canonical.id],
+        );
+        if (!owned.rowCount) return null;
+        if (request.body.isFavorite) {
+          await client.query(
+            `INSERT INTO user_favorite_employers (user_id, employer_id)
+             VALUES ($1, $2)
+             ON CONFLICT DO NOTHING`,
+            [request.authUser!.id, canonical.id],
+          );
+        } else {
+          await client.query(
+            "DELETE FROM user_favorite_employers WHERE user_id = $1 AND employer_id = $2",
+            [request.authUser!.id, canonical.id],
+          );
+        }
+        return canonical.id;
+      });
+      if (!employerId) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: { employerId, isFavorite: request.body.isFavorite } };
+    },
+  );
+
   app.patch<{ Params: IdParams; Body: EmployerPatch }>(
     "/api/v1/employers/:id",
     {
@@ -1224,7 +1286,12 @@ export async function buildApp(
     SELECT e.id, e.employer_id, employer.name AS employer_name,
            employer.status AS employer_status, e.status,
            e.start_date, e.end_date, e.role, e.category, e.modality,
-           e.country_code, e.currency_code, e.created_at, e.updated_at
+           e.country_code, e.currency_code,
+           EXISTS (
+             SELECT 1 FROM user_favorite_employers favorite
+              WHERE favorite.user_id = e.user_id AND favorite.employer_id = e.employer_id
+           ) AS is_favorite,
+           e.created_at, e.updated_at
       FROM employments e
       JOIN employers employer ON employer.id = e.employer_id`;
 
@@ -1499,7 +1566,7 @@ export async function buildApp(
       const result = await pool.query(
         `${employmentSelect}
           WHERE e.user_id = $1
-          ORDER BY e.start_date DESC, e.id`,
+          ORDER BY is_favorite DESC, e.start_date DESC, e.id`,
         [request.authUser!.id],
       );
       return { data: result.rows.map(employmentFrom) };
@@ -1774,6 +1841,18 @@ export async function buildApp(
         if (updated.rowCount !== 1) {
           throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         }
+        if (String(previous.employer_id) !== employerId) {
+          await client.query(
+            `DELETE FROM user_favorite_employers favorite
+              WHERE favorite.user_id = $1 AND favorite.employer_id = $2
+                AND NOT EXISTS (
+                  SELECT 1 FROM employments employment
+                   WHERE employment.user_id = favorite.user_id
+                     AND employment.employer_id = favorite.employer_id
+                )`,
+            [userId, previous.employer_id],
+          );
+        }
         const selected = await client.query(
           `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
           [request.params.id, userId],
@@ -1796,10 +1875,23 @@ export async function buildApp(
         if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }
-        return client.query(
-          `DELETE FROM employments WHERE id = $1 AND user_id = $2 RETURNING id`,
+        const deleted = await client.query<{ employer_id: string }>(
+          `DELETE FROM employments WHERE id = $1 AND user_id = $2 RETURNING employer_id`,
           [request.params.id, request.authUser!.id],
         );
+        if (deleted.rowCount === 1) {
+          await client.query(
+            `DELETE FROM user_favorite_employers favorite
+              WHERE favorite.user_id = $1 AND favorite.employer_id = $2
+                AND NOT EXISTS (
+                  SELECT 1 FROM employments employment
+                   WHERE employment.user_id = favorite.user_id
+                     AND employment.employer_id = favorite.employer_id
+                )`,
+            [request.authUser!.id, deleted.rows[0]!.employer_id],
+          );
+        }
+        return deleted;
       });
       if (result.rowCount !== 1) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
       return { data: null };

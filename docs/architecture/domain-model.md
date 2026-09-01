@@ -71,6 +71,8 @@ Employer representa una organización global con nombre, nombre normalizado, pa�
 
 Employment representa la relación privada de un usuario con ese empleador. Un usuario puede tener varias relaciones simultáneas o sucesivas con el mismo Employer. Document y PayrollSettlement conservan `userId` como autoridad primaria y, cuando existe `employmentId`, el servidor valida además que el Employment pertenezca al mismo usuario. El UUID global del Employer nunca autoriza datos laborales.
 
+`UserFavoriteEmployer` relaciona de forma owner-scoped a un User con un Employer canónico. La fila sólo puede mutarse cuando el titular tiene al menos un Employment propio con esa organización; todos esos episodios comparten la preferencia. Al borrar el último Employment se elimina, un merge la traslada y deduplica, y la baja de cuenta la borra por cascada. No altera identidad, asociación automática, estado laboral ni analytics: sólo presentación y orden.
+
 Campos esenciales de Employment:
 
 - userId y employerId;
@@ -78,6 +80,8 @@ Campos esenciales de Employment:
 - role, category y modality opcionales;
 - countryCode y currencyCode;
 - status y metadata mínima.
+
+El orden inicial de contextos salariales usa primero la preferencia de empresa, luego el último `payrollPeriod` elegible de la corrida activa y finalmente desempates estables. No persiste una copia de ese último período.
 
 El puesto actual vive todavía en Employment. Una futura PositionPeriod conservará cambios de puesto/categoría con vigencia sin sobrescribir historia; no está implementada.
 
@@ -285,6 +289,7 @@ Las migraciones vigentes materializan:
 
 - FK y ownership coherentes entre user, employment, document y settlement;
 - Employer global con estados/cadena de merge válidos, aliases e identificadores protegidos; Employment conserva el límite owner-only;
+- empresa favorita única por userId + employerId, siempre separada del Employer global;
 - una relación laboral exactamente igual no puede insertarse dos veces, sin impedir períodos o roles distintos;
 - unique de AuthAccount por provider + sub y vínculo a un único User;
 - intentos OIDC de un solo uso, expirables y ligados al navegador y propósito;

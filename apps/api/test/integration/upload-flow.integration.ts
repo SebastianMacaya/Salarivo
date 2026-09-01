@@ -745,6 +745,7 @@ test("upload privado crea un único documento y un único intent durable", async
   }
 
   const suffix = crypto.randomUUID();
+  const featureRemoteAddress = "198.51.100.23";
   const publicTerms = await app.inject({ method: "GET", url: "/api/v1/legal/terms" });
   assert.equal(publicTerms.statusCode, 200, publicTerms.body);
   assert.equal(publicTerms.json().data.version, "1.0");
@@ -1672,6 +1673,7 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(employmentEpisodes.statusCode, 200, employmentEpisodes.body);
   const currentEmploymentA = employmentEpisodes.json().data.find((employment: { id: string }) => employment.id === employmentA);
   assert.ok(currentEmploymentA);
+  assert.equal(currentEmploymentA.isFavorite, false);
   assert.deepEqual(
     employmentEpisodes.json().data
       .filter((employment: { employerId: string }) => employment.employerId === currentEmploymentA.employerId)
@@ -1679,6 +1681,36 @@ test("upload privado crea un único documento y un único intent durable", async
       .sort(),
     [["2024-01-01", "2025-12-31"], ["2026-01-01", null]],
   );
+  const favoriteEmployer = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PUT",
+    url: `/api/v1/employers/${currentEmploymentA.employerId}/favorite`,
+    headers: { origin, cookie: cookieA },
+    payload: { isFavorite: true },
+  });
+  assert.equal(favoriteEmployer.statusCode, 200, favoriteEmployer.body);
+  assert.deepEqual(favoriteEmployer.json().data, {
+    employerId: currentEmploymentA.employerId,
+    isFavorite: true,
+  });
+  const favoriteEmploymentEpisodes = await app.inject({
+    remoteAddress: featureRemoteAddress, method: "GET", url: "/api/v1/employments", headers: { cookie: cookieA },
+  });
+  assert.equal(favoriteEmploymentEpisodes.statusCode, 200, favoriteEmploymentEpisodes.body);
+  assert.equal(
+    favoriteEmploymentEpisodes.json().data
+      .filter((employment: { employerId: string }) => employment.employerId === currentEmploymentA.employerId)
+      .every((employment: { isFavorite: boolean }) => employment.isFavorite),
+    true,
+  );
+  const cannotFavoriteForeignEmployer = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PUT",
+    url: `/api/v1/employers/${currentEmploymentA.employerId}/favorite`,
+    headers: { origin, cookie: cookieB },
+    payload: { isFavorite: true },
+  });
+  assert.equal(cannotFavoriteForeignEmployer.statusCode, 404, cannotFavoriteForeignEmployer.body);
   const invalidExpandedEmployer = await app.inject({
     method: "POST",
     url: "/api/v1/employments",
@@ -1708,6 +1740,105 @@ test("upload privado crea un único documento y un único intent durable", async
     },
   });
   assert.equal(sharedEmployment.statusCode, 201, sharedEmployment.body);
+  const sharedEmploymentId = String(sharedEmployment.json().data.id);
+  const sharedEmployerId = String(sharedEmployment.json().data.employerId);
+  const movePriorEmployment = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PATCH", url: `/api/v1/employments/${priorEmploymentId}`,
+    headers: { origin, cookie: cookieA }, payload: { employerId: sharedEmployerId },
+  });
+  assert.equal(movePriorEmployment.statusCode, 200, movePriorEmployment.body);
+  assert.equal(
+    (await pool.query(
+      "SELECT count(*)::integer AS count FROM user_favorite_employers WHERE user_id = $1 AND employer_id = $2",
+      [userIdA, currentEmploymentA.employerId],
+    )).rows[0].count,
+    1,
+  );
+  const restorePriorEmployment = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PATCH", url: `/api/v1/employments/${priorEmploymentId}`,
+    headers: { origin, cookie: cookieA }, payload: { employerId: currentEmploymentA.employerId },
+  });
+  assert.equal(restorePriorEmployment.statusCode, 200, restorePriorEmployment.body);
+
+  const patchCleanupEmployment = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "POST", url: "/api/v1/employments", headers: { origin, cookie: cookieA },
+    payload: {
+      employerName: `Empresa Favorita Reasignada ${suffix}`, startDate: "2023-02-01",
+      countryCode: "AR", currencyCode: "ARS",
+    },
+  });
+  assert.equal(patchCleanupEmployment.statusCode, 201, patchCleanupEmployment.body);
+  const patchCleanupEmploymentData = patchCleanupEmployment.json().data;
+  assert.equal((await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PUT", url: `/api/v1/employers/${patchCleanupEmploymentData.employerId}/favorite`,
+    headers: { origin, cookie: cookieA }, payload: { isFavorite: true },
+  })).statusCode, 200);
+  const reassignLastEmployment = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PATCH", url: `/api/v1/employments/${patchCleanupEmploymentData.id}`,
+    headers: { origin, cookie: cookieA }, payload: { employerId: sharedEmployerId },
+  });
+  assert.equal(reassignLastEmployment.statusCode, 200, reassignLastEmployment.body);
+  assert.equal(
+    (await pool.query(
+      "SELECT count(*)::integer AS count FROM user_favorite_employers WHERE user_id = $1 AND employer_id = $2",
+      [userIdA, patchCleanupEmploymentData.employerId],
+    )).rows[0].count,
+    0,
+  );
+
+  const deletionEpisodeA = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "POST", url: "/api/v1/employments", headers: { origin, cookie: cookieA },
+    payload: {
+      employerName: `Empresa Favorita Eliminada ${suffix}`, startDate: "2022-01-01", endDate: "2022-12-31",
+      countryCode: "AR", currencyCode: "ARS",
+    },
+  });
+  assert.equal(deletionEpisodeA.statusCode, 201, deletionEpisodeA.body);
+  const deletionEpisodeB = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "POST", url: "/api/v1/employments", headers: { origin, cookie: cookieA },
+    payload: {
+      employerName: `Empresa Favorita Eliminada ${suffix}`, startDate: "2023-01-01",
+      countryCode: "AR", currencyCode: "ARS",
+    },
+  });
+  assert.equal(deletionEpisodeB.statusCode, 201, deletionEpisodeB.body);
+  const deletionEmployerId = String(deletionEpisodeA.json().data.employerId);
+  assert.equal(deletionEpisodeB.json().data.employerId, deletionEmployerId);
+  assert.equal((await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PUT", url: `/api/v1/employers/${deletionEmployerId}/favorite`,
+    headers: { origin, cookie: cookieA }, payload: { isFavorite: true },
+  })).statusCode, 200);
+  await grantStepUp(cookieA);
+  for (const [employmentId, expectedFavoriteCount] of [
+    [deletionEpisodeA.json().data.id, 1], [deletionEpisodeB.json().data.id, 0],
+  ] as const) {
+    const deletion = await app.inject({
+      remoteAddress: featureRemoteAddress,
+      method: "DELETE", url: `/api/v1/employments/${employmentId}`, headers: { origin, cookie: cookieA },
+    });
+    assert.equal(deletion.statusCode, 200, deletion.body);
+    assert.equal(
+      (await pool.query(
+        "SELECT count(*)::integer AS count FROM user_favorite_employers WHERE user_id = $1 AND employer_id = $2",
+        [userIdA, deletionEmployerId],
+      )).rows[0].count,
+      expectedFavoriteCount,
+    );
+  }
+  const deleteReassignedEmployment = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "DELETE", url: `/api/v1/employments/${patchCleanupEmploymentData.id}`,
+    headers: { origin, cookie: cookieA },
+  });
+  assert.equal(deleteReassignedEmployment.statusCode, 200, deleteReassignedEmployment.body);
   const ownerEmployers = await app.inject({ method: "GET", url: "/api/v1/employers", headers: { cookie: cookieA } });
   assert.equal(ownerEmployers.statusCode, 200, ownerEmployers.body);
   assert.ok(ownerEmployers.json().data.some((employer: { name: string }) => employer.name === ownOrphanEmployerName));
@@ -2928,11 +3059,20 @@ test("upload privado crea un único documento y un único intent durable", async
     );
   }
   const groupedEmploymentDocuments = [
-    { documentId: listFixtures[2]!.id, runId: crypto.randomUUID(), settlementId: crypto.randomUUID(), period: "2026-06-01" },
-    { documentId: listFixtures[3]!.id, runId: crypto.randomUUID(), settlementId: crypto.randomUUID(), period: "2026-07-01" },
+    { documentId: listFixtures[2]!.id, runId: crypto.randomUUID(), settlementId: crypto.randomUUID(), employmentId: employmentA, period: "2026-06-01" },
+    { documentId: listFixtures[3]!.id, runId: crypto.randomUUID(), settlementId: crypto.randomUUID(), employmentId: sharedEmploymentId, period: "2026-07-01" },
   ];
   for (const fixture of groupedEmploymentDocuments) {
-    await pool.query("UPDATE documents SET processing_status = 'COMPLETED' WHERE id = $1", [fixture.documentId]);
+    await pool.query(
+      "UPDATE documents SET processing_status = 'COMPLETED', employment_id = $2 WHERE id = $1",
+      [fixture.documentId, fixture.employmentId],
+    );
+    await pool.query(
+      `UPDATE import_batch_items item SET employment_id = $2, updated_at = now()
+        FROM documents document
+       WHERE document.id = $1 AND item.id = document.import_batch_item_id`,
+      [fixture.documentId, fixture.employmentId],
+    );
     await pool.query(
       `INSERT INTO extraction_runs (
          id, user_id, document_id, processing_version, status, extractor_name,
@@ -2953,30 +3093,72 @@ test("upload privado crea un único documento y un único intent durable", async
          id, user_id, document_id, extraction_run_id, employment_id, settlement_ordinal,
          payroll_period, settlement_type, is_recurring, currency_code, basic_amount
        ) VALUES ($1, $2, $3, $4, $5, 1, $6, 'NORMAL', true, 'ARS', 900.00)`,
-      [fixture.settlementId, userId, fixture.documentId, fixture.runId, employmentA, fixture.period],
+      [fixture.settlementId, userId, fixture.documentId, fixture.runId, fixture.employmentId, fixture.period],
     );
   }
   const groupedEmploymentHistory = await app.inject({
-    method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
+    remoteAddress: featureRemoteAddress, method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
   });
   assert.equal(groupedEmploymentHistory.statusCode, 200, groupedEmploymentHistory.body);
-  const groupedEmploymentContexts = groupedEmploymentHistory.json().data.contexts.filter(
-    (context: { employmentContext: string }) => context.employmentContext === employmentA,
+  const groupedHistory = groupedEmploymentHistory.json().data;
+  const groupedEmploymentContexts = groupedHistory.contexts.filter(
+    (context: { employmentContext: string }) => [employmentA, sharedEmploymentId].includes(context.employmentContext),
   );
   assert.deepEqual(
-    groupedEmploymentContexts.map((context: { firstPeriod: string; lastPeriod: string }) => ({
-      firstPeriod: context.firstPeriod, lastPeriod: context.lastPeriod,
+    groupedEmploymentContexts.map((context: { employmentContext: string; firstPeriod: string; lastPeriod: string; isFavorite: boolean }) => ({
+      employmentContext: context.employmentContext, firstPeriod: context.firstPeriod,
+      lastPeriod: context.lastPeriod, isFavorite: context.isFavorite,
     })),
-    [{ firstPeriod: "2026-06", lastPeriod: "2026-07" }],
+    [
+      { employmentContext: employmentA, firstPeriod: "2026-06", lastPeriod: "2026-06", isFavorite: true },
+      { employmentContext: sharedEmploymentId, firstPeriod: "2026-07", lastPeriod: "2026-07", isFavorite: false },
+    ],
   );
+  for (const [index, context] of groupedHistory.contexts.entries()) {
+    assert.equal(groupedHistory.analytics.scopes[index].employmentContext, context.employmentContext);
+    assert.equal(groupedHistory.analytics.scopes[index].currencyCode, context.currencyCode);
+  }
+  const unmarkFavorite = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PUT",
+    url: `/api/v1/employers/${currentEmploymentA.employerId}/favorite`,
+    headers: { origin, cookie: cookieA },
+    payload: { isFavorite: false },
+  });
+  assert.equal(unmarkFavorite.statusCode, 200, unmarkFavorite.body);
+  const recencyHistory = await app.inject({
+    remoteAddress: featureRemoteAddress, method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
+  });
+  assert.equal(recencyHistory.statusCode, 200, recencyHistory.body);
+  assert.deepEqual(
+    recencyHistory.json().data.contexts
+      .filter((context: { employmentContext: string }) => [employmentA, sharedEmploymentId].includes(context.employmentContext))
+      .map((context: { employmentContext: string }) => context.employmentContext),
+    [sharedEmploymentId, employmentA],
+  );
+  const remarkFavorite = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "PUT",
+    url: `/api/v1/employers/${currentEmploymentA.employerId}/favorite`,
+    headers: { origin, cookie: cookieA },
+    payload: { isFavorite: true },
+  });
+  assert.equal(remarkFavorite.statusCode, 200, remarkFavorite.body);
   await pool.query("DELETE FROM extraction_runs WHERE id = ANY($1::uuid[])", [
     groupedEmploymentDocuments.map(({ runId }) => runId),
   ]);
   await pool.query(
     `UPDATE documents
-        SET processing_status = CASE id WHEN $1 THEN 'OCR' WHEN $2 THEN 'FAILED_PERMANENT' END
+        SET processing_status = CASE id WHEN $1 THEN 'OCR' WHEN $2 THEN 'FAILED_PERMANENT' END,
+            employment_id = $4
       WHERE id = ANY($3::uuid[])`,
-    [listFixtures[2]!.id, listFixtures[3]!.id, [listFixtures[2]!.id, listFixtures[3]!.id]],
+    [listFixtures[2]!.id, listFixtures[3]!.id, [listFixtures[2]!.id, listFixtures[3]!.id], employmentA],
+  );
+  await pool.query(
+    `UPDATE import_batch_items item SET employment_id = $2, updated_at = now()
+      FROM documents document
+     WHERE document.id = ANY($1::uuid[]) AND item.id = document.import_batch_item_id`,
+    [[listFixtures[2]!.id, listFixtures[3]!.id], employmentA],
   );
   await pool.query(
     `UPDATE payroll_settlements
@@ -4002,7 +4184,7 @@ test("upload privado crea un único documento y un único intent durable", async
     "UPDATE documents SET detected_employer_id = NULL WHERE id = $1 AND user_id = $2",
     [documentId, userIdA],
   )).rowCount, 1);
-  assert.equal(exported.format, "salarivo-user-export-v4");
+  assert.equal(exported.format, "salarivo-user-export-v5");
   assert.deepEqual(Object.keys(exported), [
     "format", "exportedAt", "account", "authenticationMethods", "employers", "employments",
     "imports", "documents", "settlements", "concepts", "processingRuns", "processingIssues",
@@ -4011,6 +4193,8 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(exported.account.secondFactor.enabled, true);
   assert.ok(exported.employers.some((employer: { name: string; firstLinkedAt: string | null }) =>
     employer.name === ownOrphanEmployerName && employer.firstLinkedAt === null));
+  assert.ok(exported.employers.some((employer: { name: string; isFavorite: boolean }) =>
+    employer.name === "Empresa Asociada A" && employer.isFavorite));
   assert.ok(exported.employers.some((employer: {
     name: string; firstLinkedAt: string | null; status: string | null; createdAt: string | null;
   }) => employer.name === "Empresa Ajena B" && typeof employer.firstLinkedAt === "string"
@@ -4207,17 +4391,14 @@ test("upload privado crea un único documento y un único intent durable", async
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.deepEqual(activeStatuses, ["RUNNING", "RUNNING"]);
-    for (const socketRequest of socketRequests) socketRequest.destroy();
-    const capacityHeldAfterAbort = await app.inject({
+    const capacityAtLimit = await app.inject({
       method: "GET",
       url: `/api/v1/privacy/exports/${socketExports[2]!.id}/download`,
       headers: { cookie: `salarivo_session=${socketExports[2]!.token}` },
     });
-    const capacityRejection = [capacityHeldAfterAbort.statusCode, capacityHeldAfterAbort.json().error.code];
-    assert.ok(
-      (capacityRejection[0] === 503 && capacityRejection[1] === "EXPORT_CAPACITY")
-      || (capacityRejection[0] === 409 && capacityRejection[1] === "EXPORT_IN_PROGRESS"),
-      capacityHeldAfterAbort.body,
+    assert.deepEqual(
+      [capacityAtLimit.statusCode, capacityAtLimit.json().error.code],
+      [503, "EXPORT_CAPACITY"],
     );
   } finally {
     for (const socketRequest of socketRequests) socketRequest.destroy();
@@ -6386,6 +6567,7 @@ test("upload privado crea un único documento y un único intent durable", async
          (SELECT count(*)::integer FROM mfa_recovery_codes WHERE user_id = $1) AS recovery_codes,
          (SELECT count(*)::integer FROM employers WHERE created_by_user_id = $1) AS employers,
          (SELECT count(*)::integer FROM employments WHERE user_id = $1) AS employments,
+         (SELECT count(*)::integer FROM user_favorite_employers WHERE user_id = $1) AS favorite_employers,
          (SELECT count(*)::integer FROM import_batches WHERE user_id = $1) AS import_batches,
          (SELECT count(*)::integer FROM upload_sessions WHERE user_id = $1) AS upload_sessions,
          (SELECT count(*)::integer FROM documents WHERE user_id = $1) AS documents,
@@ -6405,6 +6587,7 @@ test("upload privado crea un único documento y un único intent durable", async
       recovery_codes: 0,
       employers: 0,
       employments: 0,
+      favorite_employers: 0,
       import_batches: 0,
       upload_sessions: 0,
       documents: 0,

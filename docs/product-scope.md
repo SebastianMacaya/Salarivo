@@ -23,6 +23,7 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 
 - alta e inicio de sesión exclusivamente con Google, aceptación y reaceptación versionada de Términos y confirmación del Aviso de Privacidad, onboarding, logout y gestión owner-only de sesiones activas con revocación individual o masiva;
 - alta, edición y cierre de múltiples empleos simultáneos o sucesivos sobre un registro global de empleadores con revisión conservadora;
+- empresas favoritas por titular, aplicadas a todos sus empleos confirmados con la misma organización y reutilizadas sólo para presentación y orden;
 - carga individual y masiva de PDFs;
 - ImportBatch persistente, recuperable al volver a la pantalla, con progreso agregado y por archivo;
 - admisión acotada por lote activo, cantidad, bytes, espacio de cuenta y concurrencia por usuario;
@@ -32,6 +33,7 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - detección persistida del empleador de un documento y autoasociación sólo cuando existe un único empleo propio del mismo empleador y moneda que cubre el período; los casos sin coincidencia o ambiguos requieren confirmación explícita;
 - confidence por campo, carga manual de montos ausentes y cierre explícito de revisión;
 - historial `salary-analytics-v1` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
+- selección inicial del historial por empresa favorita y luego por el último `payrollPeriod` elegible; upload, pago, emisión y alta del empleo no determinan esa recencia;
 - contexto `economic-analytics-v1` derivado para `AR` + `ARS`, con nominal intacto, equivalente USD histórico, poder adquisitivo a precios del último IPC disponible, inflación del período y procedencia inspeccionable;
 - navegación contextual y recuperable desde la URL entre un empleo, su historial salarial, períodos, conceptos y documentos asociados;
 - modo privacidad visual global en la interfaz autenticada para enmascarar importes, porcentajes y gráficos financieros durante la navegación, sin modificar datos ni crear copias censuradas, y con advertencia antes de abrir un PDF original;
@@ -90,6 +92,7 @@ Contratos y adendas en allowlist, sin OCR inicial y siempre asociados a un emple
 - Una corrección humana tiene precedencia dentro de la corrida vigente y se hereda explícitamente al reprocesar sin sobrescribir historia.
 - Un deep-link del visor conserva sólo IDs opacos, página y evidencia; nunca salario, OCR ni URL firmada.
 - El dashboard no lee PDFs; consulta datos estructurados.
+- El dashboard conserva una selección explícita y, cuando no existe, prioriza empresas favoritas y después el período salarial elegible más reciente sin cruzar contexto ni moneda.
 - Un recibo sólo se autoasocia cuando país, empleador, moneda y período producen un único empleo propio; una ambigüedad nunca se resuelve por heurística.
 - El usuario puede eliminar originales sin perder datos estructurados cuando elige conservarlos.
 - Una colisión de email entre una cuenta existente y Google nunca vincula, modifica ni expone detalles de la cuenta existente.

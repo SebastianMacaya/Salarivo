@@ -3,7 +3,11 @@ import test from "node:test";
 
 test("Fastify registers every local route and rejects untrusted mutations", async (context) => {
   process.env.DATABASE_URL ??= "postgresql://unused:unused@127.0.0.1:1/unused";
-  const [{ buildApp, validateEmploymentDates, validateRegistrationLegalDocuments }, { loadConfig }, { derivedDocumentFilename }] = await Promise.all([
+  const [
+    { buildApp, validateEmploymentDates, validateRegistrationLegalDocuments },
+    { loadConfig },
+    { derivedDocumentFilename, rankedSalaryContextIndexes },
+  ] = await Promise.all([
     import("../src/app.ts"),
     import("../src/config.ts"),
     import("../src/data-routes.ts"),
@@ -68,6 +72,18 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
   assert.equal(derivedDocumentFilename("CON.pdf"), "document-CON.pdf");
   assert.equal(derivedDocumentFilename("recibo\u202Efdp.pdf"), "recibo fdp.pdf");
   assert.ok(derivedDocumentFilename("document.pdf", "2026-07", "A".repeat(400)).length <= 250);
+
+  const contexts = [
+    { employmentContext: "recent", currencyCode: "ARS", employerName: "Reciente", lastPeriod: "2026-08", isFavorite: false, state: "CONFIRMED" as const, employmentStatus: "ACTIVE" },
+    { employmentContext: "favorite-old", currencyCode: "ARS", employerName: "Favorita vieja", lastPeriod: "2020-01", isFavorite: true, state: "CONFIRMED" as const, employmentStatus: "ENDED" },
+    { employmentContext: "older", currencyCode: "ARS", employerName: "Anterior", lastPeriod: "2025-12", isFavorite: false, state: "CONFIRMED" as const, employmentStatus: "ENDED" },
+    { employmentContext: "favorite-new", currencyCode: "ARS", employerName: "Favorita nueva", lastPeriod: "2024-02", isFavorite: true, state: "CONFIRMED" as const, employmentStatus: "ACTIVE" },
+    { employmentContext: "empty", currencyCode: "ARS", employerName: "Sin período", lastPeriod: null, isFavorite: false, state: "UNCONFIRMED" as const, employmentStatus: null },
+  ];
+  assert.deepEqual(
+    rankedSalaryContextIndexes(contexts).map((index) => contexts[index]!.employmentContext),
+    ["favorite-new", "favorite-old", "recent", "older", "empty"],
+  );
 
   const proxyApp = await buildApp({
     ...loadConfig({ APP_ENV: "test", LOG_LEVEL: "silent" }),

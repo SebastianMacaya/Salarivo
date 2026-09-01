@@ -37,6 +37,7 @@ El esquema conserva una política por cuenta y la copia al documento; el product
 | cuenta de autenticación `(provider, sub)` | PostgreSQL | mientras exista la cuenta; se elimina con ella |
 | intento/cookie OIDC | PostgreSQL + navegador | TTL corto, un solo uso; se consume al resolver callback/registro/step-up o expira |
 | sesión y cliente coarse | PostgreSQL | mientras exista la cuenta; las activas se muestran owner-only y las revocadas/expiradas permanecen hasta una política de purge aprobada |
+| empresa favorita | PostgreSQL | hasta desmarcarla, borrar el último Employment propio asociado, fusionar hacia otra identidad canónica o eliminar la cuenta |
 | access, refresh e ID tokens Google | no se persisten | sólo memoria durante canje y validación; se descartan en la misma operación |
 | contribución de benchmark | no implementada | futura: hasta revocación/borrado; retirar mapping y recomputar agregados afectados |
 | serie/observación económica global | PostgreSQL | observaciones append-only mientras la serie sea necesaria para reproducir cálculos; plazo de archivo/purge aún no aprobado |

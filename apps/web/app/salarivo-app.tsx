@@ -25,6 +25,7 @@ import {
   periodLabel,
   recentPeriodRange,
   relevantEvolutionRanges,
+  salaryContextForEmployment,
   salaryContextOptionLabel,
   salaryContextIdentityMatches,
   salaryContextMatches,
@@ -78,6 +79,7 @@ type Employment = {
   status: 'ACTIVE' | 'ENDED';
   countryCode: string;
   currencyCode: string;
+  isFavorite: boolean;
   employerStatus?: 'PENDING' | 'VERIFIED' | 'MERGED' | 'REJECTED' | null;
 };
 type EmploymentDetection = {
@@ -239,6 +241,7 @@ type SalaryContext = {
   state: 'CONFIRMED' | 'DETECTED' | 'UNCONFIRMED';
   countryCode: string | null;
   currencyCode: string;
+  isFavorite: boolean;
   employmentStatus: string | null;
   startDate: string | null;
   endDate: string | null;
@@ -1269,7 +1272,7 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
         <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú" aria-expanded={menuOpen} aria-controls="private-navigation">☰</button><Brand /><PrivacyToggle /></header>
         {authNotice && <p className="message success" aria-live="polite">{authNotice} <button type="button" className="text-button" onClick={onAuthNoticeDismiss}>Cerrar</button></p>}
         {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={navigate} />}
-        {section === 'jobs' && <Employments key={refreshKey} selectedLocation={ownerLocation} onNavigate={navigate} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={sensitiveActions.runSensitive} />}
+        {section === 'jobs' && <Employments key={refreshKey} selectedLocation={ownerLocation} onNavigate={navigate} runSensitive={sensitiveActions.runSensitive} />}
         {section === 'import' && <Importer onBusyChange={setImportBusy} onDone={() => setRefreshKey((n) => n + 1)} />}
         {section === 'history' && <History key={refreshKey} initialLocation={ownerLocation} onLocationChange={updateHistoryLocation} runSensitive={sensitiveActions.runSensitive} />}
         {section === 'settings' && <Settings user={user} onUserChanged={onUserChanged} runSensitive={sensitiveActions.runSensitive} onDeletionRequested={onDeletionRequested} />}
@@ -1390,6 +1393,13 @@ function salaryScopeKey(context: SalaryContext) {
   return JSON.stringify([context.employmentContext, context.currencyCode]);
 }
 
+function salaryScopeForContext(history: SalaryHistory, context?: SalaryContext) {
+  return context
+    ? history.analytics.scopes.find((scope) => scope.employmentContext === context.employmentContext
+      && scope.currencyCode === context.currencyCode)
+    : undefined;
+}
+
 function appendSalaryContext(query: URLSearchParams, context: SalaryContext) {
   const stableDetectedContext = /^detected:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(context.employmentContext);
   const employerName = context.state === 'DETECTED' ? context.employerName ?? '' : '';
@@ -1446,9 +1456,10 @@ function SalaryScopeControl({ history, employments = [], selectedKey, onChange, 
   const employmentById = new Map(employments.map((employment) => [employment.id, employment]));
   const filtered = history.contexts.filter((item) => salaryContextMatches(item, query, item.employmentId ? employmentById.get(item.employmentId) : null));
   const grouped = [
-    ['ACTUAL', filtered.filter((item) => item.employmentStatus === 'ACTIVE')],
-    ['ANTERIORES', filtered.filter((item) => item.employmentStatus === 'ENDED')],
-    ['SIN CONFIRMAR', filtered.filter((item) => item.employmentStatus !== 'ACTIVE' && item.employmentStatus !== 'ENDED')],
+    ['FAVORITAS', filtered.filter((item) => item.isFavorite)],
+    ['ACTUAL', filtered.filter((item) => !item.isFavorite && item.employmentStatus === 'ACTIVE')],
+    ['ANTERIORES', filtered.filter((item) => !item.isFavorite && item.employmentStatus === 'ENDED')],
+    ['SIN CONFIRMAR', filtered.filter((item) => !item.isFavorite && item.employmentStatus !== 'ACTIVE' && item.employmentStatus !== 'ENDED')],
   ] as const;
   const optionLabel = (item: SalaryContext) => {
     const employment = item.employmentId ? employmentById.get(item.employmentId) : undefined;
@@ -1462,7 +1473,7 @@ function SalaryScopeControl({ history, employments = [], selectedKey, onChange, 
     <div className="scope-picker"><label htmlFor={`${id}-search`}>Empleo y moneda</label>{history.contexts.length > 1
       ? <><input id={`${id}-search`} type="search" value={query} placeholder="Buscar empresa, puesto, año, período o estado" autoComplete="off" onChange={(event) => setQuery(event.target.value)} /><select id={id} aria-label="Contexto salarial seleccionado" value={filtered.some((item) => salaryScopeKey(item) === salaryScopeKey(context)) ? salaryScopeKey(context) : ''} onChange={(event) => onChange(event.target.value)}><option value="" disabled>{filtered.length ? 'Elegí un empleo' : 'Sin coincidencias'}</option>{grouped.map(([label, items]) => items.length ? <optgroup label={label} key={label}>{items.map((item) => <option value={salaryScopeKey(item)} key={salaryScopeKey(item)}>{optionLabel(item)}</option>)}</optgroup> : null)}</select></>
       : <strong>{optionLabel(context)}</strong>}</div>
-    <div className="scope-meta"><span className={`status ${context.state === 'CONFIRMED' ? 'ready' : 'pending'}`}>{status}</span><span>{range}</span></div>
+    <div className="scope-meta">{context.isFavorite && <span className="status ready">Favorita</span>}<span className={`status ${context.state === 'CONFIRMED' ? 'ready' : 'pending'}`}>{status}</span><span>{range}</span></div>
   </section>;
 }
 
@@ -1732,9 +1743,8 @@ function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) 
   useEffect(() => { void Promise.resolve().then(loadHistory); }, [loadHistory]);
   useEffect(() => { void Promise.resolve().then(loadDocuments); }, [loadDocuments]);
 
-  const selectedScopeIndex = history?.contexts.findIndex((context) => salaryScopeKey(context) === selectedScopeKey) ?? -1;
-  const context = history?.contexts[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
-  const scope = history?.analytics.scopes[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
+  const context = history?.contexts.find((item) => salaryScopeKey(item) === selectedScopeKey) ?? history?.contexts[0];
+  const scope = history && salaryScopeForContext(history, context);
 
   return (
     <div className="page" aria-busy={historyLoading || documentsLoading}>
@@ -1775,7 +1785,7 @@ function DocumentStatusBadges({ document }: { document: DocumentItem }) {
   return <span className="document-badges"><Status value={document.processingStatus} />{document.decisionRequired && <span className="status pending">Para revisar</span>}{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
 }
 
-function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: { selectedLocation: OwnerLocation; onNavigate: NavigateApp; onChanged: () => void; runSensitive: RunSensitive }) {
+function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedLocation: OwnerLocation; onNavigate: NavigateApp; runSensitive: RunSensitive }) {
   const [items, setItems] = useState<Employment[]>([]);
   const [detections, setDetections] = useState<EmploymentDetection[]>([]);
   const [salaryHistory, setSalaryHistory] = useState<SalaryHistory | null>(null);
@@ -1822,7 +1832,7 @@ function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: 
       };
       const path = currentEmployment === 'new' ? '/employments' : `/employments/${currentEmployment.id}`;
       await api(path, { method: currentEmployment === 'new' ? 'POST' : 'PATCH', body: JSON.stringify(payload) });
-      setEditing(null); await load(); onChanged();
+      setEditing(null); await load();
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos guardar el empleo.'); }
     finally { savingRef.current = false; setSaving(false); }
   }
@@ -1832,10 +1842,23 @@ function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: 
     try {
       await runSensitive(async () => {
         await api(`/employments/${item.id}`, { method: 'DELETE', body: '{}' });
-        await load(); onChanged();
+        await load();
       });
     }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos eliminarlo.'); }
+  }
+
+  async function toggleFavorite(item: Employment) {
+    if (savingRef.current) return;
+    savingRef.current = true; setSaving(true); setError('');
+    try {
+      await api(`/employers/${item.employerId}/favorite`, {
+        method: 'PUT', body: JSON.stringify({ isFavorite: !item.isFavorite }),
+      });
+      await load();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'No pudimos actualizar la empresa favorita.');
+    } finally { savingRef.current = false; setSaving(false); }
   }
 
   async function confirmDetection(event: FormEvent<HTMLFormElement>) {
@@ -1858,7 +1881,7 @@ function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: 
         }),
       });
       setConfirmation(null);
-      await load(); onChanged();
+      await load();
     } catch (caught) {
       setConfirmationError(caught instanceof Error ? caught.message : 'No pudimos confirmar el empleo detectado.');
     } finally { setConfirming(false); }
@@ -1878,15 +1901,13 @@ function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: 
 
   const selectedEmploymentId = selectedLocation.employmentId;
   const selectedEmployment = selectedEmploymentId ? items.find((item) => item.id === selectedEmploymentId) : undefined;
-  const selectedContextIndex = selectedEmployment
-    ? salaryHistory?.contexts.findIndex((context) => salaryContextIdentityMatches(context, {
+  const selectedContext = selectedEmployment && salaryHistory
+    ? salaryContextForEmployment(salaryHistory.contexts, selectedEmployment.id, {
       employmentContext: selectedLocation.employmentContext,
-      employmentId: selectedEmployment.id,
-      currencyCode: selectedLocation.currencyCode ?? selectedEmployment.currencyCode,
-    })) ?? -1
-    : -1;
-  const selectedContext = selectedContextIndex >= 0 ? salaryHistory?.contexts[selectedContextIndex] : undefined;
-  const selectedScope = selectedContextIndex >= 0 ? salaryHistory?.analytics.scopes[selectedContextIndex] : undefined;
+      currencyCode: selectedLocation.currencyCode,
+    })
+    : undefined;
+  const selectedScope = salaryHistory && salaryScopeForContext(salaryHistory, selectedContext);
   if (selectedEmploymentId) {
     const selectedSalaryLocation = {
       currencyCode: selectedContext?.currencyCode ?? selectedLocation.currencyCode ?? selectedEmployment?.currencyCode,
@@ -1894,13 +1915,13 @@ function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: 
       employmentId: selectedEmploymentId,
     };
     const historyHref = (tab: HistoryTab, period?: string) => `/${writeOwnerLocation('', { section: 'history', tab, ...selectedSalaryLocation, period: period ?? null })}`;
-    return <div className="page" aria-busy={loading}>
+    return <div className="page" aria-busy={loading || saving}>
       <nav className="breadcrumbs" aria-label="Migas de pan"><span><Link href="/?section=jobs" onClick={(event: MouseEvent<HTMLAnchorElement>) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('jobs', { employmentId: null }); } }}>Empleos</Link></span><span>{selectedEmployment?.employerName ?? 'Detalle'}</span></nav>
       {loading && !selectedEmployment && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando empleo…</p></div>}
       {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
       {!loading && !selectedEmployment && !error && <EmptyState title="No encontramos ese empleo" body="Puede haber sido eliminado o no pertenecer a tu cuenta." action={<button className="button secondary" onClick={() => onNavigate('jobs', { employmentId: null })}>Volver a empleos</button>} />}
       {selectedEmployment && <>
-        <PageHeader eyebrow="Trayectoria" title={selectedEmployment.employerName} action={<span className={`status ${selectedEmployment.status === 'ACTIVE' ? 'ready' : ''}`}>{selectedEmployment.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span>} />
+        <PageHeader eyebrow="Trayectoria" title={selectedEmployment.employerName} action={<button type="button" className="button secondary" disabled={saving} onClick={() => void toggleFavorite(selectedEmployment)}>{saving ? 'Guardando…' : selectedEmployment.isFavorite ? 'Quitar de favoritas' : 'Marcar favorita'}</button>} />
         <section className="panel employment-detail"><div className="employment-detail-heading"><div className="employer-avatar">{selectedEmployment.employerName.slice(0, 2).toUpperCase()}</div><div><h2>{selectedEmployment.role || 'Puesto sin especificar'}</h2><p>{selectedEmployment.employerStatus === 'VERIFIED' ? 'Empresa verificada' : selectedEmployment.employerStatus === 'PENDING' ? 'Empresa por verificar' : 'Empresa registrada'}</p></div></div><dl><div><dt>Desde</dt><dd>{dateLabel(selectedEmployment.startDate)}</dd></div><div><dt>Hasta</dt><dd>{selectedEmployment.endDate ? dateLabel(selectedEmployment.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{selectedEmployment.currencyCode}</dd></div><div><dt>Estado</dt><dd>{selectedEmployment.status === 'ACTIVE' ? 'Empleo actual' : 'Empleo anterior'}</dd></div></dl></section>
         {selectedScope && selectedContext ? <><SalaryMetricGrid scope={selectedScope} context={selectedContext} /><section className="panel employment-coverage"><div className="panel-heading"><div><p className="eyebrow">Fuentes vinculadas</p><h2>Cobertura del historial</h2></div></div><dl className="employment-summary"><div><dt>Liquidaciones</dt><dd>{selectedScope.annual.reduce((total, annual) => total + annual.settlementCount, 0)}</dd></div><div><dt>Documentos</dt><dd>{selectedScope.annual.reduce((total, annual) => total + annual.documentCount, 0)}</dd></div><div><dt>Períodos</dt><dd>{selectedScope.evolution.length}</dd></div><div><dt>Posibles faltantes</dt><dd>{selectedScope.coverage.possibleMissingPeriods.length}</dd></div></dl>{selectedScope.coverage.possibleMissingPeriods.length > 0 && <p className="coverage-note">Revisá: {selectedScope.coverage.possibleMissingPeriods.map(periodLabel).join(', ')}.</p>}</section></> : salaryHistory && !error ? <EmptyState title="Sin historial salarial asociado" body="Los datos aparecerán cuando asocies y revises recibos de este empleo." /> : null}
         <section className="employment-detail-actions" aria-label="Explorar datos del empleo">{([['summary', 'Revisar y comparar períodos'], ['evolution', 'Explorar evolución'], ['documents', 'Ver documentos fuente']] as Array<[HistoryTab, string]>).map(([tab, label]) => <a className="panel detail-action" href={historyHref(tab)} key={tab} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('history', { tab, ...selectedSalaryLocation }); } }}><strong>{label}</strong><span aria-hidden="true">→</span></a>)}</section>
@@ -1928,13 +1949,12 @@ function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: 
         <section aria-label="Empleos confirmados">
           {detections.length > 0 && <div className="panel-heading"><div><p className="eyebrow">Trayectoria confirmada</p><h2>Empleos confirmados</h2></div></div>}
           {items.length ? <div className="employment-grid">{items.map((item) => {
-            const scopeIndex = salaryHistory?.contexts.findIndex((context) => salaryContextIdentityMatches(context, { employmentId: item.id, currencyCode: item.currencyCode })) ?? -1;
-            const itemContext = scopeIndex >= 0 ? salaryHistory?.contexts[scopeIndex] : undefined;
-            const itemScope = scopeIndex >= 0 ? salaryHistory?.analytics.scopes[scopeIndex] : undefined;
+            const itemContext = salaryHistory ? salaryContextForEmployment(salaryHistory.contexts, item.id) : undefined;
+            const itemScope = salaryHistory && salaryScopeForContext(salaryHistory, itemContext);
             const settlementCount = itemScope?.annual.reduce((total, annual) => total + annual.settlementCount, 0) ?? 0;
             const documentCount = itemScope?.annual.reduce((total, annual) => total + annual.documentCount, 0) ?? 0;
             const itemLocation = { currencyCode: itemContext?.currencyCode ?? item.currencyCode, employmentContext: itemContext?.employmentContext, employmentId: item.id };
-            return <article className="employment-card interactive" key={item.id}><a className="employment-card-link" href={`/${writeOwnerLocation('', { section: 'jobs', ...itemLocation })}`} aria-label={`Abrir detalle de ${item.employerName}, ${item.role || 'puesto sin especificar'}`} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('jobs', itemLocation); } }} /><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p>{item.employerStatus === 'PENDING' && <span className="status pending">Empresa por verificar</span>}</div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl>{itemScope?.current && <div className="employment-card-summary"><span>Último neto · {periodLabel(itemScope.current.period)}</span><strong><MoneyValue value={itemScope.current.amounts.netAmount} currency={itemContext?.currencyCode ?? item.currencyCode} kind="salary" /></strong><small>{settlementCount} {settlementCount === 1 ? 'liquidación' : 'liquidaciones'} · {documentCount} documento{documentCount === 1 ? '' : 's'}{itemScope.coverage.possibleMissingPeriods.length ? ` · ${itemScope.coverage.possibleMissingPeriods.length} posible${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : ''}</small></div>}</div><details className="employment-menu"><summary aria-label={`Acciones para ${item.employerName}`}>•••</summary><div><button className="text-button" disabled={saving} onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" disabled={saving} onClick={() => void remove(item)}>Eliminar</button></div></details><span className="employment-arrow" aria-hidden="true">→</span></article>;
+            return <article className="employment-card interactive" key={item.id}><a className="employment-card-link" href={`/${writeOwnerLocation('', { section: 'jobs', ...itemLocation })}`} aria-label={`Abrir detalle de ${item.employerName}, ${item.role || 'puesto sin especificar'}`} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('jobs', itemLocation); } }} /><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p>{item.isFavorite && <span className="status ready">Favorita</span>}{item.employerStatus === 'PENDING' && <span className="status pending">Empresa por verificar</span>}</div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl>{itemScope?.current && <div className="employment-card-summary"><span>Último neto · {periodLabel(itemScope.current.period)}</span><strong><MoneyValue value={itemScope.current.amounts.netAmount} currency={itemContext?.currencyCode ?? item.currencyCode} kind="salary" /></strong><small>{settlementCount} {settlementCount === 1 ? 'liquidación' : 'liquidaciones'} · {documentCount} documento{documentCount === 1 ? '' : 's'}{itemScope.coverage.possibleMissingPeriods.length ? ` · ${itemScope.coverage.possibleMissingPeriods.length} posible${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : ''}</small></div>}</div><details className="employment-menu"><summary aria-label={`Acciones para ${item.employerName}`}>•••</summary><div><button type="button" className="text-button" disabled={saving} onClick={() => void toggleFavorite(item)}>{item.isFavorite ? 'Quitar de favoritas' : 'Marcar favorita'}</button><button className="text-button" disabled={saving} onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" disabled={saving} onClick={() => void remove(item)}>Eliminar</button></div></details><span className="employment-arrow" aria-hidden="true">→</span></article>;
           })}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" disabled={saving} onClick={() => setEditing('new')}>Agregar empleo</button>} />}
         </section>
       </div>
@@ -2187,9 +2207,8 @@ function History({ initialLocation, onLocationChange, runSensitive }: { initialL
   const selectedId = selected?.id;
   const selectedStatus = selected?.processingStatus;
   const activeDocumentId = useRef<string | undefined>(selectedId);
-  const selectedScopeIndex = history?.contexts.findIndex((item) => salaryScopeKey(item) === selectedScopeKey) ?? -1;
-  const context = history?.contexts[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
-  const scope = history?.analytics.scopes[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
+  const context = history?.contexts.find((item) => salaryScopeKey(item) === selectedScopeKey) ?? history?.contexts[0];
+  const scope = history && salaryScopeForContext(history, context);
 
   const invalidatePreview = useCallback(() => {
     previewGeneration.current += 1;

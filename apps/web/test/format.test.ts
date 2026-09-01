@@ -14,6 +14,7 @@ import {
   periodLabel,
   recentPeriodRange,
   relevantEvolutionRanges,
+  salaryContextForEmployment,
   salaryContextIdentityMatches,
   salaryContextOptionLabel,
   salaryContextMatches,
@@ -69,11 +70,19 @@ test('distingue episodios laborales y contextos salariales en selectores', () =>
     employerName: 'Empresa sintética', role: 'Analista', startDate: '2024-11-01',
     endDate: null, status: 'ACTIVE', currencyCode: 'ARS',
   }), 'Empresa sintética · Analista · Activo · 1 nov 2024 a actualidad · ARS');
+  assert.equal(employmentOptionLabel({
+    employerName: 'Empresa favorita', isFavorite: true, startDate: '2024-11-01',
+    endDate: null, status: 'ACTIVE', currencyCode: 'ARS',
+  }), 'Empresa favorita · Favorita · Puesto sin especificar · Activo · 1 nov 2024 a actualidad · ARS');
   assert.equal(salaryContextOptionLabel({
     employerName: 'Empresa sintética', state: 'CONFIRMED', currencyCode: 'ARS',
     employmentStatus: 'ACTIVE', startDate: '2024-11-01', endDate: null,
     firstPeriod: '2026-06', lastPeriod: '2026-07',
   }), 'Empresa sintética · Confirmado · Activo · 1 nov 2024 a actualidad · ARS');
+  assert.equal(salaryContextOptionLabel({
+    employerName: 'Empresa favorita', isFavorite: true, state: 'CONFIRMED', currencyCode: 'ARS',
+    employmentStatus: 'ENDED', startDate: '2020-01-01', endDate: '2024-11-30',
+  }), 'Empresa favorita · Favorita · Confirmado · Finalizado · 1 ene 2020 a 30 nov 2024 · ARS');
   assert.equal(salaryContextOptionLabel({
     employerName: 'Empresa sintética', state: 'DETECTED', currencyCode: 'ARS',
     firstPeriod: '2026-07', lastPeriod: '2026-07',
@@ -108,6 +117,8 @@ test('mantiene separados los contextos de distinta moneda dentro del mismo emple
   assert.equal(salaryContextIdentityMatches(ars, { employmentId, currencyCode: 'USD' }), false);
   assert.equal(salaryContextIdentityMatches(usd, { employmentId, currencyCode: 'USD' }), true);
   assert.equal(salaryContextIdentityMatches(usd, { employmentId, employmentContext: employmentId, currencyCode: 'USD' }), true);
+  assert.equal(salaryContextForEmployment([usd, ars], employmentId), usd);
+  assert.equal(salaryContextForEmployment([usd, ars], employmentId, { currencyCode: 'ARS' }), ars);
 });
 
 test('muestra tipos y fuentes sin exponer códigos internos', () => {

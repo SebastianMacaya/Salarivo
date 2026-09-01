@@ -23,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 23);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 23 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 24);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 24 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 23, name: "economic_observation_payload_hash" },
+    { version: 24, name: "favorite_employers" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -303,6 +303,18 @@ test("economic provider payload hashes are mandatory for new rows without rewrit
   assert.doesNotMatch(migration.sql, /ALTER COLUMN provider_payload_sha256 SET NOT NULL/);
   assert.doesNotMatch(migration.sql, /UPDATE economic_observations/);
   assert.doesNotMatch(migration.sql, /DROP TRIGGER|DISABLE TRIGGER/i);
+});
+
+test("favorite employers stay owner-scoped without changing global employer identity", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 24);
+  assert.ok(migration);
+  assert.equal(migration.name, "favorite_employers");
+  assert.match(migration.sql, /CREATE TABLE user_favorite_employers/);
+  assert.match(migration.sql, /user_id uuid NOT NULL REFERENCES users\(id\) ON DELETE CASCADE/);
+  assert.match(migration.sql, /employer_id uuid NOT NULL REFERENCES employers\(id\) ON DELETE CASCADE/);
+  assert.match(migration.sql, /PRIMARY KEY \(user_id, employer_id\)/);
+  assert.match(migration.sql, /user_favorite_employers_employer_idx/);
+  assert.doesNotMatch(migration.sql, /ALTER TABLE employers[\s\S]+favorite/i);
 });
 
 test("employer normalization aligns legal suffix punctuation without retaining punctuation-only input", () => {

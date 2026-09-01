@@ -20,6 +20,7 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
 
   const suffix = randomUUID();
   const userId = randomUUID();
+  const sourceOnlyUserId = randomUUID();
   const factorId = randomUUID();
   const sessionId = randomUUID();
   const targetEmployerId = randomUUID();
@@ -36,6 +37,7 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
   const targetEmploymentId = randomUUID();
   const sourceEmploymentId = randomUUID();
   const movedEmploymentId = randomUUID();
+  const sourceOnlyEmploymentId = randomUUID();
   const rejectedEmploymentId = randomUUID();
   const batchId = randomUUID();
   const itemId = randomUUID();
@@ -50,6 +52,7 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
   context.after(async () => {
     try {
       await pool.query("DELETE FROM import_batches WHERE id = $1", [batchId]);
+      await pool.query("DELETE FROM users WHERE id = $1", [sourceOnlyUserId]);
       await pool.query("DELETE FROM employments WHERE user_id = $1", [userId]);
       await pool.query("DELETE FROM employers WHERE id = ANY($1::uuid[])", [[
         sourceEmployerId, targetEmployerId, rejectedEmployerId, approvalEmployerId, orphanEmployerId,
@@ -80,6 +83,12 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
        email_verified_at, onboarding_completed_at, last_login_at
      ) VALUES ($1, $2, NULL, 'ACTIVE', 'ADMIN', 'READ_ONLY', now(), now(), now())`,
     [userId, adminEmail],
+  );
+  await pool.query(
+    `INSERT INTO users (
+       id, email, password_hash, status, onboarding_completed_at, last_login_at
+     ) VALUES ($1, $2, NULL, 'ACTIVE', now(), now())`,
+    [sourceOnlyUserId, `favorite-source-only-${suffix}@example.test`],
   );
   await pool.query(
     `INSERT INTO auth_accounts (id, user_id, provider, provider_account_id)
@@ -173,6 +182,12 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
        id, user_id, employer_id, status, start_date, role, category, modality, country_code, currency_code
      ) VALUES ($1, $2, $3, 'ACTIVE', '2023-01-01', 'Especialista', 'STAFF', 'REMOTE', 'AR', 'ARS')`,
     [movedEmploymentId, userId, sourceEmployerId],
+  );
+  await pool.query(
+    `INSERT INTO employments (
+       id, user_id, employer_id, status, start_date, role, country_code, currency_code
+     ) VALUES ($1, $2, $3, 'ACTIVE', '2022-01-01', 'Operador', 'AR', 'ARS')`,
+    [sourceOnlyEmploymentId, sourceOnlyUserId, sourceEmployerId],
   );
   await pool.query(
     `INSERT INTO import_batches (id, user_id, idempotency_key, request_fingerprint)
@@ -421,8 +436,8 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
     name: "Empresa Sintética Duplicada SA",
     status: "PENDING",
     matchReason: "EXACT_NORMALIZED_ALIAS",
-    employmentCount: 2,
-    userCount: 1,
+    employmentCount: 3,
+    userCount: 2,
     documentCount: 1,
   }]);
   assert.equal(aliasCandidateDetail.body.includes(identifierFingerprint), false);
@@ -568,6 +583,12 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
     [{ status: "PENDING", employer_id: rejectedEmployerId }],
   );
 
+  await pool.query(
+    `INSERT INTO user_favorite_employers (user_id, employer_id)
+     VALUES ($1, $3), ($1, $4), ($2, $3)`,
+    [userId, sourceOnlyUserId, sourceEmployerId, targetEmployerId],
+  );
+
   const [concurrentResolution, merged] = await Promise.all([
     withTransaction(async (client) => {
       await client.query("SET LOCAL statement_timeout = '5s'");
@@ -588,7 +609,7 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
   assert.equal(merged.statusCode, 200, merged.body);
   assert.equal(merged.json().data.status, "MERGED");
   assert.equal(merged.json().data.mergedIntoEmployerId, targetEmployerId);
-  assert.equal(merged.json().data.movedEmploymentCount, 1);
+  assert.equal(merged.json().data.movedEmploymentCount, 2);
   assert.equal(merged.json().data.consolidatedEmploymentCount, 1);
   assert.equal(merged.json().data.relinkedImportItemCount, 1);
   assert.equal(merged.json().data.relinkedDocumentCount, 1);
@@ -622,6 +643,17 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
   assert.deepEqual(
     (await pool.query("SELECT status, merged_into_employer_id FROM employers WHERE id = $1", [sourceEmployerId])).rows,
     [{ status: "MERGED", merged_into_employer_id: targetEmployerId }],
+  );
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT user_id, employer_id FROM user_favorite_employers
+        WHERE user_id = ANY($1::uuid[]) ORDER BY user_id`,
+      [[userId, sourceOnlyUserId]],
+    )).rows,
+    [
+      { user_id: sourceOnlyUserId, employer_id: targetEmployerId },
+      { user_id: userId, employer_id: targetEmployerId },
+    ].sort((left, right) => left.user_id.localeCompare(right.user_id)),
   );
   const mergeAudit = await pool.query(
     `SELECT result, reason_code, reference, metadata_no_sensitive
@@ -698,8 +730,8 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
     method: "GET", url: `/api/v1/admin/employers?search=${targetEmployerId}&status=PENDING`, headers: { cookie },
   });
   assert.equal(list.statusCode, 200, list.body);
-  assert.equal(list.json().data.items[0].employmentCount, 2);
-  assert.equal(list.json().data.items[0].userCount, 1);
+  assert.equal(list.json().data.items[0].employmentCount, 3);
+  assert.equal(list.json().data.items[0].userCount, 2);
   assert.equal(list.json().data.items[0].documentCount, 1);
   const aliasSearch = await app.inject({
     method: "GET", url: "/api/v1/admin/employers?search=empresa%20duplicada%20corta", headers: { cookie },

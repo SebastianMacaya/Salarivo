@@ -2767,6 +2767,22 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
         `UPDATE employments SET employer_id = $2, updated_at = now() WHERE employer_id = $1`,
         [request.params.id, target.id],
       );
+      await client.query(
+        `INSERT INTO user_favorite_employers (user_id, employer_id)
+         SELECT favorite.user_id, $2
+           FROM user_favorite_employers favorite
+          WHERE favorite.employer_id = $1
+            AND EXISTS (
+              SELECT 1 FROM employments employment
+               WHERE employment.user_id = favorite.user_id AND employment.employer_id = $2
+            )
+         ON CONFLICT DO NOTHING`,
+        [request.params.id, target.id],
+      );
+      await client.query(
+        "DELETE FROM user_favorite_employers WHERE employer_id = $1",
+        [request.params.id],
+      );
       const movedDetectedDocuments = await client.query(
         `UPDATE documents SET detected_employer_id = $2 WHERE detected_employer_id = $1`,
         [request.params.id, target.id],
