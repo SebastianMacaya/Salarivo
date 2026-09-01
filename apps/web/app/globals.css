@@ -229,7 +229,7 @@ input:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rg
 .bar { width: min(16px, 37%); min-height: 2px; border-radius: 5px 5px 1px 1px; background: #9eb9a9; }
 .bar.net { background: repeating-linear-gradient(135deg, var(--green), var(--green) 4px, #5d9d7c 4px, #5d9d7c 7px); }
 .bar-group small { color: var(--muted); font-size: 9px; }
-.chart-tooltip { width: max-content; max-width: 220px; position: absolute; z-index: 6; left: 50%; bottom: calc(100% - 8px); display: none; gap: 3px; border-radius: 9px; background: #10261c; padding: 9px 11px; color: white; font-size: 10px; line-height: 1.35; text-align: left; transform: translateX(-50%); box-shadow: 0 8px 28px rgb(0 0 0 / 20%); }
+.chart-tooltip { width: max-content; max-width: 220px; position: absolute; z-index: 6; top: 8px; left: 50%; bottom: auto; display: none; gap: 3px; border-radius: 9px; background: #10261c; padding: 9px 11px; color: white; font-size: 10px; line-height: 1.35; text-align: left; transform: translateX(-50%); box-shadow: 0 8px 28px rgb(0 0 0 / 20%); }
 .chart-tooltip > span { display: block; }
 .bar-group:hover .chart-tooltip, .bar-group:focus-visible .chart-tooltip { display: grid; }
 .empty-state { min-height: 190px; display: grid; place-items: center; place-content: center; gap: 8px; padding: 30px; text-align: center; }
@@ -622,7 +622,7 @@ td { border-top: 1px solid #edf1ee; padding: 14px 15px; white-space: nowrap; }
   .employment-detail dl, .employment-summary { grid-template-columns: 1fr 1fr; }
   .bar-chart { height: 235px; gap: 7px; padding-inline: 4px; }
   .bar-group { min-width: 52px; flex-basis: 52px; }
-  .chart-tooltip { position: fixed; left: 12px; right: 12px; bottom: 16px; width: auto; max-width: none; transform: none; }
+  .chart-tooltip { position: fixed; top: auto; left: 12px; right: 12px; bottom: 16px; width: auto; max-width: none; transform: none; }
   .settings-card, .settings-card.setting-wide { grid-template-columns: 1fr; padding: 18px; }
   .setting-actions { grid-column: 1; }
   .security-details, .export-details, .data-lifecycle { grid-template-columns: 1fr; }
