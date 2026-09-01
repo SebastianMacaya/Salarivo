@@ -6,15 +6,19 @@ import {
   fetchDocumentPrefix,
   parseNormalizedRegion,
   readDocumentLocation,
+  readOwnerLocation,
   regionPixels,
   reviewValueChanged,
   safeCanvasScale,
   writeDocumentLocation,
+  writeOwnerLocation,
 } from '../app/document-evidence.ts';
 import { createStepUpGate } from '../app/sensitive-action.ts';
 
 const documentId = '11111111-1111-4111-8111-111111111111';
 const evidenceId = '22222222-2222-4222-8222-222222222222';
+const employmentId = '33333333-3333-4333-8333-333333333333';
+const employmentContext = 'detected:44444444-4444-4444-8444-444444444444';
 const region = parseNormalizedRegion({
   version: 1,
   space: 'PAGE_NORMALIZED',
@@ -35,6 +39,73 @@ test('deep-link conserva sólo ids y página válidos', () => {
   assert.equal(writeDocumentLocation('?auth=ok&salary=100', { documentId, page: 1, evidenceId }), `?document=${documentId}&evidence=${evidenceId}`);
   assert.equal(writeDocumentLocation('', { documentId: 'salary=100', page: 999, evidenceId: 'ocr text' }), '');
   assert.equal(writeDocumentLocation(`?document=${documentId}&page=2`, null), '');
+});
+
+test('la ubicación owner lee sólo navegación y filtros válidos', () => {
+  assert.deepEqual(readOwnerLocation(
+    `?currencyCode=ARS&section=history&employmentContext=${employmentContext}&employmentId=${employmentId}&tab=documents&range=24&year=2026&period=2026-08`
+      + '&documentType=PAYROLL&settlementType=OTRO_LABORAL&status=REVIEW'
+      + '&privacy=blur&search=sebastian&filename=recibo.pdf&ocr=texto&salary=100&amount=200&unknown=value',
+  ), {
+    currencyCode: 'ARS',
+    section: 'history',
+    employmentContext,
+    employmentId,
+    tab: 'documents',
+    range: '24',
+    year: '2026',
+    period: '2026-08',
+    documentType: 'PAYROLL',
+    settlementType: 'OTRO_LABORAL',
+    status: 'REVIEW',
+  });
+
+  assert.deepEqual(readOwnerLocation(
+    '?currencyCode=ARS1&section=admin&employmentContext=detected%3Aempresa&employmentId=all&tab=raw&range=365&year=1999&period=2026-13'
+      + '&documentType=PDF&settlementType=neto%20100&status=DELETED',
+  ), {});
+});
+
+test('la ubicación owner aplica patches, permite borrar y conserva el documento válido', () => {
+  const search = `?section=summary&employmentContext=${employmentContext}&employmentId=${employmentId}&tab=summary&document=${documentId}`
+    + `&page=3&evidence=${evidenceId}&auth=secret&salary=999&unknown=value`;
+  assert.equal(
+    writeOwnerLocation(search, { section: 'history', tab: 'documents', year: '2026', status: 'READY' }),
+    `?section=history&employmentContext=${encodeURIComponent(employmentContext)}&employmentId=${employmentId}&tab=documents&year=2026&status=READY`
+      + `&document=${documentId}&page=3&evidence=${evidenceId}`,
+  );
+  assert.equal(
+    writeOwnerLocation(search, { employmentContext: null, employmentId: null, section: null, tab: null }),
+    `?document=${documentId}&page=3&evidence=${evidenceId}`,
+  );
+  assert.equal(
+    writeOwnerLocation(search, { employmentId: undefined }),
+    `?section=summary&employmentContext=${encodeURIComponent(employmentContext)}&employmentId=${employmentId}&tab=summary`
+      + `&document=${documentId}&page=3&evidence=${evidenceId}`,
+  );
+  assert.equal(
+    writeOwnerLocation('?section=history&year=2026', {
+      section: 'admin' as 'history',
+      year: '20xx',
+      settlementType: 'neto 100',
+    }),
+    '',
+  );
+});
+
+test('el deep-link documental conserva sólo el estado owner permitido', () => {
+  assert.equal(
+    writeDocumentLocation(
+      `?section=history&employmentId=${employmentId}&tab=documents&range=all&year=all`
+        + '&documentType=ALL&settlementType=SAC&status=ALL&privacy=on&search=empresa'
+        + `&filename=recibo.pdf&ocr=texto&amount=100&auth=secret&salary=999&unknown=value&document=${evidenceId}`,
+      { documentId, page: 2, evidenceId },
+    ),
+    `?section=history&employmentId=${employmentId}&tab=documents&range=all&year=all`
+      + '&documentType=ALL&settlementType=SAC&status=ALL'
+      + `&document=${documentId}&page=2&evidence=${evidenceId}`,
+  );
+  assert.equal(writeDocumentLocation(`?section=history&document=${documentId}`, null), '?section=history');
 });
 
 test('un refresh silencioso conserva las páginas ya cargadas y su próximo cursor', async () => {

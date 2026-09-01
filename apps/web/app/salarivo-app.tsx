@@ -3,7 +3,7 @@
 import { FormEvent, type KeyboardEvent, type MouseEvent, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { DocumentReview, type DocumentDetail, type ExtractedFieldDetail } from './document-review';
-import { fetchDocumentPrefix, readDocumentLocation, writeDocumentLocation, type CursorDocumentPage } from './document-evidence';
+import { fetchDocumentPrefix, readDocumentLocation, readOwnerLocation, writeDocumentLocation, writeOwnerLocation, type CursorDocumentPage, type OwnerLocation, type OwnerLocationPatch } from './document-evidence';
 import {
   batchIsActive,
   batchResolved,
@@ -18,16 +18,19 @@ import {
   dateLabel,
   documentStatusLabel,
   employmentOptionLabel,
-  money,
-  percentage,
   periodLabel,
   recentPeriodRange,
+  relevantEvolutionRanges,
   salaryContextOptionLabel,
+  salaryContextIdentityMatches,
+  salaryContextMatches,
   salaryCategories,
   settlementTypeLabel,
   timestampLabel,
   type SalaryCategory,
 } from './format';
+import { MoneyValue, PercentageValue, PrivacyModeProvider, PrivacyToggle, privacySnapshot, subscribePrivacyMode, usePrivacyMode } from './privacy-mode';
+import { privacyChartHeights } from './privacy-mode-state';
 import { mfaQrDataUrl } from './mfa-qr';
 import { createStepUpGate, type StepUpGate } from './sensitive-action';
 import { uploadFile, type AuthorizedUpload } from './storage-upload';
@@ -321,8 +324,8 @@ function browserOpaqueToken() {
   return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 }
 
-function documentName(document: DocumentItem) {
-  return document.displayFilename || document.originalFilename;
+function documentName(document: DocumentItem, privacyEnabled = false) {
+  return privacyEnabled ? 'Documento privado' : document.displayFilename || document.originalFilename;
 }
 
 function resolveDocumentItem(documents: DocumentItem[], documentId: string): DocumentItem {
@@ -545,14 +548,14 @@ export function SalarivoApp() {
   if (!user.onboardingCompleted) {
     return <OnboardingScreen user={user} onComplete={setUser} onLogout={() => setUser(null)} />;
   }
-  return <PrivateApp
-    user={user}
-    authNotice={authNotice}
-    onAuthNoticeDismiss={() => setAuthNotice('')}
-    onUserChanged={setUser}
-    onLogout={() => setUser(null)}
-    onDeletionRequested={(token, source) => { setDeletionReceiptEntry({ token, source }); setUser(null); }}
-  />;
+  return <PrivacyModeProvider><PrivateApp
+      user={user}
+      authNotice={authNotice}
+      onAuthNoticeDismiss={() => setAuthNotice('')}
+      onUserChanged={setUser}
+      onLogout={() => setUser(null)}
+      onDeletionRequested={(token, source) => { setDeletionReceiptEntry({ token, source }); setUser(null); }}
+    /></PrivacyModeProvider>;
 }
 
 function Brand() {
@@ -908,6 +911,8 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
 }
 
 type Section = 'summary' | 'jobs' | 'import' | 'history' | 'settings';
+type AppNavigationOptions = { currencyCode?: string | null; employmentContext?: string | null; employmentId?: string | null; tab?: HistoryTab; period?: string | null; range?: (typeof evolutionRanges)[number][0] };
+type NavigateApp = (section: Section, options?: AppNavigationOptions) => void;
 const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'summary', label: 'Resumen', icon: '⌂' },
   { id: 'jobs', label: 'Empleos', icon: '▣' },
@@ -924,10 +929,14 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
   onLogout: () => void;
   onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
 }) {
-  const [section, setSection] = useState<Section>('summary');
+  const [ownerLocation, setOwnerLocation] = useState<OwnerLocation>(() => {
+    const next = readOwnerLocation(window.location.search);
+    return readDocumentLocation(window.location.search) ? { ...next, section: 'history', tab: 'documents' } : next;
+  });
+  const [section, setSection] = useState<Section>(() => readDocumentLocation(window.location.search) ? 'history' : readOwnerLocation(window.location.search).section ?? 'summary');
   const [menuOpen, setMenuOpen] = useState(false);
+  const [mobileNavigation, setMobileNavigation] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [historyInitialTab, setHistoryInitialTab] = useState<HistoryTab>('summary');
   const stepUpGate = useRef<StepUpGate | null>(null);
   const stepUpReturnFocus = useRef<HTMLElement | null>(null);
   const [stepUpOpen, setStepUpOpen] = useState(false);
@@ -937,12 +946,33 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
   const visibleSections = sections;
 
   useEffect(() => {
+    const query = window.matchMedia('(max-width: 780px)');
+    const update = () => setMobileNavigation(query.matches);
+    update(); query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+
+  useEffect(() => {
+    let timer = 0;
+    const sync = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+      const documentLocation = readDocumentLocation(window.location.search);
+      const next = readOwnerLocation(window.location.search);
+      setOwnerLocation(documentLocation ? { ...next, section: 'history', tab: 'documents' } : next);
+      setSection(documentLocation ? 'history' : next.section ?? 'summary');
+      });
+    };
+    window.addEventListener('popstate', sync);
+    return () => { window.clearTimeout(timer); window.removeEventListener('popstate', sync); };
+  }, []);
+
+  useEffect(() => {
     if (!readDocumentLocation(window.location.search)) return;
-    const timer = window.setTimeout(() => {
-      setHistoryInitialTab('documents');
-      setSection('history');
-    });
-    return () => window.clearTimeout(timer);
+    const nextSearch = writeOwnerLocation(window.location.search, { section: 'history', tab: 'documents' });
+    if (nextSearch !== window.location.search) {
+      window.history.replaceState(window.history.state, '', `${window.location.pathname}${nextSearch}${window.location.hash}`);
+    }
   }, []);
 
   useEffect(() => {
@@ -952,9 +982,33 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
     return () => window.removeEventListener('beforeunload', protect);
   }, [importBusy]);
 
-  const navigate = useCallback((nextSection: Section, initialTab: HistoryTab = 'summary') => {
-    if (nextSection === 'history') setHistoryInitialTab(initialTab);
+  const navigate = useCallback<NavigateApp>((nextSection, options = {}) => {
+    const withoutDocument = writeDocumentLocation(window.location.search, null);
+    const nextSearch = writeOwnerLocation(withoutDocument, {
+      currencyCode: options.currencyCode ?? null,
+      section: nextSection,
+      employmentContext: options.employmentContext ?? null,
+      employmentId: options.employmentId ?? null,
+      tab: nextSection === 'history' ? options.tab ?? 'summary' : null,
+      period: nextSection === 'history' ? options.period ?? null : null,
+      range: nextSection === 'history' ? options.range ?? null : null,
+      year: null,
+      documentType: null,
+      settlementType: null,
+      status: null,
+    });
+    window.history.pushState(window.history.state, '', `${window.location.pathname}${nextSearch}${window.location.hash}`);
+    setOwnerLocation(readOwnerLocation(nextSearch));
     setSection(nextSection);
+  }, []);
+
+  const updateHistoryLocation = useCallback((patch: OwnerLocationPatch, replace = false, preserveDocument = false) => {
+    const baseSearch = preserveDocument ? window.location.search : writeDocumentLocation(window.location.search, null);
+    const nextSearch = writeOwnerLocation(baseSearch, { section: 'history', ...patch });
+    if (replace) window.history.replaceState(window.history.state, '', `${window.location.pathname}${nextSearch}${window.location.hash}`);
+    else window.history.pushState(window.history.state, '', `${window.location.pathname}${nextSearch}${window.location.hash}`);
+    setOwnerLocation(readOwnerLocation(nextSearch));
+    setSection('history');
   }, []);
 
   const runSensitive = useCallback<RunSensitive>(async (action) => {
@@ -992,12 +1046,13 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
 
   return (
     <div className="app-shell">
-      <aside className={menuOpen ? 'sidebar open' : 'sidebar'} inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
+      <aside id="private-navigation" className={menuOpen ? 'sidebar open' : 'sidebar'} inert={stepUpOpen || (mobileNavigation && !menuOpen) ? true : undefined} aria-hidden={stepUpOpen || (mobileNavigation && !menuOpen) || undefined}>
         <div className="sidebar-head"><Brand /><button className="icon-button mobile-only" onClick={() => setMenuOpen(false)} aria-label="Cerrar menú">×</button></div>
         <nav aria-label="Navegación principal">
-          {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} disabled={importBusy} onClick={() => { navigate(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
+          {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} aria-current={section === item.id ? 'page' : undefined} disabled={importBusy} onClick={() => { navigate(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
           {user.role === 'ADMIN' && <Link className="nav-item" href="/admin" aria-disabled={importBusy} tabIndex={importBusy ? -1 : undefined} onClick={(event: MouseEvent<HTMLAnchorElement>) => { if (importBusy) event.preventDefault(); }}><span aria-hidden="true">⚙</span>Administración</Link>}
         </nav>
+        <div className="privacy-slot"><PrivacyToggle /></div>
         {logoutError && <p className="message error" role="alert">{logoutError}</p>}
         <div className="sidebar-user">
           <span className="avatar">{(user.displayName || user.email).slice(0, 1).toUpperCase()}</span>
@@ -1007,12 +1062,12 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
       </aside>
       {menuOpen && <button className="backdrop" aria-label="Cerrar menú" onClick={() => setMenuOpen(false)} />}
       <main className="content" inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
-        <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú">☰</button><Brand /></header>
+        <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú" aria-expanded={menuOpen} aria-controls="private-navigation">☰</button><Brand /><PrivacyToggle /></header>
         {authNotice && <p className="message success" aria-live="polite">{authNotice} <button type="button" className="text-button" onClick={onAuthNoticeDismiss}>Cerrar</button></p>}
         {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={navigate} />}
-        {section === 'jobs' && <Employments key={refreshKey} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={runSensitive} />}
+        {section === 'jobs' && <Employments key={refreshKey} selectedLocation={ownerLocation} onNavigate={navigate} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={runSensitive} />}
         {section === 'import' && <Importer onBusyChange={setImportBusy} onDone={() => setRefreshKey((n) => n + 1)} />}
-        {section === 'history' && <History key={refreshKey} initialTab={historyInitialTab} runSensitive={runSensitive} />}
+        {section === 'history' && <History key={refreshKey} initialLocation={ownerLocation} onLocationChange={updateHistoryLocation} runSensitive={runSensitive} />}
         {section === 'settings' && <Settings user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
       </main>
       {stepUpOpen && <StepUpDialog
@@ -1127,21 +1182,28 @@ function ReprocessingBanner({ availableCandidates, batch, batchLimit = 100, busy
   </aside>;
 }
 
-function salaryMoney(value: string | null | undefined, currency: string) {
-  return value === null || value === undefined ? 'N/D' : money(value, currency);
-}
-
-function salaryPercentage(value: string | null | undefined) {
-  return value === null || value === undefined ? 'N/D' : percentage(value);
-}
-
-function deductionOrCredit(value: string | null | undefined, currency: string) {
-  if (value === null || value === undefined) return 'N/D';
-  return value.startsWith('-') ? `Crédito ${money(value.slice(1), currency)}` : money(value, currency);
-}
-
 function salaryScopeKey(context: SalaryContext) {
   return JSON.stringify([context.employmentContext, context.currencyCode]);
+}
+
+function appendSalaryContext(query: URLSearchParams, context: SalaryContext) {
+  const stableDetectedContext = /^detected:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(context.employmentContext);
+  const employerName = context.state === 'DETECTED' ? context.employerName ?? '' : '';
+  if (context.employmentContext.startsWith('detected:') && !stableDetectedContext && !employerName) return false;
+  query.set('employmentContext', context.employmentContext);
+  query.set('currencyCode', context.currencyCode);
+  if (!stableDetectedContext && employerName) query.set('employerName', employerName);
+  return true;
+}
+
+function salaryConceptPath(context: SalaryContext | undefined, year: string, category: 'all' | SalaryCategory, cursor?: string) {
+  if (!context) return null;
+  const query = new URLSearchParams({ limit: '100' });
+  if (!appendSalaryContext(query, context)) return null;
+  if (year !== 'all') query.set('year', year);
+  if (category !== 'all') query.set('category', category);
+  if (cursor) query.set('cursor', cursor);
+  return `/salary-history/concepts?${query}`;
 }
 
 function retainedSalaryScopeKey(current: string, history: SalaryHistory) {
@@ -1150,22 +1212,52 @@ function retainedSalaryScopeKey(current: string, history: SalaryHistory) {
     : history.contexts[0] ? salaryScopeKey(history.contexts[0]) : '';
 }
 
-function SalaryScopeControl({ history, selectedKey, onChange, id }: {
+function locationSalaryContext(history: SalaryHistory, location: Pick<OwnerLocation, 'currencyCode' | 'employmentContext' | 'employmentId'>) {
+  return history.contexts.find((context) => salaryContextIdentityMatches(context, location));
+}
+
+function effectiveSalaryContext(history: SalaryHistory, location: Pick<OwnerLocation, 'currencyCode' | 'employmentContext' | 'employmentId'>, retainedKey: string) {
+  const requested = locationSalaryContext(history, location);
+  if (requested) return requested;
+  if (!location.employmentId && !location.employmentContext) return history.contexts[0];
+  return history.contexts.find((context) => salaryScopeKey(context) === retainedKey) ?? history.contexts[0];
+}
+
+function salaryLocationMatchesContext(location: Pick<OwnerLocation, 'currencyCode' | 'employmentContext' | 'employmentId'>, context?: SalaryContext) {
+  return (location.currencyCode ?? null) === (context?.currencyCode ?? null)
+    && (location.employmentContext ?? null) === (context?.employmentContext ?? null)
+    && (location.employmentId ?? null) === (context?.employmentId ?? null);
+}
+
+function SalaryScopeControl({ history, employments = [], selectedKey, onChange, id }: {
   history: SalaryHistory;
+  employments?: Employment[];
   selectedKey: string;
   onChange: (key: string) => void;
   id: string;
 }) {
+  const [query, setQuery] = useState('');
   const context = history.contexts.find((item) => salaryScopeKey(item) === selectedKey) ?? history.contexts[0];
   if (!context) return null;
+  const employmentById = new Map(employments.map((employment) => [employment.id, employment]));
+  const filtered = history.contexts.filter((item) => salaryContextMatches(item, query, item.employmentId ? employmentById.get(item.employmentId) : null));
+  const grouped = [
+    ['ACTUAL', filtered.filter((item) => item.employmentStatus === 'ACTIVE')],
+    ['ANTERIORES', filtered.filter((item) => item.employmentStatus === 'ENDED')],
+    ['SIN CONFIRMAR', filtered.filter((item) => item.employmentStatus !== 'ACTIVE' && item.employmentStatus !== 'ENDED')],
+  ] as const;
+  const optionLabel = (item: SalaryContext) => {
+    const employment = item.employmentId ? employmentById.get(item.employmentId) : undefined;
+    return employment ? employmentOptionLabel(employment) : salaryContextOptionLabel(item);
+  };
   const status = context.state === 'CONFIRMED' ? 'Confirmado' : context.state === 'DETECTED' ? 'Detectado' : 'Sin confirmar';
   const range = context.firstPeriod && context.lastPeriod
     ? `${periodLabel(context.firstPeriod)} a ${periodLabel(context.lastPeriod)}`
     : 'Período no disponible';
   return <section className="scope-control" aria-label="Contexto salarial">
-    <div><label htmlFor={id}>Empleo y moneda</label>{history.contexts.length > 1
-      ? <select id={id} value={salaryScopeKey(context)} onChange={(event) => onChange(event.target.value)}>{history.contexts.map((item) => <option value={salaryScopeKey(item)} key={salaryScopeKey(item)}>{salaryContextOptionLabel(item)}</option>)}</select>
-      : <strong>{salaryContextOptionLabel(context)}</strong>}</div>
+    <div className="scope-picker"><label htmlFor={`${id}-search`}>Empleo y moneda</label>{history.contexts.length > 1
+      ? <><input id={`${id}-search`} type="search" value={query} placeholder="Buscar empresa, puesto, año, período o estado" autoComplete="off" onChange={(event) => setQuery(event.target.value)} /><select id={id} aria-label="Contexto salarial seleccionado" value={filtered.some((item) => salaryScopeKey(item) === salaryScopeKey(context)) ? salaryScopeKey(context) : ''} onChange={(event) => onChange(event.target.value)}><option value="" disabled>{filtered.length ? 'Elegí un empleo' : 'Sin coincidencias'}</option>{grouped.map(([label, items]) => items.length ? <optgroup label={label} key={label}>{items.map((item) => <option value={salaryScopeKey(item)} key={salaryScopeKey(item)}>{optionLabel(item)}</option>)}</optgroup> : null)}</select></>
+      : <strong>{optionLabel(context)}</strong>}</div>
     <div className="scope-meta"><span className={`status ${context.state === 'CONFIRMED' ? 'ready' : 'pending'}`}>{status}</span><span>{range}</span></div>
   </section>;
 }
@@ -1194,16 +1286,17 @@ function SalaryMetricGrid({ scope, context, recoveryPeriods = new Map() }: { sco
     : undefined;
   const recoveryCount = scope.evolution.filter((point) => point.quality?.reprocessableDocuments || recoveryPeriods.has(point.period)).length;
   return <section className="metric-grid salary-metrics" aria-label="Indicadores salariales">
-    <article className="metric accent"><small>Básico comparable</small><strong>{salaryMoney(current?.comparableSalary, context.currencyCode)}</strong><span>{currentRecovery && current?.comparableSalary === null ? currentRecovery === 'processing' ? 'Buscando el básico; el valor activo se conserva' : currentRecovery === 'partial' ? 'Análisis incompleto; requiere revisión' : `Podemos volver a buscarlo en ${periodLabel(current.period)}` : current ? periodLabel(current.period) : 'Sin período comparable'}</span></article>
-    <article className="metric"><small>Neto actual</small><strong>{salaryMoney(current?.amounts.netAmount, context.currencyCode)}</strong><span>{current ? `${periodLabel(current.period)} · sueldo regular` : 'N/D'}</span></article>
-    <article className="metric"><small>Última variación</small><strong>{salaryPercentage(latest?.percentage)}</strong><span>{latest ? `${periodLabel(latest.fromPeriod)} → ${periodLabel(latest.toPeriod)}` : recoveryCount ? `${recoveryCount} período${recoveryCount === 1 ? '' : 's'} con recuperación disponible` : 'Sin dos períodos comparables'}</span></article>
-    <article className="metric"><small>Variación en el año</small><strong>{salaryPercentage(ytd?.percentage)}</strong><span>{ytd ? `Desde ${periodLabel(ytd.fromPeriod)}` : recoveryCount ? 'Puede cambiar cuando terminen las mejoras' : 'Sin base comparable en el año'}</span></article>
-    <article className="metric"><small>{annual ? `Cobrado en ${annual.year}` : 'Total anual'}</small><strong>{salaryMoney(annual?.totals.netAmount, context.currencyCode)}</strong><span>{annual ? `${annual.periodCount} período${annual.periodCount === 1 ? '' : 's'} · ${annual.settlementCount} ${annual.settlementCount === 1 ? 'liquidación' : 'liquidaciones'}` : 'N/D'}</span></article>
+    <article className="metric accent"><small>Básico comparable</small><strong><MoneyValue value={current?.comparableSalary} currency={context.currencyCode} kind="salary" /></strong><span>{currentRecovery && current?.comparableSalary === null ? currentRecovery === 'processing' ? 'Buscando el básico; el valor activo se conserva' : currentRecovery === 'partial' ? 'Análisis incompleto; requiere revisión' : `Podemos volver a buscarlo en ${periodLabel(current.period)}` : current ? periodLabel(current.period) : 'Sin período comparable'}</span></article>
+    <article className="metric"><small>Neto actual</small><strong><MoneyValue value={current?.amounts.netAmount} currency={context.currencyCode} kind="salary" /></strong><span>{current ? `${periodLabel(current.period)} · sueldo regular` : 'N/D'}</span></article>
+    <article className="metric"><small>Última variación</small><strong><PercentageValue value={latest?.percentage} /></strong><span>{latest ? `${periodLabel(latest.fromPeriod)} → ${periodLabel(latest.toPeriod)}` : recoveryCount ? `${recoveryCount} período${recoveryCount === 1 ? '' : 's'} con recuperación disponible` : 'Sin dos períodos comparables'}</span></article>
+    <article className="metric"><small>Variación en el año</small><strong><PercentageValue value={ytd?.percentage} /></strong><span>{ytd ? `Desde ${periodLabel(ytd.fromPeriod)}` : recoveryCount ? 'Puede cambiar cuando terminen las mejoras' : 'Sin base comparable en el año'}</span></article>
+    <article className="metric"><small>{annual ? `Cobrado en ${annual.year}` : 'Total anual'}</small><strong><MoneyValue value={annual?.totals.netAmount} currency={context.currencyCode} kind="salary" /></strong><span>{annual ? `${annual.periodCount} período${annual.periodCount === 1 ? '' : 's'} · ${annual.settlementCount} ${annual.settlementCount === 1 ? 'liquidación' : 'liquidaciones'}` : 'N/D'}</span></article>
     <article className="metric"><small>Cobertura</small><strong>{coverageKnown ? `${coverage.availablePeriods.length}/${coverage.expectedPeriods.length}` : 'N/D'}</strong><span>{coverageKnown ? coverage.boundaryContradiction ? 'Límites laborales contradictorios' : coverage.possibleMissingPeriods.length ? `${coverage.possibleMissingPeriods.length} posible${coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : coverage.basis === 'OBSERVED' ? 'Rango basado en períodos observados' : 'Sin faltantes posibles en el rango' : 'No se puede determinar sin un contexto laboral'}</span></article>
   </section>;
 }
 
-function SalaryEvolution({ scope, year = 'all', limit, recoveryPeriods = new Map() }: { scope: SalaryScopeAnalytics; year?: string; limit?: number; recoveryPeriods?: Map<string, SalaryRecoveryState> }) {
+function SalaryEvolution({ scope, year = 'all', limit, recoveryPeriods = new Map(), selectedPeriod, onSelectPeriod }: { scope: SalaryScopeAnalytics; year?: string; limit?: number; recoveryPeriods?: Map<string, SalaryRecoveryState>; selectedPeriod?: string; onSelectPeriod?: (period: string) => void }) {
+  const { enabled: privacyEnabled } = usePrivacyMode();
   const filtered = year === 'all' ? scope.evolution : scope.evolution.filter((point) => point.period.startsWith(`${year}-`));
   const points = recentPeriodRange(filtered, limit);
   if (!points.length) return <EmptyState title="Sin evolución para mostrar" body="Elegí otro año o importá recibos con datos comparables." />;
@@ -1214,11 +1307,14 @@ function SalaryEvolution({ scope, year = 'all', limit, recoveryPeriods = new Map
     .filter((value) => Number.isFinite(value) && value > 0);
   const visualMaximum = Math.max(1, ...visualValues);
   const visualHeight = (value: string) => `${Math.max(2, (Number(value) / visualMaximum) * 100)}%`;
+  const protectedHeights = privacyChartHeights(chartPoints.flatMap((point) => [point.comparableSalary, point.totals.netAmount]));
+  const chartHeight = (value: string, index: number) => privacyEnabled ? protectedHeights[index] ?? '40%' : visualHeight(value);
   const currency = scope.currencyCode;
-  const exactTable = <div className="table-wrap salary-evolution-table" role="region" aria-label="Tabla desplazable de evolución salarial" tabIndex={0}><table><caption className="sr-only">Valores exactos de la evolución salarial</caption><thead><tr><th>Período</th><th>Básico comparable</th><th>Bruto total</th><th>Neto total</th><th>Descuentos / créditos</th></tr></thead><tbody>{points.map((point) => { const recovery = recoveryPeriods.get(point.period) ?? (point.quality?.reprocessableDocuments ? 'available' : point.quality?.incompleteDocuments ? 'partial' : undefined); return <tr key={point.period}><td>{periodLabel(point.period)}</td><td>{salaryMoney(point.comparableSalary, currency)}{point.comparableSalary === null && recovery && <small className="nd-context">{recovery === 'processing' ? 'Buscando una mejora…' : recovery === 'partial' ? 'Análisis incompleto' : 'Mejora disponible'}</small>}</td><td>{salaryMoney(point.totals.grossAmount, currency)}</td><td>{salaryMoney(point.totals.netAmount, currency)}</td><td>{deductionOrCredit(point.totals.deductionsAmount, currency)}</td></tr>; })}</tbody></table></div>;
+  const choosePeriod = (period: string) => onSelectPeriod?.(period);
+  const exactTable = <div className="table-wrap salary-evolution-table" role="region" aria-label="Tabla de evolución salarial" tabIndex={0}><table><caption className="sr-only">Valores de la evolución salarial</caption><thead><tr><th>Período</th><th>Básico comparable</th><th>Bruto total</th><th>Neto total</th><th>Descuentos / créditos</th></tr></thead><tbody>{points.map((point) => { const recovery = recoveryPeriods.get(point.period) ?? (point.quality?.reprocessableDocuments ? 'available' : point.quality?.incompleteDocuments ? 'partial' : undefined); return <tr className={selectedPeriod === point.period ? 'selected' : ''} key={point.period} onClick={() => choosePeriod(point.period)}><td data-label="Período"><button type="button" className="period-link" disabled={!onSelectPeriod} onClick={(event) => { event.stopPropagation(); choosePeriod(point.period); }}>{periodLabel(point.period)}</button></td><td data-label="Básico comparable"><MoneyValue value={point.comparableSalary} currency={currency} kind="salary" />{point.comparableSalary === null && recovery && <small className="nd-context">{recovery === 'processing' ? 'Buscando una mejora…' : recovery === 'partial' ? 'Análisis incompleto' : 'Mejora disponible'}</small>}</td><td data-label="Bruto total"><MoneyValue value={point.totals.grossAmount} currency={currency} kind="salary" /></td><td data-label="Neto total"><MoneyValue value={point.totals.netAmount} currency={currency} kind="salary" /></td><td data-label="Descuentos / créditos"><MoneyValue value={point.totals.deductionsAmount} currency={currency} kind="salary" creditAware /></td></tr>; })}</tbody></table></div>;
   return <div className="salary-evolution">
     <div className="legend"><span className="comparable">Básico comparable</span><span className="net">Neto total</span></div>
-    <div className="bar-chart salary-chart" role="img" aria-label="Gráfico de básico comparable y neto por período">{chartPoints.map((point) => <div className="bar-group" key={point.period} title={`${periodLabel(point.period)}: básico comparable ${salaryMoney(point.comparableSalary, currency)}, neto ${salaryMoney(point.totals.netAmount, currency)}`}><div className="bars">{point.comparableSalary !== null && <i className="bar comparable" style={{ height: visualHeight(point.comparableSalary) }} />}{point.totals.netAmount !== null && <i className="bar net" style={{ height: visualHeight(point.totals.netAmount) }} />}</div><small>{periodLabel(point.period)}</small></div>)}</div>
+    <div className="bar-chart salary-chart" role="group" aria-label="Períodos del historial salarial">{chartPoints.map((point, pointIndex) => <button type="button" className={`bar-group${selectedPeriod === point.period ? ' selected' : ''}`} aria-label={`Abrir detalle de ${periodLabel(point.period)}`} aria-pressed={selectedPeriod === point.period} disabled={!onSelectPeriod} onClick={() => choosePeriod(point.period)} key={point.period}><span className="chart-tooltip"><span>{periodLabel(point.period)}</span><span>Básico: <MoneyValue value={point.comparableSalary} currency={currency} kind="salary" /></span><span>Neto: <MoneyValue value={point.totals.netAmount} currency={currency} kind="salary" /></span></span><span className="bars" aria-hidden="true">{point.comparableSalary !== null && <i className="bar comparable" style={{ height: chartHeight(point.comparableSalary, pointIndex * 2) }} />}{point.totals.netAmount !== null && <i className="bar net" style={{ height: chartHeight(point.totals.netAmount, pointIndex * 2 + 1) }} />}</span><small>{periodLabel(point.period)}</small></button>)}</div>
     {chartPoints.length < points.length && <p className="coverage-note">El gráfico muestra {chartPoints.length} puntos seleccionados; la tabla conserva los {points.length} períodos exactos.</p>}
     {points.length > 24 ? <details className="evolution-details"><summary>Ver tabla exacta ({points.length} períodos)</summary>{exactTable}</details> : exactTable}
   </div>;
@@ -1238,14 +1334,13 @@ function ComparisonResult({ comparison }: { comparison: PeriodComparison }) {
   const currency = comparison.currencyCode;
   return <div className="comparison-result" aria-live="polite">
     <p className="comparison-conclusion">{comparison.conclusionCode ? comparisonConclusionLabels[comparison.conclusionCode] : 'Comparación calculada con los importes disponibles.'}</p>
-    <div className="table-wrap" role="region" aria-label="Tabla desplazable de comparación de períodos" tabIndex={0}><table><caption className="sr-only">Comparación exacta de períodos</caption><thead><tr><th>Importe</th><th>{periodLabel(comparison.fromPeriod)}</th><th>{periodLabel(comparison.toPeriod)}</th><th>Diferencia</th><th>Variación</th></tr></thead><tbody>{comparisonAmountLabels.map(([key, label]) => {
+    <div className="table-wrap" role="region" aria-label="Comparación de períodos" tabIndex={0}><table><caption className="sr-only">Comparación de períodos</caption><thead><tr><th>Importe</th><th>{periodLabel(comparison.fromPeriod)}</th><th>{periodLabel(comparison.toPeriod)}</th><th>Diferencia</th><th>Variación</th></tr></thead><tbody>{comparisonAmountLabels.map(([key, label]) => {
       const change = comparison.changes[key];
-      const renderAmount = key === 'deductionsAmount' ? deductionOrCredit : salaryMoney;
-      return <tr key={key}><th scope="row">{label}</th><td>{change ? renderAmount(change.fromAmount, currency) : 'N/D'}</td><td>{change ? renderAmount(change.toAmount, currency) : 'N/D'}</td><td>{change ? salaryMoney(change.deltaAmount, currency) : 'N/D'}</td><td>{salaryPercentage(change?.percentage)}</td></tr>;
+      return <tr key={key}><th scope="row">{label}</th><td data-label={periodLabel(comparison.fromPeriod)}><MoneyValue value={change?.fromAmount} currency={currency} kind="salary" creditAware={key === 'deductionsAmount'} /></td><td data-label={periodLabel(comparison.toPeriod)}><MoneyValue value={change?.toAmount} currency={currency} kind="salary" creditAware={key === 'deductionsAmount'} /></td><td data-label="Diferencia"><MoneyValue value={change?.deltaAmount} currency={currency} kind="salary" /></td><td data-label="Variación"><PercentageValue value={change?.percentage} /></td></tr>;
     })}</tbody></table></div>
-    {comparison.drivers && comparison.drivers.length > 0 && <div className="comparison-drivers"><h4>Qué cambió</h4><ul>{comparison.drivers.map((driver) => <li key={`${driver.type}-${driver.code}`}><span>{driver.type === 'DEDUCTIONS' ? 'Descuentos / créditos' : categoryLabels[driver.category as SalaryCategory] ?? earningLabels[driver.code] ?? 'Ingreso extraordinario'}</span><strong>{salaryMoney(driver.change.deltaAmount, currency)}</strong></li>)}</ul></div>}
+    {comparison.drivers && comparison.drivers.length > 0 && <div className="comparison-drivers"><h4>Qué cambió</h4><ul>{comparison.drivers.map((driver) => <li key={`${driver.type}-${driver.code}`}><span>{driver.type === 'DEDUCTIONS' ? 'Descuentos / créditos' : categoryLabels[driver.category as SalaryCategory] ?? earningLabels[driver.code] ?? 'Ingreso extraordinario'}</span><strong><MoneyValue value={driver.change.deltaAmount} currency={currency} kind="salary" /></strong></li>)}</ul></div>}
     {comparison.driversComplete === false && <p className="coverage-note">Explicación parcial: algún recibo no tiene todos sus conceptos normalizados.</p>}
-    {comparison.earnings && comparison.earnings.length > 0 && <details><summary>Ver conceptos normalizados</summary><div className="table-wrap" role="region" aria-label="Tabla desplazable de conceptos comparados" tabIndex={0}><table><thead><tr><th>Concepto</th><th>Antes</th><th>Después</th><th>Diferencia</th></tr></thead><tbody>{comparison.earnings.map(({ code, change }) => <tr key={code}><td>{earningLabels[code] ?? 'Otro concepto'}</td><td>{salaryMoney(change.fromAmount, currency)}</td><td>{salaryMoney(change.toAmount, currency)}</td><td>{salaryMoney(change.deltaAmount, currency)}</td></tr>)}</tbody></table></div></details>}
+    {comparison.earnings && comparison.earnings.length > 0 && <details><summary>Ver conceptos normalizados</summary><div className="table-wrap" role="region" aria-label="Conceptos comparados" tabIndex={0}><table><thead><tr><th>Concepto</th><th>Antes</th><th>Después</th><th>Diferencia</th></tr></thead><tbody>{comparison.earnings.map(({ code, change }) => <tr key={code}><td data-label="Concepto">{earningLabels[code] ?? 'Otro concepto'}</td><td data-label="Antes"><MoneyValue value={change.fromAmount} currency={currency} kind="salary" /></td><td data-label="Después"><MoneyValue value={change.toAmount} currency={currency} kind="salary" /></td><td data-label="Diferencia"><MoneyValue value={change.deltaAmount} currency={currency} kind="salary" /></td></tr>)}</tbody></table></div></details>}
   </div>;
 }
 
@@ -1254,18 +1349,19 @@ function AnnualHistory({ rows, scope, category }: { rows: AnnualSalarySummary[];
   const categories = category === 'all' ? salaryCategories : [category];
   return <div className="annual-list">{rows.map((annual) => {
     const yearCoverage = scope.coverage?.byYear.find((item) => item.year === annual.year);
-    return <details className="panel annual-card" key={annual.year}><summary><span><strong>{annual.year}</strong><small>{annual.periodCount} período{annual.periodCount === 1 ? '' : 's'} · {annual.documentCount} documento{annual.documentCount === 1 ? '' : 's'}</small></span><strong>{salaryMoney(annual.totals.netAmount, scope.currencyCode)}</strong></summary><div className="annual-body">
-      <dl className="annual-kpis"><div><dt>Neto total</dt><dd>{salaryMoney(annual.totals.netAmount, scope.currencyCode)}</dd></div><div><dt>Neto promedio</dt><dd>{salaryMoney(annual.averages.netAmount, scope.currencyCode)}</dd></div><div><dt>Bruto total</dt><dd>{salaryMoney(annual.totals.grossAmount, scope.currencyCode)}</dd></div><div><dt>Cambio comparable</dt><dd>{salaryPercentage(annual.comparableChange?.percentage)}</dd></div></dl>
+    return <details className="panel annual-card" key={annual.year}><summary><span><strong>{annual.year}</strong><small>{annual.periodCount} período{annual.periodCount === 1 ? '' : 's'} · {annual.documentCount} documento{annual.documentCount === 1 ? '' : 's'}</small></span><strong><MoneyValue value={annual.totals.netAmount} currency={scope.currencyCode} kind="salary" /></strong></summary><div className="annual-body">
+      <dl className="annual-kpis"><div><dt>Neto total</dt><dd><MoneyValue value={annual.totals.netAmount} currency={scope.currencyCode} kind="salary" /></dd></div><div><dt>Neto promedio</dt><dd><MoneyValue value={annual.averages.netAmount} currency={scope.currencyCode} kind="salary" /></dd></div><div><dt>Bruto total</dt><dd><MoneyValue value={annual.totals.grossAmount} currency={scope.currencyCode} kind="salary" /></dd></div><div><dt>Cambio comparable</dt><dd><PercentageValue value={annual.comparableChange?.percentage} /></dd></div></dl>
       {yearCoverage && <p className="coverage-note">Cobertura {yearCoverage.availablePeriods.length}/{yearCoverage.expectedPeriods.length}{yearCoverage.possibleMissingPeriods.length ? ` · posibles faltantes: ${yearCoverage.possibleMissingPeriods.map(periodLabel).join(', ')}` : ' · sin faltantes posibles'}</p>}
       <div className="table-wrap" role="region" aria-label={`Tabla desplazable del resumen ${annual.year}`} tabIndex={0}><table><thead><tr><th>Categoría</th><th>Liquidaciones</th><th>Bruto</th><th>Neto</th><th>Conceptos normalizados</th></tr></thead><tbody>{categories.map((item) => {
         const summary = annual.byCategory[item];
-        return <tr key={item}><td>{categoryLabels[item]}</td><td>{summary.settlementCount}</td><td>{salaryMoney(summary.totals.grossAmount, scope.currencyCode)}</td><td>{salaryMoney(summary.totals.netAmount, scope.currencyCode)}</td><td>{salaryMoney(annual.normalizedEarningsByCategory?.[item], scope.currencyCode)}</td></tr>;
+        return <tr key={item}><td data-label="Categoría">{categoryLabels[item]}</td><td data-label="Liquidaciones">{summary.settlementCount}</td><td data-label="Bruto"><MoneyValue value={summary.totals.grossAmount} currency={scope.currencyCode} kind="salary" /></td><td data-label="Neto"><MoneyValue value={summary.totals.netAmount} currency={scope.currencyCode} kind="salary" /></td><td data-label="Conceptos normalizados"><MoneyValue value={annual.normalizedEarningsByCategory?.[item]} currency={scope.currencyCode} kind="salary" /></td></tr>;
       })}</tbody></table></div>
     </div></details>;
   })}</div>;
 }
 
-function Summary({ user, onNavigate }: { user: User; onNavigate: (section: Section, initialTab?: HistoryTab) => void }) {
+function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) {
+  const { enabled: privacyEnabled } = usePrivacyMode();
   const [history, setHistory] = useState<SalaryHistory | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [documentTotal, setDocumentTotal] = useState(0);
@@ -1313,15 +1409,15 @@ function Summary({ user, onNavigate }: { user: User; onNavigate: (section: Secti
         <SalaryMetricGrid scope={scope} context={context} />
       </> : history && !historyLoading && <EmptyState title="Todavía no hay datos salariales" body="Importá un recibo soportado y completá su revisión para construir el historial." action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />}
       <div className="dashboard-grid summary-documents-grid">
-        {history && context && scope && <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto reciente</h2></div><button className="text-button" onClick={() => onNavigate('history', 'summary')}>Analizar historial</button></div><SalaryEvolution scope={scope} limit={12} /></section>}
+        {history && context && scope && <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto reciente</h2></div><button className="text-button" onClick={() => onNavigate('history', { tab: 'summary', currencyCode: context.currencyCode, employmentContext: context.employmentContext, employmentId: context.employmentId })}>Analizar historial</button></div><SalaryEvolution scope={scope} limit={12} onSelectPeriod={(period) => onNavigate('history', { tab: 'evolution', currencyCode: context.currencyCode, employmentContext: context.employmentContext, employmentId: context.employmentId, period })} /></section>}
         <section className="panel recent-panel" aria-busy={documentsLoading}>
-          <div className="panel-heading"><h2>Documentos recientes</h2><button className="text-button" onClick={() => onNavigate('history', 'documents')}>Ver todos</button></div>
+          <div className="panel-heading"><h2>Documentos recientes</h2><button className="text-button" onClick={() => onNavigate('history', { tab: 'documents', currencyCode: context?.currencyCode, employmentContext: context?.employmentContext, employmentId: context?.employmentId })}>Ver todos</button></div>
           {!documentsLoading && !documentError && <p className="coverage-note">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {pendingReview} para revisar</p>}
           {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void loadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
           {documentsLoading && !documents.length ? <div className="compact-loading" role="status"><div className="loader" aria-hidden="true" /><span>Cargando documentos…</span></div> : documents.length ? <>
             <ul className="recent-list">{documents.map((document) => {
-              const name = documentName(document);
-              return <li key={document.id}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{document.payrollPeriod ? `${document.employerName || 'Sin empresa asociada'} · Período: ${periodLabel(document.payrollPeriod)}` : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED' ? 'Documento no soportado' : 'Tipo pendiente de clasificación'}</small><small>Subido {timestampLabel(document.createdAt)}</small></span><DocumentStatusBadges document={document} /></li>;
+              const name = documentName(document, privacyEnabled);
+              return <li key={document.id}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{!privacyEnabled && name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{document.payrollPeriod ? `${document.employerName || 'Sin empresa asociada'} · Período: ${periodLabel(document.payrollPeriod)}` : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED' ? 'Documento no soportado' : 'Tipo pendiente de clasificación'}</small><small>Subido {timestampLabel(document.createdAt)}</small></span><DocumentStatusBadges document={document} /></li>;
             })}</ul>
             <p className="recent-count">Mostrando últimos {documents.length} de {documentTotal}</p>
           </> : !documentError && <EmptyState title="Sin documentos" body="Todavía no importaste ningún documento." action={<button className="button secondary" onClick={() => onNavigate('import')}>Importar</button>} />}
@@ -1341,9 +1437,10 @@ function DocumentStatusBadges({ document }: { document: DocumentItem }) {
   return <span className="document-badges"><Status value={document.processingStatus} />{document.decisionRequired && <span className="status pending">Para revisar</span>}{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
 }
 
-function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSensitive: RunSensitive }) {
+function Employments({ selectedLocation, onNavigate, onChanged, runSensitive }: { selectedLocation: OwnerLocation; onNavigate: NavigateApp; onChanged: () => void; runSensitive: RunSensitive }) {
   const [items, setItems] = useState<Employment[]>([]);
   const [detections, setDetections] = useState<EmploymentDetection[]>([]);
+  const [salaryHistory, setSalaryHistory] = useState<SalaryHistory | null>(null);
   const [editing, setEditing] = useState<Employment | null | 'new'>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -1355,13 +1452,19 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
   const load = useCallback(async () => {
     setError(''); setLoading(true);
     try {
-      const [employments, detected] = await Promise.all([
+      const [employmentsResult, detectedResult, historyResult] = await Promise.allSettled([
         api<Employment[]>('/employments'),
         api<EmploymentDetection[]>('/employment-detections'),
+        api<SalaryHistory>('/salary-history'),
       ]);
-      setItems(employments); setDetections(detected);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'No pudimos cargar tus empleos.');
+      if (employmentsResult.status === 'fulfilled') setItems(employmentsResult.value);
+      if (detectedResult.status === 'fulfilled') setDetections(detectedResult.value);
+      if (historyResult.status === 'fulfilled') setSalaryHistory(historyResult.value);
+      else setSalaryHistory(null);
+      const failure = employmentsResult.status === 'rejected' ? employmentsResult.reason
+        : detectedResult.status === 'rejected' ? detectedResult.reason
+          : historyResult.status === 'rejected' ? historyResult.reason : null;
+      if (failure) setError(failure instanceof Error ? failure.message : 'No pudimos cargar todos los datos de tus empleos.');
     } finally { setLoading(false); }
   }, []);
   useEffect(() => { void Promise.resolve().then(load); }, [load]);
@@ -1435,6 +1538,38 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
         : normalizedEmployerName(item.employerName) === normalizedEmployerName(confirmation.employerName)))
     : [];
 
+  const selectedEmploymentId = selectedLocation.employmentId;
+  const selectedEmployment = selectedEmploymentId ? items.find((item) => item.id === selectedEmploymentId) : undefined;
+  const selectedContextIndex = selectedEmployment
+    ? salaryHistory?.contexts.findIndex((context) => salaryContextIdentityMatches(context, {
+      employmentContext: selectedLocation.employmentContext,
+      employmentId: selectedEmployment.id,
+      currencyCode: selectedLocation.currencyCode ?? selectedEmployment.currencyCode,
+    })) ?? -1
+    : -1;
+  const selectedContext = selectedContextIndex >= 0 ? salaryHistory?.contexts[selectedContextIndex] : undefined;
+  const selectedScope = selectedContextIndex >= 0 ? salaryHistory?.analytics.scopes[selectedContextIndex] : undefined;
+  if (selectedEmploymentId) {
+    const selectedSalaryLocation = {
+      currencyCode: selectedContext?.currencyCode ?? selectedLocation.currencyCode ?? selectedEmployment?.currencyCode,
+      employmentContext: selectedContext?.employmentContext,
+      employmentId: selectedEmploymentId,
+    };
+    const historyHref = (tab: HistoryTab, period?: string) => `/${writeOwnerLocation('', { section: 'history', tab, ...selectedSalaryLocation, period: period ?? null })}`;
+    return <div className="page" aria-busy={loading}>
+      <nav className="breadcrumbs" aria-label="Migas de pan"><span><Link href="/?section=jobs" onClick={(event: MouseEvent<HTMLAnchorElement>) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('jobs', { employmentId: null }); } }}>Empleos</Link></span><span>{selectedEmployment?.employerName ?? 'Detalle'}</span></nav>
+      {loading && !selectedEmployment && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando empleo…</p></div>}
+      {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
+      {!loading && !selectedEmployment && !error && <EmptyState title="No encontramos ese empleo" body="Puede haber sido eliminado o no pertenecer a tu cuenta." action={<button className="button secondary" onClick={() => onNavigate('jobs', { employmentId: null })}>Volver a empleos</button>} />}
+      {selectedEmployment && <>
+        <PageHeader eyebrow="Trayectoria" title={selectedEmployment.employerName} action={<span className={`status ${selectedEmployment.status === 'ACTIVE' ? 'ready' : ''}`}>{selectedEmployment.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span>} />
+        <section className="panel employment-detail"><div className="employment-detail-heading"><div className="employer-avatar">{selectedEmployment.employerName.slice(0, 2).toUpperCase()}</div><div><h2>{selectedEmployment.role || 'Puesto sin especificar'}</h2><p>{selectedEmployment.employerStatus === 'VERIFIED' ? 'Empresa verificada' : selectedEmployment.employerStatus === 'PENDING' ? 'Empresa por verificar' : 'Empresa registrada'}</p></div></div><dl><div><dt>Desde</dt><dd>{dateLabel(selectedEmployment.startDate)}</dd></div><div><dt>Hasta</dt><dd>{selectedEmployment.endDate ? dateLabel(selectedEmployment.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{selectedEmployment.currencyCode}</dd></div><div><dt>Estado</dt><dd>{selectedEmployment.status === 'ACTIVE' ? 'Empleo actual' : 'Empleo anterior'}</dd></div></dl></section>
+        {selectedScope && selectedContext ? <><SalaryMetricGrid scope={selectedScope} context={selectedContext} /><section className="panel employment-coverage"><div className="panel-heading"><div><p className="eyebrow">Fuentes vinculadas</p><h2>Cobertura del historial</h2></div></div><dl className="employment-summary"><div><dt>Liquidaciones</dt><dd>{selectedScope.annual.reduce((total, annual) => total + annual.settlementCount, 0)}</dd></div><div><dt>Documentos</dt><dd>{selectedScope.annual.reduce((total, annual) => total + annual.documentCount, 0)}</dd></div><div><dt>Períodos</dt><dd>{selectedScope.evolution.length}</dd></div><div><dt>Posibles faltantes</dt><dd>{selectedScope.coverage.possibleMissingPeriods.length}</dd></div></dl>{selectedScope.coverage.possibleMissingPeriods.length > 0 && <p className="coverage-note">Revisá: {selectedScope.coverage.possibleMissingPeriods.map(periodLabel).join(', ')}.</p>}</section></> : salaryHistory && !error ? <EmptyState title="Sin historial salarial asociado" body="Los datos aparecerán cuando asocies y revises recibos de este empleo." /> : null}
+        <section className="employment-detail-actions" aria-label="Explorar datos del empleo">{([['summary', 'Revisar y comparar períodos'], ['evolution', 'Explorar evolución'], ['documents', 'Ver documentos fuente']] as Array<[HistoryTab, string]>).map(([tab, label]) => <a className="panel detail-action" href={historyHref(tab)} key={tab} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('history', { tab, ...selectedSalaryLocation }); } }}><strong>{label}</strong><span aria-hidden="true">→</span></a>)}</section>
+      </>}
+    </div>;
+  }
+
   return (
     <div className="page" aria-busy={loading || confirming || saving}>
       <PageHeader eyebrow="Trayectoria" title="Empleos" action={<button className="button primary" disabled={saving} onClick={() => setEditing('new')}>Agregar empleo</button>} />
@@ -1454,7 +1589,15 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
         </section>}
         <section aria-label="Empleos confirmados">
           {detections.length > 0 && <div className="panel-heading"><div><p className="eyebrow">Trayectoria confirmada</p><h2>Empleos confirmados</h2></div></div>}
-          {items.length ? <div className="employment-grid">{items.map((item) => <article className="employment-card" key={item.id}><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p>{item.employerStatus === 'PENDING' && <span className="status pending">Empresa por verificar</span>}</div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl><div className="card-actions"><button className="text-button" disabled={saving} onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" disabled={saving} onClick={() => remove(item)}>Eliminar</button></div></div></article>)}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" disabled={saving} onClick={() => setEditing('new')}>Agregar empleo</button>} />}
+          {items.length ? <div className="employment-grid">{items.map((item) => {
+            const scopeIndex = salaryHistory?.contexts.findIndex((context) => salaryContextIdentityMatches(context, { employmentId: item.id, currencyCode: item.currencyCode })) ?? -1;
+            const itemContext = scopeIndex >= 0 ? salaryHistory?.contexts[scopeIndex] : undefined;
+            const itemScope = scopeIndex >= 0 ? salaryHistory?.analytics.scopes[scopeIndex] : undefined;
+            const settlementCount = itemScope?.annual.reduce((total, annual) => total + annual.settlementCount, 0) ?? 0;
+            const documentCount = itemScope?.annual.reduce((total, annual) => total + annual.documentCount, 0) ?? 0;
+            const itemLocation = { currencyCode: itemContext?.currencyCode ?? item.currencyCode, employmentContext: itemContext?.employmentContext, employmentId: item.id };
+            return <article className="employment-card interactive" key={item.id}><a className="employment-card-link" href={`/${writeOwnerLocation('', { section: 'jobs', ...itemLocation })}`} aria-label={`Abrir detalle de ${item.employerName}, ${item.role || 'puesto sin especificar'}`} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('jobs', itemLocation); } }} /><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p>{item.employerStatus === 'PENDING' && <span className="status pending">Empresa por verificar</span>}</div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl>{itemScope?.current && <div className="employment-card-summary"><span>Último neto · {periodLabel(itemScope.current.period)}</span><strong><MoneyValue value={itemScope.current.amounts.netAmount} currency={itemContext?.currencyCode ?? item.currencyCode} kind="salary" /></strong><small>{settlementCount} {settlementCount === 1 ? 'liquidación' : 'liquidaciones'} · {documentCount} documento{documentCount === 1 ? '' : 's'}{itemScope.coverage.possibleMissingPeriods.length ? ` · ${itemScope.coverage.possibleMissingPeriods.length} posible${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : ''}</small></div>}</div><details className="employment-menu"><summary aria-label={`Acciones para ${item.employerName}`}>•••</summary><div><button className="text-button" disabled={saving} onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" disabled={saving} onClick={() => void remove(item)}>Eliminar</button></div></details><span className="employment-arrow" aria-hidden="true">→</span></article>;
+          })}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" disabled={saving} onClick={() => setEditing('new')}>Agregar empleo</button>} />}
         </section>
       </div>
       {editing && <div className="modal-layer" role="presentation" onMouseDown={() => { if (!saving) setEditing(null); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="employment-title" aria-busy={saving} tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, () => { if (!saving) setEditing(null); })} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" disabled={saving} onClick={() => setEditing(null)} aria-label="Cerrar">×</button></div><form className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><label>Moneda<select name="currencyCode" defaultValue={editing === 'new' ? 'ARS' : editing.currencyCode}><option value="ARS">ARS — Peso argentino</option><option value="USD">USD — Dólar</option><option value="EUR">EUR — Euro</option></select></label>{error && <p className="message error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="button secondary" disabled={saving} onClick={() => setEditing(null)}>Cancelar</button><button className="button primary" disabled={saving}>{saving ? 'Guardando…' : 'Guardar'}</button></div></form></section></div>}
@@ -1477,6 +1620,7 @@ function Employments({ onChanged, runSensitive }: { onChanged: () => void; runSe
 }
 
 function Importer({ onBusyChange, onDone }: { onBusyChange: (busy: boolean) => void; onDone: () => void }) {
+  const { enabled: privacyEnabled } = usePrivacyMode();
   const [files, setFiles] = useState<File[]>([]);
   const [progress, setProgress] = useState<ImportProgress[]>([]);
   const [batch, setBatch] = useState<ImportBatch | null>(null);
@@ -1609,13 +1753,18 @@ function Importer({ onBusyChange, onDone }: { onBusyChange: (busy: boolean) => v
       <label className="import-employment">Asociar todo el lote a<select value={employmentId} disabled={hasActiveBatch || busy} onChange={(event) => setEmploymentId(event.target.value)}><option value="">Sin asociar · detectar empresa</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employmentOptionLabel(employment)}</option>)}</select><small>Si mezclás empresas, dejalo sin asociar y usá los checkboxes del historial después.</small></label>
       <label className={`drop-zone${hasActiveBatch || busy ? ' disabled' : ''}`} aria-disabled={hasActiveBatch || busy} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); choose(event.dataTransfer.files); }}><input type="file" accept="application/pdf,.pdf" multiple disabled={hasActiveBatch || busy} onChange={(event) => choose(event.target.files)} /><span className="upload-mark">↑</span><strong>{hasActiveBatch ? 'Hay un lote en curso' : 'Arrastrá tus recibos acá'}</strong><span>{hasActiveBatch ? 'Cuando termine vas a poder iniciar otro' : 'o hacé clic para elegir PDFs'}</span><small>El servidor limita archivos, tamaño total, espacio por cuenta y trabajo simultáneo.</small></label>
       {error && <p className="message error" role="alert">{error}</p>}
-      {(batch || progress.length > 0) && <section className="panel upload-list" aria-live="polite"><div className="panel-heading"><div><p className="eyebrow">Lote</p><h2>{batch?.progress.total ?? progress.length} archivo{(batch?.progress.total ?? progress.length) === 1 ? '' : 's'}</h2></div>{batch && <span className="batch-id">Lote {batch.id.slice(0, 8)}</span>}</div>{batch && <div className="upload-summary"><progress max={Math.max(1, batch.progress.total)} value={batch.progress.resolved} aria-label="Progreso del lote" /><strong>{batch.progress.resolved} de {batch.progress.total} resueltos · {batch.progress.percentage}%</strong><small>{batch.totals.PROCESSING ?? 0} procesando · {(batch.totals.UPLOADED ?? 0) + (batch.totals.PENDING_UPLOAD ?? 0)} pendientes · {batch.totals.NEEDS_REVIEW ?? 0} para revisar · {(batch.totals.REJECTED ?? 0) + (batch.totals.FAILED ?? 0)} no procesados{batch.totals.DUPLICATE ? ` · ${batch.totals.DUPLICATE} duplicado${batch.totals.DUPLICATE === 1 ? '' : 's'} descartado${batch.totals.DUPLICATE === 1 ? '' : 's'}` : ''}</small></div>}<ul>{progress.map((item) => <li key={item.key}><span className="file-icon">PDF</span><span className="upload-name"><strong>{item.name}</strong><small>{item.message ?? (item.status === 'PENDIENTE' ? 'Listo para subir' : 'Enviando…')} · {item.uploadPercentage}% cargado</small><progress max="100" value={item.uploadPercentage} aria-label={`Carga de ${item.name}`} /></span><span className={`upload-state ${item.status.toLowerCase()}`}>{item.status.replace('_', ' ')}</span></li>)}</ul><div className="upload-footer"><p>{hasActiveBatch && !busy && progress.some((item) => item.status === 'PENDIENTE') ? 'La carga se interrumpió. Cancelá los pendientes y volvé a seleccionarlos.' : 'Los errores de un archivo no detienen el resto del lote.'}</p>{hasActiveBatch ? (batch.totals.PENDING_UPLOAD ?? 0) > 0 && <button className="button secondary" disabled={busy} onClick={cancelPending}>Cancelar pendientes</button> : <button className="button primary" disabled={busy || !files.length} onClick={start}>{busy ? 'Subiendo…' : 'Iniciar importación'}</button>}</div></section>}
+      {(batch || progress.length > 0) && <section className="panel upload-list" aria-live="polite"><div className="panel-heading"><div><p className="eyebrow">Lote</p><h2>{batch?.progress.total ?? progress.length} archivo{(batch?.progress.total ?? progress.length) === 1 ? '' : 's'}</h2></div>{batch && <span className="batch-id">Lote {batch.id.slice(0, 8)}</span>}</div>{batch && <div className="upload-summary"><progress max={Math.max(1, batch.progress.total)} value={batch.progress.resolved} aria-label="Progreso del lote" /><strong>{batch.progress.resolved} de {batch.progress.total} resueltos · {batch.progress.percentage}%</strong><small>{batch.totals.PROCESSING ?? 0} procesando · {(batch.totals.UPLOADED ?? 0) + (batch.totals.PENDING_UPLOAD ?? 0)} pendientes · {batch.totals.NEEDS_REVIEW ?? 0} para revisar · {(batch.totals.REJECTED ?? 0) + (batch.totals.FAILED ?? 0)} no procesados{batch.totals.DUPLICATE ? ` · ${batch.totals.DUPLICATE} duplicado${batch.totals.DUPLICATE === 1 ? '' : 's'} descartado${batch.totals.DUPLICATE === 1 ? '' : 's'}` : ''}</small></div>}<ul>{progress.map((item, index) => { const name = privacyEnabled ? `Archivo PDF ${index + 1}` : item.name; return <li key={item.key}><span className="file-icon">PDF</span><span className="upload-name"><strong>{name}</strong><small>{item.message ?? (item.status === 'PENDIENTE' ? 'Listo para subir' : 'Enviando…')} · {item.uploadPercentage}% cargado</small><progress max="100" value={item.uploadPercentage} aria-label={`Carga de ${name}`} /></span><span className={`upload-state ${item.status.toLowerCase()}`}>{item.status.replace('_', ' ')}</span></li>; })}</ul><div className="upload-footer"><p>{hasActiveBatch && !busy && progress.some((item) => item.status === 'PENDIENTE') ? 'La carga se interrumpió. Cancelá los pendientes y volvé a seleccionarlos.' : 'Los errores de un archivo no detienen el resto del lote.'}</p>{hasActiveBatch ? (batch.totals.PENDING_UPLOAD ?? 0) > 0 && <button className="button secondary" disabled={busy} onClick={cancelPending}>Cancelar pendientes</button> : <button className="button primary" disabled={busy || !files.length} onClick={start}>{busy ? 'Subiendo…' : 'Iniciar importación'}</button>}</div></section>}
       <aside className="privacy-note"><span aria-hidden="true">◇</span><div><strong>Privado por diseño</strong><p>Los PDFs se guardan con claves opacas. Antes de extraer datos pasan por validación de formato y malware.</p></div></aside>
     </div>
   );
 }
 
-function History({ initialTab = 'summary', runSensitive }: { initialTab?: HistoryTab; runSensitive: RunSensitive }) {
+function History({ initialLocation, onLocationChange, runSensitive }: { initialLocation: OwnerLocation; onLocationChange: (patch: OwnerLocationPatch, replace?: boolean, preserveDocument?: boolean) => void; runSensitive: RunSensitive }) {
+  const { enabled: privacyEnabled } = usePrivacyMode();
+  const initialCurrencyCode = useRef(initialLocation.currencyCode);
+  const initialEmploymentId = useRef(initialLocation.employmentId);
+  const initialEmploymentContext = useRef(initialLocation.employmentContext);
+  const historyInitialized = useRef(false);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [history, setHistory] = useState<SalaryHistory | null>(null);
   const [employments, setEmployments] = useState<Employment[]>([]);
@@ -1641,10 +1790,12 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const [reprocessingLoading, setReprocessingLoading] = useState(true);
   const [reprocessingBusy, setReprocessingBusy] = useState(false);
   const [reprocessingError, setReprocessingError] = useState('');
-  const [tab, setTab] = useState<HistoryTab>(initialTab);
+  const [tab, setTab] = useState<HistoryTab>(initialLocation.tab ?? 'summary');
   const [selectedScopeKey, setSelectedScopeKey] = useState('');
-  const [yearFilter, setYearFilter] = useState('all');
-  const [evolutionRange, setEvolutionRange] = useState<(typeof evolutionRanges)[number][0]>('12');
+  const selectedScopeKeyRef = useRef('');
+  const [yearFilter, setYearFilter] = useState(initialLocation.year ?? 'all');
+  const [evolutionRange, setEvolutionRange] = useState<(typeof evolutionRanges)[number][0]>(initialLocation.range ?? '12');
+  const [selectedPeriod, setSelectedPeriod] = useState(initialLocation.period ?? '');
   const [categoryFilter, setCategoryFilter] = useState<'all' | SalaryCategory>('all');
   const [fromPeriod, setFromPeriod] = useState('');
   const [toPeriod, setToPeriod] = useState('');
@@ -1657,15 +1808,16 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const [conceptLoadingMore, setConceptLoadingMore] = useState(false);
   const [conceptError, setConceptError] = useState('');
   const [conceptReloadKey, setConceptReloadKey] = useState(0);
-  const [documentKind, setDocumentKind] = useState<'ALL' | 'PAYROLL' | 'UNSUPPORTED'>('ALL');
+  const conceptRequestGeneration = useRef(0);
+  const [documentKind, setDocumentKind] = useState<'ALL' | 'PAYROLL' | 'UNSUPPORTED'>(initialLocation.documentType ?? 'ALL');
   const [documentSearchDraft, setDocumentSearchDraft] = useState('');
   const [documentSearch, setDocumentSearch] = useState('');
-  const [documentYearDraft, setDocumentYearDraft] = useState('');
-  const [documentYear, setDocumentYear] = useState('all');
-  const [documentPeriod, setDocumentPeriod] = useState('');
-  const [documentSettlementType, setDocumentSettlementType] = useState('all');
-  const [documentEmploymentId, setDocumentEmploymentId] = useState('all');
-  const [documentStatusGroup, setDocumentStatusGroup] = useState<(typeof documentStatusGroups)[number][0]>('ALL');
+  const [documentYearDraft, setDocumentYearDraft] = useState(initialLocation.year && initialLocation.year !== 'all' ? initialLocation.year : '');
+  const [documentYear, setDocumentYear] = useState(initialLocation.year ?? 'all');
+  const [documentPeriod, setDocumentPeriod] = useState(initialLocation.period ?? '');
+  const [documentSettlementType, setDocumentSettlementType] = useState(() => initialLocation.settlementType && settlementTypeOptions.includes(initialLocation.settlementType as (typeof settlementTypeOptions)[number]) ? initialLocation.settlementType : 'all');
+  const [documentEmploymentId, setDocumentEmploymentId] = useState(initialLocation.employmentId ?? 'all');
+  const [documentStatusGroup, setDocumentStatusGroup] = useState<(typeof documentStatusGroups)[number][0]>(initialLocation.status ?? 'ALL');
   const [documentsLoading, setDocumentsLoading] = useState(true);
   const [loadingMoreDocuments, setLoadingMoreDocuments] = useState(false);
   const [documentCursor, setDocumentCursor] = useState<string | null>(null);
@@ -1676,11 +1828,13 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const [detailError, setDetailError] = useState('');
   const [detailReload, setDetailReload] = useState(0);
   const [preview, setPreview] = useState<{ documentId: string; expiresAt?: string; url: string } | null>(null);
+  const [privacyPreviewDocumentId, setPrivacyPreviewDocumentId] = useState<string | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState('');
   const previewRequested = useRef(false);
   const previewGeneration = useRef(0);
   const documentRequestGeneration = useRef(0);
+  const comparisonRequestGeneration = useRef(0);
   const loadedDocumentCount = useRef(0);
   const [openedFromList, setOpenedFromList] = useState(false);
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -1694,6 +1848,9 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const selectedId = selected?.id;
   const selectedStatus = selected?.processingStatus;
   const activeDocumentId = useRef<string | undefined>(selectedId);
+  const selectedScopeIndex = history?.contexts.findIndex((item) => salaryScopeKey(item) === selectedScopeKey) ?? -1;
+  const context = history?.contexts[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
+  const scope = history?.analytics.scopes[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
 
   const invalidatePreview = useCallback(() => {
     previewGeneration.current += 1;
@@ -1702,6 +1859,33 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     setPreviewBusy(false);
     setPreviewError('');
   }, []);
+  const invalidateScopeData = useCallback(() => {
+    conceptRequestGeneration.current += 1;
+    comparisonRequestGeneration.current += 1;
+    documentRequestGeneration.current += 1;
+    setConcepts([]); setConceptCursor(null); setConceptError(''); setConceptLoading(false); setConceptLoadingMore(false);
+    setComparison(null); setComparisonLoaded(false); setComparisonLoading(false); setFromPeriod(''); setToPeriod('');
+    setDocuments([]); setDocumentCursor(null); setDocumentTotal(0); setDocumentPendingReview(0); setDocumentError(''); setDocumentNavigationError('');
+    setDocumentsLoading(true); setLoadingMoreDocuments(false); setCheckedDocumentIds([]);
+    invalidatePreview(); setPrivacyPreviewDocumentId(null); activeDocumentId.current = undefined; setSelected(null); setDetail(null);
+  }, [invalidatePreview]);
+  const canonicalizeSalaryContext = useCallback((next?: SalaryContext) => {
+    initialCurrencyCode.current = next?.currencyCode;
+    initialEmploymentContext.current = next?.employmentContext;
+    initialEmploymentId.current = next?.employmentId ?? undefined;
+    onLocationChange({
+      currencyCode: next?.currencyCode ?? null,
+      employmentContext: next?.employmentContext ?? null,
+      employmentId: next?.employmentId ?? null,
+    }, true, true);
+    if (readDocumentLocation(window.location.search)) reviewUrl.current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  }, [onLocationChange]);
+  useEffect(() => subscribePrivacyMode(() => {
+    if (!privacySnapshot()) return;
+    setPrivacyPreviewDocumentId(null);
+    invalidatePreview();
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+  }), [invalidatePreview]);
   useEffect(() => { activeDocumentId.current = selectedId; }, [selectedId]);
   useEffect(() => { loadedDocumentCount.current = documents.length; }, [documents.length]);
   useEffect(() => {
@@ -1712,6 +1896,10 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
 
   const authorizePreview = useCallback(() => {
     if (!selectedId) return;
+    if (privacyEnabled && privacyPreviewDocumentId !== selectedId) {
+      if (!window.confirm('El modo privacidad está activo. El PDF original contiene datos salariales que no pueden ocultarse dentro del documento. ¿Mostrarlo igualmente?')) return;
+      setPrivacyPreviewDocumentId(selectedId);
+    }
     const documentId = selectedId;
     if (activeDocumentId.current !== documentId) return;
     const generation = ++previewGeneration.current;
@@ -1729,7 +1917,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
       setPreviewBusy(false);
       setPreviewError(caught instanceof Error ? caught.message : 'No pudimos autorizar la vista privada.');
     });
-  }, [runSensitive, selectedId]);
+  }, [privacyEnabled, privacyPreviewDocumentId, runSensitive, selectedId]);
 
   const applyDocuments = useCallback((docs: DocumentItem[]) => {
     setDocuments(docs);
@@ -1753,12 +1941,21 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     if (documentYear !== 'all') query.set('year', documentYear);
     if (documentPeriod) query.set('period', documentPeriod);
     if (documentSettlementType !== 'all' && documentKind !== 'UNSUPPORTED') query.set('settlementType', documentSettlementType);
-    if (documentEmploymentId !== 'all') query.set('employmentId', documentEmploymentId);
+    if (context) {
+      if (!appendSalaryContext(query, context)) throw new Error('No pudimos resolver el contexto laboral detectado.');
+    } else if (initialEmploymentContext.current) {
+      if (!initialCurrencyCode.current || /^detected:[0-9a-f]{24}$/i.test(initialEmploymentContext.current)) {
+        throw new Error('No pudimos resolver el contexto laboral solicitado.');
+      }
+      query.set('employmentContext', initialEmploymentContext.current);
+      query.set('currencyCode', initialCurrencyCode.current);
+    } else if (documentEmploymentId !== 'all') query.set('employmentId', documentEmploymentId);
     if (documentStatusGroup !== 'ALL') query.set('statusGroup', documentStatusGroup);
     if (cursor) query.set('cursor', cursor);
     return api<DocumentPage>(`/documents?${query}`);
-  }, [documentEmploymentId, documentKind, documentPeriod, documentSearch, documentSettlementType, documentStatusGroup, documentYear]);
+  }, [context, documentEmploymentId, documentKind, documentPeriod, documentSearch, documentSettlementType, documentStatusGroup, documentYear]);
   const reloadDocuments = useCallback(async (silent = false) => {
+    if (loading) return;
     const generation = ++documentRequestGeneration.current;
     setLoadingMoreDocuments(false);
     setDocumentNavigationError('');
@@ -1775,14 +1972,22 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
       if (generation !== documentRequestGeneration.current) return;
       setDocumentError(caught instanceof Error ? caught.message : 'No pudimos cargar los documentos.');
     } finally { if (!silent && generation === documentRequestGeneration.current) setDocumentsLoading(false); }
-  }, [applyDocuments, fetchDocumentPage]);
-  const loadSalary = useCallback(async () => {
+  }, [applyDocuments, fetchDocumentPage, loading]);
+  const loadSalary = useCallback(async (preferredLocation?: Pick<OwnerLocation, 'currencyCode' | 'employmentContext' | 'employmentId'>) => {
+    comparisonRequestGeneration.current += 1;
     const next = await api<SalaryHistory>('/salary-history');
+    const owner = readOwnerLocation(window.location.search);
+    const effective = effectiveSalaryContext(next, preferredLocation ?? owner, selectedScopeKeyRef.current);
+    const nextKey = effective ? salaryScopeKey(effective) : '';
+    if (nextKey !== selectedScopeKeyRef.current) invalidateScopeData();
     setHistory(next);
-    setSelectedScopeKey((current) => retainedSalaryScopeKey(current, next));
+    selectedScopeKeyRef.current = nextKey;
+    setSelectedScopeKey(nextKey);
+    setDocumentEmploymentId(effective?.employmentId ?? 'all');
+    if (!salaryLocationMatchesContext(owner, effective)) canonicalizeSalaryContext(effective);
     setComparison(null); setComparisonLoaded(false);
     return next;
-  }, []);
+  }, [canonicalizeSalaryContext, invalidateScopeData]);
   const loadReprocessingCandidates = useCallback(async () => {
     const next = await api<{ items: ReprocessingCandidate[]; total: number; batchLimit: number }>('/reprocessing/candidates?page=1&limit=100');
     setReprocessingCandidates(next.items);
@@ -1814,15 +2019,24 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     ]);
     if (historyResult.status === 'fulfilled') {
       const nextHistory = historyResult.value;
+      const owner = readOwnerLocation(window.location.search);
+      const effective = effectiveSalaryContext(nextHistory, owner, selectedScopeKeyRef.current);
+      const nextKey = effective ? salaryScopeKey(effective) : '';
       setHistory(nextHistory);
-      setSelectedScopeKey((current) => retainedSalaryScopeKey(current, nextHistory));
+      selectedScopeKeyRef.current = nextKey;
+      setSelectedScopeKey(nextKey);
+      if (!salaryLocationMatchesContext(owner, effective)) canonicalizeSalaryContext(effective);
+      if (!historyInitialized.current) {
+        historyInitialized.current = true;
+        setDocumentEmploymentId(effective?.employmentId ?? 'all');
+      }
       setComparison(null); setComparisonLoaded(false);
     }
     if (jobsResult.status === 'fulfilled') setEmployments(jobsResult.value);
     const failure = historyResult.status === 'rejected' ? historyResult.reason : jobsResult.status === 'rejected' ? jobsResult.reason : null;
     if (failure) setError(failure instanceof Error ? failure.message : 'No pudimos cargar todo el historial.');
     setLoading(false);
-  }, []);
+  }, [canonicalizeSalaryContext]);
   useEffect(() => { void Promise.resolve().then(load); }, [load]);
   useEffect(() => { void Promise.resolve().then(loadRecovery); }, [loadRecovery]);
   useEffect(() => { void Promise.resolve().then(() => reloadDocuments()); }, [reloadDocuments]);
@@ -1926,7 +2140,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
           originalAvailable: nextDetail.originalAvailable,
           processingStatus: nextDetail.processingStatus,
         } : current);
-        if (nextDetail.originalAvailable && nextDetail.securityStatus === 'CLEAN' && !previewRequested.current) authorizePreview();
+        if (nextDetail.originalAvailable && nextDetail.securityStatus === 'CLEAN' && !previewRequested.current && !privacyEnabled) authorizePreview();
       })
       .catch(async (caught: unknown) => {
         if (stopped || activeDocumentId.current !== documentId) return;
@@ -1934,7 +2148,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
         if (!stopped && activeDocumentId.current === documentId) setDetailError(caught instanceof ApiError && caught.status === 404 ? 'Este documento fue eliminado o ya no está disponible.' : caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.');
       });
     return () => { stopped = true; };
-  }, [authorizePreview, detailReload, selectedId, selectedStatus]);
+  }, [authorizePreview, detailReload, privacyEnabled, selectedId, selectedStatus]);
 
   const refreshDetail = useCallback(async () => {
     if (!selectedId) return;
@@ -1980,8 +2194,37 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
         return;
       }
       const location = readDocumentLocation(window.location.search);
+      const owner = readOwnerLocation(window.location.search);
+      initialCurrencyCode.current = owner.currencyCode;
+      initialEmploymentId.current = owner.employmentId;
+      initialEmploymentContext.current = owner.employmentContext;
+      setTab(owner.tab ?? (location ? 'documents' : 'summary'));
+      setYearFilter(owner.year ?? 'all');
+      setEvolutionRange(owner.range ?? '12');
+      setSelectedPeriod(owner.period ?? '');
+      setDocumentYear(owner.year ?? 'all');
+      setDocumentYearDraft(owner.year && owner.year !== 'all' ? owner.year : '');
+      setDocumentPeriod(owner.period ?? '');
+      setDocumentKind(owner.documentType ?? 'ALL');
+      setDocumentSettlementType(owner.settlementType && settlementTypeOptions.includes(owner.settlementType as (typeof settlementTypeOptions)[number]) ? owner.settlementType : 'all');
+      setDocumentStatusGroup(owner.status ?? 'ALL');
+      if (history) {
+        const nextContext = effectiveSalaryContext(history, owner, selectedScopeKey);
+        const nextKey = nextContext ? salaryScopeKey(nextContext) : '';
+        if (nextKey !== selectedScopeKey) {
+          invalidateScopeData();
+          setCategoryFilter('all');
+        }
+        selectedScopeKeyRef.current = nextKey;
+        setSelectedScopeKey(nextKey);
+        setDocumentEmploymentId(nextContext?.employmentId ?? 'all');
+        if (!salaryLocationMatchesContext(owner, nextContext)) canonicalizeSalaryContext(nextContext);
+      } else {
+        setDocumentEmploymentId(owner.employmentId ?? 'all');
+      }
       if (location?.documentId !== selectedId) {
         invalidatePreview();
+        setPrivacyPreviewDocumentId(null);
         setDetail(null);
         setDetailError('');
         setProcessingRuns([]);
@@ -1999,7 +2242,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     };
     window.addEventListener('popstate', syncFromHistory);
     return () => window.removeEventListener('popstate', syncFromHistory);
-  }, [documents, invalidatePreview, reviewBusy, reviewDirty, selectedId]);
+  }, [canonicalizeSalaryContext, documents, history, invalidatePreview, invalidateScopeData, reviewBusy, reviewDirty, selectedId, selectedScopeKey]);
 
   function openDocument(document: DocumentItem, trigger: HTMLButtonElement) {
     if (selectedId === document.id) {
@@ -2007,6 +2250,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
       return;
     }
     invalidatePreview();
+    setPrivacyPreviewDocumentId(null);
     opener.current = trigger;
     activeDocumentId.current = document.id;
     setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); setRunsError('');
@@ -2038,6 +2282,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   }
   async function downloadOriginal() {
     if (!selected) return;
+    if (privacyEnabled && !window.confirm('El modo privacidad está activo. El PDF descargado conserva todos los datos salariales. ¿Descargarlo igualmente?')) return;
     await runSensitive(async () => {
       const download = await api<{ url: string }>(`/documents/${selected.id}/original?disposition=attachment`);
       const anchor = document.createElement('a');
@@ -2051,7 +2296,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     invalidatePreview();
     await runSensitive(async () => {
       await api(`/documents/${selected.id}`, { method: 'DELETE', body: '{}' });
-      window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.hash}`);
+      onLocationChange({ tab: 'documents', employmentId: context?.employmentId ?? null }, true);
       activeDocumentId.current = undefined;
       setSelected(null); setDetail(null);
       await Promise.all([loadSalary(), reloadDocuments(true)]);
@@ -2084,12 +2329,13 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
 
   function closeDocument() {
     invalidatePreview();
+    setPrivacyPreviewDocumentId(null);
     if (openedFromList && readDocumentLocation(window.location.search)?.documentId === selectedId) {
       allowNextPop.current = true;
       window.history.back();
       return;
     }
-    window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.hash}`);
+    onLocationChange({ tab: 'documents', employmentId: context?.employmentId ?? null }, true);
     activeDocumentId.current = undefined;
     setSelected(null); setDetail(null); setDetailError('');
   }
@@ -2124,6 +2370,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     }
     if (!next) return;
     invalidatePreview();
+    setPrivacyPreviewDocumentId(null);
     activeDocumentId.current = next.id;
     setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); setRunsError('');
     setSelected(next); setDetail(null); setDetailError(''); setLocationSeed({});
@@ -2165,7 +2412,8 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   function reviewReprocessingResults() {
     setTab('documents'); setDocumentKind('ALL'); setDocumentSearchDraft(''); setDocumentSearch('');
     setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all');
-    setDocumentEmploymentId('all'); setDocumentStatusGroup('REVIEW'); setCheckedDocumentIds([]); setSelected(null);
+    setDocumentEmploymentId(context?.employmentId ?? 'all'); setDocumentStatusGroup('REVIEW'); setCheckedDocumentIds([]); setSelected(null);
+    onLocationChange({ tab: 'documents', employmentId: context?.employmentId ?? null, documentType: 'ALL', year: null, period: null, settlementType: null, status: 'REVIEW' }, false);
     window.setTimeout(() => {
       const panel = document.getElementById('history-panel-documents');
       panel?.focus();
@@ -2195,6 +2443,13 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   }
   async function associateDocuments() {
     if (!checkedDocumentIds.length || !employmentChoice || associating) return;
+    const preferredEmploymentId = employmentChoice === 'none' ? undefined : employmentChoice;
+    const preferredEmployment = employments.find((employment) => employment.id === preferredEmploymentId);
+    const preferredLocation = preferredEmploymentId ? {
+      currencyCode: context?.currencyCode ?? preferredEmployment?.currencyCode,
+      employmentContext: preferredEmploymentId,
+      employmentId: preferredEmploymentId,
+    } : undefined;
     setAssociating(true); setError('');
     try {
       await api('/documents/employment', {
@@ -2204,70 +2459,130 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
           employmentId: employmentChoice === 'none' ? null : employmentChoice,
         }),
       });
-      setCheckedDocumentIds([]); setEmploymentChoice(''); await Promise.all([loadSalary(), reloadDocuments(true)]);
+      setCheckedDocumentIds([]); setEmploymentChoice(''); await Promise.all([loadSalary(preferredLocation), reloadDocuments(true)]);
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos asociar los documentos.'); }
     finally { setAssociating(false); }
   }
 
-  const selectedScopeIndex = history?.contexts.findIndex((item) => salaryScopeKey(item) === selectedScopeKey) ?? -1;
-  const context = history?.contexts[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
-  const scope = history?.analytics.scopes[selectedScopeIndex < 0 ? 0 : selectedScopeIndex];
   const years = scope?.annual.map(({ year }) => year) ?? [];
   const selectedYear = yearFilter === 'all' || years.includes(yearFilter) ? yearFilter : 'all';
   const periods = scope?.evolution.map(({ period }) => period) ?? [];
+  const availableRangeValues = relevantEvolutionRanges(periods);
+  const selectedEvolutionRange = (availableRangeValues as readonly string[]).includes(evolutionRange) ? evolutionRange : 'all';
   const selectedFromPeriod = periods.includes(fromPeriod) ? fromPeriod : periods[0] ?? '';
   const selectedToPeriod = periods.includes(toPeriod) ? toPeriod : periods.at(-1) ?? '';
+  const visibleComparison = comparison
+    && comparison.employmentContext === context?.employmentContext
+    && comparison.currencyCode === context?.currencyCode
+    && comparison.fromPeriod === selectedFromPeriod
+    && comparison.toPeriod === selectedToPeriod
+    ? comparison
+    : null;
+  const selectedPoint = scope?.evolution.find((point) => point.period === selectedPeriod) ?? null;
   const annualRows = scope?.annual.filter(({ year }) => selectedYear === 'all' || year === selectedYear) ?? [];
   const latestEvents = scope?.events?.slice(-6).reverse() ?? [];
   const possibleDuplicates = context
     ? history?.analytics.possibleDuplicates.filter((duplicate) => duplicate.employmentContext === context.employmentContext && duplicate.currencyCode === context.currencyCode) ?? []
     : [];
-  const conceptEmploymentContext = context?.employmentContext ?? '';
-  const conceptCurrency = context?.currencyCode ?? '';
-  const conceptEmployerName = context?.state === 'DETECTED' ? context.employerName ?? '' : '';
-  const stableDetectedContext = /^detected:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(conceptEmploymentContext);
-  const buildConceptQuery = useCallback((cursor?: string) => {
-    if (!conceptEmploymentContext || !conceptCurrency || (conceptEmploymentContext.startsWith('detected:') && !stableDetectedContext && !conceptEmployerName)) return null;
-    const query = new URLSearchParams({
-      employmentContext: conceptEmploymentContext,
-      currencyCode: conceptCurrency,
-      limit: '100',
-    });
-    if (!stableDetectedContext && conceptEmployerName) query.set('employerName', conceptEmployerName);
-    if (selectedYear !== 'all') query.set('year', selectedYear);
-    if (categoryFilter !== 'all') query.set('category', categoryFilter);
-    if (cursor) query.set('cursor', cursor);
-    return `/salary-history/concepts?${query}`;
-  }, [categoryFilter, conceptCurrency, conceptEmployerName, conceptEmploymentContext, selectedYear, stableDetectedContext]);
+  const conceptPath = tab === 'concepts' ? salaryConceptPath(context, selectedYear, categoryFilter) : null;
   useEffect(() => {
-    const path = tab === 'concepts' ? buildConceptQuery() : null;
-    if (!path) return;
+    if (!conceptPath) return;
+    const generation = ++conceptRequestGeneration.current;
     let stopped = false;
     void Promise.resolve().then(async () => {
       setConceptLoading(true); setConcepts([]); setConceptCursor(null); setConceptError('');
       try {
-        const page = await api<SalaryConceptPage>(path);
-        if (!stopped) { setConcepts(page.items); setConceptCursor(page.nextCursor); }
+        const page = await api<SalaryConceptPage>(conceptPath);
+        if (!stopped && generation === conceptRequestGeneration.current) { setConcepts(page.items); setConceptCursor(page.nextCursor); }
       } catch (caught) {
-        if (!stopped) setConceptError(caught instanceof Error ? caught.message : 'No pudimos cargar los conceptos.');
-      } finally { if (!stopped) setConceptLoading(false); }
+        if (!stopped && generation === conceptRequestGeneration.current) setConceptError(caught instanceof Error ? caught.message : 'No pudimos cargar los conceptos.');
+      } finally { if (!stopped && generation === conceptRequestGeneration.current) setConceptLoading(false); }
     });
     return () => { stopped = true; };
-  }, [buildConceptQuery, conceptReloadKey, history, tab]);
+  }, [conceptPath, conceptReloadKey]);
 
   function selectScope(key: string) {
+    invalidateScopeData();
+    selectedScopeKeyRef.current = key;
     setSelectedScopeKey(key); setYearFilter('all'); setCategoryFilter('all');
-    setEvolutionRange('12');
-    setConcepts([]); setConceptCursor(null); setConceptError('');
-    setFromPeriod(''); setToPeriod(''); setComparison(null); setComparisonLoaded(false);
+    const nextContext = history?.contexts.find((item) => salaryScopeKey(item) === key);
+    initialCurrencyCode.current = nextContext?.currencyCode;
+    initialEmploymentId.current = nextContext?.employmentId ?? undefined;
+    initialEmploymentContext.current = nextContext?.employmentContext;
+    setEvolutionRange('12'); setSelectedPeriod('');
+    setDocumentYear('all'); setDocumentYearDraft(''); setDocumentPeriod('');
+    setDocumentEmploymentId(nextContext?.employmentId ?? 'all');
+    onLocationChange({ currencyCode: nextContext?.currencyCode ?? null, employmentContext: nextContext?.employmentContext ?? null, employmentId: nextContext?.employmentId ?? null, year: null, period: null, range: null }, false);
+  }
+
+  function historyTabPatch(next: HistoryTab): OwnerLocationPatch {
+    const scopeLocation = {
+      section: 'history' as const,
+      currencyCode: context?.currencyCode ?? initialLocation.currencyCode ?? null,
+      employmentContext: context?.employmentContext ?? initialLocation.employmentContext ?? null,
+      employmentId: context?.employmentId ?? initialLocation.employmentId ?? null,
+    };
+    if (next === 'documents') {
+      const year = tab === 'annual' || tab === 'concepts' ? selectedYear : documentYear;
+      const period = tab === 'evolution' ? selectedPeriod : documentPeriod;
+      return { ...scopeLocation, tab: next, year, period: period || null, range: null, documentType: documentKind, settlementType: documentSettlementType === 'all' ? null : documentSettlementType, status: documentStatusGroup };
+    }
+    if (next === 'annual' || next === 'concepts') {
+      const year = tab === 'documents' ? documentYear : selectedYear;
+      return { ...scopeLocation, tab: next, year, period: null, range: null, documentType: null, settlementType: null, status: null };
+    }
+    if (next === 'evolution') {
+      const period = tab === 'documents' ? documentPeriod : selectedPeriod;
+      return { ...scopeLocation, tab: next, year: null, period: period || null, range: selectedEvolutionRange, documentType: null, settlementType: null, status: null };
+    }
+    return { ...scopeLocation, tab: next, year: null, period: null, range: null, documentType: null, settlementType: null, status: null };
+  }
+
+  function historyTabHref(next: HistoryTab) {
+    return `/${writeOwnerLocation('', historyTabPatch(next))}`;
+  }
+
+  function selectHistoryTab(next: HistoryTab) {
+    setTab(next);
+    if (next === 'documents') {
+      const year = tab === 'annual' || tab === 'concepts' ? selectedYear : documentYear;
+      const period = tab === 'evolution' ? selectedPeriod : documentPeriod;
+      setDocumentYear(year); setDocumentYearDraft(year === 'all' ? '' : year); setDocumentPeriod(period);
+    } else if (next === 'annual' || next === 'concepts') {
+      setYearFilter(tab === 'documents' ? documentYear : selectedYear);
+    } else if (next === 'evolution') {
+      const period = tab === 'documents' ? documentPeriod : selectedPeriod;
+      setSelectedPeriod(period);
+    }
+    onLocationChange(historyTabPatch(next), false);
+  }
+
+  function selectEvolutionPeriod(period: string) {
+    setSelectedPeriod(period);
+    onLocationChange({ tab: 'evolution', employmentId: context?.employmentId ?? null, period }, true);
+  }
+
+  function showPeriodDocuments(period: string) {
+    setTab('documents'); setDocumentPeriod(period); setDocumentYear('all'); setDocumentYearDraft('');
+    setDocumentEmploymentId(context?.employmentId ?? 'all'); setCheckedDocumentIds([]); setSelected(null);
+    onLocationChange({ tab: 'documents', employmentId: context?.employmentId ?? null, period, year: null }, false);
+  }
+
+  function preparePeriodComparison(period: string) {
+    comparisonRequestGeneration.current += 1;
+    const index = periods.indexOf(period);
+    const previous = periods[index - 1] ?? periods[0] ?? '';
+    setFromPeriod(previous); setToPeriod(period); setComparison(null); setComparisonLoaded(false); setTab('summary');
+    onLocationChange({ tab: 'summary', employmentId: context?.employmentId ?? null, period }, false);
   }
 
   function selectDocumentKind(kind: (typeof documentKinds)[number][0]) {
     setDocumentKind(kind); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod('');
-    setDocumentSettlementType('all'); setDocumentEmploymentId('all'); setCheckedDocumentIds([]); setSelected(null);
+    setDocumentSettlementType('all'); setCheckedDocumentIds([]); setSelected(null);
+    onLocationChange({ documentType: kind, year: null, period: null, settlementType: null }, true);
   }
 
-  function moveHistoryTab(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+  function moveHistoryTab(event: KeyboardEvent<HTMLAnchorElement>, index: number) {
     const last = historyTabs.length - 1;
     const nextIndex = event.key === 'ArrowRight' ? (index === last ? 0 : index + 1)
       : event.key === 'ArrowLeft' ? (index === 0 ? last : index - 1)
@@ -2277,25 +2592,28 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     if (nextIndex === null) return;
     event.preventDefault();
     const next = historyTabs[nextIndex]![0];
-    setTab(next);
+    selectHistoryTab(next);
     document.getElementById(`history-tab-${next}`)?.focus();
   }
 
   async function loadMoreConcepts() {
-    const path = conceptCursor ? buildConceptQuery(conceptCursor) : null;
+    const path = conceptCursor ? salaryConceptPath(context, selectedYear, categoryFilter, conceptCursor) : null;
     if (!path || conceptLoadingMore) return;
+    const generation = conceptRequestGeneration.current;
     setConceptLoadingMore(true); setConceptError('');
     try {
       const page = await api<SalaryConceptPage>(path);
+      if (generation !== conceptRequestGeneration.current) return;
       setConcepts((current) => [...current, ...page.items]);
       setConceptCursor(page.nextCursor);
     } catch (caught) {
-      setConceptError(caught instanceof Error ? caught.message : 'No pudimos cargar más conceptos.');
-    } finally { setConceptLoadingMore(false); }
+      if (generation === conceptRequestGeneration.current) setConceptError(caught instanceof Error ? caught.message : 'No pudimos cargar más conceptos.');
+    } finally { if (generation === conceptRequestGeneration.current) setConceptLoadingMore(false); }
   }
 
   async function comparePeriods() {
     if (!context || !selectedFromPeriod || !selectedToPeriod || selectedFromPeriod === selectedToPeriod) return;
+    const generation = ++comparisonRequestGeneration.current;
     setComparisonLoading(true); setComparisonLoaded(false); setError('');
     try {
       const query = new URLSearchParams({
@@ -2304,10 +2622,12 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
         fromPeriod: selectedFromPeriod,
         toPeriod: selectedToPeriod,
       });
-      setComparison(await api<PeriodComparison | null>(`/salary-history/comparison?${query}`));
+      const next = await api<PeriodComparison | null>(`/salary-history/comparison?${query}`);
+      if (generation !== comparisonRequestGeneration.current) return;
+      setComparison(next);
       setComparisonLoaded(true);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos comparar los períodos.'); }
-    finally { setComparisonLoading(false); }
+    } catch (caught) { if (generation === comparisonRequestGeneration.current) setError(caught instanceof Error ? caught.message : 'No pudimos comparar los períodos.'); }
+    finally { if (generation === comparisonRequestGeneration.current) setComparisonLoading(false); }
   }
 
   async function loadMoreDocuments() {
@@ -2330,6 +2650,11 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const allAssignableSelected = assignableDocuments.length > 0
     && assignableDocuments.every((document) => checkedDocumentIds.includes(document.id));
   const candidateByDocument = new Map(reprocessingCandidates.map((candidate) => [candidate.documentId, candidate]));
+  const documentGroups = new Map<string, DocumentItem[]>();
+  for (const item of documents) {
+    const year = item.payrollPeriod?.slice(0, 4) || item.createdAt.slice(0, 4) || 'Sin fecha';
+    documentGroups.set(year, [...(documentGroups.get(year) ?? []), item]);
+  }
   const candidatePeriods = new Map<string, 'available' | 'processing'>();
   for (const document of documents) {
     const candidate = candidateByDocument.get(document.id);
@@ -2344,14 +2669,14 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   function documentRow(document: DocumentItem) {
     const showCheckbox = documentKind === 'PAYROLL';
     const assignable = document.documentType === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus);
-    const name = documentName(document);
+    const name = documentName(document, privacyEnabled);
     const metadata = document.documentType === 'PAYROLL'
       ? [document.employerName || 'Sin empresa asociada', document.payrollPeriod ? `Período: ${periodLabel(document.payrollPeriod)}` : 'Período sin detectar', document.settlementType ? settlementTypeLabel(document.settlementType) : null].filter(Boolean).join(' · ')
       : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED'
         ? 'Documento no soportado'
         : 'Tipo pendiente de clasificación';
     const candidate = candidateByDocument.get(document.id);
-    return <div className={`document-entry${showCheckbox ? '' : ' no-check'}`} key={document.id}>{showCheckbox && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${name}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{metadata}</small><small>Subido {timestampLabel(document.createdAt)}</small>{candidate && <small className="document-improvement">{candidate.inProgress ? 'Buscando una mejora…' : 'Mejora disponible para datos faltantes'}</small>}{document.errorCode && document.errorCode !== 'DOCUMENT_DUPLICATE' && <small className="document-reason">{importErrorLabels[document.errorCode] ?? 'El documento no pudo procesarse.'}</small>}</span><span className="document-badges"><DocumentStatusBadges document={document} />{candidate && <span className={`status ${candidate.inProgress ? 'pending' : 'ready'}`}>{candidate.inProgress ? 'Procesando' : 'Mejora disponible'}</span>}</span><span aria-hidden="true">›</span></button></div>;
+    return <div className={`document-entry${showCheckbox ? '' : ' no-check'}`} key={document.id}>{showCheckbox && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${name}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{!privacyEnabled && name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{metadata}</small><small>Subido {timestampLabel(document.createdAt)}</small>{candidate && <small className="document-improvement">{candidate.inProgress ? 'Buscando una mejora…' : 'Mejora disponible para datos faltantes'}</small>}{document.errorCode && document.errorCode !== 'DOCUMENT_DUPLICATE' && <small className="document-reason">{importErrorLabels[document.errorCode] ?? 'El documento no pudo procesarse.'}</small>}</span><span className="document-badges"><DocumentStatusBadges document={document} />{candidate && <span className={`status ${candidate.inProgress ? 'pending' : 'ready'}`}>{candidate.inProgress ? 'Procesando' : 'Mejora disponible'}</span>}</span><span aria-hidden="true">›</span></button></div>;
   }
   const selectedDocumentIndex = documents.findIndex(({ id }) => id === selected?.id);
   const reprocessingBatchDismissed = batchWasDismissed(reprocessingBatch, dismissedReprocessingBatchId);
@@ -2362,44 +2687,45 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     <div className="page" aria-busy={loading || documentsLoading || comparisonLoading || conceptLoading || conceptLoadingMore}>
       <PageHeader eyebrow="Datos estructurados" title="Historial salarial" />
       {showReprocessingBanner && <ReprocessingBanner availableCandidates={reprocessingCandidates.filter((candidate) => candidate.available).length} batch={visibleReprocessingBatch} batchLimit={reprocessingBatchLimit} busy={reprocessingBusy} candidates={reprocessingCandidateTotal} error={reprocessingError} loading={reprocessingLoading} onDismiss={dismissReprocessingBatch} onRetry={() => void loadRecovery()} onReview={reviewReprocessingResults} onStart={() => void startReprocessingBatch()} reviewCandidates={documentPendingReview} />}
-      <div className="tabs history-tabs" role="tablist" aria-label="Secciones del historial">{historyTabs.map(([value, label], index) => <button type="button" id={`history-tab-${value}`} role="tab" aria-controls={`history-panel-${value}`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className={tab === value ? 'active' : ''} onKeyDown={(event) => moveHistoryTab(event, index)} onClick={() => setTab(value)} key={value}>{label}</button>)}</div>
+      <div className="tabs history-tabs" role="tablist" aria-label="Secciones del historial">{historyTabs.map(([value, label], index) => <a id={`history-tab-${value}`} role="tab" href={historyTabHref(value)} aria-controls={`history-panel-${value}`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className={tab === value ? 'active' : ''} onKeyDown={(event) => moveHistoryTab(event, index)} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); selectHistoryTab(value); } }} key={value}>{label}</a>)}</div>
       {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
       {loading && !history && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando el historial salarial…</p></div>}
 
-      {tab !== 'documents' && history && context && scope && <>
-        <SalaryScopeControl history={history} selectedKey={selectedScopeKey} onChange={selectScope} id="history-salary-scope" />
+      {history && context && scope && <>
+        <SalaryScopeControl history={history} employments={employments} selectedKey={selectedScopeKey} onChange={selectScope} id="history-salary-scope" />
         <SalaryContextNotice context={context} />
-        {(tab === 'evolution' || tab === 'annual' || tab === 'concepts') && <div className="history-filters">{tab === 'evolution' ? <label>Rango<select value={evolutionRange} onChange={(event) => setEvolutionRange(event.target.value as (typeof evolutionRanges)[number][0])}>{evolutionRanges.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label> : <><label>Año<select value={selectedYear} onChange={(event) => setYearFilter(event.target.value)}><option value="all">Todos</option>{years.map((year) => <option value={year} key={year}>{year}</option>)}</select></label><label>Categoría<select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value as 'all' | SalaryCategory)}><option value="all">Todas</option>{salaryCategories.map((item) => <option value={item} key={item}>{categoryLabels[item]}</option>)}</select></label></>}</div>}
+        {(tab === 'evolution' || tab === 'annual' || tab === 'concepts') && <div className="history-filters">{tab === 'evolution' ? <label>Rango<select value={selectedEvolutionRange} onChange={(event) => { const range = event.target.value as (typeof evolutionRanges)[number][0]; setEvolutionRange(range); onLocationChange({ range }, true); }}>{evolutionRanges.filter(([value]) => (availableRangeValues as readonly (string | number)[]).includes(value === 'all' ? 'all' : Number(value))).map(([value, label]) => <option value={value} key={value}>{value === 'all' ? 'Todo el empleo' : label}</option>)}</select></label> : <><label>Año<select value={selectedYear} onChange={(event) => { setYearFilter(event.target.value); onLocationChange({ year: event.target.value }, true); }}><option value="all">Todos</option>{years.map((year) => <option value={year} key={year}>{year}</option>)}</select></label><label>Categoría<select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value as 'all' | SalaryCategory)}><option value="all">Todas</option>{salaryCategories.map((item) => <option value={item} key={item}>{categoryLabels[item]}</option>)}</select></label></>}</div>}
       </>}
 
       {tab === 'summary' && <section id="history-panel-summary" role="tabpanel" aria-labelledby="history-tab-summary" tabIndex={0}>{history && context && scope ? <>
         <SalaryMetricGrid scope={scope} context={context} recoveryPeriods={candidatePeriods} />
         <div className="history-summary-grid">
-          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Últimos cambios</p><h2>Eventos informados</h2></div></div>{latestEvents.length ? <ul className="event-list">{latestEvents.map((event) => <li key={`${event.type}-${event.period}-${event.type === 'EXTRAORDINARY' ? event.settlementId : event.change.toPeriod}`}><span><strong>{event.type === 'COMPARABLE_INCREASE' ? 'Aumento comparable' : categoryLabels[event.category]}</strong><small>{periodLabel(event.period)}</small></span><strong>{event.type === 'COMPARABLE_INCREASE' ? salaryPercentage(event.change.percentage) : salaryMoney(event.amount, scope.currencyCode)}</strong></li>)}</ul> : <EmptyState title="Sin cambios informados" body="Hacen falta más períodos comparables o liquidaciones extraordinarias." />}</section>
+          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Últimos cambios</p><h2>Eventos informados</h2></div></div>{latestEvents.length ? <ul className="event-list">{latestEvents.map((event) => <li key={`${event.type}-${event.period}-${event.type === 'EXTRAORDINARY' ? event.settlementId : event.change.toPeriod}`}><span><strong>{event.type === 'COMPARABLE_INCREASE' ? 'Aumento comparable' : categoryLabels[event.category]}</strong><small>{periodLabel(event.period)}</small></span><strong>{event.type === 'COMPARABLE_INCREASE' ? <PercentageValue value={event.change.percentage} /> : <MoneyValue value={event.amount} currency={scope.currencyCode} kind="salary" />}</strong></li>)}</ul> : <EmptyState title="Sin cambios informados" body="Hacen falta más períodos comparables o liquidaciones extraordinarias." />}</section>
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Calidad del historial</p><h2>Cobertura</h2></div></div>{scope.coverage && scope.coverage.basis !== 'INDETERMINATE_CONTEXT' ? <><p className="coverage-total"><strong>{scope.coverage.availablePeriods.length}/{scope.coverage.expectedPeriods.length}</strong> períodos disponibles</p><p>{scope.coverage.possibleMissingPeriods.length ? `Posibles faltantes: ${scope.coverage.possibleMissingPeriods.map(periodLabel).join(', ')}.` : scope.coverage.basis === 'OBSERVED' ? 'Sin faltantes dentro del rango observado; no implica una relación laboral completa.' : 'No se detectaron posibles faltantes dentro del rango laboral.'}</p>{scope.coverage.boundaryContradiction && <p className="message warning" role="status">Las fechas del empleo contradicen períodos observados; se amplió el rango para no ocultarlos.</p>}</> : <p>N/D: sin contexto laboral suficiente para determinar períodos esperados.</p>}{possibleDuplicates.length > 0 && <p className="message warning" role="status">Hay {possibleDuplicates.length} período{possibleDuplicates.length === 1 ? '' : 's'} con posibles recibos duplicados para revisar.</p>}</section>
         </div>
-        <section className="panel comparison-panel"><div className="panel-heading"><div><p className="eyebrow">Comparación exacta</p><h2>Dos períodos</h2></div></div>{periods.length > 1 ? <><div className="comparison-controls"><label>Desde<select value={selectedFromPeriod} onChange={(event) => { setFromPeriod(event.target.value); setComparisonLoaded(false); }} >{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><label>Hasta<select value={selectedToPeriod} onChange={(event) => { setToPeriod(event.target.value); setComparisonLoaded(false); }}>{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><button type="button" className="button primary" disabled={comparisonLoading || selectedFromPeriod === selectedToPeriod} onClick={() => void comparePeriods()}>{comparisonLoading ? 'Comparando…' : 'Comparar'}</button></div>{comparison && <ComparisonResult comparison={comparison} />}{comparisonLoaded && !comparison && <EmptyState title="No se pueden comparar" body="No hay datos suficientes en uno de los períodos elegidos." />}</> : <EmptyState title="Falta otro período" body="La comparación necesita al menos dos períodos del mismo empleo y moneda." />}</section>
+        <section className="panel comparison-panel"><div className="panel-heading"><div><p className="eyebrow">Comparación exacta</p><h2>Dos períodos</h2></div></div>{periods.length > 1 ? <><div className="comparison-controls"><label>Desde<select value={selectedFromPeriod} onChange={(event) => { comparisonRequestGeneration.current += 1; setFromPeriod(event.target.value); setComparison(null); setComparisonLoaded(false); setComparisonLoading(false); }} >{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><label>Hasta<select value={selectedToPeriod} onChange={(event) => { comparisonRequestGeneration.current += 1; setToPeriod(event.target.value); setComparison(null); setComparisonLoaded(false); setComparisonLoading(false); }}>{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><button type="button" className="button primary" disabled={comparisonLoading || selectedFromPeriod === selectedToPeriod} onClick={() => void comparePeriods()}>{comparisonLoading ? 'Comparando…' : 'Comparar'}</button></div>{visibleComparison && <ComparisonResult comparison={visibleComparison} />}{comparisonLoaded && !visibleComparison && <EmptyState title="No se pueden comparar" body="No hay datos suficientes en uno de los períodos elegidos." />}</> : <EmptyState title="Falta otro período" body="La comparación necesita al menos dos períodos del mismo empleo y moneda." />}</section>
       </> : history && !loading ? <EmptyState title="Todavía no hay datos salariales" body="Importá recibos soportados y completá su revisión para construir el historial." /> : null}</section>}
 
-      {tab === 'evolution' && <section id="history-panel-evolution" role="tabpanel" aria-labelledby="history-tab-evolution" tabIndex={0}>{scope ? <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto</h2></div></div><SalaryEvolution scope={scope} limit={evolutionRanges.find(([value]) => value === evolutionRange)?.[2]} recoveryPeriods={candidatePeriods} /></section> : history && !loading ? <EmptyState title="Sin evolución" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
+      {tab === 'evolution' && <section id="history-panel-evolution" role="tabpanel" aria-labelledby="history-tab-evolution" tabIndex={0}>{scope ? <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto</h2></div></div><SalaryEvolution scope={scope} limit={evolutionRanges.find(([value]) => value === selectedEvolutionRange)?.[2]} recoveryPeriods={candidatePeriods} selectedPeriod={selectedPoint?.period} onSelectPeriod={selectEvolutionPeriod} />{selectedPoint && <section className="settlement-detail" aria-labelledby="selected-period-title"><div className="panel-heading"><div><p className="eyebrow">Período seleccionado</p><h3 id="selected-period-title">{periodLabel(selectedPoint.period)}</h3></div><button type="button" className="icon-button" aria-label="Cerrar detalle del período" onClick={() => { setSelectedPeriod(''); onLocationChange({ period: null }, true); }}>×</button></div><dl className="settlement-overview"><div><dt>Básico comparable</dt><dd><MoneyValue value={selectedPoint.comparableSalary} currency={scope.currencyCode} kind="salary" /></dd></div><div><dt>Bruto</dt><dd><MoneyValue value={selectedPoint.totals.grossAmount} currency={scope.currencyCode} kind="salary" /></dd></div><div><dt>Neto</dt><dd><MoneyValue value={selectedPoint.totals.netAmount} currency={scope.currencyCode} kind="salary" /></dd></div><div><dt>Descuentos / créditos</dt><dd><MoneyValue value={selectedPoint.totals.deductionsAmount} currency={scope.currencyCode} kind="salary" creditAware /></dd></div></dl><div className="modal-actions"><button type="button" className="button primary" onClick={() => showPeriodDocuments(selectedPoint.period)}>Ver conceptos y documentos fuente</button>{periods.length > 1 && <button type="button" className="button secondary" onClick={() => preparePeriodComparison(selectedPoint.period)}>Comparar período</button>}</div></section>}</section> : history && !loading ? <EmptyState title="Sin evolución" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
 
       {tab === 'annual' && <section id="history-panel-annual" role="tabpanel" aria-labelledby="history-tab-annual" tabIndex={0}>{scope ? <AnnualHistory rows={annualRows} scope={scope} category={categoryFilter} /> : history && !loading ? <EmptyState title="Sin resumen anual" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
 
       {tab === 'concepts' && <section id="history-panel-concepts" role="tabpanel" aria-labelledby="history-tab-concepts" tabIndex={0} aria-busy={conceptLoading || conceptLoadingMore}>
         {conceptError && <p className="message error" role="alert">{conceptError} <button type="button" className="text-button" disabled={conceptLoading} onClick={() => setConceptReloadKey((current) => current + 1)}>Reintentar</button></p>}
-        {conceptLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando conceptos…</p></div> : scope && concepts.length ? <><div className="table-wrap" role="region" aria-label="Tabla desplazable de conceptos salariales" tabIndex={0}><table><caption className="sr-only">Conceptos normalizados paginados por el servidor</caption><thead><tr><th>Período</th><th>Liquidación</th><th>Categoría</th><th>Concepto</th><th>Recurrencia</th><th>Importe</th></tr></thead><tbody>{concepts.map((row) => <tr key={`${row.settlementId}-${row.earningIndex}`}><td>{periodLabel(row.period)}</td><td>{settlementTypeLabel(row.settlementType)}</td><td>{categoryLabels[row.category]}</td><td>{earningLabels[row.code] ?? 'Otro concepto'}</td><td>{row.isRecurring === true ? 'Recurrente' : row.isRecurring === false ? 'No recurrente' : 'N/D'}</td><td>{salaryMoney(row.amount, scope.currencyCode)}</td></tr>)}</tbody></table></div>{conceptCursor && <div className="load-more"><button type="button" className="button secondary" disabled={conceptLoadingMore} onClick={() => void loadMoreConcepts()}>{conceptLoadingMore ? 'Cargando…' : 'Cargar más'}</button></div>}</> : scope ? <EmptyState title="Sin conceptos para esos filtros" body="Sólo se muestran conceptos ya normalizados por el servidor." /> : history && !loading ? <EmptyState title="Sin conceptos" body="Todavía no hay liquidaciones analizadas." /> : null}
+        {conceptLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando conceptos…</p></div> : scope && concepts.length ? <><div className="table-wrap" role="region" aria-label="Conceptos salariales" tabIndex={0}><table><caption className="sr-only">Conceptos normalizados paginados por el servidor</caption><thead><tr><th>Período</th><th>Liquidación</th><th>Categoría</th><th>Concepto</th><th>Recurrencia</th><th>Importe</th></tr></thead><tbody>{concepts.map((row) => <tr key={`${row.settlementId}-${row.earningIndex}`}><td data-label="Período">{periodLabel(row.period)}</td><td data-label="Liquidación">{settlementTypeLabel(row.settlementType)}</td><td data-label="Categoría">{categoryLabels[row.category]}</td><td data-label="Concepto">{earningLabels[row.code] ?? 'Otro concepto'}</td><td data-label="Recurrencia">{row.isRecurring === true ? 'Recurrente' : row.isRecurring === false ? 'No recurrente' : 'N/D'}</td><td data-label="Importe"><MoneyValue value={row.amount} currency={scope.currencyCode} kind="salary" /></td></tr>)}</tbody></table></div>{conceptCursor && <div className="load-more"><button type="button" className="button secondary" disabled={conceptLoadingMore} onClick={() => void loadMoreConcepts()}>{conceptLoadingMore ? 'Cargando…' : 'Cargar más'}</button></div>}</> : scope ? <EmptyState title="Sin conceptos para esos filtros" body="Sólo se muestran conceptos ya normalizados por el servidor." /> : history && !loading ? <EmptyState title="Sin conceptos" body="Todavía no hay liquidaciones analizadas." /> : null}
       </section>}
 
       {tab === 'documents' && <section id="history-panel-documents" role="tabpanel" aria-labelledby="history-tab-documents" tabIndex={0}>
         <div className="document-kind" role="group" aria-label="Tipo de documento">{documentKinds.map(([value, label]) => <button type="button" aria-pressed={documentKind === value} className={documentKind === value ? 'active' : ''} onClick={() => selectDocumentKind(value)} key={value}>{label}</button>)}</div>
-        <form className="document-filters" role="search" onSubmit={(event) => { event.preventDefault(); setDocumentSearch(documentSearchDraft.trim()); setDocumentYear(documentYearDraft || 'all'); }}><label>Buscar<input type="search" value={documentSearchDraft} maxLength={100} placeholder="Archivo o empresa" onChange={(event) => setDocumentSearchDraft(event.target.value)} /></label><label>Empleo<select value={documentEmploymentId} onChange={(event) => setDocumentEmploymentId(event.target.value)}><option value="all">Todos</option><option value="unassociated">Sin empleo asociado</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employmentOptionLabel(employment)}</option>)}</select></label><label>Año<input type="text" inputMode="numeric" pattern="20[0-9]{2}" maxLength={4} value={documentYearDraft} placeholder="Todos" title="Ingresá un año entre 2000 y 2099" onChange={(event) => setDocumentYearDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label><label>Período<input type="month" value={documentPeriod} onChange={(event) => setDocumentPeriod(event.target.value)} /></label>{documentKind !== 'UNSUPPORTED' && <label>Tipo de liquidación<select value={documentSettlementType} onChange={(event) => setDocumentSettlementType(event.target.value)}><option value="all">Todos</option>{settlementTypeOptions.map((value) => <option value={value} key={value}>{settlementTypeLabel(value)}</option>)}</select></label>}<label>Estado<select value={documentStatusGroup} onChange={(event) => setDocumentStatusGroup(event.target.value as (typeof documentStatusGroups)[number][0])}>{documentStatusGroups.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><button type="submit" className="button secondary compact">Buscar</button>{(documentSearch || documentYear !== 'all' || documentPeriod || documentSettlementType !== 'all' || documentEmploymentId !== 'all' || documentStatusGroup !== 'ALL') && <button type="button" className="text-button" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all'); setDocumentEmploymentId('all'); setDocumentStatusGroup('ALL'); }}>Limpiar filtros</button>}</form>
+        <form className="document-filters" role="search" onSubmit={(event) => { event.preventDefault(); const year = documentYearDraft || 'all'; setDocumentSearch(documentSearchDraft.trim()); setDocumentYear(year); onLocationChange({ year }, true); }}><label>Buscar<input type="search" value={documentSearchDraft} maxLength={100} placeholder="Archivo, empresa, mes o tipo" onChange={(event) => setDocumentSearchDraft(event.target.value)} /></label><label>Año<input type="text" inputMode="numeric" pattern="20[0-9]{2}" maxLength={4} value={documentYearDraft} placeholder="Todos" title="Ingresá un año entre 2000 y 2099" onChange={(event) => setDocumentYearDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label><label>Período<input type="month" value={documentPeriod} onChange={(event) => { setDocumentPeriod(event.target.value); onLocationChange({ period: event.target.value || null }, true); }} /></label>{documentKind !== 'UNSUPPORTED' && <label>Tipo de liquidación<select value={documentSettlementType} onChange={(event) => { setDocumentSettlementType(event.target.value); onLocationChange({ settlementType: event.target.value === 'all' ? null : event.target.value }, true); }}><option value="all">Todos</option>{settlementTypeOptions.map((value) => <option value={value} key={value}>{settlementTypeLabel(value)}</option>)}</select></label>}<label>Estado<select value={documentStatusGroup} onChange={(event) => { const status = event.target.value as (typeof documentStatusGroups)[number][0]; setDocumentStatusGroup(status); onLocationChange({ status }, true); }}>{documentStatusGroups.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><button type="submit" className="button secondary compact">Buscar</button>{(documentSearch || documentYear !== 'all' || documentPeriod || documentSettlementType !== 'all' || documentStatusGroup !== 'ALL') && <button type="button" className="text-button" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all'); setDocumentStatusGroup('ALL'); onLocationChange({ year: null, period: null, settlementType: null, status: 'ALL' }, true); }}>Limpiar filtros</button>}</form>
         {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void reloadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
         {!documentsLoading && !documentError && <p className="document-count">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {documentPendingReview} para revisar · mostrando {documents.length}</p>}
+        {documentPeriod && <p className="coverage-note">Documentos de {periodLabel(documentPeriod)}. Abrí uno para revisar sus conceptos y, si decidís mostrarlo, el PDF fuente.</p>}
         {documentKind === 'PAYROLL' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employmentOptionLabel(employment)}</option>)}<option value="none">Quitar asociación</option></select><button type="button" className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={() => void associateDocuments()}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
-        <div id="document-results">{documentError ? null : documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-list">{documents.map(documentRow)}</div>{documentCursor && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title="No encontramos documentos con estos filtros" body="Probá limpiar los filtros o importá un PDF nuevo." />}</div>
+        <div id="document-results">{documentError ? null : documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-groups">{[...documentGroups.entries()].map(([year, items]) => <details className="document-year" open key={year}><summary><strong>{year}</strong><span>{items.length} documento{items.length === 1 ? '' : 's'}</span></summary><div className="document-list">{items.map(documentRow)}</div></details>)}</div>{documentCursor && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title="No encontramos documentos con estos filtros" body="Probá limpiar los filtros o importá un PDF nuevo." action={<button type="button" className="button secondary" onClick={() => { setDocumentSearchDraft(''); setDocumentSearch(''); setDocumentYearDraft(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all'); setDocumentStatusGroup('ALL'); onLocationChange({ year: null, period: null, settlementType: null, status: 'ALL' }, true); }}>Limpiar filtros</button>} />}</div>
       </section>}
 
-      {selected && (!detail || detailError) && <div className="modal-layer" role="presentation" onMouseDown={closeDetailState}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="document-loading-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, closeDetailState)} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Documento privado</p><h2 id="document-loading-title">{documentName(selected)}</h2></div><button className="icon-button" disabled={reviewBusy} onClick={closeDetailState} aria-label="Cerrar">×</button></div>{detailError ? <><p className="message error" role="alert">{detailError}</p><div className="modal-actions"><button type="button" className="button secondary" disabled={reviewBusy} onClick={closeDetailState}>Cerrar</button><button type="button" className="button primary" disabled={reviewBusy} onClick={() => setDetailReload((value) => value + 1)}>Reintentar</button></div></> : <p aria-live="polite">Cargando metadatos y datos extraídos…</p>}</section></div>}
+      {selected && (!detail || detailError) && <div className="modal-layer" role="presentation" onMouseDown={closeDetailState}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="document-loading-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, closeDetailState)} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Documento privado</p><h2 id="document-loading-title">{documentName(selected, privacyEnabled)}</h2></div><button className="icon-button" disabled={reviewBusy} onClick={closeDetailState} aria-label="Cerrar">×</button></div>{detailError ? <><p className="message error" role="alert">{detailError}</p><div className="modal-actions"><button type="button" className="button secondary" disabled={reviewBusy} onClick={closeDetailState}>Cerrar</button><button type="button" className="button primary" disabled={reviewBusy} onClick={() => setDetailReload((value) => value + 1)}>Reintentar</button></div></> : <p aria-live="polite">Cargando metadatos y datos extraídos…</p>}</section></div>}
       {selected && detail && !detailError && <DocumentReview
         key={selected.id}
         detail={detail}
@@ -2407,7 +2733,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
         initialPage={locationSeed.page}
         position={{ canNext: selectedDocumentIndex >= 0 && (selectedDocumentIndex < documents.length - 1 || Boolean(documentCursor)), current: selectedDocumentIndex < 0 ? null : selectedDocumentIndex + 1, total: Math.max(1, documentTotal) }}
         settlement={detail.reviewSettlement ?? undefined}
-        source={preview?.documentId === selected.id ? preview : null}
+        source={preview?.documentId === selected.id && (!privacyEnabled || privacyPreviewDocumentId === selected.id) ? preview : null}
         sourceBusy={previewBusy}
         sourceError={previewError}
         navigationBusy={loadingMoreDocuments}

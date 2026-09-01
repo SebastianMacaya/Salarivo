@@ -3,7 +3,9 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { evidenceIdForPage, extractionRunChanged, reviewValueChanged } from './document-evidence';
 import { DocumentViewer } from './document-viewer';
-import { documentStatusLabel, money, periodLabel, settlementTypeLabel, timestampLabel } from './format';
+import { documentStatusLabel, periodLabel, settlementTypeLabel, timestampLabel } from './format';
+import { MoneyValue, PercentageValue, PrivacyToggle, SensitiveValue, usePrivacyMode } from './privacy-mode';
+import { MONEY_MASK, PERCENTAGE_MASK, isMonetaryField, isSalaryPercentageField } from './privacy-mode-state';
 import {
   analysisPresentation,
   issueLabel,
@@ -144,10 +146,11 @@ function comparisonValue(preview: ProcessingComparisonPreview, fieldPath: string
   if (value === null) return 'No disponible';
   if (fieldPath === 'settlement.payrollPeriod') return periodLabel(value);
   if (fieldPath === 'settlement.type') return settlementTypeLabel(value);
-  if (fieldPath.includes('Amount')) {
+  if (isMonetaryField(fieldPath)) {
     const currency = preview.fields.find((field) => field.fieldPath === 'settlement.currencyCode')?.[side] ?? 'ARS';
-    return money(value, currency);
+    return <MoneyValue value={value} currency={currency} />;
   }
+  if (isSalaryPercentageField(fieldPath)) return <PercentageValue value={value} />;
   return value;
 }
 
@@ -237,6 +240,7 @@ export function DocumentReview({
   runsError?: string;
   runsLoading?: boolean;
 }) {
+  const { enabled: privacyEnabled } = usePrivacyMode();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
   const [editingRunId, setEditingRunId] = useState<string | null>(null);
@@ -258,6 +262,9 @@ export function DocumentReview({
       : [];
   }), [detail.extractedFields, drafts]);
   const correctionsDirty = changes.length > 0;
+  const privacyBlocksSave = privacyEnabled && changes.some(({ field }) => (
+    isMonetaryField(field.fieldPath) || isSalaryPercentageField(field.fieldPath)
+  ));
   const feedbackDirty = feedbackDraft.trim() !== (detail.unsupportedFeedback ?? '');
   const dirty = correctionsDirty || feedbackDirty;
   const currentRunId = detail.extractionRun?.id ?? null;
@@ -267,6 +274,7 @@ export function DocumentReview({
   const analysis = detail.analysis;
   const analysisCopy = analysis ? analysisPresentation(analysis) : null;
   const runTimeline = processingRuns.length ? processingRuns : analysis?.currentRun ? [analysis.currentRun] : [];
+  const currencyCode = detail.settlement?.currencyCode ?? 'ARS';
 
   useEffect(() => {
     if (!dirty) return;
@@ -346,6 +354,7 @@ export function DocumentReview({
   const canEdit = ['COMPLETED', 'NEEDS_REVIEW'].includes(detail.processingStatus) && currentRunId !== null;
   const originalViewable = detail.originalAvailable && detail.securityStatus === 'CLEAN';
   const unsupported = detail.documentType === 'UNSUPPORTED' || detail.processingStatus === 'REJECTED_UNSUPPORTED';
+  const visibleFilename = privacyEnabled ? 'Documento privado' : filename(detail);
   const unsupportedReason = detail.errorCode === 'DOCUMENT_UNSUPPORTED'
     ? 'Salarivo detectó que este PDF no parece ser un recibo de sueldo, aguinaldo ni otro documento salarial compatible.'
     : 'Este PDF fue confirmado como un tipo de documento que Salarivo todavía no procesa.';
@@ -354,7 +363,8 @@ export function DocumentReview({
     <div className={styles.layer} role="presentation">
       <section className={styles.workspace} role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleReviewKey(event, close)}>
         <header className={styles.header}>
-          <div className={styles.heading}><span className={styles.fileIcon}>PDF</span><div><p>{position.current === null ? 'Documento fuera del listado actual' : `Documento ${position.current} de ${position.total}`}</p><h2 id="review-title" title={detail.originalFilename}>{filename(detail)}</h2></div></div>
+          <div className={styles.heading}><span className={styles.fileIcon}>PDF</span><div><p>{position.current === null ? 'Documento fuera del listado actual' : `Documento ${position.current} de ${position.total}`}</p><h2 id="review-title" title={visibleFilename}>{visibleFilename}</h2></div></div>
+          <PrivacyToggle className={styles.privacyControl} />
           <nav aria-label="Navegar documentos"><button type="button" onClick={() => navigate(-1)} disabled={busy || navigationBusy || position.current === null || position.current <= 1} aria-label="Documento anterior">‹</button><button type="button" onClick={() => navigate(1)} disabled={busy || navigationBusy || position.current === null || position.canNext === false || (position.canNext === undefined && position.current >= position.total)} aria-label="Documento siguiente">›</button></nav>
           <button className={styles.close} type="button" onClick={close} disabled={busy} aria-label="Cerrar revisión">×</button>
         </header>
@@ -396,30 +406,37 @@ export function DocumentReview({
             {detail.processingStatus === 'NEEDS_TYPE_CONFIRMATION' && <section className={styles.callout}><h3>¿Es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente.</p><div><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('PAYROLL'))}>Sí, continuar</button><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('UNSUPPORTED'))}>No corresponde</button></div></section>}
             {unsupported && <section className={styles.callout}><h3>Tipo de documento no soportado</h3><p>{unsupportedReason} El PDF original se elimina automáticamente; conservamos esta ficha mínima.</p><form className={styles.feedback} onSubmit={(event) => { event.preventDefault(); void run(async () => setFeedbackDraft(await onSaveUnsupportedFeedback(feedbackDraft) ?? '')); }}><label htmlFor="unsupported-feedback">¿Qué tipo de archivo es y por qué te serviría?</label><textarea id="unsupported-feedback" maxLength={500} value={feedbackDraft} onChange={(event) => setFeedbackDraft(event.target.value)} placeholder="Ej.: certificado laboral; me serviría para completar fechas del empleo." /><small>No incluyas salarios, DNI/CUIL ni otros datos personales.</small><button type="submit" disabled={busy || !feedbackDirty}>{busy ? 'Guardando…' : detail.unsupportedFeedback ? 'Actualizar feedback' : 'Enviar feedback'}</button></form></section>}
 
-            {detail.settlement && <section className={styles.section}><p>Liquidación extraída</p><h3>{periodLabel(detail.settlement.payrollPeriod)} · {settlementTypeLabel(detail.settlement.settlementType)}</h3><dl className={styles.settlementOverview}><div><dt>Sueldo básico</dt><dd>{money(detail.settlement.basicAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Bruto</dt><dd>{money(detail.settlement.grossAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Remunerativo</dt><dd>{money(detail.settlement.remunerativeAmount, detail.settlement.currencyCode)}</dd></div><div><dt>No remunerativo</dt><dd>{money(detail.settlement.nonRemunerativeAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Neto</dt><dd>{money(detail.settlement.netAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Descuentos / créditos</dt><dd>{money(detail.settlement.deductionsAmount, detail.settlement.currencyCode)}</dd></div>{detail.settlement.deductionsChargedAmount && <div><dt>Descuentos cobrados</dt><dd>{money(detail.settlement.deductionsChargedAmount, detail.settlement.currencyCode)}</dd></div>}{detail.settlement.reimbursementsAmount && <div><dt>Reintegros</dt><dd>{money(detail.settlement.reimbursementsAmount, detail.settlement.currencyCode)}</dd></div>}</dl></section>}
+            {detail.settlement && <section className={styles.section}><p>Liquidación extraída</p><h3>{periodLabel(detail.settlement.payrollPeriod)} · {settlementTypeLabel(detail.settlement.settlementType)}</h3><dl className={styles.settlementOverview}><div><dt>Sueldo básico</dt><dd><MoneyValue value={detail.settlement.basicAmount} currency={detail.settlement.currencyCode} /></dd></div><div><dt>Bruto</dt><dd><MoneyValue value={detail.settlement.grossAmount} currency={detail.settlement.currencyCode} /></dd></div><div><dt>Remunerativo</dt><dd><MoneyValue value={detail.settlement.remunerativeAmount} currency={detail.settlement.currencyCode} /></dd></div><div><dt>No remunerativo</dt><dd><MoneyValue value={detail.settlement.nonRemunerativeAmount} currency={detail.settlement.currencyCode} /></dd></div><div><dt>Neto</dt><dd><MoneyValue value={detail.settlement.netAmount} currency={detail.settlement.currencyCode} /></dd></div><div><dt>Descuentos / créditos</dt><dd><MoneyValue value={detail.settlement.deductionsAmount} currency={detail.settlement.currencyCode} creditAware /></dd></div>{detail.settlement.deductionsChargedAmount && <div><dt>Descuentos cobrados</dt><dd><MoneyValue value={detail.settlement.deductionsChargedAmount} currency={detail.settlement.currencyCode} /></dd></div>}{detail.settlement.reimbursementsAmount && <div><dt>Reintegros</dt><dd><MoneyValue value={detail.settlement.reimbursementsAmount} currency={detail.settlement.currencyCode} /></dd></div>}</dl></section>}
 
             <section className={styles.section}>
               <div className={styles.sectionHead}><div><p>Extracción</p><h3>Campos detectados</h3></div>{!editing ? <button type="button" disabled={busy || !canEdit} onClick={() => { setEditingRunId(currentRunId); setEditing(true); }}>Editar</button> : <span>Modo edición</span>}</div>
+              {privacyEnabled && <p className={styles.privacyNotice} role="status">Los importes y porcentajes salariales están ocultos y su edición permanece bloqueada. El PDF original también queda oculto hasta que decidas mostrarlo tras la advertencia.</p>}
               <div className={styles.fields}>{detail.extractedFields.map((field) => {
                 const value = drafts[field.fieldPath] ?? savedValue(field);
                 const confidence = Number(field.confidence);
                 const percent = Math.round(confidence * 100);
                 const isEditable = editable.has(field.fieldPath);
-                const editor = field.fieldPath === 'settlement.type'
+                const monetary = isMonetaryField(field.fieldPath);
+                const salaryPercentage = isSalaryPercentageField(field.fieldPath);
+                const editor = privacyEnabled && (monetary || salaryPercentage)
+                  ? monetary
+                    ? <MoneyValue className={styles.maskedEditor} value={value || null} currency={currencyCode} />
+                    : <PercentageValue className={styles.maskedEditor} value={value || null} />
+                  : field.fieldPath === 'settlement.type'
                   ? <select disabled={!editing || !isEditable} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))}>{settlementTypes.map((type) => <option key={type}>{type}</option>)}</select>
-                  : <input disabled={!editing || !isEditable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={field.fieldPath.includes('Amount') ? 'decimal' : undefined} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))} />;
+                  : <input disabled={!editing || !isEditable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={monetary ? 'decimal' : undefined} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))} />;
                 return <article id={field.id ? `field-${field.id}` : undefined} tabIndex={-1} key={field.fieldPath} className={`${styles.field}${selectedEvidenceId === field.id ? ` ${styles.selectedField}` : ''}`} onMouseEnter={() => { if (field.id && field.pageNumber === page) setSelectedEvidenceId(field.id); }}>
                   <label><span>{labels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label>
                   <div className={styles.provenance}><span>{provenance(field)}</span>{field.source !== 'MANUAL_REQUIRED' && Number.isFinite(percent) && confidence < .9 && <strong className={confidence < .7 ? styles.low : ''}>{confidence < .7 ? 'Confianza baja' : 'Confianza media'} · {percent}%</strong>}{field.pageNumber && <button type="button" onClick={() => showSource(field)}>Ver fuente · pág. {field.pageNumber}</button>}</div>
                   {field.missingReason && <small>{missingReasons[field.missingReason]}</small>}
-                  {(field.rawValue || field.correction) && (editing || field.correction) && <details><summary>Comparar con dato detectado</summary>{field.rawValue && <p>Texto fuente: {field.rawValue}</p>}{field.correction && <><small>Interpretado: {field.interpretedValue ?? 'No disponible'}</small><small>Corrección v{field.correction.version} · {timestampLabel(field.correction.correctedAt)}</small></>}</details>}
+                  {(field.rawValue || field.correction) && (editing || field.correction) && <details><summary>Comparar con dato detectado</summary>{field.rawValue && <p>Texto fuente: <SensitiveValue value={field.rawValue} mask={monetary ? `${currencyCode} ${MONEY_MASK}` : salaryPercentage ? PERCENTAGE_MASK : 'Dato oculto'} /></p>}{field.correction && <><small>Interpretado: {monetary || salaryPercentage ? <SensitiveValue value={field.interpretedValue} missing="No disponible" mask={monetary ? `${currencyCode} ${MONEY_MASK}` : PERCENTAGE_MASK} /> : field.interpretedValue ?? 'No disponible'}</small><small>Corrección v{field.correction.version} · {timestampLabel(field.correction.correctedAt)}</small></>}</details>}
                 </article>;
               })}</div>
               {editingStale && <p className={styles.error} role="alert">El documento fue reprocesado durante la edición. Cancelá y revisá la nueva extracción antes de volver a guardar.</p>}
-              {editing && <div className={styles.editActions}><button type="button" disabled={busy || editingStale || !editingRunId || !correctionsDirty || changes.some(({ value }) => !value.trim())} onClick={() => { if (!editingRunId || editingStale) return; void run(async () => { await onSave(changes, editingRunId); setDrafts({}); setEditingRunId(null); setEditing(false); }); }}>{busy ? 'Guardando…' : `Guardar ${changes.length || ''} cambio${changes.length === 1 ? '' : 's'}`}</button><button type="button" disabled={busy} onClick={() => { setDrafts({}); setEditingRunId(null); setEditing(false); }}>Cancelar</button></div>}
+              {editing && <div className={styles.editActions}><button type="button" disabled={busy || editingStale || !editingRunId || !correctionsDirty || privacyBlocksSave || changes.some(({ value }) => !value.trim())} onClick={() => { if (!editingRunId || editingStale || privacyBlocksSave) return; void run(async () => { await onSave(changes, editingRunId); setDrafts({}); setEditingRunId(null); setEditing(false); }); }}>{busy ? 'Guardando…' : `Guardar ${changes.length || ''} cambio${changes.length === 1 ? '' : 's'}`}</button><button type="button" disabled={busy} onClick={() => { setDrafts({}); setEditingRunId(null); setEditing(false); }}>Cancelar</button></div>}
             </section>
 
-            {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li key={item.id}><span>{item.rawDescription}</span><strong>{item.amount} {item.currencyCode}</strong>{item.sourcePage && <small>Pág. {item.sourcePage}</small>}</li>)}</ul></section>}
+            {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li key={item.id}><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /><strong><MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></strong>{item.sourcePage && <small>Pág. {item.sourcePage}</small>}</li>)}</ul></section>}
 
             {analysis && <details className={styles.timeline} open={runTimeline.some(runNeedsDecision) || undefined}>
               <summary>Historial técnico del análisis ({runTimeline.length})</summary>
@@ -446,7 +463,7 @@ export function DocumentReview({
               })}</ol> : <p>No hay versiones registradas.</p>}
             </details>}
 
-            <details className={styles.metadata}><summary>Metadatos y trazabilidad</summary><dl><div><dt>Archivo original</dt><dd>{detail.originalFilename}</dd></div><div><dt>Tipo</dt><dd>{detail.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Importado</dt><dd>{timestampLabel(detail.createdAt)}</dd></div><div><dt>Páginas</dt><dd>{detail.pageCount ?? '—'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(detail.sizeBytes)}</dd></div><div><dt>Seguridad</dt><dd>{detail.securityStatus}</dd></div><div><dt>Clasificación</dt><dd>{detail.classificationStatus ?? '—'}</dd></div><div><dt>Extracción</dt><dd>{detail.extractionRun?.processingVersion ?? '—'}</dd></div><div><dt>Método</dt><dd>{detail.extractionRun?.ocrProvider ? `OCR · ${detail.extractionRun.ocrProvider}` : detail.extractionRun?.extractorName ?? '—'}</dd></div><div><dt>Procesado</dt><dd>{timestampLabel(detail.processedAt)}</dd></div><div><dt>Retención</dt><dd>{detail.retentionPolicy}</dd></div></dl></details>
+            <details className={styles.metadata}><summary>Metadatos y trazabilidad</summary><dl><div><dt>Archivo original</dt><dd><SensitiveValue value={detail.originalFilename} mask="Nombre de archivo oculto" /></dd></div><div><dt>Tipo</dt><dd>{detail.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Importado</dt><dd>{timestampLabel(detail.createdAt)}</dd></div><div><dt>Páginas</dt><dd>{detail.pageCount ?? '—'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(detail.sizeBytes)}</dd></div><div><dt>Seguridad</dt><dd>{detail.securityStatus}</dd></div><div><dt>Clasificación</dt><dd>{detail.classificationStatus ?? '—'}</dd></div><div><dt>Extracción</dt><dd>{detail.extractionRun?.processingVersion ?? '—'}</dd></div><div><dt>Método</dt><dd>{detail.extractionRun?.ocrProvider ? `OCR · ${detail.extractionRun.ocrProvider}` : detail.extractionRun?.extractorName ?? '—'}</dd></div><div><dt>Procesado</dt><dd>{timestampLabel(detail.processedAt)}</dd></div><div><dt>Retención</dt><dd>{detail.retentionPolicy}</dd></div></dl></details>
 
             {detail.processingStatus === 'NEEDS_REVIEW' && settlement?.deductionsMatchTotal === false && <label className={styles.acceptance}><input type="checkbox" checked={acceptMismatch} onChange={(event) => setAcceptedMismatchRunId(event.target.checked ? currentRunId : null)} />Revisé los conceptos y acepto esta diferencia.</label>}
 

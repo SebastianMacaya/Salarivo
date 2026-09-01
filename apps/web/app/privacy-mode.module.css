@@ -1,0 +1,28 @@
+.toggle {
+  align-items: center;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--green-dark);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-weight: 700;
+  gap: .45rem;
+  min-height: 2.75rem;
+  padding: .5rem .7rem;
+}
+
+.toggle:hover { border-color: #a7c7b4; background: var(--green-soft); }
+.toggle:focus-visible { outline: 3px solid rgb(23 108 74 / 24%); outline-offset: 2px; }
+.toggle svg { flex: 0 0 auto; height: 1.2rem; width: 1.2rem; }
+
+.srOnly {
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  height: 1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}

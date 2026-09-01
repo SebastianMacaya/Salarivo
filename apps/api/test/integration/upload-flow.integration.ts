@@ -1667,6 +1667,7 @@ test("upload privado crea un único documento y un único intent durable", async
     },
   });
   assert.equal(priorEmploymentA.statusCode, 201, priorEmploymentA.body);
+  const priorEmploymentId = String(priorEmploymentA.json().data.id);
   const employmentEpisodes = await app.inject({ method: "GET", url: "/api/v1/employments", headers: { cookie: cookieA } });
   assert.equal(employmentEpisodes.statusCode, 200, employmentEpisodes.body);
   const currentEmploymentA = employmentEpisodes.json().data.find((employment: { id: string }) => employment.id === employmentA);
@@ -2711,6 +2712,80 @@ test("upload privado crea un único documento y un único intent durable", async
   );
   const listedDocument = documentsView.json().data.items.find((document: { id: string }) => document.id === documentId);
   assert.equal(listedDocument.displayFilename, "2026-08 - Empresa Sintética SA.pdf");
+  try {
+    const semanticPeriodUpdate = await pool.query(
+      `UPDATE extracted_fields
+          SET interpreted_value = to_jsonb('2024-11'::text)
+        WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3
+          AND field_path = 'settlement.payrollPeriod'`,
+      [userId, documentId, runId],
+    );
+    assert.equal(semanticPeriodUpdate.rowCount, 1);
+    const semanticSettlementUpdate = await pool.query(
+      `UPDATE payroll_settlements
+          SET payroll_period = '2024-11-01', settlement_type = 'SAC'
+        WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3`,
+      [userId, documentId, runId],
+    );
+    assert.equal(semanticSettlementUpdate.rowCount, 1);
+    for (const search of ["noviembre 2024", "2024-11", "2024", "aguinaldo"]) {
+      const semanticSearch = await app.inject({
+        method: "GET",
+        url: `/api/v1/documents?search=${encodeURIComponent(search)}`,
+        headers: { cookie: cookieA },
+      });
+      assert.equal(semanticSearch.statusCode, 200, `${search}: ${semanticSearch.body}`);
+      assert.deepEqual(
+        semanticSearch.json().data.items.map((document: { id: string }) => document.id),
+        [documentId],
+        search,
+      );
+      assert.deepEqual(
+        [semanticSearch.json().data.total, semanticSearch.json().data.pendingReview],
+        [1, 0],
+        search,
+      );
+    }
+    const isolatedSemanticSearch = await app.inject({
+      method: "GET",
+      url: "/api/v1/documents?search=aguinaldo",
+      headers: { cookie: cookieB },
+    });
+    assert.equal(isolatedSemanticSearch.statusCode, 200, isolatedSemanticSearch.body);
+    assert.deepEqual(
+      isolatedSemanticSearch.json().data,
+      { items: [], total: 0, pendingReview: 0, nextCursor: null },
+    );
+    await pool.query(
+      `UPDATE payroll_settlements SET settlement_type = 'COMISION'
+        WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3`,
+      [userId, documentId, runId],
+    );
+    const accentInsensitiveSearch = await app.inject({
+      method: "GET",
+      url: `/api/v1/documents?search=${encodeURIComponent("COMISIÓN")}`,
+      headers: { cookie: cookieA },
+    });
+    assert.equal(accentInsensitiveSearch.statusCode, 200, accentInsensitiveSearch.body);
+    assert.deepEqual(
+      accentInsensitiveSearch.json().data.items.map((document: { id: string }) => document.id),
+      [documentId],
+    );
+  } finally {
+    await pool.query(
+      `UPDATE extracted_fields
+          SET interpreted_value = to_jsonb('2026-08'::text)
+        WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3
+          AND field_path = 'settlement.payrollPeriod'`,
+      [userId, documentId, runId],
+    );
+    await pool.query(
+      `UPDATE payroll_settlements
+          SET payroll_period = '2026-08-01', settlement_type = 'NORMAL'
+        WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3`,
+      [userId, documentId, runId],
+    );
+  }
   const filteredDocuments = await app.inject({
     method: "GET",
     url: "/api/v1/documents?year=2026&documentType=PAYROLL&settlementType=NORMAL&search=Empresa%20Sint%C3%A9tica",
@@ -2797,6 +2872,41 @@ test("upload privado crea un único documento y un único intent durable", async
     assert.equal(response.json().data.total, expectedIds.length, query);
     assert.equal(response.json().data.pendingReview, pendingReview, query);
   }
+  const confirmedFallbackQuery = `employmentContext=${employmentA}&currencyCode=ARS`;
+  const firstConfirmedFallbackPage = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents?${confirmedFallbackQuery}&limit=2`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(firstConfirmedFallbackPage.statusCode, 200, firstConfirmedFallbackPage.body);
+  assert.equal(firstConfirmedFallbackPage.json().data.total, 3);
+  assert.equal(firstConfirmedFallbackPage.json().data.pendingReview, 0);
+  assert.equal(typeof firstConfirmedFallbackPage.json().data.nextCursor, "string");
+  const secondConfirmedFallbackPage = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents?${confirmedFallbackQuery}&limit=2&cursor=${encodeURIComponent(firstConfirmedFallbackPage.json().data.nextCursor)}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(secondConfirmedFallbackPage.statusCode, 200, secondConfirmedFallbackPage.body);
+  assert.equal(secondConfirmedFallbackPage.json().data.total, 3);
+  assert.equal(secondConfirmedFallbackPage.json().data.pendingReview, 0);
+  assert.equal(secondConfirmedFallbackPage.json().data.nextCursor, null);
+  assert.deepEqual(
+    [...firstConfirmedFallbackPage.json().data.items, ...secondConfirmedFallbackPage.json().data.items]
+      .map((document: { id: string }) => document.id)
+      .sort(),
+    listFixtures.slice(1).map(({ id }) => id).sort(),
+  );
+  for (const [query, cookie] of [
+    [`employmentContext=${employmentA}&currencyCode=USD`, cookieA],
+    [`employmentContext=${priorEmploymentId}&currencyCode=ARS`, cookieA],
+    [confirmedFallbackQuery, cookieB],
+    ["employmentContext=detected%3Ano-es-un-contexto&currencyCode=ARS", cookieA],
+  ]) {
+    const response = await app.inject({ method: "GET", url: `/api/v1/documents?${query}`, headers: { cookie } });
+    assert.equal(response.statusCode, 200, `${query}: ${response.body}`);
+    assert.deepEqual(response.json().data, { items: [], total: 0, pendingReview: 0, nextCursor: null }, query);
+  }
   assert.equal(
     (await pool.query("SELECT document_type FROM documents WHERE id = $1", [listFixtures[1]!.id])).rows[0].document_type,
     null,
@@ -2808,6 +2918,8 @@ test("upload privado crea un único documento y un único intent durable", async
   for (const query of [
     "limit=101", "cursor=no-es-un-cursor", "period=2026-13", "processingStatus=INVENTADO",
     "statusGroup=INVENTADO", "documentType=INVENTADO", "search=uno&search=dos",
+    `employmentContext=${employmentA}`, "currencyCode=ARS", `employmentContext=${employmentA}&currencyCode=ars`,
+    "employerName=Empresa",
   ]) {
     assert.equal(
       (await app.inject({ method: "GET", url: `/api/v1/documents?${query}`, headers: { cookie: cookieA } })).statusCode,
@@ -2971,6 +3083,33 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.match(employmentContext, /^detected:[0-9a-f-]{36}$/);
   const detectedEmployerContextId = employmentContext.slice("detected:".length);
   const conceptContextQuery = `employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa Sintética SA")}`;
+  const detectedDocumentContextQuery = `employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=ARS`;
+  const detectedContextDocuments = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents?${detectedDocumentContextQuery}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(detectedContextDocuments.statusCode, 200, detectedContextDocuments.body);
+  assert.deepEqual(
+    detectedContextDocuments.json().data.items.map((document: { id: string }) => document.id),
+    [documentId],
+  );
+  assert.deepEqual(
+    {
+      total: detectedContextDocuments.json().data.total,
+      pendingReview: detectedContextDocuments.json().data.pendingReview,
+      nextCursor: detectedContextDocuments.json().data.nextCursor,
+    },
+    { total: 1, pendingReview: 0, nextCursor: null },
+  );
+  for (const [query, cookie] of [
+    [`employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=USD`, cookieA],
+    [detectedDocumentContextQuery, cookieB],
+  ]) {
+    const response = await app.inject({ method: "GET", url: `/api/v1/documents?${query}`, headers: { cookie } });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json().data, { items: [], total: 0, pendingReview: 0, nextCursor: null });
+  }
   assert.equal((await app.inject({
     method: "GET",
     url: `/api/v1/salary-history/concepts?employmentContext=${encodeURIComponent(employmentContext)}&currencyCode=ARS&employerName=Otra`,
@@ -3026,31 +3165,134 @@ test("upload privado crea un único documento y un único intent durable", async
     [userId, runId],
   );
   assert.equal(employerCorrectionState.rowCount, 1);
-  await pool.query("UPDATE documents SET detected_employer_id = NULL WHERE id = $1", [documentId]);
-  await pool.query("UPDATE user_corrections SET corrected_value = $2::jsonb WHERE id = $1", [
-    employerCorrectionState.rows[0].id, JSON.stringify("Empresa+Sintética SA"),
-  ]);
-  const legacyPunctuationSalaryHistory = await app.inject({
-    method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
-  });
-  assert.equal(legacyPunctuationSalaryHistory.statusCode, 200, legacyPunctuationSalaryHistory.body);
-  const legacyPunctuationContext = legacyPunctuationSalaryHistory.json().data.contexts.find(
-    (context: { employerName: string }) => context.employerName === "Empresa+Sintética SA",
-  )?.employmentContext as string;
-  assert.match(legacyPunctuationContext, /^detected:[0-9a-f]{24}$/);
-  const legacyPunctuationConcepts = await app.inject({
-    method: "GET",
-    url: `/api/v1/salary-history/concepts?employmentContext=${encodeURIComponent(legacyPunctuationContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa+Sintética SA")}`,
-    headers: { cookie: cookieA },
-  });
-  assert.equal(legacyPunctuationConcepts.statusCode, 200, legacyPunctuationConcepts.body);
-  assert.ok(legacyPunctuationConcepts.json().data.items.length > 0);
-  await pool.query("UPDATE user_corrections SET corrected_value = $2::jsonb WHERE id = $1", [
-    employerCorrectionState.rows[0].id, JSON.stringify(employerCorrectionState.rows[0].corrected_value),
-  ]);
-  await pool.query("UPDATE documents SET detected_employer_id = $2 WHERE id = $1", [
-    documentId, detectedCanonicalEmployerId,
-  ]);
+  try {
+    await pool.query("UPDATE documents SET detected_employer_id = NULL WHERE id = $1", [documentId]);
+    await pool.query("UPDATE user_corrections SET corrected_value = $2::jsonb WHERE id = $1", [
+      employerCorrectionState.rows[0].id, JSON.stringify("Empresa+Sintética SA"),
+    ]);
+    const legacyPunctuationSalaryHistory = await app.inject({
+      method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
+    });
+    assert.equal(legacyPunctuationSalaryHistory.statusCode, 200, legacyPunctuationSalaryHistory.body);
+    const legacyPunctuationContext = legacyPunctuationSalaryHistory.json().data.contexts.find(
+      (context: { employerName: string }) => context.employerName === "Empresa+Sintética SA",
+    )?.employmentContext as string;
+    assert.match(legacyPunctuationContext, /^detected:[0-9a-f]{24}$/);
+    const legacyPunctuationConcepts = await app.inject({
+      method: "GET",
+      url: `/api/v1/salary-history/concepts?employmentContext=${encodeURIComponent(legacyPunctuationContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa+Sintética SA")}`,
+      headers: { cookie: cookieA },
+    });
+    assert.equal(legacyPunctuationConcepts.statusCode, 200, legacyPunctuationConcepts.body);
+    assert.ok(legacyPunctuationConcepts.json().data.items.length > 0);
+    const legacyPunctuationDocuments = await app.inject({
+      method: "GET",
+      url: `/api/v1/documents?employmentContext=${encodeURIComponent(legacyPunctuationContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa+Sintética SA")}`,
+      headers: { cookie: cookieA },
+    });
+    assert.equal(legacyPunctuationDocuments.statusCode, 200, legacyPunctuationDocuments.body);
+    assert.deepEqual(
+      legacyPunctuationDocuments.json().data.items.map((document: { id: string }) => document.id),
+      [documentId],
+    );
+    assert.deepEqual(
+      {
+        total: legacyPunctuationDocuments.json().data.total,
+        pendingReview: legacyPunctuationDocuments.json().data.pendingReview,
+        nextCursor: legacyPunctuationDocuments.json().data.nextCursor,
+      },
+      { total: 1, pendingReview: 0, nextCursor: null },
+    );
+    const isolatedLegacyPunctuationDocuments = await app.inject({
+      method: "GET",
+      url: `/api/v1/documents?employmentContext=${encodeURIComponent(legacyPunctuationContext)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa+Sintética SA")}`,
+      headers: { cookie: cookieB },
+    });
+    assert.equal(isolatedLegacyPunctuationDocuments.statusCode, 200, isolatedLegacyPunctuationDocuments.body);
+    assert.deepEqual(isolatedLegacyPunctuationDocuments.json().data, {
+      items: [], total: 0, pendingReview: 0, nextCursor: null,
+    });
+    assert.equal((await app.inject({
+      method: "GET",
+      url: `/api/v1/documents?employmentContext=${encodeURIComponent(legacyPunctuationContext)}&currencyCode=ARS&employerName=Otra`,
+      headers: { cookie: cookieA },
+    })).statusCode, 400);
+
+    const unconfirmedContext = `unconfirmed:${documentId}`;
+    const namedUnconfirmedDocuments = await app.inject({
+      method: "GET",
+      url: `/api/v1/documents?employmentContext=${encodeURIComponent(unconfirmedContext)}&currencyCode=ARS`,
+      headers: { cookie: cookieA },
+    });
+    assert.equal(namedUnconfirmedDocuments.statusCode, 200, namedUnconfirmedDocuments.body);
+    assert.deepEqual(namedUnconfirmedDocuments.json().data, {
+      items: [], total: 0, pendingReview: 0, nextCursor: null,
+    });
+    await pool.query(
+      `UPDATE user_corrections
+          SET extracted_field_id = NULL, field_path = 'employer.name.hidden'
+        WHERE id = $1`,
+      [employerCorrectionState.rows[0].id],
+    );
+    await pool.query("UPDATE extracted_fields SET field_path = 'employer.name.hidden' WHERE id = $1", [employerFieldId]);
+    const unconfirmedSalaryHistory = await app.inject({
+      method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA },
+    });
+    assert.equal(unconfirmedSalaryHistory.statusCode, 200, unconfirmedSalaryHistory.body);
+    assert.equal(
+      unconfirmedSalaryHistory.json().data.contexts.find(
+        (context: { employmentContext: string }) => context.employmentContext === unconfirmedContext,
+      )?.state,
+      "UNCONFIRMED",
+    );
+    const unconfirmedDocuments = await app.inject({
+      method: "GET",
+      url: `/api/v1/documents?employmentContext=${encodeURIComponent(unconfirmedContext)}&currencyCode=ARS`,
+      headers: { cookie: cookieA },
+    });
+    assert.equal(unconfirmedDocuments.statusCode, 200, unconfirmedDocuments.body);
+    assert.deepEqual(
+      unconfirmedDocuments.json().data.items.map((document: { id: string }) => document.id),
+      [documentId],
+    );
+    assert.deepEqual(
+      {
+        total: unconfirmedDocuments.json().data.total,
+        pendingReview: unconfirmedDocuments.json().data.pendingReview,
+        nextCursor: unconfirmedDocuments.json().data.nextCursor,
+      },
+      { total: 1, pendingReview: 0, nextCursor: null },
+    );
+    const unconfirmedContextCases: Array<[string, string, string]> = [
+      [unconfirmedContext, "USD", cookieA],
+      [`unconfirmed:${crypto.randomUUID()}`, "ARS", cookieA],
+      [unconfirmedContext, "ARS", cookieB],
+    ];
+    for (const [context, currencyCode, cookie] of unconfirmedContextCases) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/documents?employmentContext=${encodeURIComponent(context)}&currencyCode=${currencyCode}`,
+        headers: { cookie },
+      });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.deepEqual(response.json().data, { items: [], total: 0, pendingReview: 0, nextCursor: null });
+    }
+  } finally {
+    await pool.query("UPDATE extracted_fields SET field_path = 'employer.name' WHERE id = $1", [employerFieldId]);
+    await pool.query(
+      `UPDATE user_corrections
+          SET corrected_value = $2::jsonb, extracted_field_id = $3, field_path = 'employer.name'
+        WHERE id = $1`,
+      [
+        employerCorrectionState.rows[0].id,
+        JSON.stringify(employerCorrectionState.rows[0].corrected_value),
+        employerFieldId,
+      ],
+    );
+    await pool.query("UPDATE documents SET detected_employer_id = $2 WHERE id = $1", [
+      documentId, detectedCanonicalEmployerId,
+    ]);
+  }
   const isolatedSalaryHistory = await app.inject({ method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieB } });
   assert.equal(isolatedSalaryHistory.statusCode, 200, isolatedSalaryHistory.body);
   assert.deepEqual(isolatedSalaryHistory.json().data.analytics.scopes, []);
@@ -3133,6 +3375,64 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(String(persistedAssociation.rows[0].document_employment_id), employmentA);
   assert.equal(String(persistedAssociation.rows[0].settlement_employment_id), employmentA);
   assert.equal(String(persistedAssociation.rows[0].item_employment_id), employmentA);
+
+  let priorEpisodeAssigned = false;
+  try {
+    const assignPriorEpisode = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/documents/employment",
+      headers: { origin, cookie: cookieA },
+      payload: { documentIds: [listFixtures[3]!.id], employmentId: priorEmploymentId },
+    });
+    assert.equal(assignPriorEpisode.statusCode, 200, assignPriorEpisode.body);
+    priorEpisodeAssigned = true;
+    await pool.query(
+      "UPDATE payroll_settlements SET currency_code = 'USD' WHERE id = $1 AND user_id = $2",
+      [settlementId, userId],
+    );
+    const confirmedContextCases: Array<[string, string, string[]]> = [
+      [cookieA, `employmentContext=${employmentA}&currencyCode=ARS`, [listFixtures[1]!.id, listFixtures[2]!.id]],
+      [cookieA, `employmentContext=${employmentA}&currencyCode=USD`, [documentId]],
+      [cookieA, `employmentContext=${priorEmploymentId}&currencyCode=ARS`, [listFixtures[3]!.id]],
+      [cookieA, `employmentContext=${priorEmploymentId}&currencyCode=USD`, []],
+      [cookieB, `employmentContext=${employmentA}&currencyCode=ARS`, []],
+      [cookieA, `employmentContext=${employmentB}&currencyCode=ARS`, []],
+    ];
+    for (const [cookie, query, expectedIds] of confirmedContextCases) {
+      const response = await app.inject({
+        method: "GET", url: `/api/v1/documents?${query}`, headers: { cookie },
+      });
+      assert.equal(response.statusCode, 200, `${query}: ${response.body}`);
+      assert.deepEqual(
+        response.json().data.items.map((document: { id: string }) => document.id).sort(),
+        [...expectedIds].sort(),
+        query,
+      );
+      assert.deepEqual(
+        {
+          total: response.json().data.total,
+          pendingReview: response.json().data.pendingReview,
+          nextCursor: response.json().data.nextCursor,
+        },
+        { total: expectedIds.length, pendingReview: 0, nextCursor: null },
+        query,
+      );
+    }
+  } finally {
+    await pool.query(
+      "UPDATE payroll_settlements SET currency_code = 'ARS' WHERE id = $1 AND user_id = $2",
+      [settlementId, userId],
+    );
+    if (priorEpisodeAssigned) {
+      const restoreCurrentEpisode = await app.inject({
+        method: "PATCH",
+        url: "/api/v1/documents/employment",
+        headers: { origin, cookie: cookieA },
+        payload: { documentIds: [listFixtures[3]!.id], employmentId: employmentA },
+      });
+      assert.equal(restoreCurrentEpisode.statusCode, 200, restoreCurrentEpisode.body);
+    }
+  }
 
   const disassociation = await app.inject({
     method: "PATCH",

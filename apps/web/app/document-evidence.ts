@@ -4,6 +4,24 @@ export type DocumentLocation = {
   page?: number;
 };
 
+export type OwnerLocation = {
+  currencyCode?: string;
+  documentType?: 'PAYROLL' | 'UNSUPPORTED' | 'ALL';
+  employmentContext?: string;
+  employmentId?: string;
+  period?: string;
+  range?: '6' | '12' | '24' | '60' | 'all';
+  section?: 'summary' | 'jobs' | 'import' | 'history' | 'settings';
+  settlementType?: string;
+  status?: 'ALL' | 'READY' | 'REVIEW' | 'PROCESSING' | 'ERROR';
+  tab?: 'summary' | 'evolution' | 'annual' | 'concepts' | 'documents';
+  year?: string;
+};
+
+export type OwnerLocationPatch = {
+  [Key in keyof OwnerLocation]?: OwnerLocation[Key] | null;
+};
+
 export type CursorDocumentPage<T> = {
   items: T[];
   nextCursor: string | null;
@@ -23,6 +41,28 @@ export type NormalizedRegion = {
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const amountField = /^settlement\..+Amount$/;
+const ownerSections = ['summary', 'jobs', 'import', 'history', 'settings'] as const;
+const ownerTabs = ['summary', 'evolution', 'annual', 'concepts', 'documents'] as const;
+const ownerRanges = ['6', '12', '24', '60', 'all'] as const;
+const ownerDocumentTypes = ['PAYROLL', 'UNSUPPORTED', 'ALL'] as const;
+const ownerStatuses = ['ALL', 'READY', 'REVIEW', 'PROCESSING', 'ERROR'] as const;
+const year = /^(?:20\d{2}|all)$/;
+const period = /^20\d{2}-(?:0[1-9]|1[0-2])$/;
+const currencyCode = /^[A-Z]{3}$/;
+const safeToken = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+function listed<T extends string>(values: readonly T[], value: string | null): value is T {
+  return value !== null && values.includes(value as T);
+}
+
+function safeEmploymentContext(value: string | null): value is string {
+  if (!value) return false;
+  if (uuid.test(value)) return true;
+  const [prefix, id, extra] = value.split(':');
+  return extra === undefined
+    && (prefix === 'detected' || prefix === 'unconfirmed')
+    && (uuid.test(id ?? '') || (prefix === 'detected' && /^[0-9a-f]{24}$/i.test(id ?? '')));
+}
 
 export async function fetchDocumentPrefix<T>(
   fetchPage: (cursor: string | undefined, limit: number) => Promise<CursorDocumentPage<T>>,
@@ -115,6 +155,71 @@ export function extractionRunChanged(editingRunId: string | null, currentRunId: 
   return editingRunId !== currentRunId;
 }
 
+export function readOwnerLocation(search: string): OwnerLocation {
+  const params = new URLSearchParams(search);
+  const location: OwnerLocation = {};
+  const currency = params.get('currencyCode');
+  const section = params.get('section');
+  const employmentContext = params.get('employmentContext');
+  const employmentId = params.get('employmentId');
+  const tab = params.get('tab');
+  const range = params.get('range');
+  const selectedYear = params.get('year');
+  const selectedPeriod = params.get('period');
+  const documentType = params.get('documentType');
+  const settlementType = params.get('settlementType');
+  const status = params.get('status');
+
+  if (currency && currencyCode.test(currency)) location.currencyCode = currency;
+  if (listed(ownerSections, section)) location.section = section;
+  if (safeEmploymentContext(employmentContext)) location.employmentContext = employmentContext;
+  if (employmentId && uuid.test(employmentId)) location.employmentId = employmentId;
+  if (listed(ownerTabs, tab)) location.tab = tab;
+  if (listed(ownerRanges, range)) location.range = range;
+  if (selectedYear && year.test(selectedYear)) location.year = selectedYear;
+  if (selectedPeriod && period.test(selectedPeriod)) location.period = selectedPeriod;
+  if (listed(ownerDocumentTypes, documentType)) location.documentType = documentType;
+  if (settlementType && safeToken.test(settlementType)) location.settlementType = settlementType;
+  if (listed(ownerStatuses, status)) location.status = status;
+  return location;
+}
+
+function locationSearch(owner: OwnerLocation, documentLocation: DocumentLocation | null): string {
+  const params = new URLSearchParams();
+  if (owner.currencyCode && currencyCode.test(owner.currencyCode)) params.set('currencyCode', owner.currencyCode);
+  if (listed(ownerSections, owner.section ?? null)) params.set('section', owner.section!);
+  if (safeEmploymentContext(owner.employmentContext ?? null)) params.set('employmentContext', owner.employmentContext!);
+  if (owner.employmentId && uuid.test(owner.employmentId)) params.set('employmentId', owner.employmentId);
+  if (listed(ownerTabs, owner.tab ?? null)) params.set('tab', owner.tab!);
+  if (listed(ownerRanges, owner.range ?? null)) params.set('range', owner.range!);
+  if (owner.year && year.test(owner.year)) params.set('year', owner.year);
+  if (owner.period && period.test(owner.period)) params.set('period', owner.period);
+  if (listed(ownerDocumentTypes, owner.documentType ?? null)) params.set('documentType', owner.documentType!);
+  if (owner.settlementType && safeToken.test(owner.settlementType)) params.set('settlementType', owner.settlementType);
+  if (listed(ownerStatuses, owner.status ?? null)) params.set('status', owner.status!);
+  if (documentLocation && uuid.test(documentLocation.documentId)) {
+    params.set('document', documentLocation.documentId);
+    if (Number.isInteger(documentLocation.page) && documentLocation.page! > 1 && documentLocation.page! <= 500) {
+      params.set('page', String(documentLocation.page));
+    }
+    if (documentLocation.evidenceId && uuid.test(documentLocation.evidenceId)) {
+      params.set('evidence', documentLocation.evidenceId);
+    }
+  }
+  const value = params.toString();
+  return value ? `?${value}` : '';
+}
+
+export function writeOwnerLocation(search: string, patch: OwnerLocationPatch): string {
+  const next = { ...readOwnerLocation(search) };
+  for (const key of Object.keys(patch) as Array<keyof OwnerLocation>) {
+    const value = patch[key];
+    if (value === null) delete next[key];
+    else if (value !== undefined) Object.assign(next, { [key]: value });
+  }
+  return locationSearch(next, readDocumentLocation(search));
+}
+
 export function readDocumentLocation(search: string): DocumentLocation | null {
   const params = new URLSearchParams(search);
   const documentId = params.get('document');
@@ -129,15 +234,8 @@ export function readDocumentLocation(search: string): DocumentLocation | null {
   };
 }
 
-export function writeDocumentLocation(_search: string, location: DocumentLocation | null): string {
-  const params = new URLSearchParams();
-  if (location && uuid.test(location.documentId)) {
-    params.set('document', location.documentId);
-    if (Number.isInteger(location.page) && location.page! > 1 && location.page! <= 500) params.set('page', String(location.page));
-    if (location.evidenceId && uuid.test(location.evidenceId)) params.set('evidence', location.evidenceId);
-  }
-  const value = params.toString();
-  return value ? `?${value}` : '';
+export function writeDocumentLocation(search: string, location: DocumentLocation | null): string {
+  return locationSearch(readOwnerLocation(search), location);
 }
 
 export function normalizeReviewValue(fieldPath: string, input: string): string {

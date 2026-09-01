@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–020. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–021. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 

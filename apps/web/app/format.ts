@@ -96,6 +96,32 @@ export function salaryContextOptionLabel(context: {
   ].filter(Boolean).join(' · ');
 }
 
+export function salaryContextMatches(
+  context: Parameters<typeof salaryContextOptionLabel>[0],
+  query: string,
+  employment?: { role?: string | null } | null,
+) {
+  const normalizedQuery = query.normalize('NFKD').replace(/\p{Diacritic}/gu, '').trim().toLowerCase();
+  if (!normalizedQuery) return true;
+  const haystack = `${salaryContextOptionLabel(context)} ${employment?.role ?? ''} ${periodLabel(context.firstPeriod)} ${periodLabel(context.lastPeriod)}`
+    .normalize('NFKD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+  return normalizedQuery.split(/\s+/).every((term) => haystack.includes(term));
+}
+
+export function salaryContextIdentityMatches(
+  context: { employmentContext: string; employmentId?: string | null; currencyCode: string },
+  requested: { employmentContext?: string | null; employmentId?: string | null; currencyCode?: string | null },
+) {
+  if (requested.employmentId) {
+    return context.employmentId === requested.employmentId
+      && (!requested.employmentContext || context.employmentContext === requested.employmentContext)
+      && (!requested.currencyCode || context.currencyCode === requested.currencyCode);
+  }
+  return Boolean(requested.employmentContext)
+    && context.employmentContext === requested.employmentContext
+    && (!requested.currencyCode || context.currencyCode === requested.currencyCode);
+}
+
 export function timestampLabel(value?: string | null) {
   if (!value || !value.includes('T')) return '—';
   const date = new Date(value);
@@ -136,6 +162,13 @@ export function recentPeriodRange<T extends { period: string }>(items: T[], mont
   const index = (period: string) => Number(period.slice(0, 4)) * 12 + Number(period.slice(5, 7)) - 1;
   const first = index(items.at(-1)!.period) - months + 1;
   return items.filter(({ period }) => index(period) >= first);
+}
+
+export function relevantEvolutionRanges(periods: string[]) {
+  if (!periods.length) return ['all'] as const;
+  const index = (period: string) => Number(period.slice(0, 4)) * 12 + Number(period.slice(5, 7)) - 1;
+  const span = index(periods.at(-1)!) - index(periods[0]!) + 1;
+  return [...([6, 12, 24, 60] as const).filter((months) => span > months), 'all'] as const;
 }
 
 export const salaryCategories = [

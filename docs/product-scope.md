@@ -32,6 +32,8 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - detección persistida del empleador de un documento y autoasociación sólo cuando existe un único empleo propio del mismo empleador y moneda que cubre el período; los casos sin coincidencia o ambiguos requieren confirmación explícita;
 - confidence por campo, carga manual de montos ausentes y cierre explícito de revisión;
 - historial `salary-analytics-v1` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
+- navegación contextual y recuperable desde la URL entre un empleo, su historial salarial, períodos, conceptos y documentos asociados;
+- modo privacidad visual global en la interfaz autenticada para enmascarar importes, porcentajes y gráficos financieros durante la navegación, sin modificar datos ni crear copias censuradas, y con advertencia antes de abrir un PDF original;
 - visor privado del PDF por página con evidencia espacial cuando es inequívoca, datos extraídos y procedencia lado a lado;
 - corrección en bloque, detección de resultados recuperables y reproceso individual/agrupado que compara candidatos, conserva la precedencia humana y promociona sólo mejoras seguras;
 - eliminación de original, documento o cuenta;

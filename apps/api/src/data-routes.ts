@@ -90,6 +90,9 @@ type DocumentListQuery = {
   year?: string;
   period?: string;
   employmentId?: string;
+  employmentContext?: string;
+  currencyCode?: string;
+  employerName?: string;
   processingStatus?: string;
   statusGroup?: "ALL" | "READY" | "REVIEW" | "PROCESSING" | "ERROR";
   documentType?: string;
@@ -129,6 +132,45 @@ const settlementTypes = new Set([
   "NORMAL", "SAC", "VACACIONES", "BONO", "RETROACTIVO", "COMISION",
   "HORAS_EXTRA", "LIQUIDACION_FINAL", "INDEMNIZACION", "AJUSTE", "REINTEGRO", "OTRO_LABORAL",
 ]);
+const spanishPayrollMonths = new Map([
+  ["enero", "01"], ["febrero", "02"], ["marzo", "03"], ["abril", "04"],
+  ["mayo", "05"], ["junio", "06"], ["julio", "07"], ["agosto", "08"],
+  ["septiembre", "09"], ["setiembre", "09"], ["octubre", "10"],
+  ["noviembre", "11"], ["diciembre", "12"],
+]);
+const settlementSearchTerms = new Map([
+  ["normal", "NORMAL"], ["liquidacion normal", "NORMAL"],
+  ["sac", "SAC"], ["aguinaldo", "SAC"], ["sueldo anual complementario", "SAC"],
+  ["vacacion", "VACACIONES"], ["vacaciones", "VACACIONES"],
+  ["bono", "BONO"], ["bonos", "BONO"], ["premio", "BONO"], ["premios", "BONO"],
+  ["retroactivo", "RETROACTIVO"], ["retroactiva", "RETROACTIVO"],
+  ["retroactivos", "RETROACTIVO"], ["retroactivas", "RETROACTIVO"],
+  ["comision", "COMISION"], ["comisiones", "COMISION"],
+  ["hora extra", "HORAS_EXTRA"], ["horas extra", "HORAS_EXTRA"], ["horas extras", "HORAS_EXTRA"],
+  ["liquidacion final", "LIQUIDACION_FINAL"],
+  ["indemnizacion", "INDEMNIZACION"], ["indemnizaciones", "INDEMNIZACION"],
+  ["ajuste", "AJUSTE"], ["ajustes", "AJUSTE"],
+  ["reintegro", "REINTEGRO"], ["reintegros", "REINTEGRO"],
+  ["devolucion", "REINTEGRO"], ["devoluciones", "REINTEGRO"],
+  ["credito", "REINTEGRO"], ["creditos", "REINTEGRO"],
+  ["otra liquidacion", "OTRO_LABORAL"], ["otro laboral", "OTRO_LABORAL"],
+  ["otro_laboral", "OTRO_LABORAL"],
+]);
+
+function documentSearchTerms(input: string): { month?: string; period?: string; settlementType?: string; year?: string } {
+  const normalized = input.normalize("NFKD").replace(/\p{Diacritic}/gu, "").toLowerCase().replace(/\s+/g, " ").trim();
+  const monthMatch = /^([a-z]+)(?: (?:de )?(20\d{2}))?$/.exec(normalized);
+  const numericPeriod = /^(20\d{2})-(0[1-9]|1[0-2])$/.test(normalized) ? normalized : undefined;
+  const year = /^20\d{2}$/.test(normalized) ? normalized : undefined;
+  const month = monthMatch?.[1] ? spanishPayrollMonths.get(monthMatch[1]) : undefined;
+  const settlementType = settlementSearchTerms.get(normalized);
+  return {
+    ...(month ? { month } : {}),
+    ...(numericPeriod ? { period: numericPeriod } : month && monthMatch?.[2] ? { period: `${monthMatch[2]}-${month}` } : {}),
+    ...(settlementType ? { settlementType } : {}),
+    ...(year ? { year } : {}),
+  };
+}
 const manualCorrectionPaths = new Set([
   "employer.name", "settlement.type", "settlement.payrollPeriod", ...settlementAmountColumns.keys(),
 ]);
@@ -2234,6 +2276,25 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         && !uuid.test(request.query.employmentId)) {
         throw new ApiError(400, "VALIDATION_ERROR", "El empleo no es válido.");
       }
+      const hasEmploymentContext = request.query.employmentContext !== undefined;
+      const hasCurrencyCode = request.query.currencyCode !== undefined;
+      if (hasEmploymentContext !== hasCurrencyCode) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El contexto laboral y la moneda deben informarse juntos.");
+      }
+      if (request.query.employmentContext !== undefined
+        && (request.query.employmentContext.length < 1 || request.query.employmentContext.length > 128)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "El contexto laboral no es válido.");
+      }
+      if (request.query.currencyCode !== undefined && !/^[A-Z]{3}$/.test(request.query.currencyCode)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "La moneda no es válida.");
+      }
+      if (request.query.employerName !== undefined
+        && (request.query.employerName.length < 1 || request.query.employerName.length > 160)) {
+        throw new ApiError(400, "VALIDATION_ERROR", "La empresa no es válida.");
+      }
+      if (request.query.employerName !== undefined && !hasEmploymentContext) {
+        throw new ApiError(400, "VALIDATION_ERROR", "La empresa requiere un contexto laboral.");
+      }
       if (request.query.documentType !== undefined && !["PAYROLL", "UNSUPPORTED"].includes(request.query.documentType)) {
         throw new ApiError(400, "VALIDATION_ERROR", "El tipo de documento no es válido.");
       }
@@ -2254,15 +2315,88 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         return `$${parameters.length}`;
       };
       if (search) {
+        const semantic = documentSearchTerms(search);
         const searchParameter = parameter(`%${search.replace(/[\\%_]/g, "\\$&")}%`);
-        conditions.push(`(document.original_filename ILIKE ${searchParameter} ESCAPE '\\'
-          OR COALESCE(employer.name, projection.corrected_employer_name, projection.extracted_employer_name, '')
-             ILIKE ${searchParameter} ESCAPE '\\')`);
+        const searchConditions = [
+          `document.original_filename ILIKE ${searchParameter} ESCAPE '\\'`,
+          `COALESCE(employer.name, projection.corrected_employer_name, projection.extracted_employer_name, '')
+             ILIKE ${searchParameter} ESCAPE '\\'`,
+        ];
+        if (semantic.period) searchConditions.push(`projection.payroll_period = ${parameter(semantic.period)}`);
+        else if (semantic.month) {
+          searchConditions.push(`substring(projection.payroll_period FROM 6 FOR 2) = ${parameter(semantic.month)}`);
+        }
+        else if (semantic.year) searchConditions.push(`projection.payroll_period LIKE ${parameter(`${semantic.year}-%`)}`);
+        if (semantic.settlementType) {
+          searchConditions.push(`projection.settlement_type = ${parameter(semantic.settlementType)}`);
+        }
+        conditions.push(`(${searchConditions.join(" OR ")})`);
       }
       if (request.query.year) conditions.push(`projection.payroll_period LIKE ${parameter(`${request.query.year}-%`)}`);
       if (request.query.period) conditions.push(`projection.payroll_period = ${parameter(request.query.period)}`);
       if (request.query.employmentId === "unassociated") conditions.push("document.employment_id IS NULL");
       else if (request.query.employmentId) conditions.push(`document.employment_id = ${parameter(request.query.employmentId)}::uuid`);
+      if (request.query.employmentContext !== undefined && request.query.currencyCode !== undefined) {
+        const currencyParameter = parameter(request.query.currencyCode);
+        const activeSettlementScope = (scopeCondition: string, join = "") => `EXISTS (
+          SELECT 1 FROM payroll_settlements settlement
+          ${join}
+           WHERE settlement.user_id = document.user_id
+             AND settlement.document_id = document.id
+             AND settlement.extraction_run_id = document.active_extraction_run_id
+             AND settlement.currency_code = ${currencyParameter}
+             AND ${scopeCondition}
+        )`;
+        const stableDetectedContext = /^detected:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.exec(request.query.employmentContext);
+        const legacyDetectedContext = /^detected:[0-9a-f]{24}$/.test(request.query.employmentContext);
+        const unconfirmedContext = /^unconfirmed:([0-9a-f-]{36})$/.exec(request.query.employmentContext);
+        if (uuid.test(request.query.employmentContext)) {
+          const contextParameter = parameter(request.query.employmentContext);
+          conditions.push(`(
+            ${activeSettlementScope(`settlement.employment_id = ${contextParameter}::uuid`)}
+            OR (
+              document.employment_id = ${contextParameter}::uuid
+              AND NOT EXISTS (
+                SELECT 1 FROM payroll_settlements active_settlement
+                 WHERE active_settlement.user_id = document.user_id
+                   AND active_settlement.document_id = document.id
+                   AND active_settlement.extraction_run_id = document.active_extraction_run_id
+              )
+              AND EXISTS (
+                SELECT 1 FROM employments context_employment
+                 WHERE context_employment.id = ${contextParameter}::uuid
+                   AND context_employment.user_id = document.user_id
+                   AND context_employment.currency_code = ${currencyParameter}
+              )
+            )
+          )`);
+        } else if (stableDetectedContext) {
+          const detectedEmployerParameter = parameter(stableDetectedContext[1]);
+          conditions.push(activeSettlementScope(`settlement.employment_id IS NULL
+            AND document.detected_employer_id = ${detectedEmployerParameter}::uuid`));
+        } else if (legacyDetectedContext) {
+          const identity = request.query.employerName === undefined
+            ? null
+            : detectedEmploymentIdentity(request.query.employerName);
+          if (identity === null || identity.context !== request.query.employmentContext) {
+            throw new ApiError(400, "VALIDATION_ERROR", "El contexto laboral no es válido.");
+          }
+          conditions.push(activeSettlementScope(
+            `settlement.employment_id IS NULL
+             AND normalize_employer_name_conservative(detected_employer.name) = ${parameter(identity.key)}`,
+            detectedEmployerNameJoin,
+          ));
+        } else if (unconfirmedContext !== null && uuid.test(unconfirmedContext[1]!)) {
+          conditions.push(activeSettlementScope(
+            `settlement.employment_id IS NULL
+             AND document.id = ${parameter(unconfirmedContext[1])}::uuid
+             AND NULLIF(btrim(normalize(detected_employer.name, NFKC)), '') IS NULL`,
+            detectedEmployerNameJoin,
+          ));
+        } else {
+          return { data: { items: [], total: 0, pendingReview: 0, nextCursor: null } };
+        }
+      }
       if (request.query.processingStatus) conditions.push(`document.processing_status = ${parameter(request.query.processingStatus)}`);
       if (request.query.statusGroup === "READY") {
         conditions.push(`document.processing_status = 'COMPLETED' AND NOT ${documentNeedsReviewSql}`);

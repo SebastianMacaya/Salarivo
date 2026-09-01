@@ -9,7 +9,10 @@ import {
   percentage,
   periodLabel,
   recentPeriodRange,
+  relevantEvolutionRanges,
+  salaryContextIdentityMatches,
   salaryContextOptionLabel,
+  salaryContextMatches,
   settlementTypeLabel,
   timestampLabel,
 } from '../app/format.ts';
@@ -57,6 +60,30 @@ test('los rangos temporales usan meses calendario aunque falten recibos', () => 
   const points = [{ period: '2025-01' }, { period: '2025-12' }, { period: '2026-01' }];
   assert.deepEqual(recentPeriodRange(points, 6), points.slice(1));
   assert.equal(recentPeriodRange(points), points);
+  assert.deepEqual(relevantEvolutionRanges(['2026-01', '2026-11']), [6, 'all']);
+  assert.deepEqual(relevantEvolutionRanges(['2026-01', '2026-05']), ['all']);
+  assert.deepEqual(relevantEvolutionRanges(['2025-01', '2026-01']), [6, 12, 'all']);
+});
+
+test('busca contextos por empresa, puesto, estado y período sin depender de tildes', () => {
+  const context = {
+    employerName: 'Compañía sintética', state: 'CONFIRMED' as const, currencyCode: 'ARS',
+    employmentStatus: 'ENDED', startDate: '2020-02-01', endDate: '2024-11-30',
+    firstPeriod: '2020-02', lastPeriod: '2024-11',
+  };
+  assert.equal(salaryContextMatches(context, 'compania analista 2024 finalizado', { role: 'Analista sénior' }), true);
+  assert.equal(salaryContextMatches(context, 'noviembre', { role: 'Analista sénior' }), true);
+  assert.equal(salaryContextMatches(context, 'actual'), false);
+});
+
+test('mantiene separados los contextos de distinta moneda dentro del mismo empleo', () => {
+  const employmentId = '00000000-0000-4000-8000-000000000001';
+  const ars = { employmentContext: employmentId, employmentId, currencyCode: 'ARS' };
+  const usd = { employmentContext: employmentId, employmentId, currencyCode: 'USD' };
+
+  assert.equal(salaryContextIdentityMatches(ars, { employmentId, currencyCode: 'USD' }), false);
+  assert.equal(salaryContextIdentityMatches(usd, { employmentId, currencyCode: 'USD' }), true);
+  assert.equal(salaryContextIdentityMatches(usd, { employmentId, employmentContext: employmentId, currencyCode: 'USD' }), true);
 });
 
 test('muestra tipos y fuentes sin exponer códigos internos', () => {

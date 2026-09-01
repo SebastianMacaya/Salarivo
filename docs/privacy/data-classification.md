@@ -28,6 +28,14 @@ Para Google se conserva sólo la relación necesaria entre el UUID interno y `(p
 
 Para reconocer sesiones se persisten únicamente categorías allowlisted de dispositivo, navegador y sistema operativo. El user-agent se trata como entrada no confiable y se reduce antes de persistir; se descartan valor crudo, versiones, IP, ubicación, fingerprint y nombre de dispositivo.
 
+## Enmascarado visual de privacidad
+
+El modo privacidad de la interfaz reduce la exposición accidental al compartir pantalla; no es anonimización, redacción del origen ni un límite de autorización. Los salarios, porcentajes derivados y gráficos conservan su clase `Restricted`, y la API continúa aplicando los mismos controles y entregando los mismos datos autorizados al navegador.
+
+La preferencia vive sólo en el cliente, nunca viaja en la URL ni se persiste en el backend, y no crea ni modifica registros o copias censuradas. Mientras está activa, la interfaz reemplaza importes y porcentajes por marcadores estables y no conserva el valor visible en `title`, nombres o descripciones accesibles, tooltips, popovers, labels de gráficos, mensajes o acciones de copiado. La alternativa accesible describe que el valor está oculto, sin repetirlo. Los gráficos no muestran escalas ni valores exactos reconstruibles; conservar una forma relativa no reclasifica los datos ni permite presentarla como anónima.
+
+El PDF original permanece `Restricted` y sin alteraciones. Antes de abrirlo con el modo activo, la interfaz advierte que su contenido no puede enmascararse automáticamente y exige una decisión explícita del titular.
+
 ## Reglas por sistema
 
 ### PostgreSQL

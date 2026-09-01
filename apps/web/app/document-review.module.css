@@ -1,6 +1,6 @@
 .layer { background: #07111dd9; inset: 0; position: fixed; z-index: 60; }
 .workspace { background: #f7f8fa; color: #182230; display: flex; flex-direction: column; height: 100%; outline: none; width: 100%; }
-.header { align-items: center; background: #fff; border-bottom: 1px solid #dce1e8; display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr) auto auto; min-height: 4.5rem; padding: .65rem 1rem; }
+.header { align-items: center; background: #fff; border-bottom: 1px solid #dce1e8; display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr) auto auto auto; min-height: 4.5rem; padding: .65rem 1rem; }
 .heading { align-items: center; display: flex; min-width: 0; }
 .heading div { min-width: 0; }
 .heading p, .sectionHead p, .section > p { color: #64748b; font-size: .75rem; font-weight: 700; letter-spacing: .08em; margin: 0; text-transform: uppercase; }
@@ -11,6 +11,7 @@
 .header button, .section button, .actions button, .callout button, .metadata button { background: #fff; border: 1px solid #cbd5e1; border-radius: .45rem; color: inherit; cursor: pointer; min-height: 2.75rem; padding: .5rem .75rem; }
 .header button:disabled, .section button:disabled, .actions button:disabled, .callout button:disabled { cursor: default; opacity: .45; }
 .close { font-size: 1.4rem; min-width: 2.75rem; }
+.privacyControl { white-space: nowrap; }
 .body { display: grid; flex: 1; grid-template-columns: minmax(0, 3fr) minmax(23rem, 2fr); min-height: 0; }
 .documentPane { display: flex; min-height: 0; min-width: 0; }
 .dataPane { background: #f8fafc; border-left: 1px solid #dce1e8; min-height: 0; overflow-y: auto; padding: 1rem; }
@@ -57,6 +58,9 @@
 .field label > span { display: block; font-size: .78rem; font-weight: 700; margin-bottom: .25rem; }
 .field input, .field select { background: #fff; border: 1px solid #b8c2d0; border-radius: .4rem; color: #111827; font: inherit; min-height: 2.6rem; padding: .45rem .55rem; width: 100%; }
 .field input:disabled, .field select:disabled { background: #f8fafc; border-color: transparent; color: #273548; opacity: 1; }
+.maskedEditor { align-items: center; background: #f8fafc; border: 1px solid transparent; border-radius: .4rem; color: #273548; display: flex; min-height: 2.6rem; padding: .45rem .55rem; width: 100%; }
+.field label > .maskedEditor { display: flex; font-size: inherit; font-weight: 400; margin-bottom: 0; }
+.privacyNotice { background: #f1f5f9; border-radius: .45rem; color: #475569; font-size: .78rem; line-height: 1.45; margin: 0 0 .75rem; padding: .6rem; }
 .provenance { align-items: center; color: #64748b; display: flex; flex-wrap: wrap; font-size: .75rem; gap: .45rem; margin-top: .4rem; }
 .provenance strong { background: #fef3c7; border-radius: 1rem; color: #92400e; padding: .15rem .4rem; }
 .provenance .low { background: #fee2e2; color: #991b1b; }
@@ -102,7 +106,8 @@
 .mobileTabs { display: none; }
 
 @media (max-width: 760px), (max-height: 500px) and (orientation: landscape) {
-  .header { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .header { gap: .5rem; grid-template-columns: minmax(0, 1fr) auto auto auto; }
+  .privacyControl span { display: none; }
   .body { display: block; overflow: hidden; }
   .documentPane, .dataPane { height: 100%; }
   .dataPane { border-left: 0; overflow-y: auto; }

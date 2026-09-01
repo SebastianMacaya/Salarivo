@@ -215,7 +215,7 @@ export function DocumentViewer({
       {controlError && <p className={styles.controlError} role="alert">{controlError}</p>}
       <div className={styles.viewport} ref={viewportRef}>
         {!source && !visibleError && <div className={styles.empty}>{originalViewable ? <><p>{sourceBusy ? 'Autorizando vista privada…' : 'La vista privada necesita autorización reciente.'}</p><button type="button" onClick={onAuthorize} disabled={sourceBusy}>{sourceBusy ? 'Autorizando…' : 'Mostrar PDF'}</button></> : <p>{originalAvailable ? 'El original no está habilitado para vista previa.' : 'El archivo original fue eliminado según la política de retención.'} Los datos extraídos siguen disponibles.</p>}</div>}
-        {visibleError && <div className={styles.empty} role="alert"><p>{visibleError}</p><div><button type="button" onClick={onAuthorize} disabled={sourceBusy || !originalViewable}>Reintentar</button> <button type="button" onClick={onDownload} disabled={!originalViewable}>Descargar</button></div></div>}
+        {visibleError && <div className={styles.empty} role="alert"><p>{visibleError}</p><div><button type="button" onClick={onAuthorize} disabled={sourceBusy || !originalViewable}>Mostrar PDF</button> <button type="button" onClick={onDownload} disabled={!originalViewable}>Descargar</button></div></div>}
         {source && originalViewable && !visibleError && <div className={styles.page} aria-busy={rendering}>
           <canvas ref={canvasRef} role="img" aria-label={`Página ${page} de ${pageCount || '—'}`} />
           {pageEvidence.map(({ id, label, region }) => <button

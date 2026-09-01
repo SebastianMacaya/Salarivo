@@ -14,6 +14,8 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - extracción determinística de recibos argentinos, campos trazables, importes remunerativos/no remunerativos, liquidación, reintegros y conceptos;
 - visor PDF privado por página, evidencia espacial, confirmación de tipo, correcciones humanas y recuperación versionada con comparación/promoción segura;
 - historial salarial derivado con resumen, evolución, análisis anual y comparación por empleo y moneda;
+- navegación contextual entre cada empleo, su historial y sus documentos, con el contexto recuperable desde la URL;
+- modo privacidad visual global para enmascarar importes y porcentajes en la interfaz autenticada, con advertencia antes de abrir el PDF original sin censurar;
 - detección no persistida de empleos a partir de recibos sin asociar, siempre sujeta a confirmación;
 - borrado separado de original o documento completo;
 - MFA TOTP, recovery codes y step-up de acciones sensibles; MFA obligatorio para administración;
