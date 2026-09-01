@@ -202,6 +202,10 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
     [extractionId, userId, documentId],
   );
   await pool.query(
+    "UPDATE documents SET active_extraction_run_id = $1 WHERE id = $2",
+    [extractionId, documentId],
+  );
+  await pool.query(
     `INSERT INTO payroll_settlements (
        id, user_id, document_id, extraction_run_id, employment_id,
        settlement_ordinal, payroll_period, settlement_type, is_recurring, currency_code
@@ -435,6 +439,10 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
        ($1, $3, $4, 2, 'COMPLETED', $5, '2', '2', '2', 'synthetic-private-ocr', '1', now(), 0.8123),
        ($2, $3, $4, 3, 'FAILED', 'failed-private-extractor', '3', '3', '3', NULL, NULL, now(), NULL)`,
     [provenanceExtractionId, failedProvenanceExtractionId, userId, documentId, extractorSentinel],
+  );
+  await pool.query(
+    "UPDATE documents SET active_extraction_run_id = $1 WHERE id = $2",
+    [provenanceExtractionId, documentId],
   );
   await pool.query(
     `INSERT INTO extracted_fields (

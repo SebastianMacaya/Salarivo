@@ -76,6 +76,22 @@ docker compose --profile processing down
 
 Las credenciales de `.env.example` son exclusivamente locales. Antes de cualquier VPS hay que definir secretos, TLS, cifrado y backups reales; no reutilices esos valores.
 
+## Despliegue
+
+Producción se construye desde `main` en tres aplicaciones separadas de Coolify: `salarivo-main`, `salarivo-api` y `salarivo-worker-documents`. Cada una debe tener su propio webhook de GitHub para eventos `push`; CI valida el código, pero no reemplaza esos despliegues. Las URLs y los secretos de webhook se configuran sólo en Coolify y GitHub, nunca en este repositorio.
+
+La API usa en Coolify un healthcheck de tipo `Container command`: `curl --fail --silent --show-error http://127.0.0.1:3001/health`. La API y el worker ejecutan las migraciones y validan la política privada de R2 al iniciar; su CORS y lifecycle deben conservar el contrato de [seguridad de upload](docs/security/file-upload.md).
+
+Un despliegue se considera completo únicamente cuando:
+
+- las tres aplicaciones muestran el mismo commit completo de `main`;
+- la base tiene aplicada la migración más reciente de `packages/database/migrations`;
+- la API está saludable y una ruta autenticada sin sesión responde `401`, no `404`;
+- el worker está ejecutándose sin errores de inicio;
+- la vista principal funciona en un smoke test autenticado.
+
+Si una aplicación queda en un commit anterior, hay que redesplegarla y corregir su webhook antes de dar el cambio por terminado. Esta mecánica operativa no modifica el estado de seguridad del producto ni habilita el uso de datos reales mientras siga vigente el aviso al inicio de este README.
+
 ## Verificación
 
 ~~~powershell

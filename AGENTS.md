@@ -73,6 +73,16 @@ Una tarea termina cuando:
 - se ejecutaron las verificaciones descubiertas en los manifests y git diff --check;
 - el handoff distingue lo implementado de lo pendiente.
 
+Para cambios que deban llegar a producción:
+
+- un `push` o CI verde no demuestra que el despliegue terminó;
+- `salarivo-main`, `salarivo-api` y `salarivo-worker-documents` deben tener habilitado su webhook de `push` a `main` y converger en el mismo commit completo;
+- la API y el worker aplican las migraciones al iniciar; no dupliques esa ejecución en comandos de ciclo de vida de la plataforma;
+- verificá la última migración aplicada, la salud de la API, el worker y un smoke test autenticado de la web;
+- una ruta autenticada sin sesión debe responder el rechazo de autenticación esperado, no `404`;
+- si un recurso queda rezagado, el despliegue está incompleto: redesplegalo y no declares éxito hasta comprobar la convergencia;
+- nunca persistas URLs de webhook, secretos, tokens, PII ni datos salariales en el repositorio o en logs de despliegue.
+
 No inventes comandos de build o test. Descubrilos en los manifests. Verificá como mínimo typecheck, tests, build web, Docker Compose y git diff --check; para cambios de ingestión ejecutá además la integración local. Antes del primer commit, usá git add --intent-to-add . para que el diff incluya archivos nuevos; eso no autoriza un commit.
 
 ## Mejora supervisada para agentes
