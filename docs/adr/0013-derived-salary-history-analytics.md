@@ -17,7 +17,7 @@ Dinero se convierte de decimal a centavos BigInt. Totales, promedios, deltas y p
 
 El comparable inicial es exclusivamente basicAmount cuando el período tiene una liquidación `NORMAL` recurrente y un valor único. Si falta o es ambiguo devuelve N/D; bruto y neto no son fallback. Las liquidaciones del mismo mes se conservan, los tipos extraordinarios permanecen separados y los conceptos sólo explican una comparación cuando la extracción normalizada está completa.
 
-Cobertura y anomalías son conservadoras: un período ausente se marca como posible, un duplicado estructural sólo como advertencia y un bono, SAC, reintegro o retroactivo nunca como aumento permanente. Confirmar un empleo o eliminar datos invalida la proyección naturalmente porque el siguiente request vuelve a derivarla.
+Cobertura y anomalías son conservadoras: un período ausente se marca como posible, un duplicado estructural sólo como advertencia y un bono, SAC, reintegro o retroactivo nunca como aumento permanente. Esta regla no incluye un segundo upload byte-a-byte del mismo titular, que se descarta antes de analytics. Confirmar un empleo o eliminar datos invalida la proyección naturalmente porque el siguiente request vuelve a derivarla.
 
 IPC y variación real no forman parte de esta versión. Requieren fuente oficial, índice, período, fecha de actualización, versionado y una decisión separada; el límite `EconomicIndexProvider` continúa sin implementación.
 

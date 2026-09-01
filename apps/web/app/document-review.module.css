@@ -22,6 +22,11 @@
 .callout { background: #fff7ed; border: 1px solid #fed7aa; }
 .callout h3 { margin: 0; }
 .callout div { display: flex; gap: .5rem; margin-top: .75rem; }
+.feedback { display: grid; gap: .5rem; margin-top: .8rem; }
+.feedback label { font-size: .8rem; font-weight: 700; }
+.feedback textarea { border: 1px solid #cbd5e1; border-radius: .45rem; font: inherit; min-height: 5rem; padding: .55rem; resize: vertical; width: 100%; }
+.feedback small { color: #64748b; }
+.feedback button { justify-self: start; }
 .analysis { border: 1px solid #cbd5e1; border-radius: .65rem; background: #fff; margin-bottom: 1rem; padding: .9rem; }
 .analysis.ready { border-color: #a7d7b8; background: #f0faf3; }
 .analysis.warning, .analysis.improvement, .analysis.pending { border-color: #e8d39b; background: #fffaf0; }

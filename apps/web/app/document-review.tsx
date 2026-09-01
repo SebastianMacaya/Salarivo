@@ -92,6 +92,7 @@ export type DocumentDetail = {
     settlementType: string;
   };
   sizeBytes: number;
+  unsupportedFeedback: string | null;
 };
 
 export type ReviewSettlement = {
@@ -198,6 +199,7 @@ export function DocumentReview({
   onReprocess,
   onRunDecision,
   onSave,
+  onSaveUnsupportedFeedback,
   processingRuns = [],
   runPreviewErrors = {},
   runPreviews = {},
@@ -228,6 +230,7 @@ export function DocumentReview({
   onReprocess: (retry?: boolean) => Promise<void>;
   onRunDecision: (run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE') => Promise<void>;
   onSave: (changes: Array<{ field: ExtractedFieldDetail; value: string }>, extractionRunId: string) => Promise<void>;
+  onSaveUnsupportedFeedback: (comment: string) => Promise<string | null>;
   processingRuns?: ProcessingRun[];
   runPreviewErrors?: Record<string, string>;
   runPreviews?: Record<string, ProcessingComparisonPreview | null | undefined>;
@@ -245,6 +248,7 @@ export function DocumentReview({
   const [acceptedMismatchRunId, setAcceptedMismatchRunId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [feedbackDraft, setFeedbackDraft] = useState(detail.unsupportedFeedback ?? '');
   const pendingMobileFocus = useRef<'data' | 'document' | null>(null);
 
   const changes = useMemo(() => detail.extractedFields.flatMap((field) => {
@@ -253,7 +257,9 @@ export function DocumentReview({
       ? [{ field, value: draft }]
       : [];
   }), [detail.extractedFields, drafts]);
-  const dirty = changes.length > 0;
+  const correctionsDirty = changes.length > 0;
+  const feedbackDirty = feedbackDraft.trim() !== (detail.unsupportedFeedback ?? '');
+  const dirty = correctionsDirty || feedbackDirty;
   const currentRunId = detail.extractionRun?.id ?? null;
   const acceptMismatch = acceptedMismatchRunId === currentRunId;
   const editingStale = editing && extractionRunChanged(editingRunId, currentRunId);
@@ -388,7 +394,7 @@ export function DocumentReview({
             </section>}
 
             {detail.processingStatus === 'NEEDS_TYPE_CONFIRMATION' && <section className={styles.callout}><h3>¿Es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente.</p><div><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('PAYROLL'))}>Sí, continuar</button><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('UNSUPPORTED'))}>No corresponde</button></div></section>}
-            {unsupported && <section className={styles.callout}><h3>Tipo de documento no soportado</h3><p>{unsupportedReason} No volveremos a procesarlo automáticamente.</p></section>}
+            {unsupported && <section className={styles.callout}><h3>Tipo de documento no soportado</h3><p>{unsupportedReason} El PDF original se elimina automáticamente; conservamos esta ficha mínima.</p><form className={styles.feedback} onSubmit={(event) => { event.preventDefault(); void run(async () => setFeedbackDraft(await onSaveUnsupportedFeedback(feedbackDraft) ?? '')); }}><label htmlFor="unsupported-feedback">¿Qué tipo de archivo es y por qué te serviría?</label><textarea id="unsupported-feedback" maxLength={500} value={feedbackDraft} onChange={(event) => setFeedbackDraft(event.target.value)} placeholder="Ej.: certificado laboral; me serviría para completar fechas del empleo." /><small>No incluyas salarios, DNI/CUIL ni otros datos personales.</small><button type="submit" disabled={busy || !feedbackDirty}>{busy ? 'Guardando…' : detail.unsupportedFeedback ? 'Actualizar feedback' : 'Enviar feedback'}</button></form></section>}
 
             {detail.settlement && <section className={styles.section}><p>Liquidación extraída</p><h3>{periodLabel(detail.settlement.payrollPeriod)} · {settlementTypeLabel(detail.settlement.settlementType)}</h3><dl className={styles.settlementOverview}><div><dt>Sueldo básico</dt><dd>{money(detail.settlement.basicAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Bruto</dt><dd>{money(detail.settlement.grossAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Remunerativo</dt><dd>{money(detail.settlement.remunerativeAmount, detail.settlement.currencyCode)}</dd></div><div><dt>No remunerativo</dt><dd>{money(detail.settlement.nonRemunerativeAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Neto</dt><dd>{money(detail.settlement.netAmount, detail.settlement.currencyCode)}</dd></div><div><dt>Descuentos / créditos</dt><dd>{money(detail.settlement.deductionsAmount, detail.settlement.currencyCode)}</dd></div>{detail.settlement.deductionsChargedAmount && <div><dt>Descuentos cobrados</dt><dd>{money(detail.settlement.deductionsChargedAmount, detail.settlement.currencyCode)}</dd></div>}{detail.settlement.reimbursementsAmount && <div><dt>Reintegros</dt><dd>{money(detail.settlement.reimbursementsAmount, detail.settlement.currencyCode)}</dd></div>}</dl></section>}
 
@@ -410,7 +416,7 @@ export function DocumentReview({
                 </article>;
               })}</div>
               {editingStale && <p className={styles.error} role="alert">El documento fue reprocesado durante la edición. Cancelá y revisá la nueva extracción antes de volver a guardar.</p>}
-              {editing && <div className={styles.editActions}><button type="button" disabled={busy || editingStale || !editingRunId || !dirty || changes.some(({ value }) => !value.trim())} onClick={() => { if (!editingRunId || editingStale) return; void run(async () => { await onSave(changes, editingRunId); setDrafts({}); setEditingRunId(null); setEditing(false); }); }}>{busy ? 'Guardando…' : `Guardar ${changes.length || ''} cambio${changes.length === 1 ? '' : 's'}`}</button><button type="button" disabled={busy} onClick={() => { setDrafts({}); setEditingRunId(null); setEditing(false); }}>Cancelar</button></div>}
+              {editing && <div className={styles.editActions}><button type="button" disabled={busy || editingStale || !editingRunId || !correctionsDirty || changes.some(({ value }) => !value.trim())} onClick={() => { if (!editingRunId || editingStale) return; void run(async () => { await onSave(changes, editingRunId); setDrafts({}); setEditingRunId(null); setEditing(false); }); }}>{busy ? 'Guardando…' : `Guardar ${changes.length || ''} cambio${changes.length === 1 ? '' : 's'}`}</button><button type="button" disabled={busy} onClick={() => { setDrafts({}); setEditingRunId(null); setEditing(false); }}>Cancelar</button></div>}
             </section>
 
             {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li key={item.id}><span>{item.rawDescription}</span><strong>{item.amount} {item.currencyCode}</strong>{item.sourcePage && <small>Pág. {item.sourcePage}</small>}</li>)}</ul></section>}

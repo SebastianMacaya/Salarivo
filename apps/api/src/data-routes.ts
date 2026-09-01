@@ -96,6 +96,7 @@ type DocumentListQuery = {
   settlementType?: string;
 };
 type OriginalQuery = { disposition?: "inline" | "attachment" };
+type UnsupportedFeedbackBody = { comment: string };
 type ReprocessBody = { retry?: boolean };
 type ReprocessingBatchBody = { documentIds?: string[] };
 type ProcessingRunParams = { id: string; runId: string };
@@ -198,6 +199,7 @@ const exportSections = [
       (document.original_deleted_at IS NULL) AS "originalAvailable",
       document.created_at AS "importedAt", document.processed_at AS "processedAt",
       document.original_deleted_at AS "originalDeletedAt", employer.name AS "employerName",
+      document.unsupported_feedback AS "unsupportedFeedback",
       employment.start_date AS "employmentStartDate", employment.end_date AS "employmentEndDate",
       employment.currency_code AS "employmentCurrencyCode"
       FROM documents document
@@ -426,19 +428,23 @@ function importItem(row: Record<string, unknown>) {
 
 function importBatchView(batch: Record<string, unknown>, itemRows: Record<string, unknown>[]) {
   const items = itemRows.map(importItem);
+  const discardedDuplicates = Number(batch.discarded_duplicate_count ?? 0);
   const totals = items.reduce<Record<string, number>>((counts, item) => {
     counts[item.status] = (counts[item.status] ?? 0) + 1;
     return counts;
   }, {});
-  const resolved = items.filter((item) => terminalImportItemStatuses.has(item.status)).length;
+  if (discardedDuplicates) totals.DUPLICATE = discardedDuplicates;
+  const resolved = items.filter((item) => terminalImportItemStatuses.has(item.status)).length
+    + discardedDuplicates;
+  const total = items.length + discardedDuplicates;
   return {
     id: String(batch.id),
     status: String(batch.status),
     createdAt: timestamp(batch.created_at),
     progress: {
-      total: items.length,
+      total,
       resolved,
-      percentage: items.length ? Math.floor((resolved * 100) / items.length) : 100,
+      percentage: total ? Math.floor((resolved * 100) / total) : 100,
     },
     totals,
     items,
@@ -1275,7 +1281,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     { preHandler: requireAuth },
     async (request) => {
       const batch = await pool.query(
-        `SELECT id, status, created_at FROM import_batches
+        `SELECT id, status, created_at, discarded_duplicate_count FROM import_batches
           WHERE user_id = $1 AND status IN ('ACTIVE', 'PAUSED')
           ORDER BY created_at DESC LIMIT 1`,
         [request.authUser!.id],
@@ -1330,7 +1336,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           itemCount: Number(cancelled.rows[0].count),
         });
         const currentBatch = await client.query(
-          "SELECT id, status, created_at FROM import_batches WHERE id = $1 AND user_id = $2",
+          "SELECT id, status, created_at, discarded_duplicate_count FROM import_batches WHERE id = $1 AND user_id = $2",
           [request.params.id, request.authUser!.id],
         );
         const items = await client.query(
@@ -1349,7 +1355,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     { preHandler: requireAuth, schema: { params: idParamsSchema } },
     async (request) => {
       const batch = await pool.query(
-        `SELECT id, status, created_at FROM import_batches WHERE id = $1 AND user_id = $2`,
+        `SELECT id, status, created_at, discarded_duplicate_count FROM import_batches WHERE id = $1 AND user_id = $2`,
         [request.params.id, request.authUser!.id],
       );
       if (!batch.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
@@ -2344,6 +2350,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 document.deleted_at, document.declared_mime_type, document.detected_mime_type,
                 document.size_bytes, document.page_count, document.security_status,
                 document.classification_status, document.retention_policy, document.processed_at,
+                document.unsupported_feedback,
                 item.error_code, projection.payroll_period, projection.settlement_type,
                 COALESCE(employer.name, projection.corrected_employer_name,
                          projection.extracted_employer_name) AS employer_name
@@ -2601,6 +2608,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         securityStatus: String(row.security_status),
         classificationStatus: String(row.classification_status),
         retentionPolicy: String(row.retention_policy),
+        unsupportedFeedback: value(row, "unsupported_feedback"),
         processedAt: row.processed_at === null ? null : timestamp(row.processed_at),
         lastReprocessError: lastReprocessJob.rows[0]?.state === "FAILED" ? {
           code: String(lastReprocessJob.rows[0].error_code),
@@ -2837,7 +2845,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           await client.query(
             `UPDATE documents
                 SET classification_status = 'UNSUPPORTED', document_type = NULL,
-                    processing_status = 'REJECTED_UNSUPPORTED', processed_at = now()
+                    processing_status = 'REJECTED_UNSUPPORTED', processed_at = now(),
+                    retention_policy = 'DELETE_AFTER_PROCESSING'
               WHERE id = $1 AND user_id = $2`,
             [request.params.id, request.authUser!.id],
           );
@@ -2847,7 +2856,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
               WHERE id = $1 AND user_id = $2`,
             [row.import_batch_item_id, request.authUser!.id],
           );
-          if (row.retention_policy === "DELETE_AFTER_PROCESSING" && row.original_deleted_at === null) {
+          if (row.original_deleted_at === null) {
             await client.query(
               `INSERT INTO storage_deletion_tombstones (
                  id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
@@ -2915,6 +2924,43 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         return { processingStatus: "UPLOADED", job: { id: jobId, state: "PENDING" } };
       });
       return reply.code(201).send({ data: result });
+    },
+  );
+
+  app.put<{ Params: IdParams; Body: UnsupportedFeedbackBody }>(
+    "/api/v1/documents/:id/unsupported-feedback",
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["comment"],
+          properties: { comment: { type: "string", maxLength: 500 } },
+        },
+      },
+    },
+    async (request) => {
+      const comment = request.body.comment.normalize("NFKC").replace(/\s+/gu, " ").trim();
+      if (comment.length > 500 || /[\u0000-\u001f\u007f]/u.test(comment)) {
+        throw new ApiError(400, "INVALID_UNSUPPORTED_FEEDBACK", "El comentario no es válido.");
+      }
+      return { data: await withTransaction(async (client) => {
+        const updated = await client.query<{ unsupported_feedback: string | null }>(
+          `UPDATE documents
+              SET unsupported_feedback = $3
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+              AND processing_status = 'REJECTED_UNSUPPORTED'
+          RETURNING unsupported_feedback`,
+          [request.params.id, request.authUser!.id, comment || null],
+        );
+        if (!updated.rowCount) throw new ApiError(404, "NOT_FOUND", "Documento no soportado no encontrado.");
+        await audit(client, request.authUser!.id, "UNSUPPORTED_FEEDBACK_UPDATED", "DOCUMENT", request.params.id, {
+          commentProvided: Boolean(comment),
+        });
+        return { comment: updated.rows[0]!.unsupported_feedback };
+      }) };
     },
   );
 
@@ -3491,7 +3537,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   app.get<{ Params: IdParams; Querystring: OriginalQuery }>(
     "/api/v1/documents/:id/original",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAuth,
       schema: {
         params: idParamsSchema,
         querystring: {
@@ -3502,8 +3548,10 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       },
     },
     async (request) => {
+      const disposition = request.query.disposition ?? "attachment";
+      const mfaInline = disposition === "inline" && request.authUser!.mfaEnabled;
       const objectKey = await withTransaction(async (client) => {
-        if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
+        if (!mfaInline && !await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }
         const document = await client.query(
@@ -3517,9 +3565,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         return String(document.rows[0].object_key);
       });
       try {
-        return { data: await storage.authorizeDownload(objectKey, {
-          disposition: request.query.disposition ?? "attachment",
-        }) };
+        return { data: await storage.authorizeDownload(objectKey, { disposition }) };
       } catch {
         throw new ApiError(503, "STORAGE_UNAVAILABLE", "El almacenamiento no está disponible temporalmente.");
       }

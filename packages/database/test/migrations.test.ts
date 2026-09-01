@@ -23,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 20);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 20 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 21);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 21 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 20, name: "versioned_reprocessing" },
+    { version: 21, name: "discard_unsupported_and_exact_duplicates" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -236,6 +236,21 @@ test("versioned reprocessing keeps promotion explicit, attributable and idempote
   assert.match(sql, /DOCUMENT_PIPELINE_V2/);
   assert.match(sql, /BEFORE INSERT ON storage_deletion_tombstones/);
   assert.doesNotMatch(sql, /^\s*(?:content|raw_text|ocr_text)\s+text/im);
+});
+
+test("unsupported originals are scheduled for deletion and exact duplicates retain only an aggregate count", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 21);
+  assert.ok(migration);
+  const { sql } = migration;
+
+  assert.match(sql, /ADD COLUMN discarded_duplicate_count integer NOT NULL DEFAULT 0/);
+  assert.match(sql, /ADD COLUMN unsupported_feedback text/);
+  assert.match(sql, /length\(unsupported_feedback\) BETWEEN 1 AND 500/);
+  assert.match(sql, /processing_status = 'REJECTED_UNSUPPORTED'/);
+  assert.match(sql, /INSERT INTO storage_deletion_tombstones/);
+  assert.match(sql, /SET retention_policy = 'DELETE_AFTER_PROCESSING'/);
+  assert.match(sql, /canonical_object_key = document\.object_key/);
+  assert.doesNotMatch(sql, /DELETE_AFTER_[0-9]+_DAYS|interval '\d+ days'/i);
 });
 
 test("employer normalization aligns legal suffix punctuation without retaining punctuation-only input", () => {

@@ -1658,6 +1658,201 @@ async function completeBatchIfTerminal(
   );
 }
 
+type DiscardableDuplicate = {
+  batch_id: string;
+  canonical_object_key: string;
+  document_id: string;
+  incoming_object_key: string;
+  item_id: string;
+  upload_expires_at: Date;
+  user_id: string;
+};
+
+async function discardDuplicateRecord(db: PoolClient, duplicate: DiscardableDuplicate): Promise<void> {
+  await db.query(
+    `INSERT INTO storage_deletion_tombstones (
+       id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
+     ) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT DO NOTHING`,
+    [
+      randomUUID(),
+      duplicate.user_id,
+      duplicate.canonical_object_key,
+      duplicate.incoming_object_key,
+      duplicate.upload_expires_at,
+    ],
+  );
+  const tombstone = await db.query(
+    `SELECT 1 FROM storage_deletion_tombstones
+      WHERE user_id = $1 AND canonical_object_key = $2`,
+    [duplicate.user_id, duplicate.canonical_object_key],
+  );
+  if (!tombstone.rowCount) throw new Error('DELETION_TOMBSTONE_NOT_CREATED');
+  const batch = await db.query(
+    `UPDATE import_batches
+        SET discarded_duplicate_count = discarded_duplicate_count + 1,
+            idempotency_key = $3, request_fingerprint = $4, updated_at = now()
+      WHERE id = $1 AND user_id = $2
+      RETURNING discarded_duplicate_count`,
+    [
+      duplicate.batch_id,
+      duplicate.user_id,
+      randomUUID(),
+      createHash('sha256').update(randomUUID()).digest('hex'),
+    ],
+  );
+  if (!batch.rowCount) throw new Error('DUPLICATE_BATCH_NOT_FOUND');
+  await db.query(
+    `UPDATE audit_events SET resource_id = NULL, metadata_no_sensitive = '{}'::jsonb
+      WHERE user_id = $1 AND resource_type = 'DOCUMENT' AND resource_id = $2`,
+    [duplicate.user_id, duplicate.document_id],
+  );
+  await db.query(
+    `INSERT INTO audit_events (
+       id, user_id, actor_user_id, action, resource_type, resource_id,
+       result, metadata_no_sensitive
+     ) VALUES ($1, $2, NULL, 'IMPORT_DUPLICATE_DISCARDED', 'IMPORT_BATCH', $3,
+       'SUCCESS', $4::jsonb)`,
+    [randomUUID(), duplicate.user_id, duplicate.batch_id, JSON.stringify({ itemCount: 1 })],
+  );
+  const removed = await db.query(
+    `DELETE FROM import_batch_items WHERE id = $1 AND user_id = $2`,
+    [duplicate.item_id, duplicate.user_id],
+  );
+  if (removed.rowCount !== 1) throw new Error('DUPLICATE_ITEM_NOT_REMOVED');
+  await db.query(
+    `UPDATE import_batches AS batch
+        SET status = 'COMPLETED', completed_at = now(), updated_at = now()
+      WHERE batch.id = $1 AND batch.user_id = $2 AND batch.status = 'ACTIVE'
+        AND NOT EXISTS (
+          SELECT 1 FROM import_batch_items AS item
+           WHERE item.user_id = batch.user_id AND item.batch_id = batch.id
+             AND item.status IN ('PENDING_UPLOAD', 'UPLOADED', 'PROCESSING')
+        )`,
+    [duplicate.batch_id, duplicate.user_id],
+  );
+}
+
+async function discardExactDuplicate(job: JobRow, checksum: string): Promise<boolean> {
+  return await withTransaction(async (db: PoolClient) => {
+    const activeUser = await db.query(
+      `SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE`,
+      [job.user_id],
+    );
+    if (!activeUser.rowCount) return false;
+    const duplicate = await db.query<DiscardableDuplicate>(
+      `SELECT item.batch_id, item.id AS item_id,
+              document.id AS document_id, document.user_id,
+              document.object_key AS canonical_object_key,
+              session.object_key AS incoming_object_key,
+              session.expires_at AS upload_expires_at
+         FROM processing_jobs AS active_job
+         JOIN documents AS document
+           ON document.id = active_job.document_id AND document.user_id = active_job.user_id
+         JOIN import_batch_items AS item
+           ON item.id = document.import_batch_item_id AND item.user_id = document.user_id
+         JOIN upload_sessions AS session
+           ON session.id = document.upload_session_id AND session.user_id = document.user_id
+         JOIN import_batches AS batch
+           ON batch.id = item.batch_id AND batch.user_id = item.user_id
+        WHERE active_job.id = $1 AND active_job.user_id = $2
+          AND active_job.document_id = $3 AND active_job.state = 'RUNNING'
+          AND active_job.lease_owner = $4 AND active_job.execution_owner IS NULL
+          AND document.deleted_at IS NULL
+        FOR UPDATE OF active_job, document, item, session, batch`,
+      [job.id, job.user_id, job.document_id, job.lease_owner],
+    );
+    const current = duplicate.rows[0];
+    if (!current) return false;
+    const survivor = await db.query(
+      `SELECT id FROM documents
+        WHERE user_id = $1 AND sha256 = $2 AND id <> $3 AND deleted_at IS NULL
+        ORDER BY id
+        LIMIT 1
+        FOR KEY SHARE`,
+      [job.user_id, checksum, job.document_id],
+    );
+    if (!survivor.rowCount) return false;
+    await discardDuplicateRecord(db, current);
+    return true;
+  });
+}
+
+export async function cleanupLegacyExactDuplicate(): Promise<number> {
+  return await withTransaction(async (db: PoolClient) => {
+    const candidate = await db.query<{ document_id: string; user_id: string }>(
+      `SELECT document.id AS document_id, document.user_id
+         FROM documents AS document
+         JOIN import_batch_items AS item
+           ON item.id = document.import_batch_item_id AND item.user_id = document.user_id
+         JOIN users AS user_account
+           ON user_account.id = document.user_id AND user_account.status = 'ACTIVE'
+        WHERE document.processing_status = 'FAILED_PERMANENT'
+          AND document.deleted_at IS NULL
+          AND item.status = 'FAILED' AND item.error_code = 'DOCUMENT_DUPLICATE'
+          AND EXISTS (
+            SELECT 1 FROM processing_jobs AS failed_job
+             WHERE failed_job.document_id = document.id
+               AND failed_job.user_id = document.user_id
+               AND failed_job.state = 'FAILED'
+               AND failed_job.error_code = 'DOCUMENT_DUPLICATE'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS active_job
+             WHERE active_job.document_id = document.id
+               AND active_job.user_id = document.user_id
+               AND active_job.execution_owner IS NOT NULL
+          )
+        ORDER BY document.created_at, document.id
+        LIMIT 1`,
+    );
+    const next = candidate.rows[0];
+    if (!next) return 0;
+    const activeUser = await db.query(
+      `SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE SKIP LOCKED`,
+      [next.user_id],
+    );
+    if (!activeUser.rowCount) return 0;
+    const duplicate = await db.query<DiscardableDuplicate>(
+      `SELECT item.batch_id, item.id AS item_id,
+              document.id AS document_id, document.user_id,
+              document.object_key AS canonical_object_key,
+              session.object_key AS incoming_object_key,
+              session.expires_at AS upload_expires_at
+         FROM documents AS document
+         JOIN import_batch_items AS item
+           ON item.id = document.import_batch_item_id AND item.user_id = document.user_id
+         JOIN upload_sessions AS session
+           ON session.id = document.upload_session_id AND session.user_id = document.user_id
+         JOIN import_batches AS batch
+           ON batch.id = item.batch_id AND batch.user_id = item.user_id
+        WHERE document.id = $1 AND document.user_id = $2
+          AND document.processing_status = 'FAILED_PERMANENT'
+          AND document.deleted_at IS NULL
+          AND item.status = 'FAILED' AND item.error_code = 'DOCUMENT_DUPLICATE'
+          AND EXISTS (
+            SELECT 1 FROM processing_jobs AS failed_job
+             WHERE failed_job.document_id = document.id
+               AND failed_job.user_id = document.user_id
+               AND failed_job.state = 'FAILED'
+               AND failed_job.error_code = 'DOCUMENT_DUPLICATE'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS active_job
+             WHERE active_job.document_id = document.id
+               AND active_job.user_id = document.user_id
+               AND active_job.execution_owner IS NOT NULL
+          )
+        FOR UPDATE OF document, item, session, batch`,
+      [next.document_id, next.user_id],
+    );
+    const current = duplicate.rows[0];
+    if (!current) return 0;
+    await discardDuplicateRecord(db, current);
+    return 1;
+  });
+}
+
 async function scheduleRetentionDeletion(
   db: PoolClient,
   job: Pick<JobRow, 'document_id' | 'user_id'>,
@@ -1740,7 +1935,10 @@ async function finishClassification(
       await db.query(
         `UPDATE documents
             SET classification_status = $3, document_type = $4,
-                classification_confidence = $5, processing_status = $6, processed_at = now()
+                classification_confidence = $5, processing_status = $6,
+                retention_policy = CASE WHEN $3 = 'UNSUPPORTED'
+                  THEN 'DELETE_AFTER_PROCESSING' ELSE retention_policy END,
+                processed_at = now()
           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
             AND security_status = 'CLEAN'`,
         [job.document_id, job.user_id, classification.decision, null, classification.confidence, processingStatus],
@@ -2674,6 +2872,8 @@ async function processJob(
   const { document, job } = claim;
   const started = Date.now();
   let directory: string | null = null;
+  let checksum: string | null = null;
+  let duplicateChecksum: string | null = null;
   try {
     if (isReprocessingJob(job)) {
       const artifact = await loadCompatibleTextArtifact(s3, config, job);
@@ -2708,7 +2908,7 @@ async function processJob(
     }
     directory = await mkdtemp(join(tmpdir(), 'salarivo-job-'));
     const pdfPath = join(directory, 'document.pdf');
-    const checksum = await downloadObject(s3, config, document, pdfPath);
+    checksum = await downloadObject(s3, config, document, pdfPath);
     const pages = await inspectPdf(pdfPath, config);
     await scanWithClamAv(pdfPath, config);
     await inspectActiveContent(pdfPath, config);
@@ -2788,7 +2988,12 @@ async function processJob(
     const result = await persistExtraction(job, classification, extraction, source, partialOcr, Date.now() - started);
     log('job_completed', { jobId: job.id, result: result ?? 'STALE' });
   } catch (error) {
-    await failJob(job, error);
+    const normalized = normalizeError(error);
+    if (normalized.code === 'DOCUMENT_DUPLICATE' && checksum) {
+      duplicateChecksum = checksum;
+    } else {
+      await failJob(job, error);
+    }
   } finally {
     let removed = true;
     if (directory) {
@@ -2805,6 +3010,21 @@ async function processJob(
           WHERE id = $1 AND execution_owner = $2`,
         [job.id, workerId],
       );
+    }
+    if (duplicateChecksum) {
+      if (!removed) {
+        await failJob(job, new WorkerError('DOCUMENT_DUPLICATE', false));
+      } else {
+        try {
+          if (await discardExactDuplicate(job, duplicateChecksum)) {
+            log('document_duplicate_discarded', { count: 1 });
+          } else {
+            await failJob(job, new WorkerError('DOCUMENT_DUPLICATE', false));
+          }
+        } catch {
+          await failJob(job, new WorkerError('DOCUMENT_DUPLICATE', false));
+        }
+      }
     }
   }
 }
@@ -2833,6 +3053,13 @@ async function maintenanceLoop(s3: S3Client, config: WorkerConfig, signal: Abort
       if (reconciled.recovered) log('job_leases_recovered', { count: reconciled.recovered });
       if (reconciled.released) log('job_execution_owners_released', { count: reconciled.released });
       if (reconciled.batches) log('batches_completed', { count: reconciled.batches });
+      let legacyDuplicates = 0;
+      for (let index = 0; index < 100; index += 1) {
+        const discarded = await cleanupLegacyExactDuplicate();
+        if (!discarded) break;
+        legacyDuplicates += discarded;
+      }
+      if (legacyDuplicates) log('legacy_document_duplicates_discarded', { count: legacyDuplicates });
       const cleaned = await cleanupExpiredUploads(s3, config);
       if (cleaned.objects) log('uploads_cleaned', { count: cleaned.objects });
       if (cleaned.items) log('upload_items_cancelled', { count: cleaned.items });

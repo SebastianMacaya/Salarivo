@@ -45,7 +45,7 @@ La identidad del dominio sigue siendo el UUID interno. Google OIDC agrega una cu
 
 Analytics usa sólo `activeExtractionRunId` de documentos `COMPLETED`; corridas candidatas, fallidas o dudosas y resultados todavía en revisión no afectan la proyección. Un dato ausente sigue como N/D y añade contexto únicamente cuando existe una recuperación compatible. El salario comparable inicial es el sueldo básico verificado de una liquidación `NORMAL` recurrente: no usa neto ni bruto como fallback y devuelve N/D si falta o el período es ambiguo. Los porcentajes se calculan con decimal exacto mediante `(final / inicial) - 1`, nunca sumando variaciones mensuales ni cruzando contextos laborales o monedas.
 
-Las deducciones individuales siguen minimizadas a etiqueta genérica e importe: no se conserva ni expone obra social, sindicato, descripción original, código normalizado, recurrencia ni campo fuente. Un total de descuentos negativo se presenta como crédito/reintegro, conservando el signo para el cálculo. Toda firma de posible duplicado requiere revisión y confirmación humana.
+Las deducciones individuales siguen minimizadas a etiqueta genérica e importe: no se conserva ni expone obra social, sindicato, descripción original, código normalizado, recurrencia ni campo fuente. Un total de descuentos negativo se presenta como crédito/reintegro, conservando el signo para el cálculo. Un duplicado binario exacto del mismo titular se descarta sin conservar documento, item ni metadata del archivo; una firma estructural parecida sólo advierte y requiere revisión humana. Un tipo no soportado elimina siempre el PDF original y puede conservar un comentario owner-only opcional para evaluar demanda futura, sin habilitar OCR genérico.
 
 ### No incluye
 

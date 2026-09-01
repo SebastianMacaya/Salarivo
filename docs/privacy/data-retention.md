@@ -10,13 +10,13 @@ Conserva el documento cifrado para descarga y reprocesamiento hasta que el usuar
 
 ### DELETE_AFTER_PROCESSING
 
-Cuando el procesamiento termina —sin revisión o cuando el usuario la completa—, se rechaza como no soportado o falla de forma permanente, bloquea el acceso al original y agenda su borrado durable. El delete físico ocurre después de vencer la autorización de upload y su ventana de gracia. No agenda mientras existe revisión o retry pendiente. Conserva sólo información estructurada permitida, trazabilidad mínima y evidencia no sensible.
+Cuando el procesamiento termina —sin revisión o cuando el usuario la completa—, bloquea el acceso al original y agenda su borrado durable. Un tipo no soportado fuerza siempre esta política aunque la cuenta use `KEEP_ORIGINAL`; conserva sólo la ficha mínima y el comentario owner-only opcional. El delete físico ocurre después de vencer la autorización de upload y su ventana de gracia. No agenda mientras existe revisión o retry pendiente.
 
 ### DELETE_AFTER_N_DAYS
 
 Capacidad futura. El número es configuración visible al usuario; no se habilita hasta implementar scheduler, advertencias, reconciliación y tests.
 
-El esquema ya conserva una política por cuenta y la copia al documento, pero el producto actual crea cuentas con `KEEP_ORIGINAL` y todavía no ofrece ruta ni UI para cambiarla. `DELETE_AFTER_PROCESSING` sólo se ejecuta si una operación interna revisada dejó esa política en el documento. Hacer editable la preferencia global o por documento requiere contrato, UX y pruebas; nunca podrá restaurar un original ya borrado.
+El esquema conserva una política por cuenta y la copia al documento; el producto actual crea cuentas con `KEEP_ORIGINAL` y todavía no ofrece ruta ni UI para cambiarla. La excepción vigente son los tipos no soportados, que fuerzan `DELETE_AFTER_PROCESSING`. Hacer editable la preferencia global o por documento requiere contrato, UX y pruebas; nunca podrá restaurar un original ya borrado.
 
 ## Objetos y lifecycle
 
@@ -25,6 +25,8 @@ El esquema ya conserva una política por cuenta y la copia al documento, pero el
 | upload incompleto | storage + UploadSession | TTL corto configurable |
 | original en cuarentena | storage + Document | hasta decisión de seguridad y cleanup |
 | original aceptado | storage + `Document.retentionPolicy` | según la política persistida; `KEEP_ORIGINAL` por defecto actual |
+| original no soportado | storage + tombstone | acceso bloqueado al clasificar y borrado después de expiración/gracia |
+| feedback de tipo no soportado | PostgreSQL + Document | opcional, owner-only, hasta eliminar documento o cuenta |
 | render/thumbnail y archivos de trabajo OCR | filesystem efímero | mínimo técnico y cleanup al finalizar |
 | artefacto de texto reutilizable | storage privado cifrado + metadata `ProcessingArtifact` | sólo mientras el original siga disponible; se elimina con el original, documento o cuenta |
 | ExtractionRun | PostgreSQL | historial versionado mientras exista el dato estructurado |
@@ -59,6 +61,8 @@ El artefacto reutilizable contiene texto Restricted derivado del documento. Usa 
 9. registrar AuditEvent sin contenido sensible.
 
 La operación es idempotente.
+
+Un duplicado binario exacto owner-scoped se trata como descarte, no como documento fallido durable. Después de limpiar el temporal del worker, el reconciliador materializa/verifica el tombstone, elimina por cascada Document, ImportBatchItem, UploadSession, jobs, corridas y artefactos, y randomiza los fingerprints del lote. El tombstone conserva sólo keys opacas hasta confirmar `DELETE` y `HEAD` ausente; después también desaparece. Sólo sobreviven el conteo agregado del lote y un AuditEvent sin filename, hash, documentId ni import item.
 
 ## Eliminar documento y datos
 

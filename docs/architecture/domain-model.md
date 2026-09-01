@@ -127,7 +127,7 @@ El nombre visible del recibo se deriva exclusivamente de la corrida activa (`pay
 
 La asociación con Employment puede definirse al importar, resolverse de manera inequívoca durante el procesamiento o confirmarse después. El cambio actualiza en una sola transacción el ImportBatchItem, el Document y sus PayrollSettlement. Un nombre aislado nunca basta cuando hay más de un candidato.
 
-No hay deduplicación física global. La advertencia de checksum se consulta por userId para evitar un canal lateral.
+No hay deduplicación física global. El checksum se compara sólo dentro del mismo `userId`: un segundo binario exacto se tombstonea y elimina junto con item, sesión, jobs y metadata; sólo queda un conteo agregado en el lote y auditoría sanitaria. Las similitudes estructurales no borran datos y continúan como advertencia.
 
 El tipo implementado sigue siendo PAYROLL. Contratos y adendas son una expansión propuesta con allowlist, Employment obligatorio, original privado y sin OCR inicial; ver [ADR 0005](../adr/0005-employment-history-and-evidence.md).
 

@@ -52,6 +52,349 @@ function syntheticPayrollPdf(): Uint8Array<ArrayBuffer> {
   return new TextEncoder().encode(pdf);
 }
 
+type DuplicateDiscardHarness = {
+  app: { inject(options: unknown): Promise<{ body: string; json(): { data: Record<string, unknown> }; statusCode: number }> };
+  cookie: string;
+  documentId: string;
+  objectExists(key: string): Promise<boolean>;
+  pdfBytes: Uint8Array<ArrayBuffer>;
+  pool: { query(sql: string, values?: unknown[]): Promise<{ rowCount: number | null; rows: Array<Record<string, unknown>> }> };
+  runWorkerUntil(event: string): Promise<void>;
+  userId: string;
+};
+
+async function verifyExactDuplicateDiscard({
+  app, cookie, documentId, objectExists, pdfBytes, pool, runWorkerUntil, userId,
+}: DuplicateDiscardHarness): Promise<void> {
+  const duplicateChecksum = createHash("sha256").update(pdfBytes).digest("hex");
+  await pool.query("UPDATE documents SET sha256 = $2 WHERE id = $1", [documentId, duplicateChecksum]);
+  const duplicateIdempotencyKey = crypto.randomUUID();
+  const duplicateBatchResponse = await app.inject({
+    method: "POST",
+    url: "/api/v1/imports",
+    headers: { origin, cookie, "idempotency-key": duplicateIdempotencyKey },
+    payload: {
+      items: [{
+        clientItemKey: crypto.randomUUID(),
+        originalFilename: "duplicado-exacto-sintetico.pdf",
+        declaredMimeType: "application/pdf",
+        expectedSizeBytes: pdfBytes.byteLength,
+      }],
+    },
+  });
+  assert.equal(duplicateBatchResponse.statusCode, 201, duplicateBatchResponse.body);
+  const duplicateBatch = duplicateBatchResponse.json().data as unknown as { id: string; items: Array<{ id: string }> };
+  const duplicateSessionResponse = await app.inject({
+    method: "POST",
+    url: "/api/v1/upload-sessions",
+    headers: { origin, cookie },
+    payload: { itemId: duplicateBatch.items[0]!.id },
+  });
+  assert.equal(duplicateSessionResponse.statusCode, 201, duplicateSessionResponse.body);
+  const duplicateSession = duplicateSessionResponse.json().data as unknown as {
+    fields: Record<string, string>;
+    id: string;
+    url: string;
+  };
+  const duplicateForm = new FormData();
+  for (const [name, value] of Object.entries(duplicateSession.fields)) duplicateForm.append(name, value);
+  duplicateForm.append("file", new Blob([pdfBytes], { type: "application/pdf" }), "duplicado-exacto-sintetico.pdf");
+  const duplicateUpload = await fetch(duplicateSession.url, { method: "POST", body: duplicateForm });
+  assert.equal(duplicateUpload.status, 204, await duplicateUpload.text());
+  const duplicateConfirmation = await app.inject({
+    method: "POST",
+    url: `/api/v1/upload-sessions/${duplicateSession.id}/complete`,
+    headers: { origin, cookie },
+    payload: {},
+  });
+  assert.equal(duplicateConfirmation.statusCode, 200, duplicateConfirmation.body);
+  const duplicateDocumentId = String(duplicateConfirmation.json().data.id);
+  const duplicateBeforeDiscard = (await pool.query(
+    `SELECT document.object_key AS canonical_object_key,
+            session.object_key AS incoming_object_key,
+            batch.request_fingerprint, audit.id AS upload_audit_id
+       FROM documents AS document
+       JOIN upload_sessions AS session ON session.id = document.upload_session_id
+       JOIN import_batches AS batch ON batch.id = document.import_batch_id
+       JOIN audit_events AS audit
+         ON audit.user_id = document.user_id AND audit.resource_type = 'DOCUMENT'
+        AND audit.resource_id = document.id AND audit.action = 'UPLOAD_CONFIRMED'
+      WHERE document.id = $1`,
+    [duplicateDocumentId],
+  )).rows[0]!;
+  assert.equal(await objectExists(String(duplicateBeforeDiscard.canonical_object_key)), true);
+
+  await runWorkerUntil("document_duplicate_discarded");
+
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT
+         (SELECT count(*)::integer FROM import_batch_items WHERE id = $1) AS items,
+         (SELECT count(*)::integer FROM upload_sessions WHERE id = $2) AS sessions,
+         (SELECT count(*)::integer FROM documents WHERE id = $3) AS documents,
+         (SELECT count(*)::integer FROM processing_jobs WHERE document_id = $3) AS jobs,
+         (SELECT count(*)::integer FROM extraction_runs WHERE document_id = $3) AS runs,
+         (SELECT count(*)::integer FROM audit_events WHERE resource_id = $3) AS linked_audits`,
+      [duplicateBatch.items[0]!.id, duplicateSession.id, duplicateDocumentId],
+    )).rows[0],
+    { items: 0, sessions: 0, documents: 0, jobs: 0, runs: 0, linked_audits: 0 },
+  );
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT action, resource_type, resource_id, metadata_no_sensitive
+         FROM audit_events WHERE id = $1`,
+      [duplicateBeforeDiscard.upload_audit_id],
+    )).rows[0],
+    { action: "UPLOAD_CONFIRMED", resource_type: "DOCUMENT", resource_id: null, metadata_no_sensitive: {} },
+  );
+  const discardedBatch = (await pool.query(
+    `SELECT status, discarded_duplicate_count, idempotency_key, request_fingerprint
+       FROM import_batches WHERE id = $1 AND user_id = $2`,
+    [duplicateBatch.id, userId],
+  )).rows[0]!;
+  assert.equal(discardedBatch.status, "COMPLETED");
+  assert.equal(discardedBatch.discarded_duplicate_count, 1);
+  assert.notEqual(discardedBatch.idempotency_key, duplicateIdempotencyKey);
+  assert.notEqual(discardedBatch.request_fingerprint, duplicateBeforeDiscard.request_fingerprint);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT resource_type, resource_id::text, result, metadata_no_sensitive
+         FROM audit_events
+        WHERE user_id = $1 AND action = 'IMPORT_DUPLICATE_DISCARDED' AND resource_id = $2`,
+      [userId, duplicateBatch.id],
+    )).rows[0],
+    {
+      resource_type: "IMPORT_BATCH",
+      resource_id: duplicateBatch.id,
+      result: "SUCCESS",
+      metadata_no_sensitive: { itemCount: 1 },
+    },
+  );
+  const discardedBatchView = await app.inject({
+    method: "GET", url: `/api/v1/imports/${duplicateBatch.id}`, headers: { cookie },
+  });
+  assert.equal(discardedBatchView.statusCode, 200, discardedBatchView.body);
+  assert.deepEqual(discardedBatchView.json().data.progress, { total: 1, resolved: 1, percentage: 100 });
+  assert.deepEqual(discardedBatchView.json().data.totals, { DUPLICATE: 1 });
+  assert.deepEqual(discardedBatchView.json().data.items, []);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT canonical_object_key, incoming_object_key
+         FROM storage_deletion_tombstones
+        WHERE user_id = $1 AND canonical_object_key = $2`,
+      [userId, duplicateBeforeDiscard.canonical_object_key],
+    )).rows[0],
+    {
+      canonical_object_key: duplicateBeforeDiscard.canonical_object_key,
+      incoming_object_key: duplicateBeforeDiscard.incoming_object_key,
+    },
+  );
+  assert.equal(await objectExists(String(duplicateBeforeDiscard.canonical_object_key)), true);
+  await pool.query(
+    `UPDATE storage_deletion_tombstones
+        SET upload_expires_at = now() - interval '2 minutes',
+            available_at = now() - interval '2 minutes',
+            object_delete_verify_after = now() - interval '2 minutes'
+      WHERE user_id = $1 AND canonical_object_key = $2`,
+    [userId, duplicateBeforeDiscard.canonical_object_key],
+  );
+  await runWorkerUntil("storage_deletions_completed");
+  assert.equal(
+    (await pool.query(
+      "SELECT 1 FROM storage_deletion_tombstones WHERE user_id = $1 AND canonical_object_key = $2",
+      [userId, duplicateBeforeDiscard.canonical_object_key],
+    )).rowCount,
+    0,
+  );
+  assert.equal(await objectExists(String(duplicateBeforeDiscard.canonical_object_key)), false);
+}
+
+async function verifyLegacyExactDuplicateCleanup({
+  cleanupLegacyExactDuplicate,
+  pipelineFingerprint,
+  pool,
+}: {
+  cleanupLegacyExactDuplicate(): Promise<number>;
+  pipelineFingerprint: string;
+  pool: DuplicateDiscardHarness["pool"];
+}): Promise<void> {
+  const marker = crypto.randomUUID();
+  const userId = crypto.randomUUID();
+  const batchId = crypto.randomUUID();
+  const itemId = crypto.randomUUID();
+  const sessionId = crypto.randomUUID();
+  const documentId = crypto.randomUUID();
+  const jobId = crypto.randomUUID();
+  const runId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  const executionOwner = `legacy-duplicate-${marker}`;
+  const canonicalObjectKey = `documents/${createHash("sha256").update(`canonical:${marker}`).digest("hex")}.pdf`;
+  const incomingObjectKey = `incoming/${createHash("sha256").update(`incoming:${marker}`).digest("hex")}.pdf`;
+  const requestFingerprint = createHash("sha256").update(`batch:${marker}`).digest("hex");
+  const auditMetadata = {
+    filename: "duplicado-legacy-sintetico.pdf",
+    itemId,
+    sha256: "a".repeat(64),
+  };
+  await pool.query(
+    `INSERT INTO users (id, email, password_hash)
+     VALUES ($1, $2, 'synthetic-password-hash')`,
+    [userId, `legacy-duplicate-${marker}@example.test`],
+  );
+  try {
+    await pool.query(
+      `INSERT INTO import_batches (
+         id, user_id, idempotency_key, request_fingerprint, status, completed_at
+       ) VALUES ($1, $2, $3, $4, 'COMPLETED', now())`,
+      [batchId, userId, `legacy-duplicate-${marker}`, requestFingerprint],
+    );
+    await pool.query(
+      `INSERT INTO import_batch_items (
+         id, user_id, batch_id, client_item_key, ordinal, original_filename,
+         declared_mime_type, expected_size_bytes, status, error_code
+       ) VALUES ($1, $2, $3, $4, 0, 'duplicado-legacy-sintetico.pdf',
+         'application/pdf', 128, 'FAILED', 'DOCUMENT_DUPLICATE')`,
+      [itemId, userId, batchId, `legacy-item-${marker}`],
+    );
+    await pool.query(
+      `INSERT INTO upload_sessions (
+         id, user_id, batch_id, item_id, object_key, expected_size_bytes,
+         expected_mime_type, status, expires_at, confirmed_at
+       ) VALUES ($1, $2, $3, $4, $5, 128, 'application/pdf', 'CONFIRMED',
+         now() + interval '1 hour', now())`,
+      [sessionId, userId, batchId, itemId, incomingObjectKey],
+    );
+    await pool.query(
+      `INSERT INTO documents (
+         id, user_id, import_batch_id, import_batch_item_id, upload_session_id,
+         object_key, original_filename, declared_mime_type, size_bytes,
+         security_status, classification_status, processing_status,
+         retention_policy, processed_at, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'duplicado-legacy-sintetico.pdf',
+         'application/pdf', 128, 'ERROR', 'PENDING', 'FAILED_PERMANENT',
+         'KEEP_ORIGINAL', now(), now() - interval '100 years')`,
+      [documentId, userId, batchId, itemId, sessionId, canonicalObjectKey],
+    );
+    await pool.query(
+      `INSERT INTO processing_jobs (
+         id, user_id, document_id, stage, processing_version, idempotency_key,
+         state, attempt, max_attempts, completed_at, error_code, execution_owner,
+         trigger_kind, requested_by_user_id, pipeline_fingerprint
+       ) VALUES ($1, $2, $3, 'DOCUMENT_PIPELINE_V2', 1, $4,
+         'FAILED', 1, 3, now(), 'DOCUMENT_DUPLICATE', $5,
+         'INITIAL_UPLOAD', $2, $6)`,
+      [jobId, userId, documentId, `legacy-job-${marker}`, executionOwner, pipelineFingerprint],
+    );
+    await pool.query(
+      `INSERT INTO extraction_runs (
+         id, user_id, document_id, processing_version, status,
+         classifier_name, classifier_version, extractor_name, extractor_version,
+         parser_version, normalizer_version, finished_at, error_code,
+         trigger_kind, requested_by_user_id, result_schema_version,
+         pipeline_fingerprint, promotion_outcome, comparison_summary
+       ) VALUES ($1, $2, $3, 1, 'FAILED',
+         'heuristic-ar-payroll', 'synthetic', 'deterministic-ar-payroll', 'synthetic',
+         'synthetic', 'synthetic', now(), 'DOCUMENT_DUPLICATE',
+         'INITIAL_UPLOAD', $2, 'synthetic', $4, 'NOT_EVALUATED',
+         '{"errorCode":"DOCUMENT_DUPLICATE","retryable":false}'::jsonb)`,
+      [runId, userId, documentId, pipelineFingerprint],
+    );
+    await pool.query(
+      `INSERT INTO audit_events (
+         id, user_id, actor_user_id, action, resource_type, resource_id,
+         result, metadata_no_sensitive
+       ) VALUES ($1, $2, $2, 'UPLOAD_CONFIRMED', 'DOCUMENT', $3,
+         'SUCCESS', $4::jsonb)`,
+      [auditId, userId, documentId, JSON.stringify(auditMetadata)],
+    );
+
+    assert.equal(await cleanupLegacyExactDuplicate(), 0);
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT
+           (SELECT count(*)::integer FROM import_batch_items WHERE id = $1) AS items,
+           (SELECT count(*)::integer FROM upload_sessions WHERE id = $2) AS sessions,
+           (SELECT count(*)::integer FROM documents WHERE id = $3) AS documents,
+           (SELECT count(*)::integer FROM processing_jobs WHERE id = $4) AS jobs,
+           (SELECT count(*)::integer FROM extraction_runs WHERE id = $5) AS runs,
+           (SELECT count(*)::integer FROM storage_deletion_tombstones
+             WHERE canonical_object_key = $6) AS tombstones,
+           (SELECT discarded_duplicate_count FROM import_batches WHERE id = $7) AS discarded_duplicate_count`,
+        [itemId, sessionId, documentId, jobId, runId, canonicalObjectKey, batchId],
+      )).rows[0],
+      { items: 1, sessions: 1, documents: 1, jobs: 1, runs: 1, tombstones: 0, discarded_duplicate_count: 0 },
+    );
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT resource_id::text, metadata_no_sensitive
+           FROM audit_events WHERE id = $1`,
+        [auditId],
+      )).rows[0],
+      { resource_id: documentId, metadata_no_sensitive: auditMetadata },
+    );
+
+    await pool.query("UPDATE processing_jobs SET execution_owner = NULL WHERE id = $1", [jobId]);
+    assert.equal(await cleanupLegacyExactDuplicate(), 1);
+    assert.equal(await cleanupLegacyExactDuplicate(), 0);
+
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT
+           (SELECT count(*)::integer FROM import_batch_items WHERE id = $1) AS items,
+           (SELECT count(*)::integer FROM upload_sessions WHERE id = $2) AS sessions,
+           (SELECT count(*)::integer FROM documents WHERE id = $3) AS documents,
+           (SELECT count(*)::integer FROM processing_jobs WHERE id = $4) AS jobs,
+           (SELECT count(*)::integer FROM extraction_runs WHERE id = $5) AS runs`,
+        [itemId, sessionId, documentId, jobId, runId],
+      )).rows[0],
+      { items: 0, sessions: 0, documents: 0, jobs: 0, runs: 0 },
+    );
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT user_id::text, canonical_object_key, incoming_object_key
+           FROM storage_deletion_tombstones WHERE canonical_object_key = $1`,
+        [canonicalObjectKey],
+      )).rows[0],
+      { user_id: userId, canonical_object_key: canonicalObjectKey, incoming_object_key: incomingObjectKey },
+    );
+    assert.equal(
+      (await pool.query(
+        "SELECT discarded_duplicate_count FROM import_batches WHERE id = $1",
+        [batchId],
+      )).rows[0]!.discarded_duplicate_count,
+      1,
+    );
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT resource_type, resource_id, metadata_no_sensitive
+           FROM audit_events WHERE id = $1`,
+        [auditId],
+      )).rows[0],
+      { resource_type: "DOCUMENT", resource_id: null, metadata_no_sensitive: {} },
+    );
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT resource_type, resource_id::text, result, metadata_no_sensitive
+           FROM audit_events
+          WHERE user_id = $1 AND action = 'IMPORT_DUPLICATE_DISCARDED'`,
+        [userId],
+      )).rows[0],
+      {
+        resource_type: "IMPORT_BATCH",
+        resource_id: batchId,
+        result: "SUCCESS",
+        metadata_no_sensitive: { itemCount: 1 },
+      },
+    );
+  } finally {
+    await pool.query(
+      "DELETE FROM storage_deletion_tombstones WHERE user_id = $1 AND canonical_object_key = $2",
+      [userId, canonicalObjectKey],
+    );
+    await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+  }
+}
+
 test("upload privado crea un único documento y un único intent durable", async (context) => {
   type IntegrationExtraction = {
     employerName: string | null;
@@ -93,8 +436,16 @@ test("upload privado crea un único documento y un único intent durable", async
     import(workerModuleUrl),
     import(extractionEngineModuleUrl),
   ]);
-  const { failJob, persistExtraction, reconcileDatabaseState, setDocumentStage, WorkerError } = workerModule as {
+  const {
+    cleanupLegacyExactDuplicate,
+    failJob,
+    persistExtraction,
+    reconcileDatabaseState,
+    setDocumentStage,
+    WorkerError,
+  } = workerModule as {
     WorkerError: new (code: string, retryable: boolean) => Error;
+    cleanupLegacyExactDuplicate: () => Promise<number>;
     failJob: (job: IntegrationJobRow, error: unknown) => Promise<void>;
     persistExtraction: (
       job: IntegrationJobRow,
@@ -239,6 +590,12 @@ test("upload privado crea un único documento y un único intent durable", async
       throw error;
     }
   }
+
+  await verifyLegacyExactDuplicateCleanup({
+    cleanupLegacyExactDuplicate,
+    pipelineFingerprint: currentPipelineFingerprint,
+    pool: pool as unknown as DuplicateDiscardHarness["pool"],
+  });
 
   const deletionReceiptToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
@@ -2175,6 +2532,17 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.deepEqual(completedBatch.json().data.progress, { total: 1, resolved: 1, percentage: 100 });
   assert.equal((await app.inject({ method: "GET", url: "/api/v1/imports/active", headers: { cookie: cookieA } })).json().data, null);
 
+  await verifyExactDuplicateDiscard({
+    app: app as unknown as DuplicateDiscardHarness["app"],
+    cookie: cookieA,
+    documentId,
+    objectExists,
+    pdfBytes,
+    pool: pool as unknown as DuplicateDiscardHarness["pool"],
+    runWorkerUntil,
+    userId: userIdA,
+  });
+
   const sharedDocumentCreatedAt = "2026-08-30T12:34:56.123456Z";
   const listFixtures = [
     {
@@ -2231,6 +2599,68 @@ test("upload privado crea un único documento y un único intent durable", async
       ],
     );
   }
+
+  await pool.query(
+    `UPDATE documents
+        SET processing_status = 'NEEDS_TYPE_CONFIRMATION', classification_status = 'NEEDS_CONFIRMATION'
+      WHERE id = $1`,
+    [listFixtures[1]!.id],
+  );
+  const rejectUnsupported = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${listFixtures[1]!.id}/type-confirmation`,
+    headers: { origin, cookie: cookieA },
+    payload: { documentType: "UNSUPPORTED" },
+  });
+  assert.equal(rejectUnsupported.statusCode, 201, rejectUnsupported.body);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.retention_policy,
+              document.original_deleted_at IS NOT NULL AS original_blocked,
+              EXISTS (
+                SELECT 1 FROM storage_deletion_tombstones tombstone
+                 WHERE tombstone.user_id = document.user_id
+                   AND tombstone.canonical_object_key = document.object_key
+              ) AS deletion_scheduled
+         FROM documents AS document WHERE document.id = $1`,
+      [listFixtures[1]!.id],
+    )).rows[0],
+    { retention_policy: "DELETE_AFTER_PROCESSING", original_blocked: true, deletion_scheduled: true },
+  );
+
+  const deniedUnsupportedFeedback = await app.inject({
+    method: "PUT",
+    url: `/api/v1/documents/${listFixtures[1]!.id}/unsupported-feedback`,
+    headers: { origin, cookie: cookieB },
+    payload: { comment: "No debe persistirse" },
+  });
+  assert.equal(deniedUnsupportedFeedback.statusCode, 404, deniedUnsupportedFeedback.body);
+  const unsupportedFeedback = await app.inject({
+    method: "PUT",
+    url: `/api/v1/documents/${listFixtures[1]!.id}/unsupported-feedback`,
+    headers: { origin, cookie: cookieA },
+    payload: { comment: "  Certificado\nlaboral para completar fechas  " },
+  });
+  assert.equal(unsupportedFeedback.statusCode, 200, unsupportedFeedback.body);
+  assert.equal(unsupportedFeedback.json().data.comment, "Certificado laboral para completar fechas");
+  const unsupportedDetail = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${listFixtures[1]!.id}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(unsupportedDetail.statusCode, 200, unsupportedDetail.body);
+  assert.equal(unsupportedDetail.json().data.unsupportedFeedback, "Certificado laboral para completar fechas");
+  assert.equal(unsupportedDetail.json().data.originalAvailable, false);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT metadata_no_sensitive
+         FROM audit_events
+        WHERE action = 'UNSUPPORTED_FEEDBACK_UPDATED' AND resource_id = $1
+        ORDER BY created_at DESC LIMIT 1`,
+      [listFixtures[1]!.id],
+    )).rows[0].metadata_no_sensitive,
+    { commentProvided: true },
+  );
 
   const allListIds = [documentId, ...listFixtures.map(({ id }) => id)];
   const expectedDocumentOrder = (await pool.query<{ id: string }>(
@@ -5091,7 +5521,8 @@ test("upload privado crea un único documento y un único intent durable", async
     `UPDATE documents
         SET active_extraction_run_id = $1, processing_status = 'COMPLETED',
             security_status = 'CLEAN', classification_status = 'SUPPORTED',
-            document_type = 'PAYROLL', classification_confidence = 0.7
+            document_type = 'PAYROLL', classification_confidence = 0.7,
+            unsupported_feedback = NULL
       WHERE id = $2 AND user_id = $3`,
     [raceBaselineRunId, raceDocumentId, userId],
   );
@@ -5134,6 +5565,20 @@ test("upload privado crea un único documento y un único intent durable", async
     );
   }
 
+  const mfaSessionWithoutStepUp = await pool.query(
+    `UPDATE sessions SET step_up_expires_at = NULL
+      WHERE token_hash = $1
+      RETURNING mfa_verified_at IS NOT NULL AS mfa_verified`,
+    [tokenHash(cookieA.split("=", 2)[1]!)],
+  );
+  assert.equal(mfaSessionWithoutStepUp.rows[0].mfa_verified, true);
+  const nonMfaInline = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/original?disposition=inline`,
+    headers: { cookie: cookieB },
+  });
+  assert.equal(nonMfaInline.statusCode, 403, nonMfaInline.body);
+  assert.equal(nonMfaInline.json().error.code, "STEP_UP_REQUIRED");
   const signedOriginal = await app.inject({
     method: "GET",
     url: `/api/v1/documents/${documentId}/original?disposition=inline`,
@@ -5161,6 +5606,24 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(rangedOriginal.headers.get("cache-control"), "no-store, private, max-age=0");
   assert.equal(rangedOriginal.headers.get("content-disposition"), "inline; filename=\"salarivo-document.pdf\"");
   assert.equal(new TextDecoder().decode((await rangedOriginal.arrayBuffer()).slice(0, 5)), "%PDF-");
+  const blockedAttachment = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/original`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(blockedAttachment.statusCode, 403, blockedAttachment.body);
+  assert.equal(blockedAttachment.json().error.code, "STEP_UP_REQUIRED");
+  await grantStepUp(cookieA);
+  const signedAttachment = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/original?disposition=attachment`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(signedAttachment.statusCode, 200, signedAttachment.body);
+  assert.equal(
+    new URL(String(signedAttachment.json().data.url)).searchParams.get("response-content-disposition"),
+    "attachment; filename=\"salarivo-document.pdf\"",
+  );
 
   const rejectedReprocess = await app.inject({
     method: "POST",

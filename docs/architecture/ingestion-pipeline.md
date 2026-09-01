@@ -185,7 +185,7 @@ La implementación actual completa el lote automáticamente cuando todos sus ite
 Claves mínimas:
 
 - uploadSessionId + itemId para completar upload;
-- userId + checksum para advertir duplicado sólo dentro del usuario;
+- userId + checksum para descartar un segundo binario exacto sólo dentro del usuario; el tombstone precede al cascade y el lote conserva únicamente un conteo agregado;
 - documentId + processingVersion + stage para jobs;
 - userId + documentId + clave de idempotencia del titular para replay de la misma solicitud;
 - un único job activo por documentId y fingerprint de pipeline para carreras entre acciones individuales y batch;
