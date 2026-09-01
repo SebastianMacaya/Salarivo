@@ -232,6 +232,10 @@ input:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rg
 .chart-tooltip { width: max-content; max-width: 220px; position: absolute; z-index: 6; top: 8px; left: 50%; bottom: auto; display: none; gap: 3px; border-radius: 9px; background: #10261c; padding: 9px 11px; color: white; font-size: 10px; line-height: 1.35; text-align: left; transform: translateX(-50%); box-shadow: 0 8px 28px rgb(0 0 0 / 20%); }
 .chart-tooltip > span { display: block; }
 .bar-group:hover .chart-tooltip, .bar-group:focus-visible .chart-tooltip { display: grid; }
+@media (min-width: 521px) {
+  .bar-group:first-child .chart-tooltip { left: 0; transform: none; }
+  .bar-group:last-child .chart-tooltip { right: 0; left: auto; transform: none; }
+}
 .empty-state { min-height: 190px; display: grid; place-items: center; place-content: center; gap: 8px; padding: 30px; text-align: center; }
 .empty-state .empty-mark { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 50%; background: var(--green-soft); color: var(--green); font-size: 22px; }
 .empty-state h3 { margin: 3px 0 0; font-size: 16px; }
