@@ -395,6 +395,11 @@ dialog.modal-layer::backdrop { background: transparent; }
 .economic-context { display: grid; gap: 4px; margin: 0 0 16px; border: 1px solid #cfe4d7; border-radius: 11px; background: var(--green-soft); padding: 12px 14px; color: var(--green-dark); font-size: 11px; line-height: 1.5; }
 .economic-context span { color: #47705c; }
 .economic-context p { margin: 0; }
+.economic-reading { display: grid; gap: 5px; margin: 0 0 16px; border-left: 4px solid var(--green); border-radius: 9px; background: #f7faf8; padding: 12px 14px; color: var(--green-dark); }
+.economic-reading p { margin: 0; font-size: 11px; line-height: 1.5; }
+.economic-monthly-value { display: grid; justify-items: start; gap: 4px; }
+.economic-monthly-value small { color: var(--muted); font-size: 9px; line-height: 1.4; }
+.economic-real-change { font-weight: 750; }
 .economic-state { min-width: 210px; white-space: normal; }
 .economic-state-content { display: grid; justify-items: start; }
 .economic-state small { display: block; margin-top: 5px; color: var(--muted); font-size: 9px; line-height: 1.4; }
@@ -620,6 +625,7 @@ td { border-top: 1px solid #edf1ee; padding: 14px 15px; white-space: nowrap; }
   .salary-evolution-table td::before, .comparison-result td::before, .annual-body td::before, #history-panel-concepts td::before { content: attr(data-label); flex: 0 0 42%; color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .05em; text-align: left; text-transform: uppercase; }
   .comparison-result tbody th { justify-content: flex-start; text-align: left; }
   .economic-state-content { justify-items: end; text-align: right; }
+  .economic-monthly-value { justify-items: end; text-align: right; }
   .economic-comparison-grid { grid-template-columns: 1fr; }
 }
 

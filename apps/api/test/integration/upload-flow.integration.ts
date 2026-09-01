@@ -3090,6 +3090,7 @@ test("upload privado crea un único documento y un único intent durable", async
         status: "PENDING", reason: "SYNC_PENDING", currencyCode: "ARS", referencePeriod: null,
         amounts: null, comparableSalary: null, observations: [],
       },
+      comparisonToPrevious: null,
     },
   );
   assert.equal("settlements" in salaryHistory.json().data.analytics.scopes[0].evolution[0], false);

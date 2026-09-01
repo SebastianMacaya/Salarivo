@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  addEconomicProjections,
   buildEconomicAnalytics,
   compareEconomicPeriods,
   scopePeriodKey,
   type EconomicDataQueryable,
   type EconomicSalarySettlement,
 } from "../src/economic-analytics.ts";
+import { analyzeSalaryHistory } from "../src/salary-analytics.ts";
 
 function settlement(overrides: Partial<EconomicSalarySettlement> = {}): EconomicSalarySettlement {
   return {
@@ -180,7 +182,7 @@ test("compares historical USD and real salary with exact ratios", async () => {
       return { rows: requests.map(economicRow) };
     },
   };
-  const result = await buildEconomicAnalytics(queryable, [
+  const settlements = [
     settlement(),
     settlement({
       id: "settlement-2",
@@ -193,7 +195,19 @@ test("compares historical USD and real salary with exact ratios", async () => {
       deductionsAmount: "24000.00",
       remunerativeAmount: "120000.00",
     }),
-  ]);
+    settlement({
+      id: "settlement-3",
+      documentId: "document-3",
+      payrollPeriod: "2024-04",
+      paymentDate: "2024-05-03",
+      basicAmount: "120000.00",
+      grossAmount: "120000.00",
+      netAmount: "96000.00",
+      deductionsAmount: "24000.00",
+      remunerativeAmount: "120000.00",
+    }),
+  ];
+  const result = await buildEconomicAnalytics(queryable, settlements);
   const comparison = compareEconomicPeriods(result, {
     employmentContext: "employment-1",
     currencyCode: "ARS",
@@ -208,6 +222,17 @@ test("compares historical USD and real salary with exact ratios", async () => {
   assert.equal(comparison?.purchasingPower.earlierComparableNetCents, "9600000");
   assert.equal(comparison?.purchasingPower.laterComparableNetCents, "9600000");
   assert.equal(comparison?.inflation.changeBasisPoints, "2000");
+
+  const evolution = addEconomicProjections(analyzeSalaryHistory(settlements).scopes, result)[0]?.evolution;
+  assert.equal(evolution?.[0]?.economic.comparisonToPrevious, null);
+  assert.deepEqual(evolution?.[1]?.economic.comparisonToPrevious, {
+    fromPeriod: "2024-01",
+    historicalUsd: { status: "AVAILABLE", reason: null, changeBasisPoints: "0" },
+    purchasingPower: { status: "AVAILABLE", reason: null, changeBasisPoints: "0" },
+    inflation: { status: "AVAILABLE", reason: null, changeBasisPoints: "2000" },
+  });
+  assert.equal(evolution?.[2]?.economic.comparisonToPrevious?.fromPeriod, "2024-02");
+  assert.equal(evolution?.[2]?.economic.comparisonToPrevious?.inflation.changeBasisPoints, "2500");
 });
 
 test("uses the pending reason when only the later comparison period is still syncing", async () => {

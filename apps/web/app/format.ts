@@ -28,6 +28,30 @@ export function percentageFromBasisPoints(value?: string | null) {
   return decimalHundredths(value);
 }
 
+export type EconomicStatus = 'AVAILABLE' | 'PARTIAL' | 'PENDING' | 'UNAVAILABLE';
+export type EconomicReason = 'NOT_CONFIGURED' | 'SYNC_PENDING' | 'PROVIDER_UNAVAILABLE' | 'NO_COVERAGE' | null;
+
+const economicReasonMessages: Record<Exclude<EconomicReason, null>, string> = {
+  NOT_CONFIGURED: 'Esta perspectiva todavía no está configurada para este contexto.',
+  SYNC_PENDING: 'Los datos económicos se están sincronizando.',
+  PROVIDER_UNAVAILABLE: 'La fuente económica está temporalmente no disponible.',
+  NO_COVERAGE: 'No hay cobertura económica para este período.',
+};
+
+export function economicStatusMessage(status: EconomicStatus, reason?: EconomicReason) {
+  if (status === 'AVAILABLE') return 'Cálculo económico disponible.';
+  if (reason) return economicReasonMessages[reason];
+  if (status === 'PARTIAL') return 'El cálculo usa sólo las observaciones disponibles.';
+  if (status === 'PENDING') return 'El cálculo económico todavía está en preparación.';
+  return 'No hay un cálculo económico disponible.';
+}
+
+export function economicTrendLabel(value?: string | null) {
+  if (!/^-?\d+$/.test(value ?? '')) return null;
+  if (/^-?0+$/.test(value!)) return 'Sin cambio';
+  return value!.startsWith('-') ? 'Empeoró' : 'Mejoró';
+}
+
 const periodFormatter = new Intl.DateTimeFormat('es-AR', { month: 'long', timeZone: 'UTC' });
 const dateFormatter = new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium', timeZone: 'UTC' });
 const timestampFormatter = new Intl.DateTimeFormat('es-AR', {

@@ -4,6 +4,8 @@ import {
   amountFromCents,
   dateLabel,
   documentStatusLabel,
+  economicStatusMessage,
+  economicTrendLabel,
   employmentOptionLabel,
   extractionSourceLabel,
   money,
@@ -34,6 +36,16 @@ test('convierte centavos y puntos básicos sin pasar por punto flotante', () => 
   assert.equal(percentageFromBasisPoints('-25'), '-0.25');
   assert.equal(amountFromCents('1.5'), null);
   assert.equal(percentageFromBasisPoints(null), null);
+});
+
+test('explica disponibilidad y tendencia económica sin contradecir el estado', () => {
+  assert.equal(economicStatusMessage('AVAILABLE', null), 'Cálculo económico disponible.');
+  assert.equal(economicStatusMessage('AVAILABLE', 'NOT_CONFIGURED'), 'Cálculo económico disponible.');
+  assert.equal(economicStatusMessage('PENDING', 'SYNC_PENDING'), 'Los datos económicos se están sincronizando.');
+  assert.equal(economicTrendLabel('125'), 'Mejoró');
+  assert.equal(economicTrendLabel('-1'), 'Empeoró');
+  assert.equal(economicTrendLabel('0'), 'Sin cambio');
+  assert.equal(economicTrendLabel(null), null);
 });
 
 test('formatea períodos válidos en español', () => {

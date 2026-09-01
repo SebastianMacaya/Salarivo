@@ -28,6 +28,7 @@ test('privacy helpers mask values without retaining the raw amount', () => {
   assert.equal(privateMoney(economicAmount, 'USD', true, 'salary'), 'USD ••••••••');
   assert.equal(privatePercentage(economicChange, true), '••,••%');
   assert.equal(privatePercentage(economicChange, false), '18,75%');
+  assert.equal(privateText('Mejoró', true, 'Resultado oculto'), 'Resultado oculto');
   assert.doesNotMatch(`${privateMoney(economicAmount, 'USD', true, 'salary')} ${privatePercentage(economicChange, true)}`, /123456|1875|18,75/);
 });
 

@@ -18,6 +18,8 @@ import {
   amountFromCents,
   dateLabel,
   documentStatusLabel,
+  economicStatusMessage,
+  economicTrendLabel,
   employmentOptionLabel,
   percentageFromBasisPoints,
   periodLabel,
@@ -29,9 +31,11 @@ import {
   salaryCategories,
   settlementTypeLabel,
   timestampLabel,
+  type EconomicReason,
+  type EconomicStatus,
   type SalaryCategory,
 } from './format';
-import { MoneyValue, PercentageValue, PrivacyModeProvider, PrivacyToggle, privacySnapshot, subscribePrivacyMode, usePrivacyMode } from './privacy-mode';
+import { MoneyValue, PercentageValue, PrivacyModeProvider, PrivacyToggle, SensitiveValue, privacySnapshot, subscribePrivacyMode, usePrivacyMode } from './privacy-mode';
 import { privacyChartHeights } from './privacy-mode-state';
 import { mfaQrDataUrl } from './mfa-qr';
 import { createStepUpGate, type StepUpGate } from './sensitive-action';
@@ -129,8 +133,6 @@ type SalaryAmounts = {
   remunerativeAmount: string | null;
   nonRemunerativeAmount: string | null;
 };
-type EconomicStatus = 'AVAILABLE' | 'PARTIAL' | 'PENDING' | 'UNAVAILABLE';
-type EconomicReason = 'NOT_CONFIGURED' | 'SYNC_PENDING' | 'PROVIDER_UNAVAILABLE' | 'NO_COVERAGE' | null;
 type EconomicObservation = {
   seriesCode: string;
   externalSeriesId: string;
@@ -163,7 +165,16 @@ type MonthlyEvolution = {
   regular: SalaryAmounts;
   comparableSalary: string | null;
   quality?: { incompleteDocuments: number; reprocessableDocuments: number };
-  economic?: { historicalUsd: EconomicProjection; purchasingPower: EconomicProjection };
+  economic?: {
+    historicalUsd: EconomicProjection;
+    purchasingPower: EconomicProjection;
+    comparisonToPrevious: {
+      fromPeriod: string;
+      historicalUsd: { status: EconomicStatus; reason: EconomicReason; changeBasisPoints: string | null };
+      purchasingPower: { status: EconomicStatus; reason: EconomicReason; changeBasisPoints: string | null };
+      inflation: { status: EconomicStatus; reason: EconomicReason; changeBasisPoints: string | null };
+    } | null;
+  };
 };
 type SalaryConcept = {
   period: string;
@@ -1339,21 +1350,6 @@ const economicStatusLabels: Record<EconomicStatus, string> = {
   UNAVAILABLE: 'No disponible',
 };
 
-const economicReasonMessages: Record<Exclude<EconomicReason, null>, string> = {
-  NOT_CONFIGURED: 'Esta perspectiva todavía no está configurada para este contexto.',
-  SYNC_PENDING: 'Los datos económicos se están sincronizando.',
-  PROVIDER_UNAVAILABLE: 'La fuente económica está temporalmente no disponible.',
-  NO_COVERAGE: 'No hay cobertura económica para este período.',
-};
-
-function economicStatusMessage(status: EconomicStatus, reason: EconomicReason) {
-  if (reason) return economicReasonMessages[reason];
-  if (status === 'PARTIAL') return 'El cálculo usa sólo las observaciones disponibles.';
-  if (status === 'PENDING') return 'El cálculo económico todavía está en preparación.';
-  if (status === 'UNAVAILABLE') return 'No hay un cálculo económico disponible.';
-  return 'Cálculo económico disponible.';
-}
-
 function economicStatusClass(status: EconomicStatus) {
   return status === 'AVAILABLE' ? 'ready' : status === 'UNAVAILABLE' ? 'danger' : 'pending';
 }
@@ -1421,6 +1417,22 @@ function SalaryMetricGrid({ scope, context, recoveryPeriods = new Map() }: { sco
   </section>;
 }
 
+function EconomicRealChange({ basisPoints }: { basisPoints?: string | null }) {
+  const label = economicTrendLabel(basisPoints);
+  if (!label) return <span>N/D</span>;
+  return <span className="economic-real-change"><SensitiveValue value={label} mask="Resultado oculto" /> <PercentageValue value={percentageFromBasisPoints(basisPoints)} /></span>;
+}
+
+function EconomicProjectionNote({ projection }: { projection?: EconomicProjection }) {
+  if (!projection || projection.status === 'AVAILABLE') return null;
+  return <small>{economicStatusLabels[projection.status]}: {economicStatusMessage(projection.status, projection.reason)}</small>;
+}
+
+function EconomicChangeNote({ change }: { change?: { status: EconomicStatus; reason: EconomicReason } }) {
+  if (!change || change.status === 'AVAILABLE') return null;
+  return <small>Cambio {economicStatusLabels[change.status].toLocaleLowerCase('es-AR')}: {economicStatusMessage(change.status, change.reason)}</small>;
+}
+
 function SalaryEvolution({ scope, year = 'all', limit, perspective = 'nominal', recoveryPeriods = new Map(), selectedPeriod, onSelectPeriod }: { scope: SalaryScopeAnalytics; year?: string; limit?: number; perspective?: EconomicPerspective; recoveryPeriods?: Map<string, SalaryRecoveryState>; selectedPeriod?: string; onSelectPeriod?: (period: string) => void }) {
   const { enabled: privacyEnabled } = usePrivacyMode();
   const filtered = year === 'all' ? scope.evolution : scope.evolution.filter((point) => point.period.startsWith(`${year}-`));
@@ -1447,13 +1459,36 @@ function SalaryEvolution({ scope, year = 'all', limit, perspective = 'nominal', 
   const protectedHeights = privacyChartHeights(chartPoints.flatMap((point) => { const values = valuesFor(point); return [values.comparableSalary, values.amounts?.netAmount ?? null]; }));
   const chartHeight = (value: string, index: number) => privacyEnabled ? protectedHeights[index] ?? '40%' : visualHeight(value);
   const choosePeriod = (period: string) => onSelectPeriod?.(period);
-  const exactTable = <div className="table-wrap salary-evolution-table" role="region" aria-label={`Tabla de evolución salarial en perspectiva ${perspectiveLabel}`} tabIndex={0}><table><caption className="sr-only">Valores de la evolución salarial en perspectiva {perspectiveLabel}</caption><thead><tr><th>Período</th><th>Básico comparable</th><th>Bruto total</th><th>Neto total</th><th>Descuentos / créditos</th>{economic && <th>Estado</th>}</tr></thead><tbody>{points.map((point) => {
+  const standardExactTable = <div className="table-wrap salary-evolution-table" role="region" aria-label={`Tabla de evolución salarial en perspectiva ${perspectiveLabel}`} tabIndex={0}><table><caption className="sr-only">Valores de la evolución salarial en perspectiva {perspectiveLabel}</caption><thead><tr><th>Período</th><th>Básico comparable</th><th>Bruto total</th><th>Neto total</th><th>Descuentos / créditos</th>{economic && <th>Estado</th>}</tr></thead><tbody>{points.map((point) => {
     const recovery = recoveryPeriods.get(point.period) ?? (point.quality?.reprocessableDocuments ? 'available' : point.quality?.incompleteDocuments ? 'partial' : undefined);
     const values = valuesFor(point);
     const status = values.projection?.status ?? 'UNAVAILABLE';
-    const reason = values.projection?.reason ?? 'NOT_CONFIGURED';
+    const reason = values.projection?.reason ?? null;
     return <tr className={selectedPeriod === point.period ? 'selected' : ''} key={point.period} onClick={() => choosePeriod(point.period)}><td data-label="Período"><button type="button" className="period-link" disabled={!onSelectPeriod} onClick={(event) => { event.stopPropagation(); choosePeriod(point.period); }}>{periodLabel(point.period)}</button></td><td data-label="Básico comparable"><MoneyValue value={values.comparableSalary} currency={values.currency} kind="salary" />{!economic && values.comparableSalary === null && recovery && <small className="nd-context">{recovery === 'processing' ? 'Buscando una mejora…' : recovery === 'partial' ? 'Análisis incompleto' : 'Mejora disponible'}</small>}</td><td data-label="Bruto total"><MoneyValue value={values.amounts?.grossAmount} currency={values.currency} kind="salary" /></td><td data-label="Neto total"><MoneyValue value={values.amounts?.netAmount} currency={values.currency} kind="salary" /></td><td data-label="Descuentos / créditos"><MoneyValue value={values.amounts?.deductionsAmount} currency={values.currency} kind="salary" creditAware /></td>{economic && <td data-label="Estado" className="economic-state"><div className="economic-state-content"><span className={`status ${economicStatusClass(status)}`}>{economicStatusLabels[status]}</span><small>{economicStatusMessage(status, reason)}</small></div></td>}</tr>;
   })}</tbody></table></div>;
+  const referencePeriod = [...points].reverse().find((point) => point.economic?.purchasingPower.referencePeriod)?.economic?.purchasingPower.referencePeriod ?? null;
+  const latestRealPoint = [...points].reverse().find((point) => typeof point.economic?.comparisonToPrevious?.purchasingPower.changeBasisPoints === 'string');
+  const latestRealComparison = latestRealPoint?.economic?.comparisonToPrevious ?? null;
+  const economicExactTable = <div className="table-wrap salary-evolution-table economic-monthly-table" role="region" aria-label="Evolución económica por período salarial del neto" tabIndex={0}>
+    <table>
+      <caption className="sr-only">Neto nominal, equivalente histórico en USD, inflación y poder adquisitivo por período</caption>
+      <thead><tr><th>Período</th><th>Neto original</th><th>USD histórico</th><th>Inflación desde el período anterior</th><th>{referencePeriod ? `Neto a precios de ${periodLabel(referencePeriod)}` : 'Poder adquisitivo'}</th></tr></thead>
+      <tbody>{points.map((point) => {
+        const usd = point.economic?.historicalUsd;
+        const purchasingPower = point.economic?.purchasingPower;
+        const comparison = point.economic?.comparisonToPrevious;
+        const fromPeriod = comparison?.fromPeriod;
+        return <tr className={selectedPeriod === point.period ? 'selected' : ''} key={point.period} onClick={() => choosePeriod(point.period)}>
+          <td data-label="Período"><button type="button" className="period-link" disabled={!onSelectPeriod} onClick={(event) => { event.stopPropagation(); choosePeriod(point.period); }}>{periodLabel(point.period)}</button></td>
+          <td data-label="Neto original"><MoneyValue value={point.totals.netAmount} currency={scope.currencyCode} kind="salary" /></td>
+          <td data-label="USD histórico"><div className="economic-monthly-value"><MoneyValue value={usd?.amounts?.netAmount} currency={usd?.currencyCode ?? 'USD'} kind="salary" />{fromPeriod && <small>Vs. {periodLabel(fromPeriod)}: <PercentageValue value={percentageFromBasisPoints(comparison?.historicalUsd.changeBasisPoints)} /></small>}<EconomicProjectionNote projection={usd} /><EconomicChangeNote change={comparison?.historicalUsd} /></div></td>
+          <td data-label="Inflación desde el período anterior"><div className="economic-monthly-value"><PercentageValue value={percentageFromBasisPoints(comparison?.inflation.changeBasisPoints)} sensitive={false} /><small>{fromPeriod ? `Desde ${periodLabel(fromPeriod)}` : 'Primer período disponible'}</small><EconomicChangeNote change={comparison?.inflation} /></div></td>
+          <td data-label={referencePeriod ? `Neto a precios de ${periodLabel(referencePeriod)}` : 'Poder adquisitivo'}><div className="economic-monthly-value"><MoneyValue value={purchasingPower?.amounts?.netAmount} currency={purchasingPower?.currencyCode ?? scope.currencyCode} kind="salary" />{fromPeriod && <small>Vs. {periodLabel(fromPeriod)}: <EconomicRealChange basisPoints={comparison?.purchasingPower.changeBasisPoints} /></small>}<EconomicProjectionNote projection={purchasingPower} /><EconomicChangeNote change={comparison?.purchasingPower} /></div></td>
+        </tr>;
+      })}</tbody>
+    </table>
+  </div>;
+  const exactTable = perspective === 'purchasing-power' ? economicExactTable : standardExactTable;
   const economicStates = economic ? points.map((point) => valuesFor(point).projection?.status ?? 'UNAVAILABLE') : [];
   const economicNotice = !economic ? '' : economicStates.includes('PARTIAL')
     ? 'Hay períodos con cobertura parcial. Cada fila indica qué cálculo pudo completarse.'
@@ -1466,6 +1501,7 @@ function SalaryEvolution({ scope, year = 'all', limit, perspective = 'nominal', 
           : '';
   return <div className="salary-evolution">
     {economicNotice && <p className="message warning" role="status">{economicNotice}</p>}
+    {perspective === 'purchasing-power' && <div className="economic-reading" role="note"><strong>¿El neto total cobrado ganó o perdió poder de compra?</strong>{latestRealPoint && latestRealComparison ? <p>Último cambio real del neto total: <EconomicRealChange basisPoints={latestRealComparison.purchasingPower.changeBasisPoints} /> · {periodLabel(latestRealComparison.fromPeriod)} → {periodLabel(latestRealPoint.period)}.</p> : <p>Todavía no hay dos períodos con datos completos para medir el cambio real.</p>}<p>Cada fila reúne tu neto original, su equivalente histórico en USD, la inflación entre recibos y el neto ajustado por IPC. Aguinaldos, bonos u otras liquidaciones también forman parte del neto total, por lo que este resultado no equivale por sí solo a la evolución del sueldo regular.</p></div>}
     <div className="legend"><span className="comparable">Básico comparable</span><span className="net">Neto total</span></div>
     {visualValues.length > 0 && <div className="bar-chart salary-chart" role="group" aria-label={`Períodos del historial salarial en perspectiva ${perspectiveLabel}`}>{chartPoints.map((point, pointIndex) => { const values = valuesFor(point); return <button type="button" className={`bar-group${selectedPeriod === point.period ? ' selected' : ''}`} aria-label={`Abrir detalle de ${periodLabel(point.period)}`} aria-pressed={selectedPeriod === point.period} disabled={!onSelectPeriod} onClick={() => choosePeriod(point.period)} key={point.period}><span className="chart-tooltip"><span>{periodLabel(point.period)}</span><span>Básico: <MoneyValue value={values.comparableSalary} currency={values.currency} kind="salary" /></span><span>Neto: <MoneyValue value={values.amounts?.netAmount} currency={values.currency} kind="salary" /></span></span><span className="bars" aria-hidden="true">{values.comparableSalary !== null && <i className="bar comparable" style={{ height: chartHeight(values.comparableSalary, pointIndex * 2) }} />}{values.amounts?.netAmount != null && <i className="bar net" style={{ height: chartHeight(values.amounts.netAmount, pointIndex * 2 + 1) }} />}</span><small>{periodLabel(point.period)}</small></button>; })}</div>}
     {chartPoints.length < points.length && <p className="coverage-note">El gráfico muestra {chartPoints.length} puntos seleccionados; la tabla conserva los {points.length} períodos exactos.</p>}
@@ -2659,12 +2695,18 @@ function History({ initialLocation, onLocationChange, runSensitive }: { initialL
     : selectedPoint && selectedPerspective === 'purchasing-power'
       ? selectedPoint.economic?.purchasingPower
       : undefined;
+  const selectedEconomicObservations = selectedPoint && selectedPerspective === 'purchasing-power'
+    ? [...(selectedPoint.economic?.historicalUsd.observations ?? []), ...(selectedPoint.economic?.purchasingPower.observations ?? [])]
+    : selectedEconomicProjection?.observations ?? [];
   const selectedPointAmounts = selectedPerspective === 'nominal' ? selectedPoint?.totals : selectedEconomicProjection?.amounts;
   const selectedPointComparable = selectedPerspective === 'nominal' ? selectedPoint?.comparableSalary : selectedEconomicProjection?.comparableSalary;
   const selectedPointCurrency = selectedPerspective === 'nominal' ? scope?.currencyCode : selectedEconomicProjection?.currencyCode || scope?.currencyCode;
   const purchasingPowerReferencePeriod = selectedPerspective === 'purchasing-power'
     ? scope?.evolution.map((point) => point.economic?.purchasingPower.referencePeriod).find((period) => period) ?? null
     : null;
+  const economicContextDescription = purchasingPowerReferencePeriod
+    ? `El gráfico y la columna de poder adquisitivo están expresados a precios de ${periodLabel(purchasingPowerReferencePeriod)}. Los importes originales del recibo no cambian.`
+    : 'Es una perspectiva derivada: los importes originales del recibo no cambian.';
   const annualRows = scope?.annual.filter(({ year }) => selectedYear === 'all' || year === selectedYear) ?? [];
   const latestEvents = scope?.events?.slice(-6).reverse() ?? [];
   const possibleDuplicates = context
@@ -2907,7 +2949,7 @@ function History({ initialLocation, onLocationChange, runSensitive }: { initialL
         <section className="panel comparison-panel"><div className="panel-heading"><div><p className="eyebrow">Comparación exacta</p><h2>Dos períodos</h2></div></div>{periods.length > 1 ? <><div className="comparison-controls"><label>Desde<select value={selectedFromPeriod} onChange={(event) => { comparisonRequestGeneration.current += 1; setFromPeriod(event.target.value); setComparison(null); setComparisonLoaded(false); setComparisonLoading(false); }} >{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><label>Hasta<select value={selectedToPeriod} onChange={(event) => { comparisonRequestGeneration.current += 1; setToPeriod(event.target.value); setComparison(null); setComparisonLoaded(false); setComparisonLoading(false); }}>{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><button type="button" className="button primary" disabled={comparisonLoading || selectedFromPeriod === selectedToPeriod} onClick={() => void comparePeriods()}>{comparisonLoading ? 'Comparando…' : 'Comparar'}</button></div>{visibleComparison && <ComparisonResult comparison={visibleComparison} />}{comparisonLoaded && !visibleComparison && <EmptyState title="No se pueden comparar" body="No hay datos suficientes en uno de los períodos elegidos." />}</> : <EmptyState title="Falta otro período" body="La comparación necesita al menos dos períodos del mismo empleo y moneda." />}</section>
       </> : history && !loading ? <EmptyState title="Todavía no hay datos salariales" body="Importá recibos soportados y completá su revisión para construir el historial." /> : null}</section>}
 
-      {evolutionTab && <section id={`history-panel-${tab}`} role="tabpanel" aria-labelledby={`history-tab-${tab}`} tabIndex={0}>{scope ? <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">{tab === 'purchasing-power' ? 'Poder adquisitivo' : 'Evolución'}</p><h2>{selectedPerspective === 'nominal' ? 'Comparable y neto' : `Comparable y neto · ${selectedPerspectiveLabel}`}</h2></div></div>{selectedPerspective !== 'nominal' && <div className="economic-context" role="note"><strong>Contexto económico</strong><span>{context?.countryCode ?? 'País sin confirmar'} · moneda original {scope.currencyCode}{history?.economicCalculationVersion ? ` · cálculo ${history.economicCalculationVersion}` : ''}</span><p>{purchasingPowerReferencePeriod ? `Valores expresados a precios de ${periodLabel(purchasingPowerReferencePeriod)}. ` : ''}Es una perspectiva derivada: los importes originales del recibo no cambian.</p></div>}<SalaryEvolution scope={scope} perspective={selectedPerspective} limit={evolutionRanges.find(([value]) => value === selectedEvolutionRange)?.[2]} recoveryPeriods={candidatePeriods} selectedPeriod={selectedPoint?.period} onSelectPeriod={selectEvolutionPeriod} />{selectedPoint && <section className="settlement-detail" aria-labelledby="selected-period-title"><div className="panel-heading"><div><p className="eyebrow">Período seleccionado · {selectedPerspectiveLabel}</p><h3 id="selected-period-title">{periodLabel(selectedPoint.period)}</h3></div><button type="button" className="icon-button" aria-label="Cerrar detalle del período" onClick={() => { setSelectedPeriod(''); onLocationChange({ period: null }, true); }}>×</button></div>{selectedPerspective !== 'nominal' && <div className="economic-period-state"><span className={`status ${economicStatusClass(selectedEconomicProjection?.status ?? 'UNAVAILABLE')}`}>{economicStatusLabels[selectedEconomicProjection?.status ?? 'UNAVAILABLE']}</span><p>{economicStatusMessage(selectedEconomicProjection?.status ?? 'UNAVAILABLE', selectedEconomicProjection?.reason ?? 'NOT_CONFIGURED')}</p></div>}<dl className="settlement-overview"><div><dt>Básico comparable</dt><dd><MoneyValue value={selectedPointComparable} currency={selectedPointCurrency} kind="salary" /></dd></div><div><dt>Bruto</dt><dd><MoneyValue value={selectedPointAmounts?.grossAmount} currency={selectedPointCurrency} kind="salary" /></dd></div><div><dt>Neto</dt><dd><MoneyValue value={selectedPointAmounts?.netAmount} currency={selectedPointCurrency} kind="salary" /></dd></div><div><dt>Descuentos / créditos</dt><dd><MoneyValue value={selectedPointAmounts?.deductionsAmount} currency={selectedPointCurrency} kind="salary" creditAware /></dd></div></dl>{selectedPerspective !== 'nominal' && <EconomicEvidence observations={selectedEconomicProjection?.observations ?? []} referencePeriod={selectedEconomicProjection?.referencePeriod} />}<div className="modal-actions"><button type="button" className="button primary" onClick={() => showPeriodDocuments(selectedPoint.period)}>Ver conceptos y documentos fuente</button>{periods.length > 1 && <button type="button" className="button secondary" onClick={() => preparePeriodComparison(selectedPoint.period)}>Comparar período</button>}</div></section>}</section> : history && !loading ? <EmptyState title="Sin evolución" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
+      {evolutionTab && <section id={`history-panel-${tab}`} role="tabpanel" aria-labelledby={`history-tab-${tab}`} tabIndex={0}>{scope ? <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">{tab === 'purchasing-power' ? 'Poder adquisitivo' : 'Evolución'}</p><h2>{selectedPerspective === 'nominal' ? 'Comparable y neto' : `Comparable y neto · ${selectedPerspectiveLabel}`}</h2></div></div>{selectedPerspective !== 'nominal' && <div className="economic-context" role="note"><strong>Contexto económico</strong><span>{context?.countryCode ?? 'País sin confirmar'} · moneda original {scope.currencyCode}{history?.economicCalculationVersion ? ` · cálculo ${history.economicCalculationVersion}` : ''}</span><p>{economicContextDescription}</p></div>}<SalaryEvolution scope={scope} perspective={selectedPerspective} limit={evolutionRanges.find(([value]) => value === selectedEvolutionRange)?.[2]} recoveryPeriods={candidatePeriods} selectedPeriod={selectedPoint?.period} onSelectPeriod={selectEvolutionPeriod} />{selectedPoint && <section className="settlement-detail" aria-labelledby="selected-period-title"><div className="panel-heading"><div><p className="eyebrow">Período seleccionado · {selectedPerspectiveLabel}</p><h3 id="selected-period-title">{periodLabel(selectedPoint.period)}</h3></div><button type="button" className="icon-button" aria-label="Cerrar detalle del período" onClick={() => { setSelectedPeriod(''); onLocationChange({ period: null }, true); }}>×</button></div>{selectedPerspective !== 'nominal' && <div className="economic-period-state"><span className={`status ${economicStatusClass(selectedEconomicProjection?.status ?? 'UNAVAILABLE')}`}>{economicStatusLabels[selectedEconomicProjection?.status ?? 'UNAVAILABLE']}</span><p>{economicStatusMessage(selectedEconomicProjection?.status ?? 'UNAVAILABLE', selectedEconomicProjection?.reason ?? null)}</p></div>}<dl className="settlement-overview"><div><dt>Básico comparable</dt><dd><MoneyValue value={selectedPointComparable} currency={selectedPointCurrency} kind="salary" /></dd></div><div><dt>Bruto</dt><dd><MoneyValue value={selectedPointAmounts?.grossAmount} currency={selectedPointCurrency} kind="salary" /></dd></div><div><dt>Neto</dt><dd><MoneyValue value={selectedPointAmounts?.netAmount} currency={selectedPointCurrency} kind="salary" /></dd></div><div><dt>Descuentos / créditos</dt><dd><MoneyValue value={selectedPointAmounts?.deductionsAmount} currency={selectedPointCurrency} kind="salary" creditAware /></dd></div></dl>{selectedPerspective !== 'nominal' && <EconomicEvidence observations={selectedEconomicObservations} referencePeriod={selectedEconomicProjection?.referencePeriod} />}<div className="modal-actions"><button type="button" className="button primary" onClick={() => showPeriodDocuments(selectedPoint.period)}>Ver conceptos y documentos fuente</button>{periods.length > 1 && <button type="button" className="button secondary" onClick={() => preparePeriodComparison(selectedPoint.period)}>Comparar período</button>}</div></section>}</section> : history && !loading ? <EmptyState title="Sin evolución" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
 
       {tab === 'annual' && <section id="history-panel-annual" role="tabpanel" aria-labelledby="history-tab-annual" tabIndex={0}>{scope ? <AnnualHistory rows={annualRows} scope={scope} category={categoryFilter} /> : history && !loading ? <EmptyState title="Sin resumen anual" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
 

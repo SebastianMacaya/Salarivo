@@ -23,9 +23,9 @@ import {
   type SalaryCategory,
 } from "./salary-analytics.ts";
 import {
+  addEconomicProjections,
   buildEconomicAnalytics,
   compareEconomicPeriods,
-  scopePeriodKey,
   type EconomicSalarySettlement,
 } from "./economic-analytics.ts";
 import { sessionCookieName, tokenHash } from "./security.ts";
@@ -952,21 +952,18 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
   });
   const analytics = analyzeSalaryHistory(settlements);
   const economics = includeEconomic ? await buildEconomicAnalytics(pool, settlements) : null;
+  const projectedScopes = economics ? addEconomicProjections(analytics.scopes, economics) : null;
   const publicAnalytics = {
     ...analytics,
-    scopes: analytics.scopes.map((scope) => ({
+    scopes: analytics.scopes.map((scope, scopeIndex) => ({
       ...scope,
-      evolution: scope.evolution.map((point) => ({
+      evolution: scope.evolution.map((point, pointIndex) => ({
         period: point.period,
         totals: point.totals,
         regular: point.regular,
         comparableSalary: point.comparableSalary,
-        ...(economics ? {
-          economic: economics.byScopePeriod.get(scopePeriodKey(
-            scope.employmentContext,
-            scope.currencyCode,
-            point.period,
-          ))?.public,
+        ...(projectedScopes ? {
+          economic: projectedScopes[scopeIndex]?.evolution[pointIndex]?.economic,
         } : {}),
         quality: (() => {
           const quality = qualityByScopePeriod.get(JSON.stringify([

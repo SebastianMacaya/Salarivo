@@ -87,6 +87,8 @@ Los inputs decimales se validan y se calculan como coeficientes y escalas `BigIn
 
 API solicita todas las observaciones necesarias como un snapshot batched y evita N+1 por liquidación. Cada referencia conserva serie interna y externa, observation ID, revisión, fecha pedida/usada, método, proveedor, fuente, metodología, enlace de licencia y fecha de fetch.
 
+Cada punto de la evolución salarial incluye además una comparación resumida contra el período salarial anterior disponible, calculada en memoria con las mismas funciones exactas que el comparador explícito: cambio del neto en USD histórico, variación del IPC y cambio del neto ajustado a poder adquisitivo. El primer punto no tiene comparación. Si hay un salto entre recibos, `fromPeriod` conserva la base real y la UI dice “desde ese período”; no lo presenta como una inflación mensual ni inventa observaciones intermedias.
+
 Las perspectivas económicas declaran:
 
 - `AVAILABLE`: todas las observaciones necesarias existen;

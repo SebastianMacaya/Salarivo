@@ -73,6 +73,23 @@ export interface EconomicPeriodProjection {
   purchasingPower: EconomicProjection;
 }
 
+export interface EconomicPeriodChangeSummary {
+  status: EconomicAvailabilityStatus;
+  reason: EconomicUnavailableReason | null;
+  changeBasisPoints: string | null;
+}
+
+export interface EconomicPeriodComparisonSummary {
+  fromPeriod: string;
+  historicalUsd: EconomicPeriodChangeSummary;
+  purchasingPower: EconomicPeriodChangeSummary;
+  inflation: EconomicPeriodChangeSummary;
+}
+
+export interface EconomicEvolutionProjection extends EconomicPeriodProjection {
+  comparisonToPrevious: EconomicPeriodComparisonSummary | null;
+}
+
 export interface EconomicComparisonProjection {
   status: EconomicAvailabilityStatus;
   reason: EconomicUnavailableReason | null;
@@ -619,20 +636,50 @@ export async function buildEconomicAnalytics(
 export function addEconomicProjections(
   scopes: readonly SalaryScopeAnalytics[],
   economics: EconomicAnalyticsResult,
-): Array<SalaryScopeAnalytics & { evolution: Array<MonthlyEvolution & { economic: EconomicPeriodProjection }> }> {
+): Array<SalaryScopeAnalytics & { evolution: Array<MonthlyEvolution & { economic: EconomicEvolutionProjection }> }> {
   return scopes.map((scope) => ({
     ...scope,
-    evolution: scope.evolution.map((point) => ({
-      ...point,
-      economic: economics.byScopePeriod.get(scopePeriodKey(
+    evolution: scope.evolution.map((point, index) => {
+      const projection = economics.byScopePeriod.get(scopePeriodKey(
         scope.employmentContext,
         scope.currencyCode,
         point.period,
       ))?.public ?? {
         historicalUsd: unavailableProjection(ARGENTINA_ARS_PROFILE.referenceCurrencyCode, "NOT_CONFIGURED"),
         purchasingPower: unavailableProjection(scope.currencyCode, "NOT_CONFIGURED"),
-      },
-    })),
+      };
+      const previous = scope.evolution[index - 1];
+      const comparison = previous && scope.employmentContext !== null ? compareEconomicPeriods(economics, {
+        employmentContext: scope.employmentContext,
+        currencyCode: scope.currencyCode,
+        fromPeriod: previous.period,
+        toPeriod: point.period,
+      }) : null;
+      return {
+        ...point,
+        economic: {
+          ...projection,
+          comparisonToPrevious: comparison ? {
+            fromPeriod: previous!.period,
+            historicalUsd: {
+              status: comparison.historicalUsd.status,
+              reason: comparison.historicalUsd.reason,
+              changeBasisPoints: comparison.historicalUsd.changeBasisPoints,
+            },
+            purchasingPower: {
+              status: comparison.purchasingPower.status,
+              reason: comparison.purchasingPower.reason,
+              changeBasisPoints: comparison.purchasingPower.changeBasisPoints,
+            },
+            inflation: {
+              status: comparison.inflation.status,
+              reason: comparison.inflation.reason,
+              changeBasisPoints: comparison.inflation.changeBasisPoints,
+            },
+          } : null,
+        },
+      };
+    }),
   }));
 }
 
