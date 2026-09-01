@@ -75,6 +75,7 @@ Una tarea termina cuando:
 
 Para cambios que deban llegar a producción:
 
+- Salarivo se publica únicamente en el VPS y dominio propios mediante GitHub y Coolify. No uses OpenAI Sites, no crees `.openai/hosting.json` ni publiques previews o versiones allí.
 - un `push` o CI verde no demuestra que el despliegue terminó;
 - el repositorio mantiene un único webhook manual de GitHub para eventos `push`; `salarivo-main`, `salarivo-api` y `salarivo-worker-documents` deben compartir su secreto en Coolify, tener Auto Deploy habilitado y converger en el mismo commit completo;
 - la API y el worker aplican las migraciones al iniciar; no dupliques esa ejecución en comandos de ciclo de vida de la plataforma;
