@@ -1,6 +1,6 @@
 # Threat model
 
-> Estado: Proposed para la arquitectura objetivo. Debe actualizarse con cada nuevo flujo sensible y validarse contra la implementación.
+> Estado operativo (2026-09-01): modelo `Proposed` aplicado a un sistema que ya opera en producción con múltiples cuentas activas. Debe actualizarse con cada flujo sensible; todo control aún no demostrado se trata como riesgo activo, no como garantía.
 
 ## Alcance
 
@@ -104,7 +104,7 @@ Nada que cruce desde Internet, navegador, storage o documento se considera confi
 - Una métrica con labels libres puede filtrar salario o identidad.
 - Un export o share puede sobrevivir a una revocación si no se coordina el cleanup.
 
-Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle del original. Cualquier proveedor requiere evaluación de retención, región, entrenamiento, subprocesadores y borrado antes de producción.
+Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle del original. Todo proveedor requiere evaluación de retención, región, entrenamiento, subprocesadores y borrado; la evidencia que falte debe tratarse como riesgo activo en producción.
 
 ## Alertas mínimas
 
@@ -126,7 +126,7 @@ Las alertas sólo incluyen IDs internos y códigos.
 ## Riesgos abiertos
 
 - Procedimiento operativo probado de alta inicial, recuperación y revisión periódica de administradores; la consola sólo implementa cambio/revocación bajo un `SUPER_ADMIN` activo.
-- Validación operativa de Google OIDC y rotación del client secret antes de producción; la versión legal inicial 1.0 ya fue aprobada para la instancia privada.
+- Validación operativa de Google OIDC y rotación del client secret pendiente en producción; la versión legal inicial 1.0 no cubre la operación multiusuario actual.
 - Store distribuido de rate limiting antes de escalar la API a múltiples réplicas; el proxy productivo normaliza la IP cliente antes de que la API la use como clave local.
 - Auditoría durable y alertas sanitizadas para intentos MFA denegados o bloqueados.
 - Alerta y procedimiento verificado para recuperar un `execution_owner` huérfano sin borrar temporales de un proceso vivo.

@@ -1,5 +1,7 @@
 # Auditoría de privacidad y seguridad — 2026-08-30
 
+> Actualización operativa (2026-09-01): después de este corte, Salarivo fue desplegado en producción y hoy tiene múltiples cuentas activas de personas reales. Esto registra únicamente el estado operativo posterior, no demuestra que los P0 identificados abajo hayan sido cerrados; mientras no exista evidencia posterior, deben tratarse como riesgos activos en producción.
+
 ## Veredicto
 
 El corte local cerró los gaps técnicos inmediatos de MFA, step-up, exportación, minimización y borrado durable. Salarivo todavía es **NO-GO para un servicio público con datos reales** y no debe afirmar “cumple Ley 25.326”: faltan decisiones legales, contratos e infraestructura de producción verificable.

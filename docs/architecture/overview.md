@@ -1,6 +1,6 @@
 # Arquitectura general
 
-> Estado: MVP local implementado. Las capacidades futuras del diagrama siguen siendo objetivo, no comportamiento actual.
+> Estado operativo (2026-09-01): el MVP está implementado y desplegado en producción con múltiples cuentas activas. Las capacidades futuras del diagrama siguen siendo objetivo, no comportamiento actual; los riesgos abiertos se distinguen de las garantías ya demostradas.
 
 ## Estilo
 
@@ -234,4 +234,4 @@ El workflow `.github/workflows/ci.yml` ejecuta lint, typecheck, unit, build web,
 
 ## Decisiones abiertas
 
-El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, Google OIDC, MFA TOTP y una [consola administrativa](admin-console.md) privada por defecto. Cloudflare R2 fue elegido para object storage productivo con cifrado administrado por el proveedor; siguen abiertos la evaluación operativa/jurídica de ubicación y subencargados, el aislamiento final del parser y los backups de producción. La consola y las integraciones con Google/R2 no levantan el NO-GO para un backend público ni para datos reales. Las decisiones materiales se registran mediante ADR.
+El corte vertical usa React/Vinext, Fastify, PostgreSQL mediante `pg`, Redis, sesiones propias, Google OIDC, MFA TOTP y una [consola administrativa](admin-console.md) privada por defecto. Cloudflare R2 fue elegido para object storage productivo con cifrado administrado por el proveedor. El sistema ya opera en producción con múltiples cuentas activas; la evaluación operativa/jurídica de ubicación y subencargados, el aislamiento final del parser y los backups siguen siendo riesgos abiertos en ese entorno. El despliegue y las integraciones con Google/R2 no demuestran por sí mismos el cierre de esos P0. Las decisiones materiales se registran mediante ADR.

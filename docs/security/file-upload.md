@@ -1,6 +1,6 @@
 # Seguridad de upload
 
-> Estado: protocolo implementado para el MVP local y adaptado a Cloudflare R2. Producción requiere verificar la configuración efectiva, backups, observabilidad y los P0 restantes.
+> Estado operativo (2026-09-01): protocolo implementado y activo en producción con Cloudflare R2. La configuración efectiva se valida al arranque, pero backups, observabilidad, aislamiento y los demás P0 indicados abajo siguen abiertos en producción.
 
 ## Política
 
@@ -79,7 +79,7 @@ Objetivo productivo para el proceso que inspecciona/renderiza:
 
 Nunca se abre el PDF en un navegador privilegiado del backend ni se ejecuta contenido activo.
 
-El corte local ejecuta herramientas como usuario no-root dentro del mismo contenedor del worker, con entorno mínimo, directorio temporal por job y límites de tiempo y output; Compose agrega filesystem read-only y memoria global. Todavía comparte UID y red del worker, no impone CPU/RAM por job y no tiene reconciliador de filesystem. Si el cleanup del temporal falla, `execution_owner` queda bloqueado en vez de afirmar una baja completa. Egress restringido y sandbox por job son P0 antes de datos reales.
+El corte local ejecuta herramientas como usuario no-root dentro del mismo contenedor del worker, con entorno mínimo, directorio temporal por job y límites de tiempo y output; Compose agrega filesystem read-only y memoria global. Todavía comparte UID y red del worker, no impone CPU/RAM por job y no tiene reconciliador de filesystem. Si el cleanup del temporal falla, `execution_owner` queda bloqueado en vez de afirmar una baja completa. Egress restringido y sandbox por job siguen siendo P0 abiertos en la operación productiva.
 
 ## Malware
 
@@ -122,7 +122,7 @@ El camino AWS/local exige SSE-KMS con la key configurada en producción, version
 
 Uploads incompletos expiran. Su item se cancela cuando ya no existe una sesión vigente y los items que nunca iniciaron upload se cancelan tras `UPLOAD_TTL_SECONDS + UPLOAD_CLEANUP_GRACE_MS` sin actividad del lote, permitiendo completarlo sin cortar una carga secuencial activa. En R2, borrar con éxito el marcador u objeto revoca el PUT condicional incluso si una request estaba en vuelo; el worker pasa entonces la sesión a `CANCELLED` y libera la reserva, o cambia la referencia confirmada a la key canónica. En AWS/local, donde el formulario firmado no tiene ese marcador, la sesión permanece `EXPIRED` y ambas keys se reborran hasta terminar la ventana de expiración más gracia. Rechazados, cancelados y temporales se eliminan por una tarea idempotente y reconciliable.
 
-Un borrado explícito registra antes un tombstone durable con las keys `incoming/` y canónica, bloquea la descarga e intenta el delete inmediato. El worker conserva el tombstone hasta que venza la autorización de upload, reintenta ambas keys y sólo entonces lo elimina. Antes de producción debe comprobarse que la duración máxima de una carga no supera esa ventana; si el proveedor no ofrece esa garantía, el worker deberá inventariar y reborrar después antes de cerrar la baja. En R2, el lifecycle obligatorio elimina `incoming/` y aborta multipart incompletos al día; no expira objetos canónicos. Producción aplica las comprobaciones específicas de R2 o AWS descritas arriba. Un tipo no soportado fuerza `DELETE_AFTER_PROCESSING`. Un duplicado SHA-256 exacto se detecta sólo owner-scoped; tras limpiar el temporal se tombstonea y descarta todo su registro por cascada, sin afectar similitudes estructurales ni documentos de otro titular.
+Un borrado explícito registra antes un tombstone durable con las keys `incoming/` y canónica, bloquea la descarga e intenta el delete inmediato. El worker conserva el tombstone hasta que venza la autorización de upload, reintenta ambas keys y sólo entonces lo elimina. En producción sigue pendiente demostrar que la duración máxima de una carga no supera esa ventana; si el proveedor no ofrece esa garantía, el worker deberá inventariar y reborrar después antes de cerrar la baja. En R2, el lifecycle obligatorio elimina `incoming/` y aborta multipart incompletos al día; no expira objetos canónicos. Producción aplica las comprobaciones específicas de R2 o AWS descritas arriba. Un tipo no soportado fuerza `DELETE_AFTER_PROCESSING`. Un duplicado SHA-256 exacto se detecta sólo owner-scoped; tras limpiar el temporal se tombstonea y descarta todo su registro por cascada, sin afectar similitudes estructurales ni documentos de otro titular.
 
 ## Checklist de implementación
 

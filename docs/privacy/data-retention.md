@@ -1,6 +1,6 @@
 # Retención y eliminación
 
-> Estado: política técnica Proposed. Los plazos legales y comerciales exactos deben aprobarse antes de producción.
+> Estado operativo (2026-09-01): política técnica `Proposed`. Producción ya opera con múltiples cuentas, pero los plazos legales y comerciales exactos, backups y restore con supresiones todavía no están aprobados ni demostrados; son riesgos P0 activos, no garantías implementadas.
 
 ## Preferencias
 
@@ -44,7 +44,7 @@ El esquema conserva una política por cuenta y la copia al documento; el product
 | constancia de baja | PostgreSQL sin FK ni PII | estado operativo `PENDING`/`COMPLETED`; plazo definitivo pendiente |
 | backup | no implementada | pendiente de proveedor, ventana, cifrado y lista de supresiones |
 
-Uploads vencidos y tombstones se reconcilian fuera del happy path. Producción debe garantizar que ninguna carga iniciada antes del vencimiento termine después de la ventana de gracia o, en su defecto, inventariar y reborrar posteriormente antes de cerrar la baja. Un inventario genérico de objetos huérfanos contra storage sigue pendiente antes de producción.
+Uploads vencidos y tombstones se reconcilian fuera del happy path. Producción debe garantizar que ninguna carga iniciada antes del vencimiento termine después de la ventana de gracia o, en su defecto, inventariar y reborrar posteriormente antes de cerrar la baja. Un inventario genérico de objetos huérfanos contra storage sigue pendiente en producción.
 
 El artefacto reutilizable contiene texto Restricted derivado del documento. Usa una key opaca, checksum y el mismo boundary privado/cifrado del original; no tiene URL de descarga, no se devuelve en exportaciones técnicas y nunca se incluye en logs, métricas, traces o herramientas externas. La metadata se crea como `writeState=PENDING` antes del `PUT`. Sólo permite omitir extracción/OCR después de marcar el write `COMPLETED` y demostrar compatibilidad. `DELETE_AFTER_PROCESSING` lo elimina junto con el original.
 
@@ -87,13 +87,13 @@ La orquestación actual recorre:
 - temporales;
 - exports.
 
-No existen shares, cache externa ni índice de búsqueda en el MVP. Backups y lista de supresiones son un bloqueo P0 separado: deben incorporarse al procedimiento operativo antes de aceptar datos reales.
+No existen shares, cache externa ni índice de búsqueda en el MVP. Backups y lista de supresiones son un P0 abierto en la operación productiva y deben incorporarse al procedimiento antes de poder afirmar borrado recuperable sin resurrección de datos.
 
 El navegador genera la constancia opaca antes de solicitar la baja y la muestra cuando el servidor acepta el pedido o la respuesta es ambigua por un error de red/5xx; el servidor guarda sólo su hash y el navegador no la persiste en storage. Si la persona la copia, puede reingresarla en la pantalla pública para consultar `PENDING` o `COMPLETED` aun si se perdió la respuesta o después del cascade. No se afirma borrado total instantáneo si existe retención de backup. Al restaurar un backup deberá reaplicarse una lista de supresión para no resucitar cuentas eliminadas; ese mecanismo aún no está implementado.
 
 ## Backups
 
-Antes de producción se decide y comunica:
+En la operación productiva sigue pendiente decidir, implementar y comunicar:
 
 - frecuencia y ventana;
 - cifrado y acceso;
@@ -106,7 +106,7 @@ Los backups no son un archivo histórico indefinido. No se editan objetos indivi
 
 ## Fallos y reconciliación
 
-Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se materializan en tombstones sin cargar el inventario en memoria y el worker los drena en lotes round-robin por usuario. Sólo elimina la fila de usuario después de vencer autorizaciones de upload, confirmar el cleanup de storage y comprobar que ningún job conserva `execution_owner`. El cierre también depende de que el proveedor limite la duración máxima de una carga por debajo de la ventana de gracia o de una reconciliación posterior equivalente. Ese marcador se libera después de limpiar el directorio temporal, incluso si el job ya quedó terminal o reintentable. Un crash puede dejarlo huérfano: la baja permanece bloqueada hasta verificar operativamente que el proceso y su temporal terminaron; alerta y procedimiento de recuperación son pendientes de producción.
+Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se materializan en tombstones sin cargar el inventario en memoria y el worker los drena en lotes round-robin por usuario. Sólo elimina la fila de usuario después de vencer autorizaciones de upload, confirmar el cleanup de storage y comprobar que ningún job conserva `execution_owner`. El cierre también depende de que el proveedor limite la duración máxima de una carga por debajo de la ventana de gracia o de una reconciliación posterior equivalente. Ese marcador se libera después de limpiar el directorio temporal, incluso si el job ya quedó terminal o reintentable. Un crash puede dejarlo huérfano: la baja permanece bloqueada hasta verificar operativamente que el proceso y su temporal terminaron; alerta y procedimiento de recuperación siguen pendientes en producción.
 
 ## Decisiones pendientes
 
@@ -115,6 +115,6 @@ Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se 
 - semántica exacta de borrado de ExtractionRun;
 - proveedor y lifecycle de backups;
 - plazos y comunicación del borrado diferido en producción;
-- verificación operativa de la retención de evidencia de aceptación y del mapping de identidad externa antes de producción; la versión legal inicial 1.0 ya fue aprobada para la instancia privada.
+- verificación operativa en producción de la retención de evidencia de aceptación y del mapping de identidad externa; la versión legal inicial 1.0 no cubre la operación multiusuario actual.
 
 Estas decisiones requieren producto, seguridad y asesoramiento legal aplicable; no deben inventarse en código.

@@ -2,7 +2,9 @@
 
 Aplicación privada para convertir recibos de sueldo en un historial salarial y laboral estructurado, verificable y controlado por su dueño.
 
-> Estado: MVP local implementado. Existe una vista previa `owner-only` del frontend en Sites; no existe todavía un backend de producción apto para datos reales ni debe usarse esa vista con datos reales.
+> Estado operativo (2026-09-01): Salarivo está desplegado en producción en [www.salarivo.cloud](https://www.salarivo.cloud/) con web, API, worker, PostgreSQL y object storage privado activos. Existen múltiples cuentas activas de personas reales. Esta evidencia reemplaza el estado anterior de preview frontend/local-only, pero no constituye certificación de seguridad ni de cumplimiento legal y no cierra por sí sola los P0 documentados.
+>
+> Brecha legal conocida: los Términos y el Aviso 1.0 que hoy registran aceptaciones fueron aprobados para una instancia privada de una única persona y contienen afirmaciones que ya no describen la operación multiusuario actual. Como son append-only, no deben reescribirse retroactivamente: hace falta una versión nueva aprobada para producción, revisión profesional y reaceptación cuando corresponda. Ver [Políticas legales](docs/legal/policies.md) y la [actualización de la auditoría](docs/security/privacy-security-audit-2026-08-30.md).
 
 ## Qué funciona
 
@@ -68,7 +70,7 @@ El rol `ADMIN` nunca se acepta desde registro ni desde la web. Antes de promover
 docker compose exec postgres psql -U salarivo -d salarivo -c "UPDATE users SET role = 'ADMIN', admin_role = 'SUPER_ADMIN', updated_at = now() WHERE email = 'tu-email@example.com' AND role = 'USER' AND status = 'ACTIVE' AND EXISTS (SELECT 1 FROM mfa_factors WHERE user_id = users.id AND status = 'ACTIVE');"
 ~~~
 
-La versión legal 1.0 está cerrada y aprobada por el titular para esta vista privada de uso individual y es la primera vigente para el alta exclusiva con Google. Ninguna aprobación equivale a una revisión profesional ni habilita acceso de terceros; esa ampliación requiere una versión nueva con identidad, domicilio, canal y operación legal acordes al servicio real.
+La versión legal 1.0 sigue cerrada y vigente, pero su aprobación para una vista privada individual ya no cubre el uso multiusuario actual. No se corrige editando el texto aceptado: requiere una versión nueva con identidad, domicilio, canal, destinatarios/proveedores, retención y operación de derechos acordes al servicio real, además de revisión profesional y reaceptación cuando corresponda.
 
 Para detener todo sin borrar los volúmenes:
 
@@ -92,7 +94,7 @@ Un despliegue se considera completo únicamente cuando:
 - el worker está ejecutándose sin errores de inicio;
 - la vista principal funciona en un smoke test autenticado.
 
-Si una aplicación queda en un commit anterior, hay que redesplegarla y corregir su webhook antes de dar el cambio por terminado. Esta mecánica operativa no modifica el estado de seguridad del producto ni habilita el uso de datos reales mientras siga vigente el aviso al inicio de este README.
+Si una aplicación queda en un commit anterior, hay que redesplegarla y corregir su webhook antes de dar el cambio por terminado. Esta mecánica acredita el estado operativo del despliegue, no el cierre de los riesgos legales, de privacidad, backups, aislamiento y operación que siguen abiertos en producción.
 
 ## Verificación
 

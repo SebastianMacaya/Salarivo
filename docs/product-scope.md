@@ -1,6 +1,6 @@
 # Alcance del producto
 
-> Estado: el alcance MVP listado abajo está implementado para recibos argentinos; visión, V2 y V3 siguen siendo objetivos.
+> Estado operativo (2026-09-01): el alcance MVP listado abajo está implementado para recibos argentinos y desplegado en producción en [www.salarivo.cloud](https://www.salarivo.cloud/) con múltiples cuentas activas de personas reales; visión, V2 y V3 siguen siendo objetivos. La disponibilidad productiva es un hecho actual, no evidencia de que estén cerrados los pendientes legales, de privacidad, backups, aislamiento y operación documentados en [Políticas legales](legal/policies.md) y la [auditoría de privacidad y seguridad](security/privacy-security-audit-2026-08-30.md).
 
 ## Visión
 
