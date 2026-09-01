@@ -1,9 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  currentPipelineFingerprint,
   followMergedEmployer,
   lockEmployerMutation,
   normalizeEmployerNameInDatabase,
+  parserFixCatalog,
   pool,
+  processingPipelineVersions,
   withTransaction,
   type PoolClient,
 } from "@salarivo/database";
@@ -23,6 +26,17 @@ import {
   protectArgentineCuit,
 } from "./employer-identifiers.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
+import {
+  enqueueReprocessing,
+  enqueueReprocessingBatch,
+  findReprocessingCandidates,
+  loadProcessingHealth,
+  loadReprocessingBatch,
+  processingRunView,
+  promoteProcessingRun,
+  refreshReprocessingBatch,
+  reprocessingCandidateExistsSql,
+} from "./reprocessing.ts";
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const REFERENCE_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._:/-]{2,79}$";
@@ -62,6 +76,10 @@ type ListQuery = PageQuery & {
 };
 type IdParams = { id: string };
 type Reason = { reasonCode: ReasonCode; reference: string };
+type ProcessingRunParams = { id: string; runId: string };
+type AdminReprocessBody = Reason & { retry?: boolean };
+type AdminReprocessingBatchBody = Reason & { userId: string; documentIds?: string[] };
+type ActiveReprocessingBatchQuery = { userId: string };
 type AdminAuditConfig = {
   capability: AdminPermission;
   action: string;
@@ -116,6 +134,23 @@ const paginationFields = {
   page: { type: "integer", minimum: 1 },
   pageSize: { type: "integer", minimum: 1, maximum: 100 },
   total: { type: "integer", minimum: 0 },
+};
+
+const reprocessingBatchSchema = {
+  type: "object", additionalProperties: false,
+  required: ["id", "status", "triggerKind", "createdAt", "updatedAt", "completedAt", "progress"],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN }, status: { type: "string" },
+    triggerKind: { type: "string" }, createdAt: { type: "string" }, updatedAt: { type: "string" },
+    completedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+    progress: {
+      type: "object", additionalProperties: false,
+      required: ["total", "queued", "processing", "improved", "unchanged", "reviewRequired", "failed", "skipped"],
+      properties: Object.fromEntries([
+        "total", "queued", "processing", "improved", "unchanged", "reviewRequired", "failed", "skipped",
+      ].map((key) => [key, { type: "integer", minimum: 0 }])),
+    },
+  },
 };
 
 function envelope(data: object): object {
@@ -1170,7 +1205,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     required: [
       "id", "userId", "maskedEmail", "documentType", "processingStatus", "securityStatus",
       "classificationStatus", "sizeBytes", "pageCount", "retentionPolicy", "originalAvailable",
-      "createdAt", "processedAt",
+      "createdAt", "processedAt", "activeRunStatus", "activeParserVersion", "reprocessAvailable", "issueCount",
     ],
     properties: {
       id: { type: "string", pattern: UUID_PATTERN }, userId: { type: "string", pattern: UUID_PATTERN },
@@ -1179,6 +1214,9 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
       sizeBytes: { type: "integer", minimum: 0 }, pageCount: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
       retentionPolicy: { type: "string", enum: ["KEEP_ORIGINAL", "DELETE_AFTER_PROCESSING"] }, originalAvailable: { type: "boolean" },
       createdAt: { type: "string" }, processedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+      activeRunStatus: { anyOf: [{ type: "string" }, { type: "null" }] },
+      activeParserVersion: { anyOf: [{ type: "string" }, { type: "null" }] },
+      reprocessAvailable: { type: "boolean" }, issueCount: { type: "integer", minimum: 0 },
     },
   };
 
@@ -1188,6 +1226,11 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     userId?: string;
     from?: string;
     to?: string;
+    reprocessAvailable?: boolean;
+    issueCode?: string;
+    parserVersion?: string;
+    promotionOutcome?: string;
+    runStatus?: string;
   };
 
   app.get<{ Querystring: DocumentQuery }>(
@@ -1211,6 +1254,17 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
             securityStatus: { type: "string", enum: ["PENDING", "CLEAN", "QUARANTINED", "REJECTED", "ERROR"] },
             userId: { type: "string", pattern: UUID_PATTERN },
             from: { type: "string", format: "date" }, to: { type: "string", format: "date" },
+            reprocessAvailable: { type: "boolean" },
+            issueCode: { type: "string", pattern: "^[A-Z0-9_]{1,96}$" },
+            parserVersion: { type: "string", minLength: 1, maxLength: 80 },
+            promotionOutcome: {
+              type: "string",
+              enum: ["NOT_EVALUATED", "PROMOTED", "UNCHANGED", "REVIEW_REQUIRED", "REJECTED_REGRESSION"],
+            },
+            runStatus: {
+              type: "string",
+              enum: ["RUNNING", "PROCESSING", "COMPLETED", "COMPLETED_WITH_WARNINGS", "REVIEW_REQUIRED", "FAILED", "CANCELLED"],
+            },
             sort: { type: "string", enum: ["createdAt", "status", "sizeBytes", "processedAt"] },
             direction: { type: "string", enum: ["asc", "desc"] },
           },
@@ -1226,11 +1280,21 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
       const order = sortOf(request.query.sort, request.query.direction, {
         createdAt: "d.created_at", status: "d.processing_status", sizeBytes: "d.size_bytes", processedAt: "d.processed_at",
       }, "createdAt");
+      const candidatePredicate = reprocessingCandidateExistsSql("d", "$12", "$13", "$14");
       const sql = `SELECT d.id, d.user_id, u.email, d.document_type, d.processing_status, d.security_status,
                 d.classification_status, d.size_bytes, d.page_count, d.retention_policy,
-                d.original_deleted_at, d.created_at, d.processed_at, count(*) OVER ()::integer AS total
+                d.original_deleted_at, d.created_at, d.processed_at,
+                active_run.status AS active_run_status, active_run.parser_version AS active_parser_version,
+                (${candidatePredicate}) AS reprocess_available,
+                (SELECT count(*)::integer FROM extraction_run_issues issue
+                  WHERE issue.user_id = d.user_id AND issue.document_id = d.id
+                    AND issue.extraction_run_id = d.active_extraction_run_id) AS issue_count,
+                count(*) OVER ()::integer AS total
            FROM documents d
            JOIN users u ON u.id = d.user_id
+           LEFT JOIN extraction_runs active_run
+             ON active_run.id = d.active_extraction_run_id
+            AND active_run.user_id = d.user_id AND active_run.document_id = d.id
           WHERE d.deleted_at IS NULL
             AND ($1::text IS NULL OR d.id::text = $1 OR d.user_id::text = $1)
             AND ($2::text IS NULL OR d.processing_status = $2)
@@ -1238,11 +1302,29 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
             AND ($4::uuid IS NULL OR d.user_id = $4)
             AND ($5::date IS NULL OR d.created_at >= $5::date)
             AND ($6::date IS NULL OR d.created_at < $6::date + interval '1 day')
+            AND ($7::boolean IS NULL OR (${candidatePredicate}) = $7)
+            AND ($8::text IS NULL OR EXISTS (
+              SELECT 1 FROM extraction_run_issues issue
+               WHERE issue.user_id = d.user_id AND issue.document_id = d.id
+                 AND issue.extraction_run_id = d.active_extraction_run_id AND issue.code = $8
+            ))
+            AND (($9::text IS NULL AND $10::text IS NULL AND $11::text IS NULL) OR EXISTS (
+              SELECT 1 FROM extraction_runs filtered_run
+               WHERE filtered_run.user_id = d.user_id AND filtered_run.document_id = d.id
+                 AND ($9::text IS NULL OR filtered_run.parser_version = $9)
+                 AND ($10::text IS NULL OR filtered_run.status = $10)
+                 AND ($11::text IS NULL OR filtered_run.promotion_outcome = $11)
+            ))
           ORDER BY ${order} NULLS LAST, d.id
-          LIMIT $7 OFFSET $8`;
+          LIMIT $15 OFFSET $16`;
       const values = [
           searchOf(request.query.search), request.query.processingStatus ?? null, request.query.securityStatus ?? null,
-          request.query.userId ?? null, request.query.from ?? null, request.query.to ?? null, pageSize, offset,
+          request.query.userId ?? null, request.query.from ?? null, request.query.to ?? null,
+          request.query.reprocessAvailable ?? null, request.query.issueCode ?? null,
+          request.query.parserVersion ?? null, request.query.runStatus ?? null,
+          request.query.promotionOutcome ?? null,
+          JSON.stringify(parserFixCatalog), processingPipelineVersions.parser, currentPipelineFingerprint,
+          pageSize, offset,
         ];
       const result = await pool.query(sql, values);
       const total = await totalForPage(sql, values, result.rows[0]?.total, offset);
@@ -1252,6 +1334,8 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           processingStatus: String(row.processing_status), securityStatus: String(row.security_status), classificationStatus: String(row.classification_status),
           sizeBytes: integer(row.size_bytes), pageCount: row.page_count === null ? null : integer(row.page_count), retentionPolicy: String(row.retention_policy),
           originalAvailable: row.original_deleted_at === null, createdAt: timestamp(row.created_at)!, processedAt: timestamp(row.processed_at),
+          activeRunStatus: text(row.active_run_status), activeParserVersion: text(row.active_parser_version),
+          reprocessAvailable: row.reprocess_available === true, issueCount: integer(row.issue_count),
         })), page, pageSize, total),
       };
     },
@@ -1264,11 +1348,13 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
       schema: {
         params: idParamsSchema,
         ...ok({
-          type: "object", additionalProperties: false, required: ["document", "employmentId", "importBatchId", "recentJobs"],
+          type: "object", additionalProperties: false,
+          required: ["document", "employmentId", "importBatchId", "activeRunId", "recentJobs", "processingRuns", "issues"],
           properties: {
             document: documentItemSchema,
             employmentId: { anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }] },
             importBatchId: { type: "string", pattern: UUID_PATTERN },
+            activeRunId: { anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }] },
             recentJobs: {
               type: "array", items: {
                 type: "object", additionalProperties: false,
@@ -1280,25 +1366,88 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
                 },
               },
             },
+            processingRuns: {
+              type: "array", items: {
+                type: "object", additionalProperties: false,
+                required: [
+                  "id", "processingVersion", "status", "triggerKind", "parserVersion",
+                  "resultSchemaVersion", "pipelineFingerprint", "promotionOutcome",
+                  "promotedAt", "startedAt", "finishedAt", "active",
+                ],
+                properties: {
+                  id: { type: "string", pattern: UUID_PATTERN }, processingVersion: { type: "integer", minimum: 1 },
+                  status: { type: "string" }, triggerKind: { type: "string" }, parserVersion: { type: "string" },
+                  resultSchemaVersion: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  pipelineFingerprint: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  promotionOutcome: { type: "string" },
+                  promotedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  startedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  finishedAt: { anyOf: [{ type: "string" }, { type: "null" }] }, active: { type: "boolean" },
+                },
+              },
+            },
+            issues: {
+              type: "array", items: {
+                type: "object", additionalProperties: false,
+                required: ["id", "runId", "code", "severity", "recoverable", "affectedFieldPath", "createdAt"],
+                properties: {
+                  id: { type: "string", pattern: UUID_PATTERN }, runId: { type: "string", pattern: UUID_PATTERN },
+                  code: { type: "string" }, severity: { type: "string" }, recoverable: { type: "boolean" },
+                  affectedFieldPath: { anyOf: [{ type: "string" }, { type: "null" }] }, createdAt: { type: "string" },
+                },
+              },
+            },
           },
         }),
       },
     },
     async (request) => {
       const canReadProcessing = hasAdminPermission(request.authUser!.adminRole, "processing.read");
-      const [documents, jobs] = await Promise.all([
+      const candidatePredicate = reprocessingCandidateExistsSql("d", "$2", "$3", "$4");
+      const [documents, jobs, runs, issues] = await Promise.all([
         pool.query(
           `SELECT d.id, d.user_id, u.email, d.document_type, d.processing_status, d.security_status,
                   d.classification_status, d.size_bytes, d.page_count, d.retention_policy, d.original_deleted_at,
-                  d.created_at, d.processed_at, d.employment_id, d.import_batch_id
+                  d.created_at, d.processed_at, d.employment_id, d.import_batch_id,
+                  d.active_extraction_run_id, active_run.status AS active_run_status,
+                  active_run.parser_version AS active_parser_version,
+                  (${candidatePredicate}) AS reprocess_available,
+                  (SELECT count(*)::integer FROM extraction_run_issues issue
+                    WHERE issue.user_id = d.user_id AND issue.document_id = d.id
+                      AND issue.extraction_run_id = d.active_extraction_run_id) AS issue_count
              FROM documents d JOIN users u ON u.id = d.user_id
+             LEFT JOIN extraction_runs active_run
+               ON active_run.id = d.active_extraction_run_id
+              AND active_run.user_id = d.user_id AND active_run.document_id = d.id
             WHERE d.id = $1 AND d.deleted_at IS NULL`,
-          [request.params.id],
+          [request.params.id, JSON.stringify(parserFixCatalog), processingPipelineVersions.parser, currentPipelineFingerprint],
         ),
         pool.query(
           `SELECT id, stage, processing_version, state, attempt, max_attempts, error_code, updated_at
              FROM processing_jobs WHERE document_id = $1 AND $2::boolean
             ORDER BY processing_version DESC, created_at DESC LIMIT 25`,
+          [request.params.id, canReadProcessing],
+        ),
+        pool.query(
+          `SELECT run.id, run.processing_version, run.status, run.trigger_kind,
+                  run.parser_version, run.result_schema_version, run.pipeline_fingerprint,
+                  run.promotion_outcome, run.promoted_at, run.started_at, run.finished_at,
+                  (run.id = document.active_extraction_run_id) AS active
+             FROM documents document
+             JOIN extraction_runs run
+               ON run.user_id = document.user_id AND run.document_id = document.id
+            WHERE document.id = $1 AND document.deleted_at IS NULL AND $2::boolean
+            ORDER BY run.processing_version DESC, run.id DESC LIMIT 25`,
+          [request.params.id, canReadProcessing],
+        ),
+        pool.query(
+          `SELECT issue.id, issue.extraction_run_id, issue.code, issue.severity,
+                  issue.recoverable, issue.affected_field_path, issue.created_at
+             FROM documents document
+             JOIN extraction_run_issues issue
+               ON issue.user_id = document.user_id AND issue.document_id = document.id
+            WHERE document.id = $1 AND document.deleted_at IS NULL AND $2::boolean
+            ORDER BY issue.created_at DESC, issue.id DESC LIMIT 100`,
           [request.params.id, canReadProcessing],
         ),
       ]);
@@ -1311,15 +1460,279 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
             processingStatus: String(row.processing_status), securityStatus: String(row.security_status), classificationStatus: String(row.classification_status),
             sizeBytes: integer(row.size_bytes), pageCount: row.page_count === null ? null : integer(row.page_count), retentionPolicy: String(row.retention_policy),
             originalAvailable: row.original_deleted_at === null, createdAt: timestamp(row.created_at)!, processedAt: timestamp(row.processed_at),
+            activeRunStatus: text(row.active_run_status), activeParserVersion: text(row.active_parser_version),
+            reprocessAvailable: row.reprocess_available === true, issueCount: integer(row.issue_count),
           },
           employmentId: text(row.employment_id), importBatchId: String(row.import_batch_id),
+          activeRunId: text(row.active_extraction_run_id),
           recentJobs: jobs.rows.map((job) => ({
             id: String(job.id), stage: String(job.stage), processingVersion: integer(job.processing_version), state: String(job.state),
             attempt: integer(job.attempt), maxAttempts: integer(job.max_attempts), errorCode: text(job.error_code), updatedAt: timestamp(job.updated_at)!,
           })),
+          processingRuns: runs.rows.map((run) => {
+            const view = processingRunView(run);
+            return {
+              id: view.id, processingVersion: view.processingVersion, status: view.status,
+              triggerKind: view.triggerKind, parserVersion: view.parserVersion,
+              resultSchemaVersion: view.resultSchemaVersion, pipelineFingerprint: view.pipelineFingerprint,
+              promotionOutcome: view.promotionOutcome, promotedAt: view.promotedAt,
+              startedAt: view.startedAt, finishedAt: view.finishedAt, active: view.active,
+            };
+          }),
+          issues: issues.rows.map((issue) => ({
+            id: String(issue.id), runId: String(issue.extraction_run_id), code: String(issue.code),
+            severity: String(issue.severity), recoverable: issue.recoverable === true,
+            affectedFieldPath: text(issue.affected_field_path), createdAt: timestamp(issue.created_at)!,
+          })),
         },
       };
     },
+  );
+
+  app.post<{ Params: IdParams; Body: AdminReprocessBody }>(
+    "/api/v1/admin/documents/:id/reprocess",
+    {
+      config: { adminAudit: { capability: "processing.reprocess", action: "DOCUMENT_REPROCESS_REQUESTED", resourceType: "DOCUMENT" } },
+      preHandler: guard("processing.reprocess", true),
+      schema: {
+        params: idParamsSchema,
+        body: {
+          type: "object", additionalProperties: false,
+          required: ["reasonCode", "reference"],
+          properties: { ...reasonProperties, retry: { type: "boolean" } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const requestedKey = request.headers["idempotency-key"];
+      if (typeof requestedKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(requestedKey)) {
+        throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Falta una clave de idempotencia válida.");
+      }
+      const result = await withTransaction(async (client) => {
+        const actorRole = await lockActor(client, request, "processing.reprocess", ApiError);
+        const owner = await client.query(
+          "SELECT user_id FROM documents WHERE id = $1 AND deleted_at IS NULL",
+          [request.params.id],
+        );
+        if (!owner.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        const queued = await enqueueReprocessing(client, {
+          userId: String(owner.rows[0].user_id),
+          requestedByUserId: request.authUser!.id,
+          documentId: request.params.id,
+          requestedKey,
+          triggerKind: "ADMIN_REPROCESS",
+          allowRetry: request.body.retry === true,
+        }, ApiError);
+        await audit(
+          client, request, actorRole, "processing.reprocess", "DOCUMENT_REPROCESS_REQUESTED",
+          "DOCUMENT", request.params.id, String(owner.rows[0].user_id), request.body,
+          { processingVersion: queued.job.processingVersion, activeRunId: queued.activeRunId },
+        );
+        return queued;
+      });
+      const { created, ...data } = result;
+      return reply.code(created ? 201 : 200).send({ data });
+    },
+  );
+
+  app.post<{ Body: AdminReprocessingBatchBody }>(
+    "/api/v1/admin/reprocessing-batches",
+    {
+      config: { adminAudit: { capability: "processing.reprocess", action: "REPROCESSING_BATCH_REQUESTED", resourceType: "REPROCESSING_BATCH" } },
+      preHandler: guard("processing.reprocess", true),
+      schema: {
+        body: {
+          type: "object", additionalProperties: false,
+          required: ["userId", "reasonCode", "reference"],
+          properties: {
+            ...reasonProperties,
+            userId: { type: "string", pattern: UUID_PATTERN },
+            documentIds: {
+              type: "array", minItems: 1, maxItems: 100, uniqueItems: true,
+              items: { type: "string", pattern: UUID_PATTERN },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const requestedKey = request.headers["idempotency-key"];
+      if (typeof requestedKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(requestedKey)) {
+        throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Falta una clave de idempotencia válida.");
+      }
+      const result = await withTransaction(async (client) => {
+        const actorRole = await lockActor(client, request, "processing.reprocess", ApiError);
+        const target = await client.query(
+          "SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE",
+          [request.body.userId],
+        );
+        if (!target.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        const idempotencyKey = `admin-reprocess-batch:${request.authUser!.id}:${createHash("sha256").update(requestedKey).digest("hex")}`;
+        const existing = await client.query(
+          "SELECT id FROM reprocessing_batches WHERE user_id = $1 AND idempotency_key = $2",
+          [request.body.userId, idempotencyKey],
+        );
+        if (existing.rowCount) {
+          return {
+            created: false,
+            batch: await loadReprocessingBatch(client, request.body.userId, String(existing.rows[0].id)),
+          };
+        }
+        const activeBatch = await client.query(
+          `SELECT id FROM reprocessing_batches
+            WHERE user_id = $1 AND status IN ('PENDING', 'RUNNING') LIMIT 1`,
+          [request.body.userId],
+        );
+        if (activeBatch.rowCount) {
+          throw new ApiError(409, "REPROCESSING_BATCH_ALREADY_ACTIVE", "La cuenta ya tiene un lote de reprocesamiento activo.");
+        }
+        const foundCandidates = await findReprocessingCandidates(client, request.body.userId, {
+          ...(request.body.documentIds ? { documentIds: request.body.documentIds } : {}),
+          limit: request.body.documentIds?.length ?? 100,
+        });
+        if (request.body.documentIds && foundCandidates.length !== request.body.documentIds.length) {
+          throw new ApiError(409, "BATCH_CONTAINS_UNAVAILABLE_DOCUMENT", "Uno o más documentos no están disponibles para reprocesar.");
+        }
+        const candidates = foundCandidates.filter((candidate) => !candidate.inProgress);
+        if (!candidates.length) throw new ApiError(409, "NO_REPROCESSING_CANDIDATES", "No hay documentos reprocesables.");
+        const batchId = randomUUID();
+        await client.query(
+          `INSERT INTO reprocessing_batches (
+             id, user_id, requested_by_user_id, trigger_kind, idempotency_key
+           ) VALUES ($1, $2, $3, 'ADMIN_REPROCESS', $4)`,
+          [batchId, request.body.userId, request.authUser!.id, idempotencyKey],
+        );
+        await enqueueReprocessingBatch(client, {
+          userId: request.body.userId,
+          requestedByUserId: request.authUser!.id,
+          documentIds: candidates.map((candidate) => candidate.documentId),
+          triggerKind: "ADMIN_REPROCESS",
+          batchId,
+        }, ApiError);
+        await audit(
+          client, request, actorRole, "processing.reprocess", "REPROCESSING_BATCH_REQUESTED",
+          "REPROCESSING_BATCH", batchId, request.body.userId, request.body,
+          { documentCount: candidates.length },
+        );
+        return { created: true, batch: await loadReprocessingBatch(client, request.body.userId, batchId) };
+      });
+      return reply.code(result.created ? 201 : 200).send({ data: result.batch });
+    },
+  );
+
+  app.get<{ Querystring: ActiveReprocessingBatchQuery }>(
+    "/api/v1/admin/reprocessing-batches/active",
+    {
+      preHandler: guard("processing.read"),
+      schema: {
+        querystring: {
+          type: "object", additionalProperties: false, required: ["userId"],
+          properties: { userId: { type: "string", pattern: UUID_PATTERN } },
+        },
+        ...ok({ anyOf: [reprocessingBatchSchema, { type: "null" }] }),
+      },
+    },
+    async (request) => {
+      const target = await pool.query(
+        "SELECT 1 FROM users WHERE id = $1 AND deleted_at IS NULL",
+        [request.query.userId],
+      );
+      if (!target.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const active = await pool.query(
+        `SELECT id FROM reprocessing_batches
+          WHERE user_id = $1 AND status IN ('PENDING', 'RUNNING')
+          ORDER BY created_at DESC, id DESC LIMIT 1`,
+        [request.query.userId],
+      );
+      return {
+        data: active.rowCount
+          ? await loadReprocessingBatch(pool, request.query.userId, String(active.rows[0].id))
+          : null,
+      };
+    },
+  );
+
+  app.get<{ Params: IdParams }>(
+    "/api/v1/admin/reprocessing-batches/:id",
+    {
+      preHandler: guard("processing.read"),
+      schema: {
+        params: idParamsSchema,
+        ...ok(reprocessingBatchSchema),
+      },
+    },
+    async (request) => {
+      const owner = await pool.query("SELECT user_id FROM reprocessing_batches WHERE id = $1", [request.params.id]);
+      if (!owner.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const batch = await loadReprocessingBatch(pool, String(owner.rows[0].user_id), request.params.id);
+      if (!batch) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: batch };
+    },
+  );
+
+  app.post<{ Params: ProcessingRunParams; Body: Reason }>(
+    "/api/v1/admin/documents/:id/processing-runs/:runId/rollback",
+    {
+      config: { adminAudit: { capability: "processing.rollback", action: "PROCESSING_RUN_ROLLED_BACK", resourceType: "EXTRACTION_RUN" } },
+      preHandler: guard("processing.rollback", true),
+      schema: {
+        params: {
+          type: "object", additionalProperties: false, required: ["id", "runId"],
+          properties: {
+            id: { type: "string", pattern: UUID_PATTERN },
+            runId: { type: "string", pattern: UUID_PATTERN },
+          },
+        },
+        body: reasonBodySchema,
+      },
+    },
+    async (request) => withTransaction(async (client) => {
+      const actorRole = await lockActor(client, request, "processing.rollback", ApiError);
+      const document = await client.query(
+        `SELECT user_id, active_extraction_run_id FROM documents
+          WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+        [request.params.id],
+      );
+      if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const ownerId = String(document.rows[0].user_id);
+      const activeRunId = text(document.rows[0].active_extraction_run_id);
+      if (activeRunId === request.params.runId) {
+        throw new ApiError(409, "RUN_ALREADY_ACTIVE", "Ese análisis ya está activo.");
+      }
+      const target = await client.query(
+        `SELECT id FROM extraction_runs
+          WHERE id = $1 AND document_id = $2 AND user_id = $3
+            AND promotion_outcome = 'PROMOTED' AND promoted_at IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM payroll_settlements settlement
+               WHERE settlement.user_id = extraction_runs.user_id
+                 AND settlement.document_id = extraction_runs.document_id
+                 AND settlement.extraction_run_id = extraction_runs.id
+            )
+          FOR UPDATE`,
+        [request.params.runId, request.params.id, ownerId],
+      );
+      if (!target.rowCount) {
+        throw new ApiError(409, "RUN_NOT_ROLLBACK_TARGET", "Sólo se puede volver a un análisis que ya estuvo activo.");
+      }
+      const promoted = await promoteProcessingRun(client, {
+        userId: ownerId,
+        documentId: request.params.id,
+        runId: request.params.runId,
+        expectedActiveRunId: activeRunId,
+        decision: "PROMOTE",
+      }, ApiError);
+      await audit(
+        client, request, actorRole, "processing.rollback", "PROCESSING_RUN_ROLLED_BACK",
+        "EXTRACTION_RUN", request.params.runId, ownerId, request.body,
+        {
+          documentId: request.params.id,
+          employmentAssociationRemoved: promoted.employmentAssociationRemoved ?? false,
+          previousActiveRunId: activeRunId,
+        },
+      );
+      return { data: { documentId: request.params.id, previousActiveRunId: activeRunId, activeRunId: promoted.activeRunId } };
+    }),
   );
 
   app.post<{ Params: IdParams; Body: Reason }>(
@@ -1425,7 +1838,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
             ...pagingProperties,
             search: { type: "string", minLength: 1, maxLength: 120 },
             state: { type: "string", enum: ["PENDING", "PUBLISHED", "RUNNING", "RETRYABLE", "COMPLETED", "FAILED", "CANCELLED"] },
-            stage: { type: "string", enum: ["SECURITY_VALIDATION", "DOCUMENT_CLASSIFICATION", "TEXT_EXTRACTION", "OCR", "PARSING", "NORMALIZATION", "VALIDATION", "CLEANUP"] },
+            stage: { type: "string", enum: ["SECURITY_VALIDATION", "DOCUMENT_CLASSIFICATION", "TEXT_EXTRACTION", "OCR", "PARSING", "NORMALIZATION", "VALIDATION", "CLEANUP", "DOCUMENT_PIPELINE_V2"] },
             userId: { type: "string", pattern: UUID_PATTERN }, documentId: { type: "string", pattern: UUID_PATTERN },
             sort: { type: "string", enum: ["createdAt", "updatedAt", "availableAt", "state", "attempt"] },
             direction: { type: "string", enum: ["asc", "desc"] },
@@ -1554,7 +1967,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           type: "object", additionalProperties: false, required: ["id", "state", "documentStatus"],
           properties: {
             id: { type: "string", pattern: UUID_PATTERN }, state: { type: "string", const: "CANCELLED" },
-            documentStatus: { type: "string", const: "CANCELLED" },
+            documentStatus: { type: "string" },
           },
         }),
       },
@@ -1563,6 +1976,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
       const actorRole = await lockActor(client, request, "processing.cancel", ApiError);
       const result = await client.query(
         `SELECT job.id, job.user_id, job.document_id, job.state, job.execution_owner,
+                job.trigger_kind, job.processing_version, job.reprocessing_batch_id,
                 document.import_batch_id, document.import_batch_item_id, document.processing_status,
                 document.retention_policy, document.original_deleted_at, document.object_key,
                 upload.object_key AS incoming_object_key, upload.expires_at AS upload_expires_at
@@ -1593,6 +2007,27 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           WHERE id = $1`,
         [request.params.id],
       );
+      const isReprocessing = [
+        "USER_REPROCESS", "ADMIN_REPROCESS", "PARSER_UPGRADE", "AUTOMATIC_RECOVERY",
+      ].includes(String(job.trigger_kind));
+      if (isReprocessing) {
+        await client.query(
+          `UPDATE extraction_runs
+              SET status = 'CANCELLED', finished_at = COALESCE(finished_at, now()),
+                  promotion_outcome = 'NOT_EVALUATED', promoted_at = NULL
+            WHERE user_id = $1 AND document_id = $2 AND processing_version = $3
+              AND status IN ('RUNNING', 'PROCESSING')`,
+          [job.user_id, job.document_id, job.processing_version],
+        );
+        if (job.reprocessing_batch_id !== null) {
+          await refreshReprocessingBatch(client, String(job.user_id), String(job.reprocessing_batch_id));
+        }
+        await audit(client, request, actorRole, "processing.cancel", "PROCESSING_JOB_CANCELLED", "PROCESSING_JOB", request.params.id, String(job.user_id), request.body, {
+          documentId: job.document_id, previousJobState: job.state,
+          documentStatusPreserved: job.processing_status,
+        });
+        return { data: { id: request.params.id, state: "CANCELLED", documentStatus: String(job.processing_status) } };
+      }
       await client.query(
         `UPDATE documents SET processing_status = 'CANCELLED', processed_at = now()
           WHERE id = $1 AND user_id = $2`,
@@ -1855,17 +2290,15 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           [request.params.id, String(employer.rows[0].country_code)],
         ),
         pool.query(
-          `WITH latest_completed_runs AS (
-             SELECT DISTINCT ON (run.document_id)
-                    run.id, run.user_id, run.document_id, run.finished_at,
+          `WITH active_runs AS (
+             SELECT run.id, run.user_id, run.document_id, run.finished_at,
                     document.import_batch_id
                FROM documents document
                JOIN extraction_runs run
-                 ON run.document_id = document.id AND run.user_id = document.user_id
+                 ON run.id = document.active_extraction_run_id
+                AND run.document_id = document.id AND run.user_id = document.user_id
               WHERE document.detected_employer_id = $1
                 AND document.deleted_at IS NULL
-                AND run.status = 'COMPLETED'
-              ORDER BY run.document_id, run.processing_version DESC, run.id DESC
            )
            SELECT latest.document_id, latest.import_batch_id,
                   COALESCE(
@@ -1879,7 +2312,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
                   CASE WHEN correction.id IS NULL THEN field.confidence ELSE NULL END AS confidence,
                   CASE WHEN correction.id IS NOT NULL THEN 'HUMAN_CORRECTION' ELSE field.source END AS source,
                   COALESCE(correction.created_at, field.created_at, latest.finished_at) AS detected_at
-             FROM latest_completed_runs latest
+             FROM active_runs latest
              LEFT JOIN extracted_fields field
                ON field.user_id = latest.user_id
               AND field.document_id = latest.document_id
@@ -2427,9 +2860,9 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           properties: {
             summary: {
               type: "object", additionalProperties: false,
-              required: ["totalOriginalBytes", "documentCount", "usersWithOriginals", "pendingDeletions", "quotaBytesPerUser"],
+              required: ["totalOriginalBytes", "documentCount", "usersWithOriginals", "pendingDeletions", "uncertainArtifactWrites", "quotaBytesPerUser"],
               properties: Object.fromEntries([
-                "totalOriginalBytes", "documentCount", "usersWithOriginals", "pendingDeletions", "quotaBytesPerUser",
+                "totalOriginalBytes", "documentCount", "usersWithOriginals", "pendingDeletions", "uncertainArtifactWrites", "quotaBytesPerUser",
               ].map((key) => [key, { type: "integer", minimum: 0 }])),
             },
             items: {
@@ -2474,7 +2907,9 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
              COALESCE(sum(size_bytes) FILTER (WHERE deleted_at IS NULL AND original_deleted_at IS NULL), 0)::bigint AS total_original_bytes,
              count(*) FILTER (WHERE deleted_at IS NULL AND original_deleted_at IS NULL)::integer AS document_count,
              count(DISTINCT user_id) FILTER (WHERE deleted_at IS NULL AND original_deleted_at IS NULL)::integer AS users_with_originals,
-             (SELECT count(*)::integer FROM storage_deletion_tombstones) AS pending_deletions
+             (SELECT count(*)::integer FROM storage_deletion_tombstones) AS pending_deletions,
+             (SELECT count(*)::integer FROM storage_deletion_tombstones
+               WHERE cardinality(uncertain_artifact_object_keys) > 0) AS uncertain_artifact_writes
            FROM documents`,
         ),
         pool.query(usersSql, usersValues),
@@ -2486,6 +2921,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           summary: {
             totalOriginalBytes: integer(summaryRow.total_original_bytes), documentCount: integer(summaryRow.document_count),
             usersWithOriginals: integer(summaryRow.users_with_originals), pendingDeletions: integer(summaryRow.pending_deletions),
+            uncertainArtifactWrites: integer(summaryRow.uncertain_artifact_writes),
             quotaBytesPerUser: config.maxUserStorageBytes,
           },
           ...paged(users.rows.map((row) => {
@@ -2671,6 +3107,87 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
         })), page, pageSize, total),
       };
     },
+  );
+
+  app.get<{ Querystring: PageQuery }>(
+    "/api/v1/admin/processing/health",
+    {
+      preHandler: guard("processing.read"),
+      schema: {
+        querystring: {
+          type: "object", additionalProperties: false,
+          properties: pagingProperties,
+        },
+        ...ok({
+          type: "object", additionalProperties: false,
+          required: ["summary", "currentPipeline", "versions", "issues", "checkedAt"],
+          properties: {
+            summary: {
+              type: "object", additionalProperties: false,
+              required: [
+                "totalDocuments", "completeDocuments", "warningDocuments", "failedDocuments",
+                "reviewRequiredDocuments", "candidateDocuments", "processingDocuments",
+              ],
+              properties: Object.fromEntries([
+                "totalDocuments", "completeDocuments", "warningDocuments", "failedDocuments",
+                "reviewRequiredDocuments", "candidateDocuments", "processingDocuments",
+              ].map((key) => [key, { type: "integer", minimum: 0 }])),
+            },
+            currentPipeline: {
+              type: "object", additionalProperties: false,
+              required: ["fingerprint", "parserVersion", "resultSchemaVersion"],
+              properties: {
+                fingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+                parserVersion: { type: "string" }, resultSchemaVersion: { type: "string" },
+              },
+            },
+            versions: {
+              type: "object", additionalProperties: false,
+              required: ["items", "page", "pageSize", "total"],
+              properties: {
+                items: { type: "array", items: {
+                  type: "object", additionalProperties: false,
+                  required: ["pipelineFingerprint", "parserVersion", "status", "promotionOutcome", "documents"],
+                  properties: {
+                    pipelineFingerprint: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    parserVersion: { type: "string" }, status: { type: "string" }, promotionOutcome: { type: "string" },
+                    documents: { type: "integer", minimum: 0 },
+                  },
+                } },
+                ...paginationFields,
+              },
+            },
+            issues: {
+              type: "object", additionalProperties: false,
+              required: ["items", "page", "pageSize", "total"],
+              properties: {
+                items: { type: "array", items: {
+                  type: "object", additionalProperties: false,
+                  required: ["code", "severity", "documents", "candidates"],
+                  properties: {
+                    code: { type: "string" }, severity: { type: "string" },
+                    documents: { type: "integer", minimum: 0 }, candidates: { type: "integer", minimum: 0 },
+                  },
+                } },
+                ...paginationFields,
+              },
+            },
+            checkedAt: { type: "string" },
+          },
+        }),
+      },
+    },
+    async (request) => ({
+      data: {
+        ...(await loadProcessingHealth(pool, request.query)),
+        currentPipeline: {
+          fingerprint: currentPipelineFingerprint,
+          parserVersion: processingPipelineVersions.parser,
+          resultSchemaVersion: processingPipelineVersions.resultSchema,
+        },
+        checkedAt: new Date().toISOString(),
+      },
+    }),
   );
 
   app.get(

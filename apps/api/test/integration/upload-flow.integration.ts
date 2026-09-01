@@ -55,13 +55,18 @@ function syntheticPayrollPdf(): Uint8Array<ArrayBuffer> {
 test("upload privado crea un único documento y un único intent durable", async (context) => {
   type IntegrationJobRow = {
     attempt: number;
+    base_extraction_run_id: string | null;
     document_id: string;
     id: string;
     lease_owner: string;
     max_attempts: number;
+    pipeline_fingerprint: string | null;
     previous_document_status: "COMPLETED" | "NEEDS_REVIEW" | "FAILED_PERMANENT" | "CANCELLED" | null;
     processing_version: number;
-    stage: "SECURITY_VALIDATION" | "TEXT_EXTRACTION";
+    reprocessing_batch_id: string | null;
+    requested_by_user_id: string | null;
+    stage: "SECURITY_VALIDATION" | "TEXT_EXTRACTION" | "PARSING" | "DOCUMENT_PIPELINE_V2";
+    trigger_kind: "INITIAL_UPLOAD" | "USER_TYPE_CONFIRMATION" | "USER_REPROCESS" | "ADMIN_REPROCESS" | "PARSER_UPGRADE" | "AUTOMATIC_RECOVERY";
     user_id: string;
   };
   const workerModuleUrl = new URL("../../../worker-documents/src/index.ts", import.meta.url).href;
@@ -83,7 +88,7 @@ test("upload privado crea un único documento y un único intent durable", async
     import(workerModuleUrl),
     import(extractionEngineModuleUrl),
   ]);
-  const { failJob, persistExtraction, setDocumentStage, WorkerError } = workerModule as {
+  const { failJob, persistExtraction, reconcileDatabaseState, setDocumentStage, WorkerError } = workerModule as {
     WorkerError: new (code: string, retryable: boolean) => Error;
     failJob: (job: IntegrationJobRow, error: unknown) => Promise<void>;
     persistExtraction: (
@@ -99,6 +104,9 @@ test("upload privado crea un único documento y un único intent durable", async
       partialOcr: boolean,
       computeMs: number,
     ) => Promise<"COMPLETED" | "NEEDS_REVIEW" | null>;
+    reconcileDatabaseState: (config: {
+      dispatcherBatchSize: number;
+    }) => Promise<{ batches: number; exhausted: number; recovered: number; released: number }>;
     setDocumentStage: (job: IntegrationJobRow, processingStatus: string, values?: Record<string, unknown>) => Promise<void>;
   };
   const { extractArgentinePayroll } = extractionEngineModule as {
@@ -170,7 +178,12 @@ test("upload privado crea un único documento y un único intent durable", async
 
   async function runWorkerUntil(event: string): Promise<void> {
     const worker = spawn(process.execPath, [fileURLToPath(new URL("../../../worker-documents/src/index.ts", import.meta.url))], {
-      env: { ...process.env, APP_ENV: "test", UPLOAD_CLEANUP_GRACE_MS: "60000" },
+      env: {
+        ...process.env,
+        APP_ENV: "test",
+        STORAGE_DELETE_VERIFY_DELAY_MS: "100",
+        UPLOAD_CLEANUP_GRACE_MS: "60000",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
@@ -567,10 +580,10 @@ test("upload privado crea un único documento y un único intent durable", async
       `SELECT count(*)::integer AS count
          FROM legal_acknowledgements acknowledgement
          JOIN legal_document_versions version ON version.id = acknowledgement.document_version_id
-        WHERE acknowledgement.user_id = $1 AND version.version = '1.0'`,
-      [googleUserId],
-    )).rows[0].count,
-    2,
+           WHERE acknowledgement.user_id = $1 AND version.version = '1.0'`,
+         [googleUserId],
+       )).rows[0].count,
+      2,
   );
   assert.deepEqual(
     (await pool.query(
@@ -1004,6 +1017,7 @@ test("upload privado crea un único documento y un único intent durable", async
     [crypto.randomUUID(), userIdB, `documents/fairness-b-${suffix}.pdf`, `incoming/fairness-b-${suffix}.pdf`],
   );
   await runWorkerUntil("storage_deletions_completed");
+  await runWorkerUntil("storage_deletions_completed");
   assert.equal(
     (await pool.query(
       "SELECT count(*)::integer AS count FROM storage_deletion_tombstones WHERE user_id = $1",
@@ -1016,7 +1030,7 @@ test("upload privado crea un único documento y un único intent durable", async
       "SELECT count(*)::integer AS count FROM storage_deletion_tombstones WHERE user_id = $1",
       [userIdA],
     )).rows[0].count,
-    2,
+    4,
   );
   await pool.query("DELETE FROM storage_deletion_tombstones WHERE user_id = $1", [userIdA]);
   const legalAcknowledgements = await pool.query(
@@ -1733,7 +1747,7 @@ test("upload privado crea un único documento y un único intent durable", async
        (SELECT count(*)::integer FROM documents WHERE import_batch_id = $1) AS documents,
        (SELECT count(*)::integer FROM processing_jobs job
           JOIN documents document ON document.id = job.document_id
-         WHERE document.import_batch_id = $1 AND job.stage = 'SECURITY_VALIDATION') AS jobs,
+         WHERE document.import_batch_id = $1 AND job.stage = 'DOCUMENT_PIPELINE_V2') AS jobs,
        (SELECT min(job.state) FROM processing_jobs job
           JOIN documents document ON document.id = job.document_id
          WHERE document.import_batch_id = $1) AS job_state`,
@@ -1754,7 +1768,7 @@ test("upload privado crea un único documento y un único intent durable", async
   await pool.query(
     `UPDATE processing_jobs
         SET state = 'COMPLETED', completed_at = now()
-      WHERE document_id = $1 AND stage = 'SECURITY_VALIDATION'`,
+      WHERE document_id = $1 AND stage = 'DOCUMENT_PIPELINE_V2'`,
     [documentId],
   );
   await pool.query(
@@ -1799,11 +1813,18 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(typeConfirmation.statusCode, 201, typeConfirmation.body);
   const resumed = await pool.query(
-    `SELECT stage, processing_version, state FROM processing_jobs
+    `SELECT stage, processing_version, state, trigger_kind, requested_by_user_id
+       FROM processing_jobs
       WHERE document_id = $1 ORDER BY processing_version DESC LIMIT 1`,
     [documentId],
   );
-  assert.deepEqual(resumed.rows[0], { stage: "TEXT_EXTRACTION", processing_version: 2, state: "PENDING" });
+  assert.deepEqual(resumed.rows[0], {
+    stage: "DOCUMENT_PIPELINE_V2",
+    processing_version: 2,
+    state: "PENDING",
+    trigger_kind: "USER_TYPE_CONFIRMATION",
+    requested_by_user_id: userIdA,
+  });
   assert.deepEqual(
     (await pool.query(
       `SELECT batch.status AS batch_status, item.status AS item_status
@@ -1840,6 +1861,14 @@ test("upload privado crea un único documento y un único intent durable", async
        extractor_version, parser_version, normalizer_version, finished_at, confidence
      ) VALUES ($1, $2, $3, 2, 'COMPLETED', 'synthetic-test', '3', '3', '3', now(), 0.9)`,
     [runId, userId, documentId],
+  );
+  await pool.query(
+    `UPDATE extraction_runs SET promotion_outcome = 'PROMOTED', promoted_at = now() WHERE id = $1`,
+    [runId],
+  );
+  await pool.query(
+    `UPDATE documents SET active_extraction_run_id = $1 WHERE id = $2 AND user_id = $3`,
+    [runId, documentId, userId],
   );
   await pool.query(
     `INSERT INTO extracted_fields (
@@ -2028,6 +2057,16 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(employerCorrection.statusCode, 201, employerCorrection.body);
   assert.equal(employerCorrection.json().data.extractionRunId, runId);
+  const correctedEmployerProjection = (await pool.query(
+      `SELECT document.detected_employer_id::text AS document_employer_id,
+              run.detected_employer_id::text AS run_employer_id
+         FROM documents document
+         JOIN extraction_runs run ON run.id = document.active_extraction_run_id
+        WHERE document.id = $1`,
+      [documentId],
+    )).rows[0];
+  assert.ok(correctedEmployerProjection.document_employer_id);
+  assert.equal(correctedEmployerProjection.run_employer_id, correctedEmployerProjection.document_employer_id);
   const employerCorrectionDetail = await app.inject({
     method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieA },
   });
@@ -2321,6 +2360,14 @@ test("upload privado crea un único documento y un único intent durable", async
          extractor_version, parser_version, normalizer_version, finished_at
        ) VALUES ($1, $2, $3, 1, 'COMPLETED', 'synthetic-selector', '1', '1', '1', now())`,
       [fixture.runId, userId, fixture.documentId],
+    );
+    await pool.query(
+      `UPDATE extraction_runs SET promotion_outcome = 'PROMOTED', promoted_at = now() WHERE id = $1`,
+      [fixture.runId],
+    );
+    await pool.query(
+      `UPDATE documents SET active_extraction_run_id = $1 WHERE id = $2 AND user_id = $3`,
+      [fixture.runId, fixture.documentId, userId],
     );
     await pool.query(
       `INSERT INTO payroll_settlements (
@@ -2792,6 +2839,7 @@ test("upload privado crea un único documento y un único intent durable", async
   })).statusCode, 201);
 
   const manualRunId = crypto.randomUUID();
+  const manualEmployerFieldId = crypto.randomUUID();
   const manualGrossFieldId = crypto.randomUUID();
   const manualNetFieldId = crypto.randomUUID();
   const manualDeductionsFieldId = crypto.randomUUID();
@@ -2806,6 +2854,14 @@ test("upload privado crea un único documento y un único intent durable", async
     [manualRunId, userId, documentId],
   );
   await pool.query(
+    `UPDATE extraction_runs SET promotion_outcome = 'PROMOTED', promoted_at = now() WHERE id = $1`,
+    [manualRunId],
+  );
+  await pool.query(
+    `UPDATE documents SET active_extraction_run_id = $1 WHERE id = $2 AND user_id = $3`,
+    [manualRunId, documentId, userId],
+  );
+  await pool.query(
     `INSERT INTO extracted_fields (
        id, user_id, document_id, extraction_run_id, field_path, entity_type,
        raw_value, interpreted_value, confidence, source, extractor_version
@@ -2815,7 +2871,8 @@ test("upload privado crea un único documento y un único intent durable", async
        ($8, $2, $3, $4, 'settlement.deductionsAmount', 'PAYROLL_SETTLEMENT', '180.00', $9::jsonb, 0.7, 'PDF_TEXT', '3'),
        ($10, $2, $3, $4, 'settlement.type', 'PAYROLL_SETTLEMENT', 'BONO', $11::jsonb, 0.8, 'RULE', '3'),
        ($12, $2, $3, $4, 'settlement.remunerativeAmount', 'PAYROLL_SETTLEMENT', '700.00', $13::jsonb, 0.7, 'PDF_TEXT', '3'),
-       ($14, $2, $3, $4, 'settlement.nonRemunerativeAmount', 'PAYROLL_SETTLEMENT', '300.00', $15::jsonb, 0.7, 'PDF_TEXT', '3')`,
+       ($14, $2, $3, $4, 'settlement.nonRemunerativeAmount', 'PAYROLL_SETTLEMENT', '300.00', $15::jsonb, 0.7, 'PDF_TEXT', '3'),
+       ($16, $2, $3, $4, 'employer.name', 'EMPLOYER', 'Empresa Sintética SA', $17::jsonb, 0.8, 'PDF_TEXT', '3')`,
     [
       manualGrossFieldId, userId, documentId, manualRunId, JSON.stringify({ amount: "1000.00", currencyCode: "ARS" }),
       manualNetFieldId, JSON.stringify({ amount: "820.00", currencyCode: "ARS" }),
@@ -2823,6 +2880,7 @@ test("upload privado crea un único documento y un único intent durable", async
       manualTypeFieldId, JSON.stringify("BONO"),
       manualRemunerativeFieldId, JSON.stringify({ amount: "700.00", currencyCode: "ARS" }),
       manualNonRemunerativeFieldId, JSON.stringify({ amount: "300.00", currencyCode: "ARS" }),
+      manualEmployerFieldId, JSON.stringify("Empresa Sintética SA"),
     ],
   );
   await pool.query("UPDATE documents SET processing_status = 'NEEDS_REVIEW' WHERE id = $1", [documentId]);
@@ -3081,6 +3139,15 @@ test("upload privado crea un único documento y un único intent durable", async
       WHERE id = $1 AND user_id = $3 AND employment_id IS NULL`,
     [documentId, foreignDetectedEmployerId, userIdA],
   )).rowCount, 1);
+  await pool.query(
+    `INSERT INTO extraction_run_issues (
+       id, user_id, document_id, extraction_run_id, code, severity,
+       recoverable, affected_field_path, metadata_no_sensitive
+     ) VALUES ($1, $2, $3, $4, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED', 'WARNING', true,
+       'settlement.basicAmount', '{}'::jsonb)
+     ON CONFLICT (extraction_run_id, code, affected_field_path) DO NOTHING`,
+    [crypto.randomUUID(), userIdA, documentId, manualRunId],
+  );
   const firstExport = await app.inject({
     method: "POST",
     url: "/api/v1/privacy/exports",
@@ -3152,11 +3219,11 @@ test("upload privado crea un único documento y un único intent durable", async
     "UPDATE documents SET detected_employer_id = NULL WHERE id = $1 AND user_id = $2",
     [documentId, userIdA],
   )).rowCount, 1);
-  assert.equal(exported.format, "salarivo-user-export-v3");
+  assert.equal(exported.format, "salarivo-user-export-v4");
   assert.deepEqual(Object.keys(exported), [
     "format", "exportedAt", "account", "authenticationMethods", "employers", "employments",
-    "imports", "documents", "settlements", "concepts", "corrections", "legalAcknowledgements",
-    "sessions", "privacyRequests",
+    "imports", "documents", "settlements", "concepts", "processingRuns", "processingIssues",
+    "corrections", "legalAcknowledgements", "sessions", "privacyRequests",
   ]);
   assert.equal(exported.account.secondFactor.enabled, true);
   assert.ok(exported.employers.some((employer: { name: string; firstLinkedAt: string | null }) =>
@@ -3181,14 +3248,34 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.ok(exported.documents.some((document: { filename: string; employerName: string | null }) =>
     document.filename === "recibo-sintetico.pdf" && document.employerName === unrelatedEmployerName));
   assert.ok(exported.settlements.some((settlement: {
-    payrollPeriod: string; grossAmount: string; employerName: string | null;
-  }) => settlement.payrollPeriod.startsWith("2026-10") && settlement.grossAmount === "1000.00"
-    && settlement.employerName === unrelatedEmployerName));
-  assert.equal(exported.settlements.some((settlement: { payrollPeriod: string }) =>
-    settlement.payrollPeriod.startsWith("2026-08")), false);
-  assert.ok(exported.concepts.some((concept: { description: string; type: string }) =>
-    concept.description === "Bono sintético" && concept.type === "EARNING"));
-  assert.equal(exported.concepts.some((concept: { description: string }) => concept.description === "Deducción"), false);
+    active: boolean; documentRevision: number; payrollPeriod: string;
+    grossAmount: string; employerName: string | null; promotionOutcome: string;
+  }) => settlement.documentRevision === 3 && settlement.active
+    && settlement.promotionOutcome === "PROMOTED"
+    && settlement.payrollPeriod.startsWith("2026-10") && settlement.grossAmount === "1000.00"
+    && settlement.employerName === null));
+  assert.ok(exported.settlements.some((settlement: {
+    active: boolean; documentRevision: number; payrollPeriod: string;
+  }) => settlement.documentRevision === 2 && !settlement.active
+    && settlement.payrollPeriod.startsWith("2026-08")));
+  assert.ok(exported.concepts.some((concept: {
+    active: boolean; description: string; documentRevision: number; type: string;
+  }) => concept.documentRevision === 3 && concept.active
+    && concept.description === "Bono sintético" && concept.type === "EARNING"));
+  assert.ok(exported.concepts.some((concept: {
+    active: boolean; description: string; documentRevision: number;
+  }) => concept.documentRevision === 2 && !concept.active && concept.description === "Deducción"));
+  assert.ok(exported.processingRuns.some((run: {
+    active: boolean; documentRevision: number; promotionOutcome: string; status: string;
+  }) => run.documentRevision === 3 && run.active
+    && run.promotionOutcome === "PROMOTED" && run.status === "COMPLETED"));
+  assert.ok(exported.processingRuns.some((run: {
+    active: boolean; documentRevision: number;
+  }) => run.documentRevision === 2 && !run.active));
+  assert.ok(exported.processingIssues.some((issue: {
+    affectedField: string; code: string; documentRevision: number; recoverable: boolean;
+  }) => issue.documentRevision === 3 && issue.code === "LABEL_OR_LAYOUT_NOT_RECOGNIZED"
+    && issue.affectedField === "settlement.basicAmount" && issue.recoverable));
   assert.ok(exported.corrections.some((correction: {
     documentRevision: number; field: string; correctedValue: string;
   }) => correction.documentRevision === 3
@@ -3366,6 +3453,16 @@ test("upload privado crea un único documento y un único intent durable", async
   }
   assert.deepEqual(releasedStatuses, ["READY", "READY"]);
 
+  await pool.query(
+    `INSERT INTO extraction_run_issues (
+       id, user_id, document_id, extraction_run_id, code, severity,
+       recoverable, affected_field_path, metadata_no_sensitive
+     ) VALUES ($1, $2, $3, $4, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED', 'WARNING', true,
+       'settlement.basicAmount', '{}'::jsonb)
+     ON CONFLICT (extraction_run_id, code, affected_field_path) DO NOTHING`,
+    [crypto.randomUUID(), userId, documentId, manualRunId],
+  );
+
   const associatedBeforeMismatchedReprocess = await app.inject({
     method: "PATCH",
     url: "/api/v1/documents/employment",
@@ -3373,6 +3470,15 @@ test("upload privado crea un único documento y un único intent durable", async
     payload: { documentIds: [documentId], employmentId: employmentA },
   });
   assert.equal(associatedBeforeMismatchedReprocess.statusCode, 200, associatedBeforeMismatchedReprocess.body);
+  const projectionBeforeMismatchedReprocess = (await pool.query(
+    `SELECT document.active_extraction_run_id, document.detected_employer_id,
+            document.processing_status, document.employment_id,
+            item.status AS item_status, item.employment_id AS item_employment_id
+       FROM documents document
+       JOIN import_batch_items item ON item.id = document.import_batch_item_id
+      WHERE document.id = $1`,
+    [documentId],
+  )).rows[0];
   const lineageBeforeReprocess = (await pool.query(
     `SELECT
        (SELECT count(*)::integer FROM extraction_runs WHERE document_id = $1) AS runs,
@@ -3427,10 +3533,10 @@ test("upload privado crea un único documento y un único intent durable", async
         AND root.document_id = correction.document_id
         AND root.field_path = correction.field_path
       WHERE correction.document_id = $1 AND correction.user_id = $2
-        AND run.status = 'COMPLETED' AND run.processing_version < 4
+        AND run.id = $3
       ORDER BY correction.field_path, run.processing_version DESC,
                correction.correction_version DESC, correction.created_at DESC, correction.id DESC`,
-    [documentId, userId],
+    [documentId, userId, manualRunId],
   )).rows;
   const periodCorrectionRoot = priorCorrectionRoots.find(
     ({ field_path }) => field_path === "settlement.payrollPeriod",
@@ -3442,7 +3548,7 @@ test("upload privado crea un único documento y un único intent durable", async
     headers: { origin, cookie: cookieA, "idempotency-key": "owner-reprocess-0001" },
   });
   assert.equal(reprocess.statusCode, 201, reprocess.body);
-  assert.equal(reprocess.json().data.processingStatus, "UPLOADED");
+  assert.equal(reprocess.json().data.processingStatus, "COMPLETED");
   assert.equal(reprocess.json().data.job.state, "PENDING");
   assert.equal(reprocess.json().data.job.processingVersion, 4);
   const reprocessReplay = await app.inject({
@@ -3453,6 +3559,12 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(reprocessReplay.statusCode, 200, reprocessReplay.body);
   assert.equal(reprocessReplay.json().data.job.id, reprocess.json().data.job.id);
   assert.equal(reprocessReplay.json().data.job.processingVersion, 4);
+  const concurrentReprocess = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/reprocess`,
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-reprocess-concurrent-0001" },
+  });
+  assert.equal(concurrentReprocess.statusCode, 409, concurrentReprocess.body);
   assert.deepEqual(
     (await pool.query(
       `SELECT
@@ -3484,7 +3596,8 @@ test("upload privado crea un único documento y un único intent durable", async
             started_at = COALESCE(started_at, now()), updated_at = now()
       WHERE id = $1 AND state = 'PENDING'
       RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
-                lease_owner, previous_document_status`,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
     [reprocess.json().data.job.id, reprocessLeaseOwner],
   );
   assert.equal(runningReprocess.rowCount, 1);
@@ -3516,7 +3629,7 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(reprocessResult, "NEEDS_REVIEW");
   const mismatchState = (await pool.query(
     `SELECT document.employment_id AS document_employment_id,
-            document.detected_employer_id, document.processing_status,
+            document.active_extraction_run_id, document.detected_employer_id, document.processing_status,
             item.employment_id AS item_employment_id,
             ARRAY(
               SELECT DISTINCT settlement.employment_id::text
@@ -3532,32 +3645,216 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(String(mismatchState.document_employment_id), employmentA);
   assert.equal(String(mismatchState.item_employment_id), employmentA);
   assert.deepEqual(mismatchState.settlement_employment_ids, [employmentA]);
-  assert.equal(mismatchState.processing_status, "NEEDS_REVIEW");
-  assert.notEqual(
-    String(mismatchState.detected_employer_id),
-    String((await pool.query("SELECT employer_id FROM employments WHERE id = $1", [employmentA])).rows[0].employer_id),
-  );
+  assert.equal(mismatchState.processing_status, "COMPLETED");
+  assert.equal(String(mismatchState.active_extraction_run_id), manualRunId);
+  assert.equal(String(mismatchState.detected_employer_id), String(projectionBeforeMismatchedReprocess.detected_employer_id));
   const mismatchAudit = await pool.query(
     `SELECT metadata_no_sensitive FROM audit_events
       WHERE action = 'EMPLOYMENT_ASSOCIATION_MISMATCH' AND resource_id = $1
       ORDER BY created_at DESC LIMIT 1`,
     [documentId],
   );
-  assert.equal(mismatchAudit.rowCount, 1);
-  const mismatchAuditText = JSON.stringify(mismatchAudit.rows[0].metadata_no_sensitive);
-  assert.doesNotMatch(mismatchAuditText, /Empresa|sueldo|salary|ocr|gross|net/i);
+  for (const row of mismatchAudit.rows) {
+    assert.doesNotMatch(JSON.stringify(row.metadata_no_sensitive), /Empresa|sueldo|salary|ocr|gross|net/i);
+  }
   await pool.query(
     "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
     [reprocess.json().data.job.id],
   );
 
-  const reprocessedRun = await pool.query<{ id: string }>(
-    `SELECT id FROM extraction_runs
-      WHERE document_id = $1 AND user_id = $2 AND processing_version = 4 AND status = 'COMPLETED'`,
+  const reprocessedRun = await pool.query<{ id: string; promotion_outcome: string; status: string }>(
+    `SELECT id, status, promotion_outcome FROM extraction_runs
+      WHERE document_id = $1 AND user_id = $2 AND processing_version = 4`,
     [documentId, userId],
   );
   assert.equal(reprocessedRun.rowCount, 1);
+  assert.deepEqual(
+    { outcome: reprocessedRun.rows[0]!.promotion_outcome, status: reprocessedRun.rows[0]!.status },
+    { outcome: "REVIEW_REQUIRED", status: "REVIEW_REQUIRED" },
+  );
   const reprocessedRunId = reprocessedRun.rows[0]!.id;
+  const reviewCandidateDetail = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/processing-runs/${reprocessedRunId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(reviewCandidateDetail.statusCode, 200, reviewCandidateDetail.body);
+  assert.deepEqual(
+    reviewCandidateDetail.json().data.comparisonPreview.fields.find(
+      (field: { fieldPath: string }) => field.fieldPath === "employer.name",
+    ),
+    {
+      fieldPath: "employer.name",
+      before: "Empresa Sintética SA",
+      after: "Empresa Distinta En Reproceso SA",
+      change: "CHANGED",
+    },
+  );
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/processing-runs`,
+    headers: { cookie: cookieB },
+  })).statusCode, 404);
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/processing-runs/${reprocessedRunId}`,
+    headers: { cookie: cookieB },
+  })).statusCode, 404);
+  const decisionRaceOwner = `integration-decision-race-${crypto.randomUUID()}`;
+  await pool.query(
+    "UPDATE processing_jobs SET execution_owner = $2, updated_at = now() WHERE id = $1",
+    [reprocess.json().data.job.id, decisionRaceOwner],
+  );
+  const blockedCandidateDecision = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/processing-runs/${reprocessedRunId}/decision`,
+    headers: { origin, cookie: cookieA },
+    payload: { decision: "KEEP_ACTIVE", expectedActiveRunId: manualRunId },
+  });
+  assert.equal(blockedCandidateDecision.statusCode, 409, blockedCandidateDecision.body);
+  assert.equal(blockedCandidateDecision.json().error.code, "DOCUMENT_STILL_PROCESSING");
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.active_extraction_run_id, candidate.promotion_outcome
+         FROM documents document
+         JOIN extraction_runs candidate ON candidate.id = $2
+        WHERE document.id = $1`,
+      [documentId, reprocessedRunId],
+    )).rows[0],
+    { active_extraction_run_id: manualRunId, promotion_outcome: "REVIEW_REQUIRED" },
+  );
+  await pool.query(
+    "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
+    [reprocess.json().data.job.id],
+  );
+  await pool.query(
+    "UPDATE documents SET security_status = 'QUARANTINED', processing_status = 'QUARANTINED' WHERE id = $1",
+    [documentId],
+  );
+  const quarantinedCandidateDecision = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/processing-runs/${reprocessedRunId}/decision`,
+    headers: { origin, cookie: cookieA },
+    payload: { decision: "PROMOTE", expectedActiveRunId: manualRunId },
+  });
+  assert.equal(quarantinedCandidateDecision.statusCode, 409, quarantinedCandidateDecision.body);
+  assert.equal(quarantinedCandidateDecision.json().error.code, "REPROCESS_NOT_ALLOWED");
+  await pool.query(
+    "UPDATE documents SET security_status = 'CLEAN', processing_status = 'COMPLETED' WHERE id = $1",
+    [documentId],
+  );
+  const staleBaseCorrectionId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO user_corrections (
+       id, user_id, extracted_field_id, document_id, extraction_run_id, field_path,
+       correction_version, extracted_value, corrected_value
+     ) VALUES ($1, $2, NULL, $3, $4, 'settlement.basicAmount', 1,
+       'null'::jsonb, '{"amount":"999.00","currencyCode":"ARS"}'::jsonb)`,
+    [staleBaseCorrectionId, userId, documentId, manualRunId],
+  );
+  const staleBaseDecision = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/processing-runs/${reprocessedRunId}/decision`,
+    headers: { origin, cookie: cookieA },
+    payload: { decision: "PROMOTE", expectedActiveRunId: manualRunId },
+  });
+  assert.equal(staleBaseDecision.statusCode, 409, staleBaseDecision.body);
+  assert.equal(staleBaseDecision.json().error.code, "RUN_BASE_CHANGED");
+  await pool.query("DELETE FROM user_corrections WHERE id = $1", [staleBaseCorrectionId]);
+  const promotedCandidateDecision = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/processing-runs/${reprocessedRunId}/decision`,
+    headers: { origin, cookie: cookieA },
+    payload: { decision: "PROMOTE", expectedActiveRunId: manualRunId },
+  });
+  assert.equal(promotedCandidateDecision.statusCode, 200, promotedCandidateDecision.body);
+  assert.equal(promotedCandidateDecision.json().data.activeRunId, reprocessedRunId);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.active_extraction_run_id, document.processing_status,
+              item.status AS item_status, candidate.promotion_outcome
+         FROM documents document
+         JOIN import_batch_items item ON item.id = document.import_batch_item_id
+         JOIN extraction_runs candidate ON candidate.id = $2
+        WHERE document.id = $1`,
+      [documentId, reprocessedRunId],
+    )).rows[0],
+    {
+      active_extraction_run_id: reprocessedRunId,
+      processing_status: "NEEDS_REVIEW",
+      item_status: "NEEDS_REVIEW",
+      promotion_outcome: "PROMOTED",
+    },
+  );
+  const historyWhileReviewCandidateActive = await app.inject({
+    method: "GET",
+    url: "/api/v1/salary-history",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(historyWhileReviewCandidateActive.statusCode, 200, historyWhileReviewCandidateActive.body);
+  assert.equal(historyWhileReviewCandidateActive.body.includes("1234567.89"), false);
+  const reviewCandidateEmployerId = String((await pool.query(
+    "SELECT detected_employer_id FROM extraction_runs WHERE id = $1",
+    [reprocessedRunId],
+  )).rows[0].detected_employer_id);
+  const conceptsWhileReviewCandidateActive = await app.inject({
+    method: "GET",
+    url: `/api/v1/salary-history/concepts?employmentContext=${encodeURIComponent(`detected:${reviewCandidateEmployerId}`)}&currencyCode=ARS&employerName=${encodeURIComponent("Empresa Distinta En Reproceso SA")}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(conceptsWhileReviewCandidateActive.statusCode, 200, conceptsWhileReviewCandidateActive.body);
+  assert.deepEqual(conceptsWhileReviewCandidateActive.json().data.items, []);
+  await pool.query(
+    "UPDATE users SET role = 'ADMIN', admin_role = 'SUPER_ADMIN', updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
+  await grantStepUp(cookieA);
+  await pool.query(
+    "UPDATE documents SET security_status = 'QUARANTINED', processing_status = 'QUARANTINED' WHERE id = $1",
+    [documentId],
+  );
+  const quarantinedRollback = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/documents/${documentId}/processing-runs/${manualRunId}/rollback`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "OPERATIONAL_RECOVERY", reference: `QUARANTINE-${suffix}` },
+  });
+  assert.equal(quarantinedRollback.statusCode, 409, quarantinedRollback.body);
+  assert.equal(quarantinedRollback.json().error.code, "REPROCESS_NOT_ALLOWED");
+  await pool.query(
+    "UPDATE documents SET security_status = 'CLEAN', processing_status = 'NEEDS_REVIEW' WHERE id = $1",
+    [documentId],
+  );
+  const restoreBaselineAfterOwnerDecision = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/documents/${documentId}/processing-runs/${manualRunId}/rollback`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "OPERATIONAL_RECOVERY", reference: `OWNER-DECISION-${suffix}` },
+  });
+  assert.equal(
+    restoreBaselineAfterOwnerDecision.statusCode,
+    200,
+    restoreBaselineAfterOwnerDecision.body,
+  );
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.active_extraction_run_id, document.processing_status,
+              item.status AS item_status
+         FROM documents document
+         JOIN import_batch_items item ON item.id = document.import_batch_item_id
+        WHERE document.id = $1`,
+      [documentId],
+    )).rows[0],
+    {
+      active_extraction_run_id: manualRunId,
+      processing_status: "COMPLETED",
+      item_status: "COMPLETED",
+    },
+  );
+  await pool.query(
+    "UPDATE users SET role = 'USER', admin_role = NULL, updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
   const inheritedCorrections = (await pool.query<{
     corrected_value: unknown;
     correction_version: number;
@@ -3661,7 +3958,7 @@ test("upload privado crea un único documento y un único intent durable", async
         WHERE document.id = $1`,
       [documentId],
     )).rows[0],
-    { processing_status: "NEEDS_REVIEW", security_status: "CLEAN", item_status: "NEEDS_REVIEW" },
+    { processing_status: "COMPLETED", security_status: "CLEAN", item_status: "COMPLETED" },
   );
   const reprocessedDetail = await app.inject({
     method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieA },
@@ -3676,6 +3973,109 @@ test("upload privado crea un único documento y un único intent durable", async
     version: Number(periodCorrectionRoot.root_version),
     correctedAt: new Date(periodCorrectionRoot.root_created_at).toISOString(),
   });
+
+  await pool.query(
+    `UPDATE extraction_runs SET pipeline_fingerprint = $2, parser_version = '5' WHERE id = $1`,
+    [reprocessedRunId, "a".repeat(64)],
+  );
+  await pool.query(
+    `INSERT INTO user_corrections (
+       id, user_id, extracted_field_id, document_id, extraction_run_id, field_path,
+       correction_version, extracted_value, corrected_value, inherited_from_correction_id
+     )
+     SELECT $1, correction.user_id, NULL, correction.document_id, $2,
+            correction.field_path, 1, 'null'::jsonb, correction.corrected_value,
+            COALESCE(correction.inherited_from_correction_id, correction.id)
+       FROM user_corrections AS correction
+      WHERE correction.user_id = $3 AND correction.document_id = $4
+        AND correction.field_path = 'employer.name'
+      ORDER BY correction.created_at DESC, correction.id DESC
+      LIMIT 1`,
+    [crypto.randomUUID(), manualRunId, userId, documentId],
+  );
+
+  const normalBaselineCorrection = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/corrections`,
+    headers: { origin, cookie: cookieA },
+    payload: {
+      extractedFieldId: manualTypeFieldId,
+      extractionRunId: manualRunId,
+      correctedValue: "NORMAL",
+    },
+  });
+  assert.equal(normalBaselineCorrection.statusCode, 201, normalBaselineCorrection.body);
+  const completeNormalBaselineReview = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/review-complete`,
+    headers: { origin, cookie: cookieA },
+    payload: { acceptDeductionsMismatch: true, extractionRunId: manualRunId },
+  });
+  assert.equal(completeNormalBaselineReview.statusCode, 200, completeNormalBaselineReview.body);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT settlement_type, basic_amount::text AS basic_amount
+         FROM payroll_settlements
+        WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3
+          AND settlement_ordinal = 1`,
+      [userId, documentId, manualRunId],
+    )).rows[0],
+    { settlement_type: "NORMAL", basic_amount: null },
+  );
+  const historyBeforeBasicRecovery = await app.inject({
+    method: "GET",
+    url: "/api/v1/salary-history",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(historyBeforeBasicRecovery.statusCode, 200, historyBeforeBasicRecovery.body);
+  const arsScopeBeforeBasicRecovery = historyBeforeBasicRecovery.json().data.analytics.scopes.find(
+    (scope: { currencyCode: string; current: { comparableSalary: string | null } | null }) =>
+      scope.currencyCode === "ARS" && scope.current !== null,
+  );
+  assert.ok(arsScopeBeforeBasicRecovery);
+  assert.equal(arsScopeBeforeBasicRecovery.current.comparableSalary, null);
+  assert.equal(historyBeforeBasicRecovery.body.includes("1234567.89"), false);
+
+  const disassociateBeforeImprovedReprocess = await app.inject({
+    method: "PATCH",
+    url: "/api/v1/documents/employment",
+    headers: { origin, cookie: cookieA },
+    payload: { documentIds: [documentId], employmentId: null },
+  });
+  assert.equal(
+    disassociateBeforeImprovedReprocess.statusCode,
+    200,
+    disassociateBeforeImprovedReprocess.body,
+  );
+  await pool.query(
+    `DELETE FROM payroll_line_items
+      WHERE settlement_id = (
+        SELECT id FROM payroll_settlements
+         WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3
+           AND settlement_ordinal = 1
+      )`,
+    [userId, documentId, manualRunId],
+  );
+  await pool.query(
+    `INSERT INTO payroll_line_items (
+       id, user_id, settlement_id, item_ordinal, raw_description,
+       normalized_concept_code, amount, currency_code, item_type,
+       is_recurring, confidence, source_field
+     )
+     SELECT input.id, $1, settlement.id, input.item_ordinal, input.raw_description,
+            input.normalized_concept_code, input.amount, 'ARS', input.item_type,
+            input.is_recurring, 0.84, input.source_field
+       FROM payroll_settlements settlement
+       CROSS JOIN (VALUES
+         (gen_random_uuid(), 1, 'Sueldo basico', 'BASIC_SALARY', 1000.00::numeric, 'EARNING', true, 'BASIC_SALARY'),
+         (gen_random_uuid(), 2, 'Deducción', NULL, 110.00::numeric, 'DEDUCTION', NULL, NULL),
+         (gen_random_uuid(), 3, 'Deducción', NULL, 50.00::numeric, 'DEDUCTION', NULL, NULL),
+         (gen_random_uuid(), 4, 'Deducción', NULL, 20.00::numeric, 'DEDUCTION', NULL, NULL)
+       ) AS input(id, item_ordinal, raw_description, normalized_concept_code, amount, item_type, is_recurring, source_field)
+      WHERE settlement.user_id = $1 AND settlement.document_id = $2
+        AND settlement.extraction_run_id = $3 AND settlement.settlement_ordinal = 1`,
+    [userId, documentId, manualRunId],
+  );
 
   const reviewReprocess = await app.inject({
     method: "POST",
@@ -3692,10 +4092,11 @@ test("upload privado crea un único documento y un único intent durable", async
             started_at = COALESCE(started_at, now()), updated_at = now()
       WHERE id = $1 AND state = 'PENDING'
       RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
-                lease_owner, previous_document_status`,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
     [reviewReprocess.json().data.job.id, reviewLeaseOwner],
   );
-  assert.equal(runningReviewReprocess.rows[0]!.previous_document_status, "NEEDS_REVIEW");
+  assert.equal(runningReviewReprocess.rows[0]!.previous_document_status, "COMPLETED");
   const balancedReviewExtraction = extractArgentinePayroll([
     "RECIBO DE SUELDO",
     "Empleador: Empresa Sintetica SA",
@@ -3721,18 +4122,24 @@ test("upload privado crea un único documento y un único intent durable", async
     false,
     1,
   );
-  assert.equal(reviewReprocessResult, "NEEDS_REVIEW");
+  assert.equal(reviewReprocessResult, "COMPLETED");
   await pool.query(
     "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
     [reviewReprocess.json().data.job.id],
   );
-  const reviewReprocessedRun = await pool.query<{ id: string }>(
-    `SELECT id FROM extraction_runs
-      WHERE document_id = $1 AND user_id = $2 AND processing_version = 5 AND status = 'COMPLETED'`,
+  const reviewReprocessedRun = await pool.query<{ id: string; promotion_outcome: string }>(
+    `SELECT id, promotion_outcome FROM extraction_runs
+      WHERE document_id = $1 AND user_id = $2 AND processing_version = 5
+        AND status = 'COMPLETED_WITH_WARNINGS'`,
     [documentId, userId],
   );
   assert.equal(reviewReprocessedRun.rowCount, 1);
   const reviewReprocessedRunId = reviewReprocessedRun.rows[0]!.id;
+  assert.equal(reviewReprocessedRun.rows[0]!.promotion_outcome, "PROMOTED");
+  assert.equal(
+    String((await pool.query("SELECT active_extraction_run_id FROM documents WHERE id = $1", [documentId])).rows[0].active_extraction_run_id),
+    reviewReprocessedRunId,
+  );
   assert.equal(
     (await pool.query(
       `SELECT sum(item.amount)::text AS total
@@ -3751,7 +4158,225 @@ test("upload privado crea un único documento y un único intent durable", async
         WHERE document.id = $1`,
       [documentId],
     )).rows[0],
-    { processing_status: "NEEDS_REVIEW", security_status: "CLEAN", item_status: "NEEDS_REVIEW" },
+    { processing_status: "COMPLETED", security_status: "CLEAN", item_status: "COMPLETED" },
+  );
+  const historyAfterBasicRecovery = await app.inject({
+    method: "GET",
+    url: "/api/v1/salary-history",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(historyAfterBasicRecovery.statusCode, 200, historyAfterBasicRecovery.body);
+  const arsScopeAfterBasicRecovery = historyAfterBasicRecovery.json().data.analytics.scopes.find(
+    (scope: { currencyCode: string; current: { comparableSalary: string | null } | null }) =>
+      scope.currencyCode === "ARS" && scope.current !== null,
+  );
+  assert.ok(arsScopeAfterBasicRecovery);
+  assert.equal(arsScopeAfterBasicRecovery.current.comparableSalary, "1000.00");
+  assert.equal(historyAfterBasicRecovery.body.includes("1234567.89"), false);
+  const candidatesAfterBasicRecovery = await app.inject({
+    method: "GET",
+    url: "/api/v1/reprocessing/candidates",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(candidatesAfterBasicRecovery.statusCode, 200, candidatesAfterBasicRecovery.body);
+  assert.equal(
+    candidatesAfterBasicRecovery.json().data.items.some(
+      (candidate: { documentId: string }) => candidate.documentId === documentId,
+    ),
+    false,
+  );
+  const unavailableAfterBasicRecovery = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${documentId}/reprocess`,
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-reprocess-current-pipeline" },
+  });
+  assert.equal(unavailableAfterBasicRecovery.statusCode, 409, unavailableAfterBasicRecovery.body);
+  assert.equal(unavailableAfterBasicRecovery.json().error.code, "REPROCESS_NOT_AVAILABLE");
+  const pipelineBeforeSemverProbe = (await pool.query(
+    "SELECT parser_version, pipeline_fingerprint FROM extraction_runs WHERE id = $1",
+    [reviewReprocessedRunId],
+  )).rows[0];
+  await pool.query(
+    `INSERT INTO extraction_run_issues (
+       id, user_id, document_id, extraction_run_id, code, severity,
+       recoverable, affected_field_path, metadata_no_sensitive
+     ) VALUES ($1, $2, $3, $4, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED', 'WARNING', true,
+       'settlement.basicAmount', '{}'::jsonb)
+     ON CONFLICT (extraction_run_id, code, affected_field_path) DO NOTHING`,
+    [crypto.randomUUID(), userId, documentId, reviewReprocessedRunId],
+  );
+  await pool.query(
+    "UPDATE extraction_runs SET parser_version = '6', pipeline_fingerprint = $2 WHERE id = $1",
+    [reviewReprocessedRunId, "e".repeat(64)],
+  );
+  const parserSixCandidates = await app.inject({
+    method: "GET",
+    url: "/api/v1/reprocessing/candidates",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(parserSixCandidates.statusCode, 200, parserSixCandidates.body);
+  assert.equal(
+    parserSixCandidates.json().data.items.some(
+      (candidate: { documentId: string }) => candidate.documentId === documentId,
+    ),
+    false,
+  );
+  await pool.query(
+    "UPDATE extraction_runs SET parser_version = '6.1.0', pipeline_fingerprint = $2 WHERE id = $1",
+    [reviewReprocessedRunId, "f".repeat(64)],
+  );
+  const textualVersionCandidates = await app.inject({
+    method: "GET",
+    url: "/api/v1/reprocessing/candidates",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(textualVersionCandidates.statusCode, 200, textualVersionCandidates.body);
+  await pool.query(
+    "UPDATE users SET role = 'ADMIN', admin_role = 'OPERATIONS', updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
+  const processingHealth = await app.inject({
+    method: "GET",
+    url: "/api/v1/admin/processing/health?page=1&pageSize=1",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(processingHealth.statusCode, 200, processingHealth.body);
+  assert.equal(processingHealth.json().data.versions.pageSize, 1);
+  assert.equal(processingHealth.json().data.issues.pageSize, 1);
+  assert.ok(processingHealth.json().data.versions.items.length <= 1);
+  assert.ok(processingHealth.json().data.issues.items.length <= 1);
+  assert.doesNotMatch(processingHealth.body, /1000\.00|1234567\.89|Empresa|recibo-sintetico/i);
+  await pool.query(
+    "UPDATE extraction_runs SET parser_version = $2, pipeline_fingerprint = $3 WHERE id = $1",
+    [reviewReprocessedRunId, pipelineBeforeSemverProbe.parser_version, pipelineBeforeSemverProbe.pipeline_fingerprint],
+  );
+  const operationsRollbackDenied = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/documents/${documentId}/processing-runs/${manualRunId}/rollback`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "OPERATIONAL_RECOVERY", reference: `ROLLBACK-${suffix}` },
+  });
+  assert.equal(operationsRollbackDenied.statusCode, 403, operationsRollbackDenied.body);
+  assert.equal(operationsRollbackDenied.json().error.code, "ADMIN_PERMISSION_REQUIRED");
+  await pool.query(
+    "UPDATE users SET admin_role = 'SUPER_ADMIN', updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
+  await pool.query(
+    "UPDATE sessions SET step_up_expires_at = NULL WHERE token_hash = $1",
+    [tokenHash(cookieA.split("=", 2)[1]!)],
+  );
+  const rollbackWithoutStepUp = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/documents/${documentId}/processing-runs/${manualRunId}/rollback`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "OPERATIONAL_RECOVERY", reference: `ROLLBACK-${suffix}` },
+  });
+  assert.equal(rollbackWithoutStepUp.statusCode, 403, rollbackWithoutStepUp.body);
+  assert.equal(rollbackWithoutStepUp.json().error.code, "STEP_UP_REQUIRED");
+  await grantStepUp(cookieA);
+  const rollbackToMissingBasic = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/documents/${documentId}/processing-runs/${manualRunId}/rollback`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "OPERATIONAL_RECOVERY", reference: `ROLLBACK-${suffix}` },
+  });
+  assert.equal(rollbackToMissingBasic.statusCode, 200, rollbackToMissingBasic.body);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.active_extraction_run_id, document.processing_status,
+              document.classification_confidence::text, document.detected_employer_id,
+              item.status AS item_status, item.error_code AS item_error_code
+         FROM documents document
+         JOIN import_batch_items item ON item.id = document.import_batch_item_id
+        WHERE document.id = $1`,
+      [documentId],
+    )).rows[0],
+    {
+      active_extraction_run_id: manualRunId,
+      processing_status: "COMPLETED",
+      classification_confidence: "0.7000",
+      detected_employer_id: null,
+      item_status: "COMPLETED",
+      item_error_code: null,
+    },
+  );
+  const historyAfterRollback = await app.inject({
+    method: "GET",
+    url: "/api/v1/salary-history",
+    headers: { cookie: cookieA },
+  });
+  const rollbackArsScope = historyAfterRollback.json().data.analytics.scopes.find(
+    (scope: { currencyCode: string; current: { comparableSalary: string | null } | null }) =>
+      scope.currencyCode === "ARS" && scope.current !== null,
+  );
+  assert.ok(rollbackArsScope);
+  assert.equal(rollbackArsScope.current.comparableSalary, null);
+  const candidatesAfterRollback = await app.inject({
+    method: "GET",
+    url: "/api/v1/reprocessing/candidates",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(candidatesAfterRollback.statusCode, 200, candidatesAfterRollback.body);
+  assert.ok(
+    !candidatesAfterRollback.json().data.items.some(
+      (candidate: { documentId: string }) => candidate.documentId === documentId,
+    ),
+    "a rollback must not reoffer the exact pipeline result that was already evaluated",
+  );
+  const rollbackToImprovedRun = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/documents/${documentId}/processing-runs/${reviewReprocessedRunId}/rollback`,
+    headers: { origin, cookie: cookieA },
+    payload: { reasonCode: "OPERATIONAL_RECOVERY", reference: `RESTORE-${suffix}` },
+  });
+  assert.equal(rollbackToImprovedRun.statusCode, 200, rollbackToImprovedRun.body);
+  const improvedRunProjection = (await pool.query(
+    `SELECT detected_employer_id, confidence::text FROM extraction_runs WHERE id = $1`,
+    [reviewReprocessedRunId],
+  )).rows[0];
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.active_extraction_run_id, document.processing_status,
+              document.classification_confidence::text, document.detected_employer_id,
+              item.status AS item_status, item.error_code AS item_error_code
+         FROM documents document
+         JOIN import_batch_items item ON item.id = document.import_batch_item_id
+        WHERE document.id = $1`,
+      [documentId],
+    )).rows[0],
+    {
+      active_extraction_run_id: reviewReprocessedRunId,
+      processing_status: "COMPLETED",
+      classification_confidence: improvedRunProjection.confidence,
+      detected_employer_id: improvedRunProjection.detected_employer_id,
+      item_status: "COMPLETED",
+      item_error_code: null,
+    },
+  );
+  const historyAfterRollbackRestore = await app.inject({
+    method: "GET",
+    url: "/api/v1/salary-history",
+    headers: { cookie: cookieA },
+  });
+  const restoredArsScope = historyAfterRollbackRestore.json().data.analytics.scopes.find(
+    (scope: { currencyCode: string; current: { comparableSalary: string | null } | null }) =>
+      scope.currencyCode === "ARS" && scope.current !== null,
+  );
+  assert.ok(restoredArsScope);
+  assert.equal(restoredArsScope.current.comparableSalary, "1000.00");
+  assert.equal(
+    (await pool.query(
+      `SELECT count(*)::integer AS count FROM admin_audit_events
+        WHERE actor_user_id = $1 AND action = 'PROCESSING_RUN_ROLLED_BACK'
+          AND result = 'SUCCESS' AND reason_code = 'OPERATIONAL_RECOVERY'`,
+      [userIdA],
+    )).rows[0].count,
+    3,
+  );
+  await pool.query(
+    "UPDATE users SET role = 'USER', admin_role = NULL, updated_at = now() WHERE id = $1",
+    [userIdA],
   );
   const reinheritedRoots = (await pool.query<{ field_path: string; inherited_from_correction_id: string }>(
     `SELECT field_path, inherited_from_correction_id
@@ -3760,12 +4385,16 @@ test("upload privado crea un único documento y un único intent durable", async
       ORDER BY field_path`,
     [reviewReprocessedRunId],
   )).rows;
-  assert.equal(reinheritedRoots.length, priorCorrectionRoots.length);
+  assert.equal(reinheritedRoots.length, priorCorrectionRoots.length + 1);
   for (const inherited of reinheritedRoots) {
-    assert.equal(
-      inherited.inherited_from_correction_id,
-      priorCorrectionRoots.find(({ field_path }) => field_path === inherited.field_path)?.root_id,
-    );
+    const priorRoot = priorCorrectionRoots.find(({ field_path }) => field_path === inherited.field_path);
+    if (inherited.field_path === "settlement.type") {
+      assert.equal(inherited.inherited_from_correction_id, normalBaselineCorrection.json().data.id);
+    } else if (priorRoot) assert.equal(inherited.inherited_from_correction_id, priorRoot.root_id);
+    else {
+      assert.equal(inherited.field_path, "employer.name");
+      assert.ok(inherited.inherited_from_correction_id);
+    }
   }
   const reviewReprocessedDetail = await app.inject({
     method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieA },
@@ -3786,20 +4415,43 @@ test("upload privado crea un único documento y un único intent durable", async
   )).rows[0];
   assert.deepEqual(lineageAfterReviewReprocess, {
     runs: Number(lineageAfterReprocess.runs) + 1,
-    corrections: Number(lineageAfterReprocess.corrections) + priorCorrectionRoots.length,
+    corrections: Number(lineageAfterReprocess.corrections) + priorCorrectionRoots.length + 3,
   });
 
+  await pool.query(
+    `UPDATE extraction_runs SET pipeline_fingerprint = $2, parser_version = '5' WHERE id = $1`,
+    [reviewReprocessedRunId, "b".repeat(64)],
+  );
+  await pool.query(
+    `INSERT INTO extraction_run_issues (
+       id, user_id, document_id, extraction_run_id, code, severity,
+       recoverable, affected_field_path, metadata_no_sensitive
+     ) VALUES ($1, $2, $3, $4, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED', 'WARNING', true,
+       'settlement.basicAmount', '{}'::jsonb)
+     ON CONFLICT (extraction_run_id, code, affected_field_path) DO NOTHING`,
+    [crypto.randomUUID(), userId, documentId, reviewReprocessedRunId],
+  );
+
+  await pool.query(
+    "UPDATE users SET role = 'ADMIN', admin_role = 'OPERATIONS', updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
+  await grantStepUp(cookieA);
   const failedReprocess = await app.inject({
     method: "POST",
-    url: `/api/v1/documents/${documentId}/reprocess`,
+    url: `/api/v1/admin/documents/${documentId}/reprocess`,
     headers: { origin, cookie: cookieA, "idempotency-key": "owner-reprocess-failure-0002" },
+    payload: { reasonCode: "OPERATIONAL_RECOVERY", reference: `REPROCESS-${suffix}` },
   });
   assert.equal(failedReprocess.statusCode, 201, failedReprocess.body);
   assert.equal(failedReprocess.json().data.job.processingVersion, 6);
+  await pool.query(
+    "UPDATE users SET role = 'USER', admin_role = NULL, updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
   const projectionBeforeFailedReprocess = (await pool.query(
     `SELECT classification_status, document_type, classification_confidence::text,
-            (SELECT id FROM extraction_runs WHERE document_id = document.id AND status = 'COMPLETED'
-              ORDER BY processing_version DESC LIMIT 1) AS extraction_run_id
+            active_extraction_run_id AS extraction_run_id
        FROM documents document WHERE id = $1`,
     [documentId],
   )).rows[0];
@@ -3811,10 +4463,11 @@ test("upload privado crea un único documento y un único intent durable", async
             started_at = COALESCE(started_at, now()), updated_at = now()
       WHERE id = $1 AND state = 'PENDING'
       RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
-                lease_owner, previous_document_status`,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
     [failedReprocess.json().data.job.id, failedLeaseOwner],
   );
-  assert.equal(runningFailedReprocess.rows[0]!.previous_document_status, "NEEDS_REVIEW");
+  assert.equal(runningFailedReprocess.rows[0]!.previous_document_status, "COMPLETED");
   await setDocumentStage(runningFailedReprocess.rows[0]!, "TEXT_EXTRACTION", {
     classification_status: "SUPPORTED",
     document_type: "PAYROLL",
@@ -3830,7 +4483,7 @@ test("upload privado crea un único documento y un único intent durable", async
       "SELECT state, error_code, previous_document_status FROM processing_jobs WHERE id = $1",
       [failedReprocess.json().data.job.id],
     )).rows[0],
-    { state: "FAILED", error_code: "WORKER_INTERNAL_ERROR", previous_document_status: "NEEDS_REVIEW" },
+    { state: "FAILED", error_code: "WORKER_INTERNAL_ERROR", previous_document_status: "COMPLETED" },
   );
   assert.deepEqual(
     (await pool.query(
@@ -3842,9 +4495,9 @@ test("upload privado crea un único documento y un único intent durable", async
       [documentId],
     )).rows[0],
     {
-      processing_status: "NEEDS_REVIEW",
+      processing_status: "COMPLETED",
       security_status: "CLEAN",
-      item_status: "NEEDS_REVIEW",
+      item_status: "COMPLETED",
       item_error_code: null,
     },
   );
@@ -3855,13 +4508,31 @@ test("upload privado crea un único documento y un único intent durable", async
          (SELECT count(*)::integer FROM user_corrections WHERE document_id = $1) AS corrections`,
       [documentId],
     )).rows[0],
-    lineageAfterReviewReprocess,
+    {
+      runs: Number(lineageAfterReviewReprocess.runs) + 1,
+      corrections: Number(lineageAfterReviewReprocess.corrections),
+    },
+  );
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT run.status, run.error_code, issue.code, issue.severity, issue.recoverable
+         FROM extraction_runs run
+         JOIN extraction_run_issues issue ON issue.extraction_run_id = run.id
+        WHERE run.document_id = $1 AND run.processing_version = 6`,
+      [documentId],
+    )).rows[0],
+    {
+      status: "FAILED",
+      error_code: "WORKER_INTERNAL_ERROR",
+      code: "WORKER_INTERNAL_ERROR",
+      severity: "ERROR",
+      recoverable: true,
+    },
   );
   assert.deepEqual(
     (await pool.query(
       `SELECT classification_status, document_type, classification_confidence::text,
-              (SELECT id FROM extraction_runs WHERE document_id = document.id AND status = 'COMPLETED'
-                ORDER BY processing_version DESC LIMIT 1) AS extraction_run_id
+              active_extraction_run_id AS extraction_run_id
          FROM documents document WHERE id = $1`,
       [documentId],
     )).rows[0],
@@ -3874,6 +4545,485 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(failedReprocessDetail.json().data.lastReprocessError.code, "WORKER_INTERNAL_ERROR");
   assert.equal(failedReprocessDetail.json().data.lastReprocessError.processingVersion, 6);
   assert.match(failedReprocessDetail.json().data.lastReprocessError.failedAt, /^\d{4}-\d{2}-\d{2}T/);
+  const failedEvaluationAudit = (await pool.query(
+    `SELECT result, metadata_no_sensitive
+       FROM audit_events
+      WHERE action = 'EXTRACTION_RUN_EVALUATED' AND resource_type = 'EXTRACTION_RUN'
+        AND resource_id = (
+          SELECT id FROM extraction_runs
+           WHERE user_id = $1 AND document_id = $2 AND processing_version = 6
+        )`,
+    [userId, documentId],
+  )).rows[0];
+  assert.equal(failedEvaluationAudit.result, "FAILED");
+  assert.deepEqual(
+    {
+      activeRunAfterId: failedEvaluationAudit.metadata_no_sensitive.activeRunAfterId,
+      activeRunBeforeId: failedEvaluationAudit.metadata_no_sensitive.activeRunBeforeId,
+      outcome: failedEvaluationAudit.metadata_no_sensitive.outcome,
+      processingVersion: failedEvaluationAudit.metadata_no_sensitive.processingVersion,
+      reason: failedEvaluationAudit.metadata_no_sensitive.reason,
+      triggerKind: failedEvaluationAudit.metadata_no_sensitive.triggerKind,
+    },
+    {
+      activeRunAfterId: reviewReprocessedRunId,
+      activeRunBeforeId: reviewReprocessedRunId,
+      outcome: "FAILED",
+      processingVersion: 6,
+      reason: "WORKER_INTERNAL_ERROR",
+      triggerKind: "ADMIN_REPROCESS",
+    },
+  );
+  assert.doesNotMatch(JSON.stringify(failedEvaluationAudit.metadata_no_sensitive), /salary|sueldo|gross|net|ocr|Empresa/i);
+
+  const retryRecoveryDocumentId = listFixtures[2]!.id;
+  await pool.query(
+    `UPDATE documents
+        SET active_extraction_run_id = NULL, employment_id = NULL,
+            detected_employer_id = NULL, processing_status = 'FAILED_PERMANENT',
+            security_status = 'CLEAN', classification_status = 'SUPPORTED',
+            document_type = 'PAYROLL', original_deleted_at = NULL
+      WHERE id = $1 AND user_id = $2`,
+    [retryRecoveryDocumentId, userId],
+  );
+  await pool.query(
+    `UPDATE import_batch_items
+        SET employment_id = NULL, status = 'FAILED', error_code = 'WORKER_INTERNAL_ERROR', updated_at = now()
+      WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
+    [retryRecoveryDocumentId, userId],
+  );
+  const retryRecoveryDetail = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${retryRecoveryDocumentId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(retryRecoveryDetail.statusCode, 200, retryRecoveryDetail.body);
+  assert.equal(retryRecoveryDetail.json().data.analysis.reprocess.retryAvailable, true);
+  const retryRecoveryWithoutFlag = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${retryRecoveryDocumentId}/reprocess`,
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-retry-without-flag" },
+  });
+  assert.equal(retryRecoveryWithoutFlag.statusCode, 409, retryRecoveryWithoutFlag.body);
+  assert.equal(retryRecoveryWithoutFlag.json().error.code, "REPROCESS_NOT_AVAILABLE");
+  const retryRecovery = await app.inject({
+    method: "POST",
+    url: `/api/v1/documents/${retryRecoveryDocumentId}/reprocess`,
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-retry-with-explicit-flag" },
+    payload: { retry: true },
+  });
+  assert.equal(retryRecovery.statusCode, 201, retryRecovery.body);
+  assert.equal(retryRecovery.json().data.job.processingVersion, 1);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT trigger_kind, base_extraction_run_id FROM processing_jobs WHERE id = $1`,
+      [retryRecovery.json().data.job.id],
+    )).rows[0],
+    { trigger_kind: "USER_REPROCESS", base_extraction_run_id: null },
+  );
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.processing_status, item.status AS item_status, item.error_code
+         FROM documents document
+         JOIN import_batch_items item ON item.id = document.import_batch_item_id
+        WHERE document.id = $1`,
+      [retryRecoveryDocumentId],
+    )).rows[0],
+    {
+      processing_status: "FAILED_PERMANENT",
+      item_status: "FAILED",
+      error_code: "WORKER_INTERNAL_ERROR",
+    },
+  );
+  const retryRecoveryOwner = `integration-retry-recovery-${crypto.randomUUID()}`;
+  const firstRetryRecoveryAttempt = await pool.query<IntegrationJobRow>(
+    `UPDATE processing_jobs
+        SET state = 'RUNNING', attempt = attempt + 1, lease_owner = $2,
+            lease_expires_at = now() + interval '5 minutes', execution_owner = $2,
+            started_at = COALESCE(started_at, now()), updated_at = now()
+      WHERE id = $1 AND state = 'PENDING'
+      RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
+    [retryRecovery.json().data.job.id, retryRecoveryOwner],
+  );
+  await failJob(
+    firstRetryRecoveryAttempt.rows[0]!,
+    new WorkerError("STORAGE_TEMPORARILY_UNAVAILABLE", true),
+  );
+  const transientRetryRun = (await pool.query<{ id: string }>(
+    `SELECT run.id
+       FROM extraction_runs run
+       JOIN extraction_run_issues issue
+         ON issue.user_id = run.user_id AND issue.document_id = run.document_id
+        AND issue.extraction_run_id = run.id
+      WHERE run.document_id = $1 AND run.processing_version = 1
+        AND run.status = 'FAILED' AND issue.code = 'STORAGE_TEMPORARILY_UNAVAILABLE'`,
+    [retryRecoveryDocumentId],
+  )).rows[0];
+  assert.ok(transientRetryRun);
+  await pool.query(
+    "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
+    [retryRecovery.json().data.job.id],
+  );
+  const secondRetryRecoveryOwner = `integration-retry-recovery-2-${crypto.randomUUID()}`;
+  const runningRetryRecovery = await pool.query<IntegrationJobRow>(
+    `UPDATE processing_jobs
+        SET state = 'RUNNING', attempt = attempt + 1, lease_owner = $2,
+            lease_expires_at = now() + interval '5 minutes', execution_owner = $2,
+            available_at = now(), updated_at = now()
+      WHERE id = $1 AND state = 'RETRYABLE'
+      RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
+    [retryRecovery.json().data.job.id, secondRetryRecoveryOwner],
+  );
+  assert.equal(runningRetryRecovery.rows[0]!.attempt, 2);
+  assert.equal(await persistExtraction(
+    runningRetryRecovery.rows[0]!,
+    {
+      confidence: 0.99,
+      decision: "SUPPORTED",
+      documentType: "PAYROLL",
+      signals: ["synthetic_retry_recovery"],
+    },
+    balancedReviewExtraction,
+    "PDF_TEXT",
+    false,
+    1,
+  ), "COMPLETED");
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT run.id, run.status, run.error_code,
+              count(issue.id) FILTER (WHERE issue.code = 'STORAGE_TEMPORARILY_UNAVAILABLE')::integer AS stale_issues
+         FROM extraction_runs run
+         LEFT JOIN extraction_run_issues issue
+           ON issue.user_id = run.user_id AND issue.document_id = run.document_id
+          AND issue.extraction_run_id = run.id
+        WHERE run.document_id = $1 AND run.processing_version = 1
+        GROUP BY run.id`,
+      [retryRecoveryDocumentId],
+    )).rows[0],
+    {
+      id: transientRetryRun.id,
+      status: "COMPLETED_WITH_WARNINGS",
+      error_code: null,
+      stale_issues: 0,
+    },
+  );
+  await pool.query(
+    "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
+    [retryRecovery.json().data.job.id],
+  );
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT document.processing_status,
+              document.active_extraction_run_id IS NOT NULL AS has_active_run,
+              item.status AS item_status, item.error_code
+         FROM documents document
+         JOIN import_batch_items item ON item.id = document.import_batch_item_id
+        WHERE document.id = $1`,
+      [retryRecoveryDocumentId],
+    )).rows[0],
+    {
+      processing_status: "COMPLETED",
+      has_active_run: true,
+      item_status: "COMPLETED",
+      error_code: null,
+    },
+  );
+
+  const batchFixtureIds = [listFixtures[0]!.id, listFixtures[3]!.id];
+  const batchBaselineRunIds = new Map<string, string>();
+  for (const [index, batchDocumentId] of batchFixtureIds.entries()) {
+    const baselineRunId = crypto.randomUUID();
+    batchBaselineRunIds.set(batchDocumentId, baselineRunId);
+    await pool.query(
+      `INSERT INTO extraction_runs (
+         id, user_id, document_id, processing_version, status,
+         classifier_name, classifier_version, extractor_name, extractor_version,
+         parser_version, normalizer_version, result_schema_version,
+         pipeline_fingerprint, trigger_kind, promotion_outcome, promoted_at,
+         finished_at, confidence
+       ) VALUES ($1, $2, $3, 1, 'COMPLETED_WITH_WARNINGS',
+         'heuristic-ar-payroll', '6', 'deterministic-ar-payroll', '6',
+         '5', '6', '1', $4, 'INITIAL_UPLOAD', 'PROMOTED', now(), now(), 0.7)`,
+      [baselineRunId, userId, batchDocumentId, `${index + 4}`.repeat(64)],
+    );
+    await pool.query(
+      `INSERT INTO extraction_run_issues (
+         id, user_id, document_id, extraction_run_id, code, severity,
+         recoverable, affected_field_path, metadata_no_sensitive
+       ) VALUES ($1, $2, $3, $4, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED', 'WARNING', true,
+         'settlement.basicAmount', '{}'::jsonb)`,
+      [crypto.randomUUID(), userId, batchDocumentId, baselineRunId],
+    );
+    await pool.query(
+      `UPDATE documents
+          SET active_extraction_run_id = $1, employment_id = NULL,
+              detected_employer_id = NULL, processing_status = 'COMPLETED',
+              security_status = 'CLEAN', classification_status = 'SUPPORTED',
+              document_type = 'PAYROLL', classification_confidence = 0.7
+        WHERE id = $2 AND user_id = $3`,
+      [baselineRunId, batchDocumentId, userId],
+    );
+    await pool.query(
+      `UPDATE import_batch_items
+          SET employment_id = NULL, status = 'COMPLETED', error_code = NULL, updated_at = now()
+        WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
+      [batchDocumentId, userId],
+    );
+  }
+  await pool.query(
+    "UPDATE users SET role = 'ADMIN', admin_role = 'OPERATIONS', updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
+  await pool.query(
+    "UPDATE sessions SET step_up_expires_at = NULL WHERE token_hash = $1",
+    [tokenHash(cookieA.split("=", 2)[1]!)],
+  );
+  const adminBatchWithoutStepUp = await app.inject({
+    method: "POST",
+    url: "/api/v1/admin/reprocessing-batches",
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-batch-partial-0001" },
+    payload: {
+      userId,
+      documentIds: batchFixtureIds,
+      reasonCode: "OPERATIONAL_RECOVERY",
+      reference: `BATCH-${suffix}`,
+    },
+  });
+  assert.equal(adminBatchWithoutStepUp.statusCode, 403, adminBatchWithoutStepUp.body);
+  assert.equal(adminBatchWithoutStepUp.json().error.code, "STEP_UP_REQUIRED");
+  await grantStepUp(cookieA);
+  const reprocessingBatch = await app.inject({
+    method: "POST",
+    url: "/api/v1/admin/reprocessing-batches",
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-batch-partial-0001" },
+    payload: {
+      userId,
+      documentIds: batchFixtureIds,
+      reasonCode: "OPERATIONAL_RECOVERY",
+      reference: `BATCH-${suffix}`,
+    },
+  });
+  assert.equal(reprocessingBatch.statusCode, 201, reprocessingBatch.body);
+  assert.equal(reprocessingBatch.json().data.progress.total, 2);
+  const reprocessingBatchId = String(reprocessingBatch.json().data.id);
+  const replayedReprocessingBatch = await app.inject({
+    method: "POST",
+    url: "/api/v1/admin/reprocessing-batches",
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-batch-partial-0001" },
+    payload: {
+      userId,
+      documentIds: batchFixtureIds,
+      reasonCode: "OPERATIONAL_RECOVERY",
+      reference: `BATCH-${suffix}`,
+    },
+  });
+  assert.equal(replayedReprocessingBatch.statusCode, 200, replayedReprocessingBatch.body);
+  assert.equal(replayedReprocessingBatch.json().data.id, reprocessingBatchId);
+  const conflictingReprocessingBatch = await app.inject({
+    method: "POST",
+    url: "/api/v1/admin/reprocessing-batches",
+    headers: { origin, cookie: cookieA, "idempotency-key": "owner-batch-partial-0002" },
+    payload: {
+      userId,
+      documentIds: batchFixtureIds,
+      reasonCode: "OPERATIONAL_RECOVERY",
+      reference: `BATCH-CONFLICT-${suffix}`,
+    },
+  });
+  assert.equal(conflictingReprocessingBatch.statusCode, 409, conflictingReprocessingBatch.body);
+  assert.equal(conflictingReprocessingBatch.json().error.code, "REPROCESSING_BATCH_ALREADY_ACTIVE");
+  const activeAdminBatch = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/reprocessing-batches/active?userId=${userId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(activeAdminBatch.statusCode, 200, activeAdminBatch.body);
+  assert.equal(activeAdminBatch.json().data.id, reprocessingBatchId);
+  assert.equal(activeAdminBatch.json().data.progress.total, 2);
+  assert.doesNotMatch(activeAdminBatch.body, /Empresa|recibo|1000\.00|1234567\.89/i);
+  const adminBatchView = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/reprocessing-batches/${reprocessingBatchId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(adminBatchView.statusCode, 200, adminBatchView.body);
+  assert.equal(adminBatchView.json().data.progress.total, 2);
+  assert.doesNotMatch(adminBatchView.body, /Empresa|recibo|1000\.00|1234567\.89/i);
+  assert.equal(
+    (await pool.query(
+      `SELECT count(*)::integer AS count FROM admin_audit_events
+        WHERE actor_user_id = $1 AND action = 'REPROCESSING_BATCH_REQUESTED'
+          AND resource_id = $2 AND result = 'SUCCESS'`,
+      [userIdA, reprocessingBatchId],
+    )).rows[0].count,
+    1,
+  );
+  await pool.query(
+    "UPDATE users SET role = 'USER', admin_role = NULL, updated_at = now() WHERE id = $1",
+    [userIdA],
+  );
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/reprocessing-batches/active?userId=${userId}`,
+    headers: { cookie: cookieA },
+  })).statusCode, 403);
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/v1/reprocessing-batches/${reprocessingBatchId}`,
+    headers: { cookie: cookieB },
+  })).statusCode, 404);
+  const batchJobs = await pool.query<IntegrationJobRow>(
+    `SELECT id, user_id, document_id, processing_version, stage, attempt, max_attempts,
+            ''::text AS lease_owner, previous_document_status, trigger_kind,
+            requested_by_user_id, base_extraction_run_id, reprocessing_batch_id,
+            pipeline_fingerprint
+       FROM processing_jobs
+      WHERE user_id = $1 AND reprocessing_batch_id = $2
+      ORDER BY document_id`,
+    [userId, reprocessingBatchId],
+  );
+  assert.equal(batchJobs.rowCount, 2);
+  const improvingBatchJobId = String(batchJobs.rows.find(({ document_id }) =>
+    document_id === batchFixtureIds[0])!.id);
+  const failingBatchJobId = String(batchJobs.rows.find(({ document_id }) =>
+    document_id === batchFixtureIds[1])!.id);
+  const improvingBatchOwner = `integration-batch-improved-${crypto.randomUUID()}`;
+  const improvingBatchJob = await pool.query<IntegrationJobRow>(
+    `UPDATE processing_jobs
+        SET state = 'RUNNING', attempt = attempt + 1, lease_owner = $2,
+            lease_expires_at = now() + interval '5 minutes', execution_owner = $2,
+            started_at = COALESCE(started_at, now()), updated_at = now()
+      WHERE id = $1 AND state = 'PENDING'
+      RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
+    [improvingBatchJobId, improvingBatchOwner],
+  );
+  assert.equal(await persistExtraction(
+    improvingBatchJob.rows[0]!,
+    {
+      confidence: 0.99,
+      decision: "SUPPORTED",
+      documentType: "PAYROLL",
+      signals: ["synthetic_batch_integration"],
+    },
+    balancedReviewExtraction,
+    "PDF_TEXT",
+    false,
+    1,
+  ), "COMPLETED");
+  await pool.query(
+    "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
+    [improvingBatchJobId],
+  );
+  const failingBatchOwner = `integration-batch-failed-${crypto.randomUUID()}`;
+  const failingBatchJob = await pool.query<IntegrationJobRow>(
+    `UPDATE processing_jobs
+        SET state = 'RUNNING', attempt = max_attempts, lease_owner = $2,
+            lease_expires_at = now() + interval '5 minutes', execution_owner = $2,
+            started_at = COALESCE(started_at, now()), updated_at = now()
+      WHERE id = $1 AND state = 'PENDING'
+      RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
+    [failingBatchJobId, failingBatchOwner],
+  );
+  await failJob(failingBatchJob.rows[0]!, new Error("synthetic batch terminal failure"));
+  await pool.query(
+    "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
+    [failingBatchJobId],
+  );
+  const partialReprocessingBatch = await app.inject({
+    method: "GET",
+    url: `/api/v1/reprocessing-batches/${reprocessingBatchId}`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(partialReprocessingBatch.statusCode, 200, partialReprocessingBatch.body);
+  assert.equal(partialReprocessingBatch.json().data.status, "PARTIAL");
+  assert.equal(typeof partialReprocessingBatch.json().data.completedAt, "string");
+  assert.deepEqual(partialReprocessingBatch.json().data.progress, {
+    total: 2,
+    queued: 0,
+    processing: 0,
+    improved: 1,
+    unchanged: 0,
+    reviewRequired: 0,
+    failed: 1,
+    skipped: 0,
+  });
+
+  const raceDocumentId = listFixtures[1]!.id;
+  const raceBaselineRunId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO extraction_runs (
+       id, user_id, document_id, processing_version, status,
+       classifier_name, classifier_version, extractor_name, extractor_version,
+       parser_version, normalizer_version, result_schema_version,
+       pipeline_fingerprint, trigger_kind, promotion_outcome, promoted_at,
+       finished_at, confidence
+     ) VALUES ($1, $2, $3, 1, 'COMPLETED_WITH_WARNINGS',
+       'heuristic-ar-payroll', '6', 'deterministic-ar-payroll', '6',
+       '5', '6', '1', $4, 'INITIAL_UPLOAD', 'PROMOTED', now(), now(), 0.7)`,
+    [raceBaselineRunId, userId, raceDocumentId, "e".repeat(64)],
+  );
+  await pool.query(
+    `INSERT INTO extraction_run_issues (
+       id, user_id, document_id, extraction_run_id, code, severity,
+       recoverable, affected_field_path, metadata_no_sensitive
+     ) VALUES ($1, $2, $3, $4, 'LABEL_OR_LAYOUT_NOT_RECOGNIZED', 'WARNING', true,
+       'settlement.basicAmount', '{}'::jsonb)`,
+    [crypto.randomUUID(), userId, raceDocumentId, raceBaselineRunId],
+  );
+  await pool.query(
+    `UPDATE documents
+        SET active_extraction_run_id = $1, processing_status = 'COMPLETED',
+            security_status = 'CLEAN', classification_status = 'SUPPORTED',
+            document_type = 'PAYROLL', classification_confidence = 0.7
+      WHERE id = $2 AND user_id = $3`,
+    [raceBaselineRunId, raceDocumentId, userId],
+  );
+  const [raceBatch, raceIndividual] = await Promise.all([
+    app.inject({
+      method: "POST",
+      url: "/api/v1/reprocessing-batches",
+      headers: { origin, cookie: cookieA, "idempotency-key": "owner-batch-race-0001" },
+      payload: { documentIds: [raceDocumentId] },
+    }),
+    app.inject({
+      method: "POST",
+      url: `/api/v1/documents/${raceDocumentId}/reprocess`,
+      headers: { origin, cookie: cookieA, "idempotency-key": "owner-individual-race-0001" },
+    }),
+  ]);
+  assert.deepEqual([raceBatch.statusCode, raceIndividual.statusCode].sort(), [201, 409]);
+  const raceJob = await pool.query(
+    `SELECT id, processing_version, stage, reprocessing_batch_id
+       FROM processing_jobs
+      WHERE user_id = $1 AND document_id = $2
+        AND (state IN ('PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE') OR execution_owner IS NOT NULL)`,
+    [userId, raceDocumentId],
+  );
+  assert.equal(raceJob.rowCount, 1);
+  assert.equal(raceJob.rows[0].processing_version, 2);
+  assert.equal(raceJob.rows[0].stage, "DOCUMENT_PIPELINE_V2");
+  await pool.query(
+    `UPDATE processing_jobs
+        SET state = 'CANCELLED', completed_at = now(), error_code = 'INTEGRATION_CLEANUP', updated_at = now()
+      WHERE id = $1`,
+    [raceJob.rows[0].id],
+  );
+  if (raceJob.rows[0].reprocessing_batch_id) {
+    await pool.query(
+      `UPDATE reprocessing_batches
+          SET status = 'CANCELLED', completed_at = now(), updated_at = now()
+        WHERE id = $1`,
+      [raceJob.rows[0].reprocessing_batch_id],
+    );
+  }
 
   const signedOriginal = await app.inject({
     method: "GET",
@@ -3923,13 +5073,14 @@ test("upload privado crea un único documento y un único intent durable", async
             started_at = COALESCE(started_at, now()), updated_at = now()
       WHERE id = $1 AND state = 'PENDING'
       RETURNING id, user_id, document_id, processing_version, stage, attempt, max_attempts,
-                lease_owner, previous_document_status`,
+                lease_owner, previous_document_status, trigger_kind, requested_by_user_id,
+                base_extraction_run_id, reprocessing_batch_id, pipeline_fingerprint`,
     [rejectedReprocess.json().data.job.id, rejectedLeaseOwner],
   );
-  assert.equal(runningRejectedReprocess.rows[0]!.previous_document_status, "NEEDS_REVIEW");
+  assert.equal(runningRejectedReprocess.rows[0]!.previous_document_status, "COMPLETED");
   await failJob(
     runningRejectedReprocess.rows[0]!,
-    new WorkerError("DOCUMENT_ACTIVE_CONTENT", false),
+    new WorkerError("DOCUMENT_MALWARE_DETECTED", false),
   );
   await pool.query(
     "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
@@ -3940,7 +5091,7 @@ test("upload privado crea un único documento y un único intent durable", async
       "SELECT state, error_code FROM processing_jobs WHERE id = $1",
       [rejectedReprocess.json().data.job.id],
     )).rows[0],
-    { state: "FAILED", error_code: "DOCUMENT_ACTIVE_CONTENT" },
+    { state: "FAILED", error_code: "DOCUMENT_MALWARE_DETECTED" },
   );
   assert.deepEqual(
     (await pool.query(
@@ -3952,12 +5103,19 @@ test("upload privado crea un único documento y un único intent durable", async
       [documentId],
     )).rows[0],
     {
-      processing_status: "FAILED_PERMANENT",
-      security_status: "REJECTED",
-      item_status: "FAILED",
-      item_error_code: "DOCUMENT_ACTIVE_CONTENT",
+      processing_status: "QUARANTINED",
+      security_status: "QUARANTINED",
+      item_status: "REJECTED",
+      item_error_code: "DOCUMENT_MALWARE_DETECTED",
     },
   );
+  const quarantinedSalaryHistory = await app.inject({
+    method: "GET",
+    url: "/api/v1/salary-history",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(quarantinedSalaryHistory.statusCode, 200, quarantinedSalaryHistory.body);
+  assert.equal(quarantinedSalaryHistory.body.includes("1234567.89"), false);
   assert.deepEqual(
     (await pool.query(
       `SELECT
@@ -3965,7 +5123,10 @@ test("upload privado crea un único documento y un único intent durable", async
          (SELECT count(*)::integer FROM user_corrections WHERE document_id = $1) AS corrections`,
       [documentId],
     )).rows[0],
-    lineageAfterReviewReprocess,
+    {
+      runs: Number(lineageAfterReviewReprocess.runs) + 2,
+      corrections: Number(lineageAfterReviewReprocess.corrections),
+    },
   );
   const rejectedOriginal = await app.inject({
     method: "GET",
@@ -3974,6 +5135,109 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(rejectedOriginal.statusCode, 404, rejectedOriginal.body);
   assert.equal(rejectedOriginal.json().error.code, "ORIGINAL_NOT_FOUND");
+
+  const exhaustedJobId = crypto.randomUUID();
+  const exhaustedRunId = crypto.randomUUID();
+  const exhaustedOwner = `integration-exhausted-${crypto.randomUUID()}`;
+  await pool.query(
+    `INSERT INTO processing_jobs (
+       id, user_id, document_id, stage, processing_version, idempotency_key,
+       state, attempt, max_attempts, lease_owner, lease_expires_at,
+       execution_owner, previous_document_status, trigger_kind,
+       requested_by_user_id, base_extraction_run_id, pipeline_fingerprint,
+       started_at, updated_at
+     ) VALUES ($1, $2, $3, 'TEXT_EXTRACTION', 8, $4,
+       'RUNNING', 3, 3, $5, now() - interval '2 minutes',
+       $5, 'COMPLETED', 'USER_REPROCESS', $2, $6, $7, now() - interval '5 minutes', now())`,
+    [
+      exhaustedJobId,
+      userId,
+      documentId,
+      `synthetic-exhausted:${exhaustedJobId}`,
+      exhaustedOwner,
+      reviewReprocessedRunId,
+      "d".repeat(64),
+    ],
+  );
+  await pool.query(
+    `INSERT INTO extraction_runs (
+       id, user_id, document_id, processing_version, status,
+       classifier_name, classifier_version, extractor_name, extractor_version,
+       parser_version, normalizer_version, result_schema_version,
+       pipeline_fingerprint, trigger_kind, requested_by_user_id,
+       base_extraction_run_id, promotion_outcome, started_at
+     ) VALUES ($1, $2, $3, 8, 'PROCESSING',
+       'heuristic-ar-payroll', '6', 'deterministic-ar-payroll', '6',
+       '6', '6', '1', $4, 'USER_REPROCESS', $2, $5,
+       'NOT_EVALUATED', now() - interval '5 minutes')`,
+    [exhaustedRunId, userId, documentId, "d".repeat(64), reviewReprocessedRunId],
+  );
+  const reconciledExhausted = await reconcileDatabaseState({
+    dispatcherBatchSize: 100,
+  });
+  assert.equal(reconciledExhausted.exhausted, 1);
+  assert.equal(reconciledExhausted.recovered, 0);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT job.state, job.error_code, job.execution_owner,
+              run.status AS run_status, run.error_code AS run_error_code,
+              issue.code AS issue_code, issue.severity, issue.recoverable
+         FROM processing_jobs job
+         JOIN extraction_runs run
+           ON run.user_id = job.user_id AND run.document_id = job.document_id
+          AND run.processing_version = job.processing_version
+         JOIN extraction_run_issues issue ON issue.extraction_run_id = run.id
+        WHERE job.id = $1`,
+      [exhaustedJobId],
+    )).rows[0],
+    {
+      state: "FAILED",
+      error_code: "WORKER_LEASE_EXHAUSTED",
+      execution_owner: exhaustedOwner,
+      run_status: "FAILED",
+      run_error_code: "WORKER_LEASE_EXHAUSTED",
+      issue_code: "WORKER_LEASE_EXHAUSTED",
+      severity: "ERROR",
+      recoverable: false,
+    },
+  );
+  const exhaustedAudit = (await pool.query(
+    `SELECT result, metadata_no_sensitive FROM audit_events
+      WHERE action = 'EXTRACTION_RUN_EVALUATED' AND resource_id = $1`,
+    [exhaustedRunId],
+  )).rows[0];
+  assert.equal(exhaustedAudit.result, "FAILED");
+  assert.deepEqual(
+    {
+      activeRunAfterId: exhaustedAudit.metadata_no_sensitive.activeRunAfterId,
+      activeRunBeforeId: exhaustedAudit.metadata_no_sensitive.activeRunBeforeId,
+      outcome: exhaustedAudit.metadata_no_sensitive.outcome,
+      reason: exhaustedAudit.metadata_no_sensitive.reason,
+    },
+    {
+      activeRunAfterId: reviewReprocessedRunId,
+      activeRunBeforeId: reviewReprocessedRunId,
+      outcome: "FAILED",
+      reason: "WORKER_LEASE_EXHAUSTED",
+    },
+  );
+  await pool.query(
+    `UPDATE processing_jobs
+        SET execution_owner = $2, updated_at = now() - interval '10 minutes'
+      WHERE id = $1 AND state = 'FAILED'`,
+    [exhaustedJobId, `integration-orphan-${crypto.randomUUID()}`],
+  );
+  const releasedTerminalOwner = await reconcileDatabaseState({
+    dispatcherBatchSize: 100,
+  });
+  assert.equal(releasedTerminalOwner.released, 0);
+  assert.ok(
+    (await pool.query("SELECT execution_owner FROM processing_jobs WHERE id = $1", [exhaustedJobId])).rows[0].execution_owner,
+  );
+  await pool.query(
+    "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
+    [exhaustedJobId],
+  );
 
   const blockedWithoutStepUp = await app.inject({
     method: "DELETE",
@@ -4001,6 +5265,23 @@ test("upload privado crea un único documento y un único intent durable", async
   });
   assert.equal(foreignOriginal.statusCode, 404, foreignOriginal.body);
 
+  const expectedArtifactKey = `artifacts/${createHash("sha256").update(
+    `${userId}:${documentId}:${reprocessedRunId}:PDF_TEXT:salarivo-pdf-text:6:`,
+  ).digest("hex")}.json.gz`;
+  assert.equal(
+    (await pool.query(
+      `INSERT INTO processing_artifacts (
+         id, user_id, document_id, extraction_run_id, artifact_type, object_key,
+         content_sha256, size_bytes, page_count, producer_name, producer_version,
+         metadata_no_sensitive
+       ) VALUES ($1, $2, $3, $4, 'PDF_TEXT', $5, $6, 1, 1,
+         'salarivo-pdf-text', '6',
+         '{"complete":false,"payloadVersion":1,"writeState":"PENDING"}'::jsonb)
+        RETURNING id`,
+      [crypto.randomUUID(), userId, documentId, reprocessedRunId, expectedArtifactKey, "f".repeat(64)],
+    )).rowCount,
+    1,
+  );
   const originalDeletion = await app.inject({
     method: "DELETE",
     url: `/api/v1/documents/${documentId}/original`,
@@ -4011,6 +5292,36 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(
     (await pool.query("SELECT original_deleted_at IS NOT NULL AS deleted FROM documents WHERE id = $1", [documentId])).rows[0].deleted,
     true,
+  );
+  assert.equal(
+    (await pool.query(
+      `SELECT $2 = ANY(artifact_object_keys) AS captured
+         FROM storage_deletion_tombstones
+        WHERE user_id = $1 AND canonical_object_key = $3`,
+      [userId, expectedArtifactKey, canonicalObjectKey],
+    )).rows[0].captured,
+    true,
+  );
+  assert.equal(
+    (await pool.query(
+      `SELECT $2 = ANY(uncertain_artifact_object_keys) AS captured
+         FROM storage_deletion_tombstones
+        WHERE user_id = $1 AND canonical_object_key = $3`,
+      [userId, expectedArtifactKey, canonicalObjectKey],
+    )).rows[0].captured,
+    true,
+  );
+  await pool.query(
+    `UPDATE processing_artifacts
+        SET metadata_no_sensitive = '{"complete":true,"payloadVersion":1,"writeState":"COMPLETED"}'::jsonb
+      WHERE user_id = $1 AND object_key = $2`,
+    [userId, expectedArtifactKey],
+  );
+  await pool.query(
+    `UPDATE storage_deletion_tombstones
+        SET uncertain_artifact_object_keys = '{}'::text[]
+      WHERE user_id = $1 AND canonical_object_key = $2`,
+    [userId, canonicalObjectKey],
   );
   assert.ok((await pool.query("SELECT 1 FROM payroll_settlements WHERE document_id = $1", [documentId])).rowCount);
   const deletedOriginalDownload = await app.inject({
@@ -4130,7 +5441,8 @@ test("upload privado crea un único documento y un único intent durable", async
 
   await pool.query(
     `UPDATE storage_deletion_tombstones
-        SET upload_expires_at = now() - interval '2 minutes', available_at = now() - interval '2 minutes'
+        SET upload_expires_at = now() - interval '2 minutes', available_at = now() - interval '2 minutes',
+            object_delete_verify_after = now() - interval '2 minutes'
       WHERE user_id = $1`,
     [userIdA],
   );
@@ -4202,7 +5514,8 @@ test("upload privado crea un único documento y un único intent durable", async
   );
   await pool.query(
     `UPDATE storage_deletion_tombstones
-        SET upload_expires_at = now() - interval '2 minutes', available_at = now() - interval '2 minutes'
+        SET upload_expires_at = now() - interval '2 minutes', available_at = now() - interval '2 minutes',
+            object_delete_verify_after = now() - interval '2 minutes'
       WHERE user_id = $1`,
     [userIdB],
   );

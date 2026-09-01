@@ -1,6 +1,6 @@
 # Worker de documentos
 
-Proceso local asíncrono para los jobs `SECURITY_VALIDATION` y la reanudación `TEXT_EXTRACTION` autorizada por el usuario. Publica el outbox durable de PostgreSQL en Redis y consume exclusivamente mensajes `{"jobId":"<uuid>"}`. El PDF nunca viaja por Redis ni se escribe en logs.
+Proceso local asíncrono para los jobs `DOCUMENT_PIPELINE_V2`. Publica el outbox durable de PostgreSQL en Redis y consume exclusivamente mensajes `{"jobId":"<uuid>"}`. El PDF nunca viaja por Redis ni se escribe en logs.
 
 ## Pipeline implementado
 
@@ -26,7 +26,7 @@ Los procesos externos se lanzan sin shell y sin heredar credenciales, con stdout
 
 El dispatcher ordena en rondas por `user_id`, y el claim serializa la cuota por usuario con advisory lock para que una importación grande no monopolice workers.
 
-Una confirmación humana de tipo debe crear un job `TEXT_EXTRACTION` con un `processing_version` nuevo. El worker vuelve a ejecutar todos los gates de seguridad; la confirmación sólo reemplaza la decisión de clasificación y queda registrada como señal sanitizada.
+Una confirmación humana de tipo crea un job `DOCUMENT_PIPELINE_V2` con un `processing_version` nuevo. El worker vuelve a ejecutar todos los gates de seguridad; la confirmación sólo reemplaza la decisión de clasificación y queda registrada como señal sanitizada. La migración 020 exige drenar leases activos y transforma las etapas antiguas antes de liberar su lock, por lo que un worker previo no puede reclamar trabajo creado durante un rollout gradual.
 
 ## Configuración
 

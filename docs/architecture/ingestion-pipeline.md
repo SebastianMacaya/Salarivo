@@ -65,10 +65,6 @@ stateDiagram-v2
     VALIDATION --> COMPLETED
     VALIDATION --> NEEDS_REVIEW
     NEEDS_REVIEW --> COMPLETED: usuario verifica
-    COMPLETED --> UPLOADED: reproceso explícito
-    NEEDS_REVIEW --> UPLOADED: reproceso explícito
-    FAILED_PERMANENT --> UPLOADED: reproceso explícito
-    CANCELLED --> UPLOADED: reproceso explícito
 
     SECURITY_VALIDATION --> FAILED_RETRYABLE
     SECURITY_VALIDATION --> FAILED_PERMANENT
@@ -107,7 +103,25 @@ stateDiagram-v2
     CANCELLED --> DELETED
 ~~~
 
-Cada transición usa compare-and-set o transacción equivalente. Estados terminales no retroceden salvo un comando explícito de reprocesamiento que crea una nueva versión.
+Cada transición usa compare-and-set o transacción equivalente. El estado del documento describe exclusivamente el resultado activo y no retrocede al pedir un reproceso. El progreso de una nueva versión vive en `ProcessingJob` y `ExtractionRun`, de modo que el resultado anterior continúa disponible.
+
+## Máquina de estados de una corrida
+
+~~~mermaid
+stateDiagram-v2
+    [*] --> PROCESSING
+    PROCESSING --> COMPLETED
+    PROCESSING --> COMPLETED_WITH_WARNINGS
+    PROCESSING --> REVIEW_REQUIRED
+    PROCESSING --> FAILED
+    PROCESSING --> CANCELLED
+    COMPLETED --> ACTIVE: baseline o mejora inequívoca
+    COMPLETED_WITH_WARNINGS --> ACTIVE: baseline utilizable o mejora sin regresiones
+    REVIEW_REQUIRED --> ACTIVE: decisión explícita del titular
+    ACTIVE --> HISTORICAL: promoción o rollback posterior
+~~~
+
+`ACTIVE` e `HISTORICAL` representan la relación con `Document.active_extraction_run_id`, no valores mutables de `ExtractionRun.status`. Promoción y rollback cambian sólo el puntero bajo lock y dejan auditoría.
 
 ## Etapas y gates
 
@@ -124,19 +138,20 @@ Cada transición usa compare-and-set o transacción equivalente. Estados termina
 | 9 | OCR | sólo para páginas necesarias y con budget; conserva TSV espacial cuando existe |
 | 10 | parsing/normalización | determinístico y versionado |
 | 11 | IA futura | fallback mínimo, redactado y presupuestado |
-| 12 | validación | COMPLETED o NEEDS_REVIEW; el usuario puede completar montos ausentes y cerrar la revisión |
+| 12 | validación | corrida completa, completa con observaciones o que requiere revisión |
+| 13 | comparación/promoción | promover sólo baseline válido o mejora sin regresiones |
 
-El parser no inventa montos. El neto sólo puede derivarse de los totales de una tabla salarial reconocida cuando además existe una etiqueta explícita de neto, siempre con aritmética decimal exacta. Un valor ausente queda como evidencia trazable; si bruto, descuentos y neto no balancean, los valores extraídos se conservan pero el documento pasa a NEEDS_REVIEW y no puede cerrarse hasta corregirlos.
+El parser no inventa montos. El neto sólo puede derivarse de los totales de una tabla salarial reconocida cuando además existe una etiqueta explícita de neto, siempre con aritmética decimal exacta. Un valor ausente queda como issue trazable. La completitud depende del tipo: un `NORMAL` sin básico queda con observaciones; si bruto, descuentos y neto no balancean, el candidato requiere revisión y no desplaza al activo.
 
 Confirmar manualmente el tipo nunca salta malware, límites ni parse seguro.
 
 ## Resolución de empleador y empleo
 
-Después de la extracción efectiva y antes de materializar PayrollSettlement, el worker resuelve el Employer con el mismo servicio transaccional que usa la API. El resolver admite un identificador fiscal ya validado y protegido con precedencia, pero el worker vigente sólo le entrega el nombre extraído: ingerir CUIT requiere todavía adapter por país y configuración criptográfica dedicada. Sin identificador, recupera candidatos por normalización y sólo reutiliza una coincidencia conservadora y única de nombre o alias dentro del país. Una ambigüedad no dispara OCR adicional, IA ni fuzzy matching: conserva revisión pendiente.
+Antes de comparar, el worker resuelve el Employer con el mismo servicio transaccional que usa la API y conserva la detección en la corrida candidata. El resolver admite un identificador fiscal ya validado y protegido con precedencia, pero el worker vigente sólo le entrega el nombre extraído: ingerir CUIT requiere todavía adapter por país y configuración criptográfica dedicada. Sin identificador, recupera candidatos por normalización y sólo reutiliza una coincidencia conservadora y única de nombre o alias dentro del país. Una ambigüedad no dispara OCR adicional, IA ni fuzzy matching: conserva revisión pendiente. Durante un reproceso, Document e ImportBatchItem no cambian hasta una promoción.
 
 El Employer detectado queda en Document como procedencia aunque `employment_id` permanezca nulo. La autoasociación exige exactamente un Employment del owner, para ese Employer y moneda, cuyo intervalo cubra `payrollPeriod`. Cero o varias filas dejan el documento sin asociar. Cuando hay una única coincidencia, ImportBatchItem, Document y PayrollSettlement convergen transaccionalmente al mismo Employment.
 
-Si un reproceso detecta otro Employer para un documento ya asociado, no borra la decisión existente: preserva las referencias de ImportBatchItem, Document y PayrollSettlement, guarda la nueva detección y deriva el resultado a `NEEDS_REVIEW`.
+Si un reproceso detecta otro Employer para un documento ya asociado, no borra la decisión existente ni modifica la detección activa: conserva el candidato como `REVIEW_REQUIRED`. La comparación owner-only muestra el empleador detectado en ambas corridas; una promoción explícita cambia la detección activa bajo lock, pero preserva la asociación laboral confirmada.
 
 ## Clasificación por costo
 
@@ -163,7 +178,7 @@ Contadores derivados:
 - FAILED;
 - CANCELLED.
 
-La implementación actual completa el lote automáticamente cuando todos sus items son terminales, admite un solo lote activo por usuario y permite cancelar items que aún no terminaron el upload. El titular puede reprocesar después un documento elegible como una versión nueva; pause, resume y cancelación de trabajo ya iniciado siguen siendo objetivo y no se describen como disponibles.
+La implementación actual completa el lote automáticamente cuando todos sus items son terminales, admite un solo lote activo por usuario y permite cancelar items que aún no terminaron el upload. El reproceso agrupado usa `ReprocessingBatch`: sólo correlaciona jobs existentes del mismo titular y deriva progreso y resumen sin crear otra cola. Pause y resume manuales siguen fuera del MVP.
 
 ## Idempotencia
 
@@ -172,14 +187,19 @@ Claves mínimas:
 - uploadSessionId + itemId para completar upload;
 - userId + checksum para advertir duplicado sólo dentro del usuario;
 - documentId + processingVersion + stage para jobs;
-- userId + documentId + clave de idempotencia del titular para pedir reproceso;
+- userId + documentId + clave de idempotencia del titular para replay de la misma solicitud;
+- un único job activo por documentId y fingerprint de pipeline para carreras entre acciones individuales y batch;
 - providerOperationId para OCR/IA facturable;
 - documentId + extractionRunId para materializar resultados.
 - countryCode + nombre normalizado dentro de un advisory lock para resolver o crear Employer.
 
 Restricciones de DB y transacciones son la última defensa. Un ack perdido o un mensaje duplicado no puede crear otra liquidación.
 
-El reproceso bloquea el Document, rechaza originales ausentes o no limpios y calcula processingVersion sobre jobs y corridas previas. Las corridas anteriores permanecen inmutables; la última corrección humana por fieldPath se copia con referencia a su raíz y se aplica a la nueva proyección.
+El reproceso bloquea el Document, rechaza originales ausentes o no limpios, captura `active_extraction_run_id` como baseline y calcula `processingVersion` sobre jobs y corridas previas. Las corridas anteriores permanecen inmutables; la última corrección humana por `fieldPath` se copia con referencia a su raíz y se aplica a la nueva proyección. Al terminar, la comparación vuelve a bloquear el documento y sólo promociona por compare-and-set si el activo no cambió.
+
+Todo job nuevo entra por `DOCUMENT_PIPELINE_V2` con fingerprint exacto. Cuando existe un artefacto completo, owner-scoped, con checksum válido y versiones compatibles de texto/OCR, el worker puede saltar internamente a parsing. Si cambia una etapa anterior o el artefacto no existe, parte del PDF. El texto comprimido permanece en storage privado cifrado, nunca en la cola ni en logs, y se elimina durablemente junto con el original.
+
+La migración de protocolo toma un lock exclusivo sobre jobs, exige que no haya leases ni `execution_owner`, transforma pendientes y reescribe inserts de la API previa. Los workers anteriores no conocen `DOCUMENT_PIPELINE_V2`; los posteriores sólo despachan y reclaman su fingerprint. Esto evita que una convergencia gradual publique una corrida con semántica de otro binario.
 
 ## Backpressure y fairness
 

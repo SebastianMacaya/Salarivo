@@ -24,6 +24,25 @@ export {
   type ResolvedEmployer,
 } from "./employers.ts";
 
+export {
+  compareProcessingSnapshots,
+  criticalFieldsBySettlementType,
+  currentPipelineFingerprint,
+  extractionRunStatuses,
+  parserFixCatalog,
+  processingPipelineVersions,
+  processingTriggerKinds,
+  promotionOutcomes,
+  settlementTypes,
+  type ExtractionRunStatus,
+  type ParserFix,
+  type ProcessingSnapshot,
+  type ProcessingTriggerKind,
+  type PromotionOutcome,
+  type SettlementType,
+  type SnapshotComparison,
+} from "./processing.ts";
+
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 const databaseEnvironment = process.env.NODE_ENV === "production"

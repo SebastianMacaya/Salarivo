@@ -110,6 +110,7 @@ const documentStatusLabels: Record<string, string> = {
   TEXT_EXTRACTION: 'Extrayendo texto',
   OCR: 'Leyendo imagen',
   PARSING: 'Interpretando',
+  DOCUMENT_PIPELINE_V2: 'Procesamiento versionado',
   NORMALIZATION: 'Normalizando',
   VALIDATION: 'Validando datos',
   PROCESSING: 'Procesando',

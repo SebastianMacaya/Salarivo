@@ -1132,18 +1132,14 @@ export async function buildApp(
       JOIN employers employer ON employer.id = e.employer_id`;
 
   const detectedEmploymentDocuments = `
-    WITH latest_runs AS (
-      SELECT DISTINCT ON (run.document_id) run.id, run.document_id, run.user_id
-        FROM extraction_runs run
-       WHERE run.user_id = $1 AND run.status = 'COMPLETED'
-       ORDER BY run.document_id, run.processing_version DESC
-    ), detected AS (
+    WITH detected AS (
       SELECT document.id AS document_id, document.detected_employer_id,
              COALESCE(detected_employer.name, correction.corrected_value #>> '{}', field.interpreted_value #>> '{}') AS employer_name,
              settlement.payroll_period, settlement.currency_code
         FROM documents document
-        JOIN latest_runs run
-          ON run.document_id = document.id AND run.user_id = document.user_id
+        JOIN extraction_runs run
+          ON run.id = document.active_extraction_run_id
+         AND run.document_id = document.id AND run.user_id = document.user_id
         LEFT JOIN employers detected_employer ON detected_employer.id = document.detected_employer_id
         LEFT JOIN LATERAL (
           SELECT current.corrected_value

@@ -25,7 +25,8 @@ El esquema ya conserva una política por cuenta y la copia al documento, pero el
 | upload incompleto | storage + UploadSession | TTL corto configurable |
 | original en cuarentena | storage + Document | hasta decisión de seguridad y cleanup |
 | original aceptado | storage + `Document.retentionPolicy` | según la política persistida; `KEEP_ORIGINAL` por defecto actual |
-| render/OCR/thumbnail temporal | storage/filesystem efímero | mínimo técnico, TTL y cleanup al finalizar |
+| render/thumbnail y archivos de trabajo OCR | filesystem efímero | mínimo técnico y cleanup al finalizar |
+| artefacto de texto reutilizable | storage privado cifrado + metadata `ProcessingArtifact` | sólo mientras el original siga disponible; se elimina con el original, documento o cuenta |
 | ExtractionRun | PostgreSQL | historial versionado mientras exista el dato estructurado |
 | UserCorrection | PostgreSQL | mientras exista el campo corregido o hasta borrado solicitado |
 | datos estructurados | PostgreSQL | hasta eliminación del documento/cuenta según elección |
@@ -43,16 +44,19 @@ El esquema ya conserva una política por cuenta y la copia al documento, pero el
 
 Uploads vencidos y tombstones se reconcilian fuera del happy path. Producción debe garantizar que ninguna carga iniciada antes del vencimiento termine después de la ventana de gracia o, en su defecto, inventariar y reborrar posteriormente antes de cerrar la baja. Un inventario genérico de objetos huérfanos contra storage sigue pendiente antes de producción.
 
+El artefacto reutilizable contiene texto Restricted derivado del documento. Usa una key opaca, checksum y el mismo boundary privado/cifrado del original; no tiene URL de descarga, no se devuelve en exportaciones técnicas y nunca se incluye en logs, métricas, traces o herramientas externas. La metadata se crea como `writeState=PENDING` antes del `PUT`. Sólo permite omitir extracción/OCR después de marcar el write `COMPLETED` y demostrar compatibilidad. `DELETE_AFTER_PROCESSING` lo elimina junto con el original.
+
 ## Eliminar original
 
 1. reautenticar cuando el riesgo lo requiera;
 2. autorizar ownership;
 3. registrar el tombstone y bloquear nuevas descargas;
 4. rechazar la operación mientras un job todavía necesita el binario y comprobar un estado terminal;
-5. borrar original, renders, thumbnails y OCR temporales;
-6. mantener el tombstone hasta confirmar/reconciliar ambas keys después del vencimiento del upload;
-7. conservar o borrar datos estructurados según elección;
-8. registrar AuditEvent sin contenido sensible.
+5. borrar original, artefactos de texto, renders, thumbnails y archivos OCR temporales;
+6. mantener el tombstone hasta repetir el delete y confirmar por `HEAD` la ausencia de todas las keys después del vencimiento del upload;
+7. si un timeout dejó un write de artefacto incierto, conservar esa key en el tombstone y bloquear el cierre hasta verificación operativa.
+8. conservar o borrar datos estructurados según elección;
+9. registrar AuditEvent sin contenido sensible.
 
 La operación es idempotente.
 
@@ -60,7 +64,7 @@ La operación es idempotente.
 
 Además del original:
 
-- elimina por cascada settlements, line items, extractions, corrections, upload session y jobs dentro del alcance;
+- elimina por cascada settlements, line items, extractions, issues, metadata de artefactos, corrections, upload session y jobs dentro del alcance;
 - registra y reconcilia el borrado de las keys de storage;
 - conserva sólo lo exigido por una política aprobada y sin payload salarial cuando sea posible.
 

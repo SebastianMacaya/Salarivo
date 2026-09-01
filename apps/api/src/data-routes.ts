@@ -2,10 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import {
   EmployerResolutionError,
+  currentPipelineFingerprint,
   followMergedEmployer,
   lockEmployerMutation,
   normalizeEmployerNameConservative,
+  parserFixCatalog,
   pool,
+  processingPipelineVersions,
   resolveEmployer,
   withTransaction,
   type PoolClient,
@@ -23,6 +26,19 @@ import {
 import { sessionCookieName, tokenHash } from "./security.ts";
 import { lockValidStepUpSession } from "./session-assurance.ts";
 import { lockR2UploadCapacity } from "./r2-capacity.ts";
+import {
+  enqueueReprocessing,
+  enqueueReprocessingBatch,
+  countReprocessingCandidates,
+  findReprocessingCandidates,
+  loadProcessingAnalysis,
+  loadProcessingComparisonPreview,
+  loadReprocessingBatch,
+  processingRunView,
+  promoteProcessingRun,
+  refreshReprocessingBatch,
+  reprocessingCandidateExistsSql,
+} from "./reprocessing.ts";
 import { createStorage, waitForR2WriteWindow, type Storage } from "./storage.ts";
 
 type ErrorConstructor = new (statusCode: number, code: string, message: string) => Error;
@@ -80,6 +96,13 @@ type DocumentListQuery = {
   settlementType?: string;
 };
 type OriginalQuery = { disposition?: "inline" | "attachment" };
+type ReprocessBody = { retry?: boolean };
+type ReprocessingBatchBody = { documentIds?: string[] };
+type ProcessingRunParams = { id: string; runId: string };
+type ProcessingRunDecisionBody = {
+  decision: "PROMOTE" | "KEEP_ACTIVE";
+  expectedActiveRunId: string | null;
+};
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 const TOKEN_PATTERN = "^[A-Za-z0-9_-]{43}$";
@@ -107,9 +130,6 @@ const settlementTypes = new Set([
 ]);
 const manualCorrectionPaths = new Set([
   "employer.name", "settlement.type", "settlement.payrollPeriod", ...settlementAmountColumns.keys(),
-]);
-const reprocessableDocumentStatuses = new Set([
-  "COMPLETED", "NEEDS_REVIEW", "FAILED_PERMANENT", "CANCELLED",
 ]);
 const documentProcessingStatuses = new Set([
   "CREATED", "UPLOADED", "SECURITY_VALIDATION", "DOCUMENT_CLASSIFICATION",
@@ -185,13 +205,11 @@ const exportSections = [
       LEFT JOIN employers employer ON employer.id = COALESCE(employment.employer_id, document.detected_employer_id)
       WHERE document.user_id = $1 AND document.deleted_at IS NULL
       ORDER BY document.created_at, document.id`],
-  ["settlements", `WITH latest_runs AS (
-      SELECT DISTINCT ON (document_id) id, document_id, user_id
-      FROM extraction_runs WHERE user_id = $1 AND status = 'COMPLETED'
-      ORDER BY document_id, processing_version DESC
-      )
-      SELECT document.original_filename AS "documentFilename",
+  ["settlements", `SELECT document.original_filename AS "documentFilename",
       document.created_at AS "documentImportedAt",
+      run.processing_version AS "documentRevision",
+      (run.id = document.active_extraction_run_id) AS active,
+      run.promotion_outcome AS "promotionOutcome",
       settlement.settlement_ordinal AS "settlementNumber", employer.name AS "employerName",
       employment.start_date AS "employmentStartDate", settlement.payroll_period AS "payrollPeriod",
       settlement.payment_date AS "paymentDate", settlement.issue_date AS "issueDate",
@@ -203,18 +221,17 @@ const exportSections = [
       settlement.deductions_amount AS "deductionsAmount", settlement.created_at AS "createdAt"
       FROM payroll_settlements settlement
       JOIN documents document ON document.id = settlement.document_id AND document.user_id = settlement.user_id
-      JOIN latest_runs run ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
+      JOIN extraction_runs run
+        ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
       LEFT JOIN employments employment ON employment.id = settlement.employment_id AND employment.user_id = settlement.user_id
-      LEFT JOIN employers employer ON employer.id = COALESCE(employment.employer_id, document.detected_employer_id)
+      LEFT JOIN employers employer ON employer.id = COALESCE(employment.employer_id, run.detected_employer_id)
       WHERE settlement.user_id = $1
-      ORDER BY document.created_at, settlement.settlement_ordinal, settlement.id`],
-  ["concepts", `WITH latest_runs AS (
-      SELECT DISTINCT ON (document_id) id, document_id, user_id
-      FROM extraction_runs WHERE user_id = $1 AND status = 'COMPLETED'
-      ORDER BY document_id, processing_version DESC
-      )
-      SELECT document.original_filename AS "documentFilename",
+      ORDER BY document.created_at, run.processing_version, settlement.settlement_ordinal, settlement.id`],
+  ["concepts", `SELECT document.original_filename AS "documentFilename",
       document.created_at AS "documentImportedAt",
+      run.processing_version AS "documentRevision",
+      (run.id = document.active_extraction_run_id) AS active,
+      run.promotion_outcome AS "promotionOutcome",
       settlement.settlement_ordinal AS "settlementNumber", item.item_ordinal AS "conceptNumber",
       item.raw_description AS "description", item.normalized_concept_code AS "normalizedConcept",
       item.amount, item.currency_code AS "currencyCode", item.item_type AS "type",
@@ -223,9 +240,33 @@ const exportSections = [
       FROM payroll_line_items item
       JOIN payroll_settlements settlement ON settlement.id = item.settlement_id AND settlement.user_id = item.user_id
       JOIN documents document ON document.id = settlement.document_id AND document.user_id = settlement.user_id
-      JOIN latest_runs run ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
+      JOIN extraction_runs run
+        ON run.id = settlement.extraction_run_id AND run.user_id = settlement.user_id
       WHERE item.user_id = $1
-      ORDER BY document.created_at, settlement.settlement_ordinal, item.item_ordinal, item.id`],
+      ORDER BY document.created_at, run.processing_version, settlement.settlement_ordinal, item.item_ordinal, item.id`],
+  ["processingRuns", `SELECT document.original_filename AS "documentFilename",
+      document.created_at AS "documentImportedAt", run.processing_version AS "documentRevision",
+      run.status, run.trigger_kind AS "triggerKind", run.classifier_version AS "classifierVersion",
+      run.extractor_version AS "extractorVersion", run.parser_version AS "parserVersion",
+      run.normalizer_version AS "normalizerVersion", run.result_schema_version AS "resultSchemaVersion",
+      run.pipeline_fingerprint AS "pipelineFingerprint", run.promotion_outcome AS "promotionOutcome",
+      (run.id = document.active_extraction_run_id) AS active,
+      run.started_at AS "startedAt", run.finished_at AS "finishedAt", run.promoted_at AS "promotedAt"
+      FROM extraction_runs run
+      JOIN documents document ON document.id = run.document_id AND document.user_id = run.user_id
+      WHERE run.user_id = $1
+      ORDER BY document.created_at, run.processing_version, run.id`],
+  ["processingIssues", `SELECT document.original_filename AS "documentFilename",
+      document.created_at AS "documentImportedAt", run.processing_version AS "documentRevision",
+      issue.code, issue.severity, issue.recoverable,
+      issue.affected_field_path AS "affectedField", issue.created_at AS "createdAt"
+      FROM extraction_run_issues issue
+      JOIN extraction_runs run
+        ON run.id = issue.extraction_run_id AND run.user_id = issue.user_id
+       AND run.document_id = issue.document_id
+      JOIN documents document ON document.id = run.document_id AND document.user_id = run.user_id
+      WHERE issue.user_id = $1
+      ORDER BY document.created_at, run.processing_version, issue.code, issue.affected_field_path`],
   ["corrections", `SELECT document.original_filename AS "documentFilename",
       document.created_at AS "documentImportedAt", run.processing_version AS "documentRevision",
       correction.field_path AS "field", correction.correction_version AS "correctionVersion",
@@ -326,22 +367,19 @@ const documentProjectionJoin = `
         (SELECT to_char(settlement.payroll_period, 'YYYY-MM')
            FROM payroll_settlements settlement
           WHERE settlement.user_id = document.user_id AND settlement.document_id = document.id
+            AND settlement.extraction_run_id = document.active_extraction_run_id
           ORDER BY settlement.created_at DESC LIMIT 1)
       ) AS payroll_period,
       (SELECT settlement.settlement_type
          FROM payroll_settlements settlement
         WHERE settlement.user_id = document.user_id AND settlement.document_id = document.id
+          AND settlement.extraction_run_id = document.active_extraction_run_id
         ORDER BY settlement.created_at DESC LIMIT 1) AS settlement_type,
       (SELECT correction.corrected_value #>> '{}'
          FROM user_corrections correction
         WHERE correction.user_id = document.user_id
           AND correction.document_id = document.id
-          AND correction.extraction_run_id = (
-            SELECT run.id FROM extraction_runs run
-             WHERE run.user_id = document.user_id AND run.document_id = document.id
-               AND run.status = 'COMPLETED'
-             ORDER BY run.processing_version DESC LIMIT 1
-          )
+          AND correction.extraction_run_id = document.active_extraction_run_id
            AND correction.field_path = 'employer.name'
         ORDER BY correction.correction_version DESC LIMIT 1) AS corrected_employer_name,
       max(field.interpreted_value #>> '{}')
@@ -353,12 +391,7 @@ const documentProjectionJoin = `
          ORDER BY correction_version DESC LIMIT 1
       ) correction ON true
      WHERE field.user_id = document.user_id
-       AND field.extraction_run_id = (
-         SELECT run.id FROM extraction_runs run
-          WHERE run.user_id = document.user_id AND run.document_id = document.id
-            AND run.status = 'COMPLETED'
-          ORDER BY run.processing_version DESC LIMIT 1
-       )
+       AND field.extraction_run_id = document.active_extraction_run_id
   ) projection ON true`;
 
 function importItem(row: Record<string, unknown>) {
@@ -683,15 +716,10 @@ const detectedEmployerNameJoin = `LEFT JOIN LATERAL (
 ) detected_employer ON true`;
 
 async function loadSalaryHistory(userId: string) {
-  const [result, coverageResult] = await Promise.all([
+  const candidatePredicate = reprocessingCandidateExistsSql("document", "$2", "$3", "$4");
+  const [result, coverageResult, reprocessingCandidateCount] = await Promise.all([
     pool.query(
-      `WITH latest_runs AS (
-         SELECT DISTINCT ON (run.document_id) run.id, run.document_id, run.user_id
-           FROM extraction_runs run
-          WHERE run.user_id = $1 AND run.status = 'COMPLETED'
-          ORDER BY run.document_id, run.processing_version DESC
-       )
-       SELECT settlement.id, settlement.document_id, settlement.employment_id,
+      `SELECT settlement.id, settlement.document_id, settlement.employment_id,
               document.detected_employer_id,
               to_char(settlement.payroll_period, 'YYYY-MM') AS payroll_period,
               settlement.settlement_type, settlement.is_recurring, settlement.currency_code,
@@ -703,9 +731,20 @@ async function loadSalaryHistory(userId: string) {
               COALESCE(employer.name, detected_employer.name) AS employer_name,
               COALESCE(earnings.items, '[]'::jsonb) AS earnings,
               COALESCE(earnings.earning_count, 0)::integer AS earning_count,
-              COALESCE(earnings.unknown_count, 0)::integer AS unknown_earning_count
+              COALESCE(earnings.unknown_count, 0)::integer AS unknown_earning_count,
+              EXISTS (
+                SELECT 1 FROM extraction_run_issues issue
+                 WHERE issue.user_id = document.user_id
+                   AND issue.document_id = document.id
+                   AND issue.extraction_run_id = document.active_extraction_run_id
+                   AND issue.severity IN ('WARNING', 'ERROR')
+              ) AS has_incomplete_analysis,
+              (${candidatePredicate}) AS reprocess_available
          FROM documents document
-         JOIN latest_runs run ON run.document_id = document.id AND run.user_id = document.user_id
+         JOIN extraction_runs run
+           ON run.id = document.active_extraction_run_id
+          AND run.document_id = document.id
+          AND run.user_id = document.user_id
          JOIN payroll_settlements settlement
            ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
          LEFT JOIN employments employment
@@ -727,9 +766,16 @@ async function loadSalaryHistory(userId: string) {
               AND item.item_type = 'EARNING'
          ) earnings ON true
         WHERE document.user_id = $1 AND document.deleted_at IS NULL
-          AND document.document_type = 'PAYROLL' AND document.processing_status = 'COMPLETED'
+          AND document.security_status = 'CLEAN'
+          AND document.document_type = 'PAYROLL'
+          AND document.processing_status = 'COMPLETED'
         ORDER BY settlement.payroll_period, settlement.created_at, settlement.id`,
-      [userId],
+      [
+        userId,
+        JSON.stringify(parserFixCatalog),
+        processingPipelineVersions.parser,
+        currentPipelineFingerprint,
+      ],
     ),
     pool.query(
       `SELECT count(*)::integer AS documents,
@@ -740,11 +786,19 @@ async function loadSalaryHistory(userId: string) {
               count(*) FILTER (WHERE processing_status = 'COMPLETED' AND employment_id IS NULL)::integer
                 AS unassociated_documents,
               (SELECT count(*)::integer FROM employments
-                WHERE user_id = $1 AND status = 'ACTIVE') AS active_employments
+                WHERE user_id = $1 AND status = 'ACTIVE') AS active_employments,
+              (SELECT count(DISTINCT job.document_id)::integer FROM processing_jobs job
+                WHERE job.user_id = $1
+                  AND job.trigger_kind IN ('USER_REPROCESS', 'ADMIN_REPROCESS', 'PARSER_UPGRADE', 'AUTOMATIC_RECOVERY')
+                  AND (job.state IN ('PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE')
+                       OR job.execution_owner IS NOT NULL)) AS reprocessing_documents,
+              (SELECT count(DISTINCT run.document_id)::integer FROM extraction_runs run
+                WHERE run.user_id = $1 AND run.promotion_outcome = 'REVIEW_REQUIRED') AS reprocessing_review_required_documents
          FROM documents
         WHERE user_id = $1 AND deleted_at IS NULL AND document_type = 'PAYROLL'`,
       [userId],
     ),
+    countReprocessingCandidates(pool, userId),
   ]);
 
   const contextMetadata = new Map<string, {
@@ -757,6 +811,7 @@ async function loadSalaryHistory(userId: string) {
     startDate: string | null;
     endDate: string | null;
   }>();
+  const qualityByScopePeriod = new Map<string, { incomplete: Set<string>; reprocessable: Set<string> }>();
   const settlements: SalarySettlement[] = result.rows.map((row) => {
     const employmentId = value(row, "employment_id");
     const detectedEmployerId = value(row, "detected_employer_id");
@@ -782,6 +837,14 @@ async function loadSalaryHistory(userId: string) {
         endDate: value(row, "employment_end_date"),
       });
     }
+    const qualityKey = JSON.stringify([employmentContext, currency, String(row.payroll_period)]);
+    const quality = qualityByScopePeriod.get(qualityKey) ?? {
+      incomplete: new Set<string>(),
+      reprocessable: new Set<string>(),
+    };
+    if (row.has_incomplete_analysis === true) quality.incomplete.add(documentId);
+    if (row.reprocess_available === true) quality.reprocessable.add(documentId);
+    qualityByScopePeriod.set(qualityKey, quality);
     return {
       id: String(row.id),
       documentId,
@@ -814,6 +877,17 @@ async function loadSalaryHistory(userId: string) {
         totals: point.totals,
         regular: point.regular,
         comparableSalary: point.comparableSalary,
+        quality: (() => {
+          const quality = qualityByScopePeriod.get(JSON.stringify([
+            scope.employmentContext,
+            scope.currencyCode,
+            point.period,
+          ]));
+          return {
+            incompleteDocuments: quality?.incomplete.size ?? 0,
+            reprocessableDocuments: quality?.reprocessable.size ?? 0,
+          };
+        })(),
       })),
     })),
   };
@@ -838,6 +912,11 @@ async function loadSalaryHistory(userId: string) {
         unassociatedDocuments: Number(coverage.unassociated_documents ?? 0),
         activeEmployments: Number(coverage.active_employments ?? 0),
         analyzedSettlements: settlements.length,
+        reprocessing: {
+          candidateDocuments: reprocessingCandidateCount,
+          processingDocuments: Number(coverage.reprocessing_documents ?? 0),
+          reviewRequiredDocuments: Number(coverage.reprocessing_review_required_documents ?? 0),
+        },
       },
       analytics: publicAnalytics,
     },
@@ -911,7 +990,7 @@ function privacyExportStream(
       if (account.rowCount !== 1) throw new Error("EXPORT_ACCOUNT_NOT_FOUND");
       const row = account.rows[0];
       yield JSON.stringify({
-        format: "salarivo-user-export-v3",
+        format: "salarivo-user-export-v4",
         exportedAt: new Date().toISOString(),
         account: {
           email: row.email,
@@ -1540,9 +1619,11 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         );
         await client.query(
           `INSERT INTO processing_jobs (
-             id, user_id, document_id, stage, processing_version, idempotency_key
-           ) VALUES ($1, $2, $3, 'SECURITY_VALIDATION', 1, $4)`,
-          [jobId, request.authUser!.id, documentId, `security:${documentId}:v1`],
+             id, user_id, document_id, stage, processing_version, idempotency_key,
+             trigger_kind, requested_by_user_id, pipeline_fingerprint
+           ) VALUES ($1, $2, $3, 'DOCUMENT_PIPELINE_V2', 1, $4,
+             'INITIAL_UPLOAD', $2, $5)`,
+          [jobId, request.authUser!.id, documentId, `security:${documentId}:v1`, currentPipelineFingerprint],
         );
         await client.query(
           "UPDATE upload_sessions SET status = 'CONFIRMED', confirmed_at = now() WHERE id = $1",
@@ -1648,6 +1729,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         "document.deleted_at IS NULL",
         "document.document_type = 'PAYROLL'",
         "document.processing_status = 'COMPLETED'",
+        "document.active_extraction_run_id IS NOT NULL",
         "settlement.currency_code = $2",
         "item.item_type = 'EARNING'",
         "item.normalized_concept_code IS NOT NULL",
@@ -1706,20 +1788,17 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       }
       parameters.push(limit + 1);
       const result = await pool.query(
-        `WITH latest_runs AS (
-           SELECT DISTINCT ON (run.document_id) run.id, run.document_id, run.user_id
-             FROM extraction_runs run
-            WHERE run.user_id = $1 AND run.status = 'COMPLETED'
-            ORDER BY run.document_id, run.processing_version DESC
-         )
-         SELECT to_char(settlement.payroll_period, 'YYYY-MM') AS period,
+        `SELECT to_char(settlement.payroll_period, 'YYYY-MM') AS period,
                 (extract(epoch FROM settlement.created_at) * 1000000)::numeric(30, 0)::text
                   AS settlement_created_micros,
                 settlement.settlement_ordinal, settlement.id AS settlement_id,
                 settlement.settlement_type, item.item_ordinal, item.id AS item_id,
                 item.normalized_concept_code, item.is_recurring, item.amount
            FROM documents document
-           JOIN latest_runs run ON run.document_id = document.id AND run.user_id = document.user_id
+           JOIN extraction_runs run
+             ON run.id = document.active_extraction_run_id
+            AND run.document_id = document.id
+            AND run.user_id = document.user_id
            JOIN payroll_settlements settlement
              ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
            JOIN payroll_line_items item
@@ -1779,6 +1858,322 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       const history = await loadSalaryHistory(request.authUser!.id);
       const comparison = compareSalaryPeriods(history.settlements, request.query);
       return { data: comparison };
+    },
+  );
+
+  app.get<{ Querystring: { limit?: string; page?: string } }>(
+    "/api/v1/reprocessing/candidates",
+    {
+      preHandler: requireAuth,
+      schema: {
+        querystring: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            limit: { type: "string", pattern: "^(?:[1-9]|[1-9][0-9]|100)$" },
+            page: { type: "string", pattern: "^[1-9][0-9]{0,4}$" },
+          },
+        },
+      },
+    },
+    async (request) => {
+      const pageSize = request.query.limit === undefined ? 100 : Number(request.query.limit);
+      const page = request.query.page === undefined ? 1 : Number(request.query.page);
+      const [candidates, total] = await Promise.all([
+        findReprocessingCandidates(pool, request.authUser!.id, {
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
+        }),
+        countReprocessingCandidates(pool, request.authUser!.id),
+      ]);
+      return {
+        data: {
+          items: candidates.map((candidate) => ({
+            ...candidate,
+            available: !candidate.inProgress,
+            message: "Hay una versión más reciente del análisis que puede mejorar este resultado.",
+          })),
+          page,
+          pageSize,
+          total,
+          batchLimit: 100,
+        },
+      };
+    },
+  );
+
+  app.post<{ Body: ReprocessingBatchBody }>(
+    "/api/v1/reprocessing-batches",
+    {
+      preHandler: requireAuth,
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            documentIds: {
+              type: "array",
+              minItems: 1,
+              maxItems: 100,
+              uniqueItems: true,
+              items: { type: "string", pattern: UUID_PATTERN },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const requestedKey = request.headers["idempotency-key"];
+      if (typeof requestedKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(requestedKey)) {
+        throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Falta una clave de idempotencia válida.");
+      }
+      const result = await withTransaction(async (client) => {
+        await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [request.authUser!.id]);
+        const idempotencyKey = `reprocess-batch:${createHash("sha256").update(requestedKey).digest("hex")}`;
+        const existing = await client.query(
+          `SELECT id FROM reprocessing_batches WHERE user_id = $1 AND idempotency_key = $2`,
+          [request.authUser!.id, idempotencyKey],
+        );
+        if (existing.rowCount) {
+          return { created: false, batch: await loadReprocessingBatch(client, request.authUser!.id, String(existing.rows[0].id)) };
+        }
+        const activeBatch = await client.query(
+          `SELECT id FROM reprocessing_batches
+            WHERE user_id = $1 AND status IN ('PENDING', 'RUNNING') LIMIT 1`,
+          [request.authUser!.id],
+        );
+        if (activeBatch.rowCount) {
+          throw new ApiError(409, "REPROCESSING_BATCH_ALREADY_ACTIVE", "Esperá a que termine el lote actual.");
+        }
+        const requestedIds = request.body?.documentIds;
+        const foundCandidates = await findReprocessingCandidates(client, request.authUser!.id, {
+          ...(requestedIds ? { documentIds: requestedIds } : {}),
+          limit: requestedIds?.length ?? 100,
+        });
+        if (requestedIds && foundCandidates.length !== requestedIds.length) {
+          throw new ApiError(409, "BATCH_CONTAINS_UNAVAILABLE_DOCUMENT", "Uno o más documentos no están disponibles para reprocesar.");
+        }
+        const candidates = foundCandidates.filter((candidate) => !candidate.inProgress);
+        if (!candidates.length) {
+          throw new ApiError(409, "NO_REPROCESSING_CANDIDATES", "No hay recibos que puedan mejorarse en este momento.");
+        }
+        const batchId = randomUUID();
+        await client.query(
+          `INSERT INTO reprocessing_batches (
+             id, user_id, requested_by_user_id, trigger_kind, idempotency_key
+           ) VALUES ($1, $2, $2, 'USER_REPROCESS', $3)`,
+          [batchId, request.authUser!.id, idempotencyKey],
+        );
+        await enqueueReprocessingBatch(client, {
+          userId: request.authUser!.id,
+          requestedByUserId: request.authUser!.id,
+          documentIds: candidates.map((candidate) => candidate.documentId),
+          triggerKind: "USER_REPROCESS",
+          batchId,
+        }, ApiError);
+        await audit(client, request.authUser!.id, "REPROCESSING_BATCH_REQUESTED", "REPROCESSING_BATCH", batchId, {
+          documentCount: candidates.length,
+        });
+        return { created: true, batch: await loadReprocessingBatch(client, request.authUser!.id, batchId) };
+      });
+      return reply.code(result.created ? 201 : 200).send({ data: result.batch });
+    },
+  );
+
+  app.get(
+    "/api/v1/reprocessing-batches/active",
+    { preHandler: requireAuth },
+    async (request) => {
+      const active = await pool.query(
+        `SELECT id FROM reprocessing_batches
+          WHERE user_id = $1 AND status IN ('PENDING', 'RUNNING')
+          ORDER BY created_at DESC, id DESC LIMIT 1`,
+        [request.authUser!.id],
+      );
+      return {
+        data: active.rowCount
+          ? await loadReprocessingBatch(pool, request.authUser!.id, String(active.rows[0].id))
+          : null,
+      };
+    },
+  );
+
+  app.get(
+    "/api/v1/reprocessing-batches/latest",
+    { preHandler: requireAuth },
+    async (request) => {
+      const latest = await pool.query(
+        `SELECT id FROM reprocessing_batches
+          WHERE user_id = $1
+          ORDER BY created_at DESC, id DESC LIMIT 1`,
+        [request.authUser!.id],
+      );
+      return {
+        data: latest.rowCount
+          ? await loadReprocessingBatch(pool, request.authUser!.id, String(latest.rows[0].id))
+          : null,
+      };
+    },
+  );
+
+  app.get<{ Params: IdParams }>(
+    "/api/v1/reprocessing-batches/:id",
+    { preHandler: requireAuth, schema: { params: idParamsSchema } },
+    async (request) => {
+      const batch = await loadReprocessingBatch(pool, request.authUser!.id, request.params.id);
+      if (!batch) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      return { data: batch };
+    },
+  );
+
+  app.get<{ Params: IdParams; Querystring: { limit?: string } }>(
+    "/api/v1/documents/:id/processing-runs",
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: idParamsSchema,
+        querystring: {
+          type: "object",
+          additionalProperties: false,
+          properties: { limit: { type: "string", pattern: "^(?:[1-9]|[1-4][0-9]|50)$" } },
+        },
+      },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `SELECT run.id, run.processing_version, run.status, run.trigger_kind,
+                run.parser_version, run.result_schema_version, run.pipeline_fingerprint,
+                run.promotion_outcome, run.comparison_summary, run.promoted_at,
+                run.started_at, run.finished_at,
+                (run.id = document.active_extraction_run_id) AS active
+           FROM documents document
+           JOIN extraction_runs run
+             ON run.user_id = document.user_id AND run.document_id = document.id
+          WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL
+          ORDER BY run.processing_version DESC, run.id DESC
+          LIMIT $3`,
+        [request.params.id, request.authUser!.id, request.query.limit === undefined ? 25 : Number(request.query.limit)],
+      );
+      if (!result.rowCount) {
+        const document = await pool.query(
+          "SELECT 1 FROM documents WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+          [request.params.id, request.authUser!.id],
+        );
+        if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      }
+      return { data: { items: result.rows.map(processingRunView) } };
+    },
+  );
+
+  app.get<{ Params: ProcessingRunParams }>(
+    "/api/v1/documents/:id/processing-runs/:runId",
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "runId"],
+          properties: {
+            id: { type: "string", pattern: UUID_PATTERN },
+            runId: { type: "string", pattern: UUID_PATTERN },
+          },
+        },
+      },
+    },
+    async (request) => {
+      const [run, issues] = await Promise.all([
+        pool.query(
+          `SELECT run.id, run.processing_version, run.status, run.trigger_kind,
+                  run.parser_version, run.result_schema_version, run.pipeline_fingerprint,
+                  run.promotion_outcome, run.comparison_summary, run.promoted_at,
+                  run.started_at, run.finished_at,
+                  (run.id = document.active_extraction_run_id) AS active
+             FROM documents document
+             JOIN extraction_runs run
+               ON run.user_id = document.user_id AND run.document_id = document.id
+            WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL
+              AND run.id = $3`,
+          [request.params.id, request.authUser!.id, request.params.runId],
+        ),
+        pool.query(
+          `SELECT id, code, severity, recoverable, affected_field_path, created_at
+             FROM extraction_run_issues
+            WHERE document_id = $1 AND user_id = $2 AND extraction_run_id = $3
+            ORDER BY severity DESC, code, affected_field_path`,
+          [request.params.id, request.authUser!.id, request.params.runId],
+        ),
+      ]);
+      if (!run.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+      const comparisonPreview = await loadProcessingComparisonPreview(
+        pool,
+        request.authUser!.id,
+        request.params.id,
+        request.params.runId,
+      );
+      return {
+        data: {
+          ...processingRunView(run.rows[0]),
+          comparisonPreview,
+          issues: issues.rows.map((issue) => ({
+            id: String(issue.id),
+            code: String(issue.code),
+            severity: String(issue.severity),
+            recoverable: issue.recoverable === true,
+            affectedFieldPath: value(issue, "affected_field_path"),
+            createdAt: timestamp(issue.created_at),
+          })),
+        },
+      };
+    },
+  );
+
+  app.post<{ Params: ProcessingRunParams; Body: ProcessingRunDecisionBody }>(
+    "/api/v1/documents/:id/processing-runs/:runId/decision",
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "runId"],
+          properties: {
+            id: { type: "string", pattern: UUID_PATTERN },
+            runId: { type: "string", pattern: UUID_PATTERN },
+          },
+        },
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["decision", "expectedActiveRunId"],
+          properties: {
+            decision: { type: "string", enum: ["PROMOTE", "KEEP_ACTIVE"] },
+            expectedActiveRunId: {
+              anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }],
+            },
+          },
+        },
+      },
+    },
+    async (request) => {
+      const result = await withTransaction(async (client) => {
+        const decision = await promoteProcessingRun(client, {
+          userId: request.authUser!.id,
+          documentId: request.params.id,
+          runId: request.params.runId,
+          expectedActiveRunId: request.body.expectedActiveRunId,
+          decision: request.body.decision,
+          requireReviewCandidate: true,
+        }, ApiError);
+        await audit(client, request.authUser!.id, "PROCESSING_RUN_DECIDED", "EXTRACTION_RUN", request.params.runId, {
+          decision: request.body.decision,
+          documentId: request.params.id,
+          employmentAssociationRemoved: decision.employmentAssociationRemoved ?? false,
+          previousActiveRunId: request.body.expectedActiveRunId ?? "NONE",
+        });
+        return decision;
+      });
+      return { data: result };
     },
   );
 
@@ -1944,12 +2339,15 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         [request.params.id, request.authUser!.id],
       );
       if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      const latestRun = await client.query(
+      const activeRun = await client.query(
         `SELECT id, processing_version, extractor_name, extractor_version, parser_version,
-                normalizer_version, ocr_provider, ocr_version, confidence, finished_at
-           FROM extraction_runs
-          WHERE document_id = $1 AND user_id = $2 AND status = 'COMPLETED'
-          ORDER BY processing_version DESC LIMIT 1`,
+                normalizer_version, ocr_provider, ocr_version, confidence, finished_at,
+                status, trigger_kind, result_schema_version, pipeline_fingerprint,
+                promotion_outcome, comparison_summary, promoted_at
+           FROM extraction_runs run
+          WHERE run.id = (SELECT active_extraction_run_id FROM documents
+                           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL)
+            AND run.document_id = $1 AND run.user_id = $2`,
         [request.params.id, request.authUser!.id],
       );
       const lastReprocessJob = await client.query(
@@ -1960,7 +2358,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           ORDER BY processing_version DESC LIMIT 1`,
         [request.params.id, request.authUser!.id],
       );
-      const extractionRunId = latestRun.rowCount ? String(latestRun.rows[0].id) : null;
+      const extractionRunId = activeRun.rowCount ? String(activeRun.rows[0].id) : null;
       const fields = extractionRunId ? await client.query(
         `SELECT field.id, field.field_path, field.raw_value, field.interpreted_value,
                 field.confidence, field.source, field.page_number, field.source_region,
@@ -2172,6 +2570,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         }
         extractedFields.sort((left, right) => left.fieldPath.localeCompare(right.fieldPath));
       }
+      const analysis = await loadProcessingAnalysis(client, request.authUser!.id, request.params.id);
       const row = document.rows[0];
       return { data: {
         ...documentView(row),
@@ -2193,17 +2592,17 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           componentsBalance: settlement.rows[0].components_balance === true,
           deductionsMatchTotal: settlement.rows[0].deductions_match_total === true,
         } : null,
-        extractionRun: latestRun.rowCount ? {
-          id: String(latestRun.rows[0].id),
-          processingVersion: Number(latestRun.rows[0].processing_version),
-          extractorName: String(latestRun.rows[0].extractor_name),
-          extractorVersion: String(latestRun.rows[0].extractor_version),
-          parserVersion: String(latestRun.rows[0].parser_version),
-          normalizerVersion: String(latestRun.rows[0].normalizer_version),
-          ocrProvider: value(latestRun.rows[0], "ocr_provider"),
-          ocrVersion: value(latestRun.rows[0], "ocr_version"),
-          confidence: value(latestRun.rows[0], "confidence"),
-          finishedAt: timestamp(latestRun.rows[0].finished_at),
+        extractionRun: activeRun.rowCount ? {
+          id: String(activeRun.rows[0].id),
+          processingVersion: Number(activeRun.rows[0].processing_version),
+          extractorName: String(activeRun.rows[0].extractor_name),
+          extractorVersion: String(activeRun.rows[0].extractor_version),
+          parserVersion: String(activeRun.rows[0].parser_version),
+          normalizerVersion: String(activeRun.rows[0].normalizer_version),
+          ocrProvider: value(activeRun.rows[0], "ocr_provider"),
+          ocrVersion: value(activeRun.rows[0], "ocr_version"),
+          confidence: value(activeRun.rows[0], "confidence"),
+          finishedAt: timestamp(activeRun.rows[0].finished_at),
         } : null,
         extractedFields,
         settlement: settlement.rows.length ? settlementView(settlement.rows[0]!) : null,
@@ -2220,6 +2619,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           sourcePage: item.source_page === null ? null : Number(item.source_page),
           sourceField: value(item, "source_field"),
         })),
+        analysis,
       } };
     }),
   );
@@ -2331,6 +2731,10 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 END AS deductions_difference_kind
            FROM payroll_settlements settlement
            JOIN extraction_runs run ON run.id = settlement.extraction_run_id
+           JOIN documents document
+             ON document.id = settlement.document_id
+            AND document.user_id = settlement.user_id
+            AND document.active_extraction_run_id = run.id
            LEFT JOIN employments employment ON employment.id = settlement.employment_id AND employment.user_id = settlement.user_id
            LEFT JOIN employers employer ON employer.id = employment.employer_id
            LEFT JOIN LATERAL (
@@ -2370,12 +2774,6 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 AND item.settlement_id = settlement.id
             ) breakdown ON true
           WHERE settlement.user_id = $1
-            AND run.processing_version = (
-              SELECT max(latest.processing_version) FROM extraction_runs latest
-               WHERE latest.user_id = settlement.user_id
-                 AND latest.document_id = settlement.document_id
-                 AND latest.status = 'COMPLETED'
-            )
           ORDER BY settlement.payroll_period DESC, settlement.created_at DESC LIMIT 500`,
         [request.authUser!.id],
       );
@@ -2468,9 +2866,12 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         const jobId = randomUUID();
         await client.query(
           `INSERT INTO processing_jobs (
-             id, user_id, document_id, stage, processing_version, idempotency_key
-           ) VALUES ($1, $2, $3, 'TEXT_EXTRACTION', $4, $5)`,
-          [jobId, request.authUser!.id, request.params.id, processingVersion, `confirmed-type:${request.params.id}:v${processingVersion}`],
+             id, user_id, document_id, stage, processing_version, idempotency_key,
+             trigger_kind, requested_by_user_id, pipeline_fingerprint
+           ) VALUES ($1, $2, $3, 'DOCUMENT_PIPELINE_V2', $4, $5,
+             'USER_TYPE_CONFIRMATION', $2, $6)`,
+          [jobId, request.authUser!.id, request.params.id, processingVersion,
+            `confirmed-type:${request.params.id}:v${processingVersion}`, currentPipelineFingerprint],
         );
         await client.query(
           `UPDATE documents
@@ -2497,91 +2898,44 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     },
   );
 
-  app.post<{ Params: IdParams }>(
+  app.post<{ Params: IdParams; Body: ReprocessBody }>(
     "/api/v1/documents/:id/reprocess",
-    { preHandler: requireAuth, schema: { params: idParamsSchema } },
+    {
+      preHandler: requireAuth,
+      schema: {
+        params: idParamsSchema,
+        body: {
+          anyOf: [
+            {
+              type: "object",
+              additionalProperties: false,
+              properties: { retry: { type: "boolean" } },
+            },
+            { type: "null" },
+          ],
+        },
+      },
+    },
     async (request, reply) => {
       const requestedKey = request.headers["idempotency-key"];
       if (typeof requestedKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(requestedKey)) {
         throw new ApiError(400, "IDEMPOTENCY_KEY_REQUIRED", "Falta una clave de idempotencia válida.");
       }
-      const idempotencyKey = `reprocess:${request.authUser!.id}:${request.params.id}:${createHash("sha256").update(requestedKey).digest("hex")}`;
       const result = await withTransaction(async (client) => {
-        const document = await client.query(
-          `SELECT processing_status, security_status, document_type, original_deleted_at
-             FROM documents
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-            FOR UPDATE`,
-          [request.params.id, request.authUser!.id],
-        );
-        if (!document.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-        const existing = await client.query(
-          `SELECT id, state, processing_version FROM processing_jobs
-            WHERE document_id = $1 AND user_id = $2 AND idempotency_key = $3`,
-          [request.params.id, request.authUser!.id, idempotencyKey],
-        );
-        if (existing.rowCount) {
-          return {
-            created: false,
-            processingStatus: String(document.rows[0].processing_status),
-            job: {
-              id: String(existing.rows[0].id),
-              state: String(existing.rows[0].state),
-              processingVersion: Number(existing.rows[0].processing_version),
-            },
-          };
-        }
-        const row = document.rows[0];
-        if (!reprocessableDocumentStatuses.has(String(row.processing_status))) {
-          throw new ApiError(409, "REPROCESS_NOT_ALLOWED", "El documento todavía no puede reprocesarse.");
-        }
-        if (row.original_deleted_at !== null) {
-          throw new ApiError(409, "ORIGINAL_NOT_AVAILABLE", "El original no está disponible para reprocesarlo.");
-        }
-        if (row.security_status !== "CLEAN" || row.document_type !== "PAYROLL") {
-          throw new ApiError(409, "REPROCESS_NOT_ALLOWED", "El documento no es elegible para reprocesamiento.");
-        }
-        const activeJob = await client.query(
-          `SELECT 1 FROM processing_jobs
-            WHERE document_id = $1 AND user_id = $2
-              AND (state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') OR execution_owner IS NOT NULL)
-            LIMIT 1`,
-          [request.params.id, request.authUser!.id],
-        );
-        if (activeJob.rowCount) {
-          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento actual.");
-        }
-        const version = await client.query(
-          `SELECT GREATEST(
-                    COALESCE((SELECT max(processing_version) FROM processing_jobs
-                               WHERE document_id = $1 AND user_id = $2), 0),
-                    COALESCE((SELECT max(processing_version) FROM extraction_runs
-                               WHERE document_id = $1 AND user_id = $2), 0)
-                  )::integer + 1 AS processing_version`,
-          [request.params.id, request.authUser!.id],
-        );
-        const processingVersion = Number(version.rows[0].processing_version);
-        const jobId = randomUUID();
-        await client.query(
-          `INSERT INTO processing_jobs (
-             id, user_id, document_id, stage, processing_version, idempotency_key,
-             previous_document_status
-           ) VALUES ($1, $2, $3, 'TEXT_EXTRACTION', $4, $5, $6)`,
-          [jobId, request.authUser!.id, request.params.id, processingVersion, idempotencyKey, row.processing_status],
-        );
-        await client.query(
-          `UPDATE documents SET processing_status = 'UPLOADED'
-            WHERE id = $1 AND user_id = $2`,
-          [request.params.id, request.authUser!.id],
-        );
+        const queued = await enqueueReprocessing(client, {
+          userId: request.authUser!.id,
+          requestedByUserId: request.authUser!.id,
+          documentId: request.params.id,
+          requestedKey,
+          triggerKind: "USER_REPROCESS",
+          allowRetry: request.body?.retry === true,
+        }, ApiError);
         await audit(client, request.authUser!.id, "DOCUMENT_REPROCESS_REQUESTED", "DOCUMENT", request.params.id, {
-          processingVersion,
+          processingVersion: queued.job.processingVersion,
+          activeRunId: queued.activeRunId ?? "NONE",
+          triggerKind: "USER_REPROCESS",
         });
-        return {
-          created: true,
-          processingStatus: "UPLOADED",
-          job: { id: jobId, state: "PENDING", processingVersion },
-        };
+        return queued;
       });
       const { created, ...data } = result;
       return reply.code(created ? 201 : 200).send({ data });
@@ -2685,15 +3039,18 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (!["NEEDS_REVIEW", "COMPLETED"].includes(String(correctionDocument.rows[0].processing_status))) {
           throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento para corregirlo.");
         }
-        const latestRun = await client.query(
-          `SELECT id FROM extraction_runs
-            WHERE document_id = $1 AND user_id = $2 AND status = 'COMPLETED'
-            ORDER BY processing_version DESC LIMIT 1 FOR UPDATE`,
+        const activeRun = await client.query(
+          `SELECT run.id FROM documents document
+            JOIN extraction_runs run
+              ON run.id = document.active_extraction_run_id
+             AND run.document_id = document.id AND run.user_id = document.user_id
+           WHERE document.id = $1 AND document.user_id = $2
+           FOR UPDATE OF document, run`,
           [request.params.id, request.authUser!.id],
         );
-        if (!latestRun.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-        const latestRunId = String(latestRun.rows[0].id);
-        if (request.body.extractionRunId !== latestRunId) {
+        if (!activeRun.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        const activeRunId = String(activeRun.rows[0].id);
+        if (request.body.extractionRunId !== activeRunId) {
           throw new ApiError(409, "STALE_EXTRACTION_RUN", "La extracción cambió; recargá el documento antes de corregirlo.");
         }
         const field = request.body.extractedFieldId ? await client.query(
@@ -2706,7 +3063,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
              WHERE field.id = $1 AND field.document_id = $2 AND field.user_id = $3
                AND field.extraction_run_id = $4
              FOR UPDATE OF field`,
-          [request.body.extractedFieldId, request.params.id, request.authUser!.id, latestRunId],
+          [request.body.extractedFieldId, request.params.id, request.authUser!.id, activeRunId],
         ) : await client.query(
           `SELECT NULL::uuid AS id, $3::text AS field_path, NULL::jsonb AS interpreted_value,
                    run.id AS extraction_run_id, settlement.currency_code
@@ -2716,7 +3073,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
               AND settlement.settlement_ordinal = 1
             WHERE run.id = $4 AND run.document_id = $1 AND run.user_id = $2
             FOR UPDATE OF run`,
-          [request.params.id, request.authUser!.id, request.body.fieldPath, latestRunId],
+          [request.params.id, request.authUser!.id, request.body.fieldPath, activeRunId],
         );
         if (!field.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         const row = field.rows[0];
@@ -2793,6 +3150,11 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             : String(correctionDocument.rows[0].employment_id);
           const sameCanonical = currentEmploymentId === null
             || (resolvedEmployerId !== null && currentCanonicalEmployerId === resolvedEmployerId);
+          await client.query(
+            `UPDATE extraction_runs SET detected_employer_id = $1
+              WHERE id = $2 AND user_id = $3 AND document_id = $4`,
+            [resolvedEmployerId, activeRunId, request.authUser!.id, request.params.id],
+          );
           if (resolvedEmployerId !== null && sameCanonical) {
             await client.query(
               `UPDATE documents SET detected_employer_id = $1
@@ -2873,8 +3235,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             [correctionDocument.rows[0].import_batch_item_id, request.authUser!.id],
           );
         }
-        await audit(client, request.authUser!.id, "FIELD_CORRECTED", row.id ? "EXTRACTED_FIELD" : "MANUAL_FIELD", row.id ? String(row.id) : request.params.id, { fieldPath, extractionRunId: latestRunId });
-        return { id, extractionRunId: latestRunId, fieldPath, correctedValue: displayExtracted(correctedJson) };
+        await audit(client, request.authUser!.id, "FIELD_CORRECTED", row.id ? "EXTRACTED_FIELD" : "MANUAL_FIELD", row.id ? String(row.id) : request.params.id, { fieldPath, extractionRunId: activeRunId });
+        return { id, extractionRunId: activeRunId, fieldPath, correctedValue: displayExtracted(correctedJson) };
       });
       return reply.code(201).send({ data: result });
     },
@@ -2907,13 +3269,12 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (document.rows[0].processing_status !== "NEEDS_REVIEW") {
           throw new ApiError(409, "REVIEW_NOT_REQUIRED", "El documento no requiere revisión.");
         }
-        const latestRun = await client.query(
-          `SELECT id FROM extraction_runs
-            WHERE document_id = $1 AND user_id = $2 AND status = 'COMPLETED'
-            ORDER BY processing_version DESC LIMIT 1`,
+        const activeRun = await client.query(
+          `SELECT active_extraction_run_id AS id FROM documents
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
           [request.params.id, request.authUser!.id],
         );
-        if (!latestRun.rowCount || String(latestRun.rows[0].id) !== request.body.extractionRunId) {
+        if (!activeRun.rowCount || String(activeRun.rows[0].id) !== request.body.extractionRunId) {
           throw new ApiError(409, "STALE_EXTRACTION_RUN", "La extracción cambió; recargá el documento antes de finalizar la revisión.");
         }
         const settlement = await client.query(
@@ -2939,7 +3300,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                   AND item.item_type = 'DEDUCTION'
              ) breakdown ON true
             WHERE settlement.document_id = $1 AND settlement.user_id = $2
-              AND settlement.extraction_run_id = $3 AND run.status = 'COMPLETED'
+              AND settlement.extraction_run_id = $3
             ORDER BY settlement.settlement_ordinal LIMIT 1
             FOR UPDATE OF settlement`,
           [request.params.id, request.authUser!.id, request.body.extractionRunId],
@@ -2974,6 +3335,18 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         await client.query(
           "UPDATE documents SET processing_status = 'COMPLETED', processed_at = now() WHERE id = $1 AND user_id = $2",
           [request.params.id, request.authUser!.id],
+        );
+        await client.query(
+          `UPDATE extraction_runs run
+              SET status = CASE WHEN EXISTS (
+                    SELECT 1 FROM extraction_run_issues issue
+                     WHERE issue.user_id = run.user_id
+                       AND issue.document_id = run.document_id
+                       AND issue.extraction_run_id = run.id
+                  ) THEN 'COMPLETED_WITH_WARNINGS' ELSE 'COMPLETED' END
+            WHERE run.id = $1 AND run.user_id = $2 AND run.document_id = $3
+              AND run.status = 'REVIEW_REQUIRED'`,
+          [request.body.extractionRunId, request.authUser!.id, request.params.id],
         );
         await client.query(
           "UPDATE import_batch_items SET status = 'COMPLETED', error_code = NULL, updated_at = now() WHERE id = $1 AND user_id = $2",
@@ -3025,9 +3398,26 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }
+        await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [request.authUser!.id]);
+        const lockedJobs = await client.query(
+          `SELECT execution_owner FROM processing_jobs
+            WHERE document_id = $1 AND user_id = $2
+            ORDER BY id
+            FOR UPDATE`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (lockedJobs.rows.some((job) => job.execution_owner !== null)) {
+          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento para eliminar el documento.");
+        }
         const found = await client.query(
           `SELECT document.object_key, document.original_deleted_at, document.processing_status,
-                  session.object_key AS incoming_object_key, session.expires_at
+                  session.object_key AS incoming_object_key, session.expires_at,
+                  EXISTS (
+                    SELECT 1 FROM processing_jobs job
+                     WHERE job.document_id = document.id AND job.user_id = document.user_id
+                       AND (job.state IN ('PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE')
+                            OR job.execution_owner IS NOT NULL)
+                  ) AS has_active_job
              FROM documents AS document
              JOIN upload_sessions AS session
                ON session.id = document.upload_session_id AND session.user_id = document.user_id
@@ -3036,6 +3426,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [request.params.id, request.authUser!.id],
         );
         if (!found.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
+        if (found.rows[0].has_active_job === true) {
+          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine o eliminá el documento completo.");
+        }
         if (![
           "COMPLETED", "NEEDS_REVIEW", "NEEDS_TYPE_CONFIRMATION", "REJECTED_UNSUPPORTED",
           "QUARANTINED", "FAILED_PERMANENT", "CANCELLED",
@@ -3120,6 +3513,17 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (!await lockValidStepUpSession(client, request.authSessionHash!, request.authUser!.id)) {
           throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
         }
+        await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [request.authUser!.id]);
+        const lockedJobs = await client.query(
+          `SELECT execution_owner FROM processing_jobs
+            WHERE document_id = $1 AND user_id = $2
+            ORDER BY id
+            FOR UPDATE`,
+          [request.params.id, request.authUser!.id],
+        );
+        if (lockedJobs.rows.some((job) => job.execution_owner !== null)) {
+          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento para eliminar el documento.");
+        }
         const found = await client.query(
           `SELECT document.object_key, document.import_batch_id, document.import_batch_item_id,
                   session.object_key AS incoming_object_key, session.expires_at
@@ -3131,14 +3535,6 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [request.params.id, request.authUser!.id],
         );
         if (!found.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-        const activeExecution = await client.query(
-          `SELECT 1 FROM processing_jobs
-            WHERE document_id = $1 AND user_id = $2 AND execution_owner IS NOT NULL`,
-          [request.params.id, request.authUser!.id],
-        );
-        if (activeExecution.rowCount) {
-          throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que termine el procesamiento para eliminar el documento.");
-        }
         await client.query(
           `INSERT INTO storage_deletion_tombstones (
              id, user_id, canonical_object_key, incoming_object_key, upload_expires_at
@@ -3152,14 +3548,23 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           [found.rows[0].object_key, request.authUser!.id],
         );
         if (!tombstone.rowCount) throw new Error("DELETION_TOMBSTONE_NOT_CREATED");
-        await client.query(
+        const cancelledJobs = await client.query(
           `UPDATE processing_jobs
               SET state = 'CANCELLED', completed_at = now(), lease_owner = NULL,
                   lease_expires_at = NULL, error_code = 'DOCUMENT_DELETED', updated_at = now()
             WHERE document_id = $1 AND user_id = $2
-              AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')`,
+              AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+            RETURNING reprocessing_batch_id`,
           [request.params.id, request.authUser!.id],
         );
+        const reprocessingBatchIds = new Set(
+          cancelledJobs.rows
+            .map((job) => value(job, "reprocessing_batch_id"))
+            .filter((batchId): batchId is string => batchId !== null),
+        );
+        for (const batchId of reprocessingBatchIds) {
+          await refreshReprocessingBatch(client, request.authUser!.id, batchId);
+        }
         await audit(client, request.authUser!.id, "DOCUMENT_DELETION_SCHEDULED", "DOCUMENT", request.params.id);
         await client.query(
           `DELETE FROM import_batch_items WHERE id = $1 AND user_id = $2`,

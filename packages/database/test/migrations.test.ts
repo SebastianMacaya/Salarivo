@@ -23,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 19);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 19 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 20);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 20 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 19, name: "global_employers" },
+    { version: 20, name: "versioned_reprocessing" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -198,6 +198,44 @@ test("global employer migration preserves ownership boundaries and repairs only 
   assert.match(sql, /UPDATE payroll_settlements AS settlement[\s\S]*document\.employment_id/);
   assert.doesNotMatch(sql, /UNIQUE\s*\(\s*(?:country_code\s*,\s*)?normalized_name\s*\)/i);
   assert.doesNotMatch(sql, /tax_identifier_ciphertext\s*::\s*text|encode\s*\(\s*tax_identifier_ciphertext/i);
+});
+
+test("versioned reprocessing keeps promotion explicit, attributable and idempotent", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 20);
+  assert.ok(migration);
+  assert.equal(migration.name, "versioned_reprocessing");
+  const { sql } = migration;
+
+  assert.match(sql, /ADD COLUMN active_extraction_run_id uuid/);
+  assert.match(sql, /REFERENCES extraction_runs\(user_id, document_id, id\)/);
+  assert.match(sql, /WHERE run\.status = 'COMPLETED'/);
+  for (const status of ["PROCESSING", "COMPLETED_WITH_WARNINGS", "REVIEW_REQUIRED", "CANCELLED"]) {
+    assert.match(sql, new RegExp(`'${status}'`));
+  }
+  for (const column of [
+    "trigger_kind", "requested_by_user_id", "base_extraction_run_id", "result_schema_version",
+    "pipeline_fingerprint", "promotion_outcome", "comparison_summary", "promoted_at", "created_at",
+    "ocr_language", "detected_employer_id",
+  ]) assert.match(sql, new RegExp(`ADD COLUMN ${column}`));
+  assert.match(sql, /EXTRACTION_RUN_OCR_PAIR_CONSTRAINT_NOT_FOUND/);
+  assert.match(sql, /ocr_language = CASE[\s\S]+ocr_version = CASE[\s\S]+THEN NULL/);
+  assert.match(sql, /ADD CONSTRAINT extraction_runs_ocr_metadata_check/);
+
+  assert.match(sql, /CREATE TABLE extraction_run_issues/);
+  assert.match(sql, /field\.signals ->> 'missingReason'/);
+  assert.match(sql, /SET status = 'COMPLETED_WITH_WARNINGS'[\s\S]+extraction_run_issues/);
+  assert.match(sql, /CREATE TABLE reprocessing_batches/);
+  assert.match(sql, /ADD COLUMN reprocessing_batch_id uuid/);
+  assert.match(sql, /PROCESSING_JOB_ACTIVE_CONFLICT/);
+  assert.match(sql, /CREATE UNIQUE INDEX processing_jobs_one_active_document_uidx/);
+  assert.match(sql, /state IN \('PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE'\)\s+OR execution_owner IS NOT NULL/);
+  assert.match(sql, /CREATE TABLE processing_artifacts/);
+  assert.match(sql, /ADD COLUMN artifact_object_keys text\[\]/);
+  assert.match(sql, /ADD COLUMN uncertain_artifact_object_keys text\[\]/);
+  assert.match(sql, /PROCESSING_WORKER_DRAIN_REQUIRED/);
+  assert.match(sql, /DOCUMENT_PIPELINE_V2/);
+  assert.match(sql, /BEFORE INSERT ON storage_deletion_tombstones/);
+  assert.doesNotMatch(sql, /^\s*(?:content|raw_text|ocr_text)\s+text/im);
 });
 
 test("employer normalization aligns legal suffix punctuation without retaining punctuation-only input", () => {

@@ -21,6 +21,8 @@ export const adminPermissions = [
   "employers.manage",
   "processing.read",
   "processing.retry",
+  "processing.reprocess",
+  "processing.rollback",
   "processing.cancel",
   "storage.read",
   "privacy.read",
@@ -52,6 +54,7 @@ const permissionsByRole: Record<AdminRole, readonly AdminPermission[]> = {
     ...readonlyPermissions,
     "documents.quarantine",
     "processing.retry",
+    "processing.reprocess",
     "processing.cancel",
   ],
   SUPPORT: [

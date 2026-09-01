@@ -2,6 +2,18 @@
 
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import {
+  batchIsActive,
+  batchResolved,
+  processingHealthPage,
+  processingHealthPagination,
+  runOutcomeLabel,
+  shouldHydrateActiveBatch,
+  triggerLabel,
+  type ProcessingIssue,
+  type ProcessingRun,
+  type ReprocessingBatch,
+} from './reprocessing';
 
 const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
   ?? (process.env.NODE_ENV === 'production' ? '/api/v1' : 'http://localhost:3001/api/v1');
@@ -10,7 +22,7 @@ type AdminRole = 'SUPER_ADMIN' | 'OPERATIONS' | 'SUPPORT' | 'SECURITY' | 'FINANC
 type Permission =
   | 'dashboard.read' | 'users.read_metadata' | 'users.read_contact' | 'users.status.update'
   | 'sessions.revoke' | 'documents.read_metadata' | 'documents.quarantine'
-  | 'employers.read_metadata' | 'processing.read' | 'processing.retry' | 'processing.cancel'
+  | 'employers.read_metadata' | 'processing.read' | 'processing.retry' | 'processing.cancel' | 'processing.reprocess' | 'processing.rollback'
   | 'storage.read' | 'privacy.read' | 'security.read' | 'audit.read' | 'settings.read'
   | 'system.health.read' | 'roles.manage';
 type SessionUser = {
@@ -47,6 +59,7 @@ type AdminDocument = {
   id: string; userId: string; maskedEmail: string; documentType: string | null; processingStatus: string; securityStatus: string;
   classificationStatus: string; sizeBytes: number; pageCount: number | null; retentionPolicy: string;
   originalAvailable: boolean; createdAt: string; processedAt: string | null;
+  activeRunStatus: string | null; activeParserVersion: string | null; reprocessAvailable: boolean; issueCount: number;
 };
 type AdminJob = {
   id: string; documentId: string; userId: string; stage: string; state: string; attempt: number; maxAttempts: number;
@@ -57,7 +70,20 @@ type DocumentDetail = {
   document: AdminDocument;
   employmentId: string | null;
   importBatchId: string;
+  activeRunId: string | null;
+  processingRuns: ProcessingRun[];
+  issues: Array<ProcessingIssue & { id: string; runId: string; createdAt: string }>;
   recentJobs: Array<Pick<AdminJob, 'id' | 'stage' | 'processingVersion' | 'state' | 'attempt' | 'maxAttempts' | 'errorCode' | 'updatedAt'>>;
+};
+type ProcessingHealth = {
+  summary: {
+    totalDocuments: number; completeDocuments: number; warningDocuments: number; failedDocuments: number;
+    reviewRequiredDocuments: number; candidateDocuments: number; processingDocuments: number;
+  };
+  currentPipeline: { fingerprint: string; parserVersion: string; resultSchemaVersion: string };
+  versions: Paged<{ pipelineFingerprint: string | null; parserVersion: string; status: string; promotionOutcome: string; documents: number }>;
+  issues: Paged<{ code: string; severity: string; documents: number; candidates: number }>;
+  checkedAt: string;
 };
 type AdminEmployer = {
   id: string; name: string; normalizedName: string; countryCode: string;
@@ -80,7 +106,7 @@ type AdminEmployerDetail = {
   }>;
 };
 type StorageData = {
-  summary: { totalOriginalBytes: number; documentCount: number; usersWithOriginals: number; pendingDeletions: number; quotaBytesPerUser: number };
+  summary: { totalOriginalBytes: number; documentCount: number; usersWithOriginals: number; pendingDeletions: number; uncertainArtifactWrites: number; quotaBytesPerUser: number };
   items: Array<{ userId: string; originalBytes: number; documentCount: number; largestDocumentBytes: number; quotaBytes: number; usagePercent: number; anomalyFlags: string[] }>;
   page: number; pageSize: number; total: number;
 };
@@ -134,9 +160,9 @@ function bytes(value: number | null | undefined) {
 }
 function shortId(value: string) { return `${value.slice(0, 8)}…`; }
 function tone(status: string) {
-  if (['ACTIVE', 'READY', 'SUCCEEDED', 'PROCESSED', 'COMPLETED', 'HEALTHY', 'SUCCESS', 'CLEAN', 'VERIFIED'].includes(status)) return 'ready';
+  if (['ACTIVE', 'READY', 'SUCCEEDED', 'PROCESSED', 'COMPLETED', 'HEALTHY', 'SUCCESS', 'CLEAN', 'VERIFIED', 'PROMOTED', 'UNCHANGED'].includes(status)) return 'ready';
   if (['FAILED', 'FAILED_PERMANENT', 'ERROR', 'REJECTED', 'REJECTED_UNSUPPORTED', 'BLOCKED', 'DOWN', 'UNAVAILABLE', 'QUARANTINED', 'OVER_QUOTA', 'CANCELLED'].includes(status)) return 'danger';
-  if (['PENDING', 'PUBLISHED', 'PROCESSING', 'RUNNING', 'RETRYABLE', 'FAILED_RETRYABLE', 'RETRY_SCHEDULED', 'DEGRADED', 'SUSPENDED', 'NEAR_QUOTA'].includes(status)) return 'pending';
+  if (['PENDING', 'PUBLISHED', 'PROCESSING', 'RUNNING', 'RETRYABLE', 'FAILED_RETRYABLE', 'RETRY_SCHEDULED', 'DEGRADED', 'SUSPENDED', 'NEAR_QUOTA', 'COMPLETED_WITH_WARNINGS', 'REVIEW_REQUIRED', 'NOT_EVALUATED'].includes(status)) return 'pending';
   return '';
 }
 
@@ -181,6 +207,18 @@ function Pagination({ result, path, search }: { result: { page: number; pageSize
   const pages = Math.max(1, Math.ceil(result.total / result.pageSize));
   function href(page: number) { const next = new URLSearchParams(search); next.set('page', String(page)); return `${path}?${next}`; }
   return <nav className="admin-pagination" aria-label="Paginación"><span>{numberFormatter.format(result.total)} resultados · página {result.page} de {pages}</span><div>{result.page > 1 && <a className="button secondary compact" href={href(result.page - 1)}>Anterior</a>}{result.page < pages && <a className="button secondary compact" href={href(result.page + 1)}>Siguiente</a>}</div></nav>;
+}
+
+function ProcessingHealthPagination({ versions, issues, search }: {
+  versions: ProcessingHealth['versions']; issues: ProcessingHealth['issues']; search: URLSearchParams;
+}) {
+  const pagination = processingHealthPagination(versions, issues);
+  function href(page: number) {
+    const next = new URLSearchParams(search);
+    next.set('healthPage', String(page));
+    return `/admin/processing?${next}`;
+  }
+  return <nav className="admin-pagination" aria-label="Paginación de salud del procesamiento"><span>{numberFormatter.format(versions.total)} versiones · {numberFormatter.format(issues.total)} issues · página {pagination.page} de {pagination.pages}</span><div>{pagination.hasPrevious && <a className="button secondary compact" href={href(pagination.page - 1)}>Anterior</a>}{pagination.hasNext && <a className="button secondary compact" href={href(pagination.page + 1)}>Siguiente</a>}</div></nav>;
 }
 
 const reasons = ['SUPPORT_REQUEST', 'SECURITY_INCIDENT', 'ABUSE_PREVENTION', 'USER_REQUEST', 'OPERATIONAL_RECOVERY', 'ROLE_ADMINISTRATION'] as const;
@@ -270,10 +308,66 @@ function UserPage({ id, search, permissions, currentUserId }: { id: string; sear
   const [notice, setNotice] = useState('');
   const [contact, setContact] = useState('');
   const [roleChoice, setRoleChoice] = useState('');
+  const [reprocessingBatch, setReprocessingBatch] = useState<ReprocessingBatch | null>(null);
+  const [reprocessingBatchError, setReprocessingBatchError] = useState('');
+  const canReprocessCandidates = permissions.includes('processing.reprocess');
+  const activeReprocessingBatchPath = `/admin/reprocessing-batches/active?userId=${encodeURIComponent(id)}`;
+  const activeReprocessingBatchId = reprocessingBatch && batchIsActive(reprocessingBatch) ? reprocessingBatch.id : null;
+  useEffect(() => {
+    if (!canReprocessCandidates) return;
+    let active = true;
+    api<ReprocessingBatch | null>(activeReprocessingBatchPath).then((batch) => {
+      if (active) { setReprocessingBatch(batch); setReprocessingBatchError(''); }
+    }).catch((caught) => {
+      if (active) setReprocessingBatchError(caught instanceof Error ? caught.message : 'No pudimos recuperar el lote activo.');
+    });
+    return () => { active = false; };
+  }, [activeReprocessingBatchPath, canReprocessCandidates]);
+  useEffect(() => {
+    if (!activeReprocessingBatchId) return;
+    let polling = false;
+    const timer = window.setInterval(async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        setReprocessingBatch(await api<ReprocessingBatch>(`/admin/reprocessing-batches/${activeReprocessingBatchId}`));
+        setReprocessingBatchError('');
+      } catch (caught) {
+        setReprocessingBatchError(caught instanceof Error ? caught.message : 'No pudimos actualizar el lote.');
+      } finally { polling = false; }
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [activeReprocessingBatchId]);
   const requestedTab = ['account', 'employments', 'documents', 'security'].includes(search.get('tab') ?? '') ? search.get('tab')! : 'account';
   const tab = requestedTab === 'employments' && !permissions.includes('employers.read_metadata') ? 'account' : requestedTab;
   function mutation(title: string, description: string, button: string, path: string, method: string, extra: Record<string, string>) {
     setAction({ title, description, button, execute: async (reasonCode, reference) => { await api(path, { method, body: JSON.stringify({ ...extra, reasonCode, reference }) }); return `${title}: acción completada y auditada.`; } });
+  }
+  function reprocessCandidates() {
+    const idempotencyKey = crypto.randomUUID();
+    setAction({
+      title: 'Reprocesar candidatos de esta cuenta',
+      description: 'Busca hasta 100 documentos compatibles de este único usuario. Cada análisis activo se conserva hasta comparar el resultado y la acción queda auditada.',
+      button: 'Iniciar lote',
+      execute: async (reasonCode, reference) => {
+        let batch: ReprocessingBatch;
+        try {
+          batch = await api<ReprocessingBatch>('/admin/reprocessing-batches', {
+            method: 'POST',
+            headers: { 'Idempotency-Key': idempotencyKey },
+            body: JSON.stringify({ userId: id, reasonCode, reference }),
+          });
+        } catch (caught) {
+          if (!(caught instanceof ApiError) || !shouldHydrateActiveBatch(caught.code)) throw caught;
+          const active = await api<ReprocessingBatch | null>(activeReprocessingBatchPath);
+          if (!active) throw caught;
+          batch = active;
+        }
+        setReprocessingBatch(batch);
+        setReprocessingBatchError('');
+        return `Lote activo para ${batch.progress.total} documento${batch.progress.total === 1 ? '' : 's'}; los análisis activos siguen disponibles.`;
+      },
+    });
   }
   function finished(message: string) { setAction(null); setNotice(message); state.reload(); }
   if (state.loading) return <><PageHeader eyebrow="Usuarios" title="Detalle de cuenta" description="Cargando metadata autorizada…" crumbs={[["Admin", "/admin"], ["Usuarios", "/admin/users"], [shortId(id)]]} /><LoadingState /></>;
@@ -285,7 +379,12 @@ function UserPage({ id, search, permissions, currentUserId }: { id: string; sear
     {tab === 'account' && <div className="admin-detail-grid"><section className="admin-card"><h2>Cuenta</h2><dl className="admin-definition"><div><dt>ID</dt><dd>{user.id}</dd></div><div><dt>Email</dt><dd>{contact || user.maskedEmail}</dd></div><div><dt>Estado</dt><dd><StatusBadge value={user.status} /></dd></div><div><dt>Acceso</dt><dd>{user.adminRole ?? user.role}</dd></div><div><dt>Documentos</dt><dd>{user.documentCount}</dd></div><div><dt>Último acceso</dt><dd>{date(user.lastLoginAt)}</dd></div></dl>{permissions.includes('users.read_contact') && id !== currentUserId && !contact && <button className="button secondary" onClick={() => setAction({ title: 'Acceder al email completo', description: 'Este acceso excepcional revela un dato de contacto y queda auditado.', button: 'Revelar email', execute: async (reasonCode, reference) => { const result = await api<{ email: string }>(`/admin/users/${id}/contact?reasonCode=${encodeURIComponent(reasonCode)}&reference=${encodeURIComponent(reference)}`); setContact(result.email); return 'Email revelado para esta vista y acceso auditado.'; } })}>Revelar email con motivo</button>}</section>
       <section className="admin-card"><h2>Acciones permitidas</h2><p>Las acciones críticas exigen motivo, referencia y validación server-side.</p><div className="admin-action-list">{permissions.includes('users.status.update') && id !== currentUserId && user.status === 'ACTIVE' && <><button className="button secondary" onClick={() => mutation('Suspender cuenta', 'Impide nuevos accesos sin iniciar una eliminación de privacidad.', 'Suspender', `/admin/users/${id}/status`, 'POST', { status: 'SUSPENDED' })}>Suspender</button><button className="button danger-button" onClick={() => mutation('Bloquear cuenta', 'Bloquea la cuenta por una causa de seguridad o abuso.', 'Bloquear', `/admin/users/${id}/status`, 'POST', { status: 'BLOCKED' })}>Bloquear</button></>}{permissions.includes('users.status.update') && id !== currentUserId && ['SUSPENDED', 'BLOCKED'].includes(user.status) && <button className="button primary" onClick={() => mutation('Reactivar cuenta', 'Restablece el acceso de esta cuenta.', 'Reactivar', `/admin/users/${id}/status`, 'POST', { status: 'ACTIVE' })}>Reactivar</button>}{permissions.includes('sessions.revoke') && id !== currentUserId && <button className="button secondary" onClick={() => mutation('Cerrar sesiones', 'Revoca todas las sesiones activas de esta cuenta.', 'Cerrar sesiones', `/admin/users/${id}/revoke-sessions`, 'POST', {})}>Cerrar sesiones</button>} {!permissions.includes('users.status.update') && !permissions.includes('sessions.revoke') && <small>Tu rol es de consulta para esta cuenta.</small>}</div>{permissions.includes('roles.manage') && id !== currentUserId && <div className="admin-role-control"><label>Acceso<select value={roleChoice || user.adminRole || user.role} onChange={(event) => setRoleChoice(event.target.value)}><option value="USER">USER</option>{(['SUPER_ADMIN', 'OPERATIONS', 'SUPPORT', 'SECURITY', 'FINANCE', 'READ_ONLY'] as AdminRole[]).map((role) => <option key={role}>{role}</option>)}</select></label><button className="button secondary" disabled={(roleChoice || user.adminRole || user.role) === (user.adminRole || user.role)} onClick={() => { const selected = roleChoice || user.adminRole || user.role; setAction({ title: 'Cambiar rol de acceso', description: 'Revoca todas las sesiones del usuario. Para ser administrador la cuenta debe estar activa y tener MFA.', button: 'Cambiar rol', execute: async (reasonCode, reference) => { await api(`/admin/users/${id}/role`, { method: 'PUT', body: JSON.stringify({ role: selected === 'USER' ? 'USER' : 'ADMIN', adminRole: selected === 'USER' ? null : selected, reasonCode, reference }) }); return 'Rol actualizado; las sesiones anteriores fueron revocadas.'; } }); }}>Aplicar rol</button></div>}</section></div>}
     {tab === 'employments' && (!state.data.employments.length ? <EmptyState>Este usuario no tiene empleos registrados.</EmptyState> : <div className="admin-card-grid">{state.data.employments.map((employment) => <article className="admin-card" key={employment.id}><StatusBadge value={employment.status} /><h2>{employment.employerName}</h2><p>{employment.startDate} — {employment.endDate ?? 'Actualidad'}</p><small>{employment.countryCode} · empleador {shortId(employment.employerId)}</small></article>)}</div>)}
-    {tab === 'documents' && (!state.data.recentDocuments.length ? <EmptyState>No hay documentos recientes.</EmptyState> : <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>ID</th><th>Tipo</th><th>Procesamiento</th><th>Seguridad</th><th>Tamaño</th><th>Carga</th></tr></thead><tbody>{state.data.recentDocuments.map((document) => <tr key={document.id}><td data-label="ID"><a className="entity-link" href={`/admin/documents/${document.id}`}>{shortId(document.id)}</a></td><td data-label="Tipo">{document.documentType ?? 'Sin confirmar'}</td><td data-label="Procesamiento"><StatusBadge value={document.processingStatus} /></td><td data-label="Seguridad"><StatusBadge value={document.securityStatus} /></td><td data-label="Tamaño">{bytes(document.sizeBytes)}</td><td data-label="Carga">{date(document.createdAt)}</td></tr>)}</tbody></table></div>)}
+    {tab === 'documents' && <>
+      {canReprocessCandidates && user.status === 'ACTIVE' && user.documentCount > 0 && <section className="admin-card admin-user-batch"><div><h2>Mejoras de análisis</h2><p>El lote queda limitado a esta cuenta y a los primeros 100 candidatos elegibles.</p></div><button className="button secondary" disabled={batchIsActive(reprocessingBatch)} onClick={reprocessCandidates}>{batchIsActive(reprocessingBatch) ? 'Lote en curso' : 'Reprocesar candidatos'}</button></section>}
+      {reprocessingBatch && <section className="admin-card" aria-live="polite" aria-busy={batchIsActive(reprocessingBatch)}><h2>Último lote solicitado</h2><p><StatusBadge value={reprocessingBatch.status} /> · {batchResolved(reprocessingBatch)}/{reprocessingBatch.progress.total} resueltos · {reprocessingBatch.progress.processing} procesando · {reprocessingBatch.progress.queued} en cola.</p>{reprocessingBatchError && <p className="message error" role="alert">{reprocessingBatchError}</p>}</section>}
+      {!reprocessingBatch && reprocessingBatchError && <p className="message error" role="alert">{reprocessingBatchError}</p>}
+      {!state.data.recentDocuments.length ? <EmptyState>No hay documentos recientes.</EmptyState> : <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>ID</th><th>Tipo</th><th>Procesamiento</th><th>Seguridad</th><th>Tamaño</th><th>Carga</th></tr></thead><tbody>{state.data.recentDocuments.map((document) => <tr key={document.id}><td data-label="ID"><a className="entity-link" href={`/admin/documents/${document.id}`}>{shortId(document.id)}</a></td><td data-label="Tipo">{document.documentType ?? 'Sin confirmar'}</td><td data-label="Procesamiento"><StatusBadge value={document.processingStatus} /></td><td data-label="Seguridad"><StatusBadge value={document.securityStatus} /></td><td data-label="Tamaño">{bytes(document.sizeBytes)}</td><td data-label="Carga">{date(document.createdAt)}</td></tr>)}</tbody></table></div>}
+    </>}
     {tab === 'security' && <section className="admin-card"><h2>Seguridad de la cuenta</h2><dl className="admin-definition"><div><dt>MFA</dt><dd>{user.mfaEnabled ? 'Activo' : 'No activo'}</dd></div><div><dt>Sesiones activas</dt><dd>{user.activeSessions}</dd></div><div><dt>Último acceso</dt><dd>{date(user.lastLoginAt)}</dd></div></dl><p>No se muestran dispositivos, tokens, hashes ni credenciales.</p></section>}
     {action && <ActionDialog action={action} onClose={() => setAction(null)} onDone={finished} />}
   </>;
@@ -295,8 +394,8 @@ function DocumentsPage({ search, permissions }: { search: URLSearchParams; permi
   const query = new URLSearchParams(search); query.set('pageSize', '25');
   const state = useRemote<Paged<AdminDocument>>(`/admin/documents?${query}`);
   return <><PageHeader eyebrow="Pipeline privado" title="Documentos" description="Sólo metadata operativa. Nunca se entregan PDF, filename, OCR, hash, object key ni campos salariales." />
-    <QueryFilters action="/admin/documents" search={search}><SelectFilter name="processingStatus" label="Procesamiento" values={['CREATED', 'UPLOADED', 'SECURITY_VALIDATION', 'DOCUMENT_CLASSIFICATION', 'NEEDS_TYPE_CONFIRMATION', 'TEXT_EXTRACTION', 'OCR', 'PARSING', 'NORMALIZATION', 'VALIDATION', 'COMPLETED', 'NEEDS_REVIEW', 'REJECTED_UNSUPPORTED', 'QUARANTINED', 'FAILED_RETRYABLE', 'RETRY_SCHEDULED', 'FAILED_PERMANENT', 'CANCELLED']} search={search} /><SelectFilter name="securityStatus" label="Seguridad" values={['PENDING', 'CLEAN', 'QUARANTINED', 'REJECTED', 'ERROR']} search={search} /></QueryFilters>
-    {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay documentos para estos filtros.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Documento</th><th>Usuario</th><th>Tipo</th><th>Procesamiento</th><th>Seguridad</th><th>Tamaño</th><th>Páginas</th><th>Carga</th></tr></thead><tbody>{state.data.items.map((document) => <tr key={document.id}><td data-label="Documento"><a className="entity-link" href={`/admin/documents/${document.id}`}><strong>{shortId(document.id)}</strong><small>{document.classificationStatus}</small></a></td><td data-label="Usuario"><a href={`/admin/users/${document.userId}`}>{document.maskedEmail}</a></td><td data-label="Tipo">{document.documentType ?? 'Sin confirmar'}</td><td data-label="Procesamiento"><StatusBadge value={document.processingStatus} /></td><td data-label="Seguridad"><StatusBadge value={document.securityStatus} /></td><td data-label="Tamaño">{bytes(document.sizeBytes)}</td><td data-label="Páginas">{document.pageCount ?? '—'}</td><td data-label="Carga">{date(document.createdAt)}</td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/documents" search={search} /></>}
+    <QueryFilters action="/admin/documents" search={search}><SelectFilter name="processingStatus" label="Procesamiento" values={['CREATED', 'UPLOADED', 'SECURITY_VALIDATION', 'DOCUMENT_CLASSIFICATION', 'NEEDS_TYPE_CONFIRMATION', 'TEXT_EXTRACTION', 'OCR', 'PARSING', 'NORMALIZATION', 'VALIDATION', 'COMPLETED', 'NEEDS_REVIEW', 'REJECTED_UNSUPPORTED', 'QUARANTINED', 'FAILED_RETRYABLE', 'RETRY_SCHEDULED', 'FAILED_PERMANENT', 'CANCELLED']} search={search} /><SelectFilter name="securityStatus" label="Seguridad" values={['PENDING', 'CLEAN', 'QUARANTINED', 'REJECTED', 'ERROR']} search={search} /><SelectFilter name="runStatus" label="Análisis" values={['RUNNING', 'PROCESSING', 'COMPLETED', 'COMPLETED_WITH_WARNINGS', 'REVIEW_REQUIRED', 'FAILED', 'CANCELLED']} search={search} /><SelectFilter name="promotionOutcome" label="Resultado" values={['NOT_EVALUATED', 'PROMOTED', 'UNCHANGED', 'REVIEW_REQUIRED', 'REJECTED_REGRESSION']} search={search} /><label>Mejora<select name="reprocessAvailable" defaultValue={search.get('reprocessAvailable') ?? ''}><option value="">Todas</option><option value="true">Disponible</option><option value="false">No disponible</option></select></label><label>Parser<input name="parserVersion" maxLength={80} defaultValue={search.get('parserVersion') ?? ''} placeholder="v6" /></label><label>Issue<input name="issueCode" maxLength={96} pattern="[A-Z0-9_]+" defaultValue={search.get('issueCode') ?? ''} placeholder="LABEL_…" /></label></QueryFilters>
+    {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay documentos para estos filtros.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Documento</th><th>Usuario</th><th>Tipo</th><th>Procesamiento</th><th>Análisis activo</th><th>Issues</th><th>Mejora</th><th>Seguridad</th><th>Carga</th></tr></thead><tbody>{state.data.items.map((document) => <tr key={document.id}><td data-label="Documento"><a className="entity-link" href={`/admin/documents/${document.id}`}><strong>{shortId(document.id)}</strong><small>{document.classificationStatus}</small></a></td><td data-label="Usuario"><a href={`/admin/users/${document.userId}`}>{document.maskedEmail}</a></td><td data-label="Tipo">{document.documentType ?? 'Sin confirmar'}</td><td data-label="Procesamiento"><StatusBadge value={document.processingStatus} /></td><td data-label="Análisis"><span>{document.activeRunStatus ? <StatusBadge value={document.activeRunStatus} /> : '—'}<small className="cell-note">parser {document.activeParserVersion ?? '—'}</small></span></td><td data-label="Issues">{document.issueCount}</td><td data-label="Mejora">{document.reprocessAvailable ? <StatusBadge value="READY" /> : '—'}</td><td data-label="Seguridad"><StatusBadge value={document.securityStatus} /></td><td data-label="Carga">{date(document.createdAt)}</td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/documents" search={search} /></>}
     {!permissions.includes('documents.quarantine') && <p className="admin-footnote">Tu rol permite diagnóstico, no cuarentena.</p>}
   </>;
 }
@@ -307,25 +406,97 @@ function DocumentPage({ id, permissions }: { id: string; permissions: Permission
   const [notice, setNotice] = useState('');
   if (state.loading) return <><PageHeader eyebrow="Documentos" title="Detalle seguro" description="Cargando metadata…" crumbs={[["Admin", "/admin"], ["Documentos", "/admin/documents"], [shortId(id)]]} /><LoadingState /></>;
   if (state.error || !state.data) return <><PageHeader eyebrow="Documentos" title="Detalle seguro" description="No se pudo recuperar la metadata." crumbs={[["Admin", "/admin"], ["Documentos", "/admin/documents"], [shortId(id)]]} /><ErrorState message={state.error} retry={state.reload} /></>;
-  const { document, recentJobs, employmentId, importBatchId } = state.data;
-  return <><PageHeader eyebrow="Documentos" title={shortId(document.id)} description="Diagnóstico sin exponer el contenido privado." crumbs={[["Admin", "/admin"], ["Documentos", "/admin/documents"], [shortId(id)]]} actions={permissions.includes('documents.quarantine') && document.securityStatus !== 'QUARANTINED' ? <button className="button danger-button" onClick={() => setAction({ title: 'Enviar a cuarentena', description: 'Detiene trabajo no iniciado y aísla el documento. Un job en ejecución no puede cancelarse desde aquí.', button: 'Cuarentenar', execute: async (reasonCode, reference) => { await api(`/admin/documents/${id}/quarantine`, { method: 'POST', body: JSON.stringify({ reasonCode, reference }) }); return 'Documento puesto en cuarentena.'; } })}>Cuarentenar</button> : undefined} />
-    {notice && <p className="message success" aria-live="polite">{notice}</p>}<div className="admin-detail-grid"><section className="admin-card"><h2>Metadata</h2><dl className="admin-definition"><div><dt>ID</dt><dd>{document.id}</dd></div><div><dt>Usuario</dt><dd><a href={`/admin/users/${document.userId}`}>{document.maskedEmail}</a></dd></div><div><dt>Tipo</dt><dd>{document.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(document.sizeBytes)}</dd></div><div><dt>Páginas</dt><dd>{document.pageCount ?? 'Sin dato'}</dd></div><div><dt>Empleo</dt><dd>{employmentId ? shortId(employmentId) : 'Sin asociación'}</dd></div><div><dt>Importación</dt><dd>{shortId(importBatchId)}</dd></div><div><dt>Retención</dt><dd>{document.retentionPolicy}</dd></div></dl></section><section className="admin-card"><h2>Diagnóstico</h2><dl className="admin-definition"><div><dt>Procesamiento</dt><dd><StatusBadge value={document.processingStatus} /></dd></div><div><dt>Seguridad</dt><dd><StatusBadge value={document.securityStatus} /></dd></div><div><dt>Clasificación</dt><dd>{document.classificationStatus}</dd></div><div><dt>Original</dt><dd>{document.originalAvailable ? 'Disponible bajo autorización del usuario' : 'No disponible'}</dd></div><div><dt>Carga</dt><dd>{date(document.createdAt)}</dd></div><div><dt>Procesado</dt><dd>{date(document.processedAt)}</dd></div></dl></section></div>
-    <section className="admin-card"><h2>Jobs relacionados</h2>{!permissions.includes('processing.read') ? <p>Tu rol no incluye metadata de procesamiento.</p> : recentJobs.length ? <ul className="admin-event-list">{recentJobs.map((job) => <li key={job.id}><a href={`/admin/processing?search=${job.id}`}>{shortId(job.id)}</a><StatusBadge value={job.state} /><span>{job.stage} · {job.attempt}/{job.maxAttempts} intentos</span></li>)}</ul> : <EmptyState>No hay jobs relacionados.</EmptyState>}</section>
-    {action && <ActionDialog action={action} onClose={() => setAction(null)} onDone={(message) => { setAction(null); setNotice(message); state.reload(); }} />}
+  const { document, recentJobs, employmentId, importBatchId, activeRunId, processingRuns, issues } = state.data;
+  const inProgress = processingRuns.some((run) => ['RUNNING', 'PROCESSING'].includes(run.status))
+    || recentJobs.some((job) => ['PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE'].includes(job.state));
+  const retry = activeRunId === null
+    && ['FAILED_PERMANENT', 'CANCELLED'].includes(document.processingStatus)
+    && document.originalAvailable
+    && document.securityStatus === 'CLEAN'
+    && document.documentType === 'PAYROLL';
+  const canReprocess = permissions.includes('processing.reprocess') && !inProgress && (document.reprocessAvailable || retry);
+  const finish = (message: string) => { setAction(null); setNotice(message); state.reload(); };
+  const reprocess = () => setAction({
+    title: retry ? 'Reintentar análisis' : 'Reprocesar documento',
+    description: 'Crea una versión candidata y conserva el análisis activo hasta comparar el resultado. No expone el contenido del documento.',
+    button: retry ? 'Reintentar' : 'Reprocesar',
+    execute: async (reasonCode, reference) => {
+      await api(`/admin/documents/${id}/reprocess`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({ reasonCode, reference, ...(retry ? { retry: true } : {}) }),
+      });
+      return 'Reprocesamiento encolado; el análisis activo permanece disponible.';
+    },
+  });
+  const quarantine = () => setAction({
+    title: 'Enviar a cuarentena',
+    description: 'Detiene trabajo no iniciado y aísla el documento. Un job en ejecución no puede cancelarse desde aquí.',
+    button: 'Cuarentenar',
+    execute: async (reasonCode, reference) => {
+      await api(`/admin/documents/${id}/quarantine`, { method: 'POST', body: JSON.stringify({ reasonCode, reference }) });
+      return 'Documento puesto en cuarentena.';
+    },
+  });
+  const rollback = (run: ProcessingRun) => setAction({
+    title: `Volver a la versión ${run.processingVersion}`,
+    description: 'Cambia sólo el análisis activo al resultado histórico elegido. La operación queda auditada y no elimina otras versiones.',
+    button: 'Confirmar rollback',
+    danger: true,
+    execute: async (reasonCode, reference) => {
+      await api(`/admin/documents/${id}/processing-runs/${run.id}/rollback`, { method: 'POST', body: JSON.stringify({ reasonCode, reference }) });
+      return `La versión ${run.processingVersion} volvió a quedar activa.`;
+    },
+  });
+  const headerActions = canReprocess || (permissions.includes('documents.quarantine') && document.securityStatus !== 'QUARANTINED')
+    ? <div className="row-actions">{canReprocess && <button className="button secondary" onClick={reprocess}>{retry ? 'Reintentar' : 'Reprocesar'}</button>}{permissions.includes('documents.quarantine') && document.securityStatus !== 'QUARANTINED' && <button className="button danger-button" onClick={quarantine}>Cuarentenar</button>}</div>
+    : undefined;
+  return <>
+    <PageHeader eyebrow="Documentos" title={shortId(document.id)} description="Diagnóstico sin exponer el contenido privado." crumbs={[["Admin", "/admin"], ["Documentos", "/admin/documents"], [shortId(id)]]} actions={headerActions} />
+    {notice && <p className="message success" aria-live="polite">{notice}</p>}
+    <div className="admin-detail-grid"><section className="admin-card"><h2>Metadata</h2><dl className="admin-definition"><div><dt>ID</dt><dd>{document.id}</dd></div><div><dt>Usuario</dt><dd><a href={`/admin/users/${document.userId}`}>{document.maskedEmail}</a></dd></div><div><dt>Tipo</dt><dd>{document.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(document.sizeBytes)}</dd></div><div><dt>Páginas</dt><dd>{document.pageCount ?? 'Sin dato'}</dd></div><div><dt>Empleo</dt><dd>{employmentId ? shortId(employmentId) : 'Sin asociación'}</dd></div><div><dt>Importación</dt><dd>{shortId(importBatchId)}</dd></div><div><dt>Retención</dt><dd>{document.retentionPolicy}</dd></div></dl></section><section className="admin-card"><h2>Diagnóstico</h2><dl className="admin-definition"><div><dt>Procesamiento</dt><dd><StatusBadge value={document.processingStatus} /></dd></div><div><dt>Seguridad</dt><dd><StatusBadge value={document.securityStatus} /></dd></div><div><dt>Análisis activo</dt><dd>{document.activeRunStatus ? <StatusBadge value={document.activeRunStatus} /> : 'Sin análisis'}</dd></div><div><dt>Parser activo</dt><dd>{document.activeParserVersion ?? '—'}</dd></div><div><dt>Issues activos</dt><dd>{document.issueCount}</dd></div><div><dt>Mejora</dt><dd>{document.reprocessAvailable ? 'Disponible' : inProgress ? 'Procesando' : 'No disponible'}</dd></div><div><dt>Original</dt><dd>{document.originalAvailable ? 'Disponible bajo autorización del usuario' : 'No disponible'}</dd></div><div><dt>Procesado</dt><dd>{date(document.processedAt)}</dd></div></dl></section></div>
+    <section className="admin-card"><h2>Versiones de análisis</h2><p>Timeline técnico sanitizado: versiones y decisiones, sin PDF, OCR ni importes.</p>{processingRuns.length ? <ol className="admin-run-list">{processingRuns.map((run) => <li key={run.id}><div><strong>Versión {run.processingVersion}</strong>{run.active && <StatusBadge value="ACTIVE" />}</div><span><StatusBadge value={run.status} /> · {triggerLabel(run.triggerKind)} · parser {run.parserVersion}</span><small>{runOutcomeLabel(run.promotionOutcome)} · {date(run.finishedAt ?? run.startedAt)}</small>{permissions.includes('processing.rollback') && !run.active && run.promotionOutcome === 'PROMOTED' && run.promotedAt && !inProgress && <button className="button compact danger-button" onClick={() => rollback(run)}>Rollback</button>}</li>)}</ol> : <EmptyState>No hay análisis registrados.</EmptyState>}</section>
+    <section className="admin-card"><h2>Issues estructurados</h2>{issues.length ? <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Código</th><th>Severidad</th><th>Campo</th><th>Recuperable</th><th>Versión</th><th>Fecha</th></tr></thead><tbody>{issues.map((issue) => <tr key={issue.id}><td data-label="Código">{issue.code}</td><td data-label="Severidad"><StatusBadge value={issue.severity} /></td><td data-label="Campo">{issue.affectedFieldPath ?? 'General'}</td><td data-label="Recuperable">{issue.recoverable ? 'Sí' : 'No'}</td><td data-label="Versión">{processingRuns.find((run) => run.id === issue.runId)?.processingVersion ?? '—'}</td><td data-label="Fecha">{date(issue.createdAt)}</td></tr>)}</tbody></table></div> : <EmptyState>No hay issues registrados.</EmptyState>}</section>
+    <section className="admin-card"><h2>Jobs relacionados</h2>{!permissions.includes('processing.read') ? <p>Tu rol no incluye metadata de procesamiento.</p> : recentJobs.length ? <ul className="admin-event-list">{recentJobs.map((job) => <li key={job.id}><a href={`/admin/processing?search=${job.id}`}>{shortId(job.id)}</a><StatusBadge value={job.state} /><span>{job.stage} · v{job.processingVersion} · {job.attempt}/{job.maxAttempts} intentos</span></li>)}</ul> : <EmptyState>No hay jobs relacionados.</EmptyState>}</section>
+    {activeRunId === null && <p className="admin-footnote">El documento todavía no tiene un análisis activo.</p>}
+    {action && <ActionDialog action={action} onClose={() => setAction(null)} onDone={finish} />}
   </>;
 }
 
 function ProcessingPage({ search, permissions }: { search: URLSearchParams; permissions: Permission[] }) {
-  const query = new URLSearchParams(search); query.set('pageSize', '25');
+  const query = new URLSearchParams(search); query.delete('healthPage'); query.set('pageSize', '25');
   const state = useRemote<Paged<AdminJob>>(`/admin/jobs?${query}`);
+  const healthPage = processingHealthPage(search.get('healthPage'));
+  const health = useRemote<ProcessingHealth>(`/admin/processing/health?page=${healthPage}&pageSize=25`);
   const [action, setAction] = useState<AdminAction | null>(null);
   const [notice, setNotice] = useState('');
   function jobAction(job: AdminJob, kind: 'retry' | 'cancel') {
     const retry = kind === 'retry';
     setAction({ title: retry ? 'Reintentar job' : 'Cancelar job', description: retry ? 'Sólo vuelve a disponibilizar un job RETRYABLE en su misma versión.' : 'Sólo cancela trabajo que todavía no está en ejecución.', button: retry ? 'Reintentar ahora' : 'Cancelar job', execute: async (reasonCode, reference) => { await api(`/admin/jobs/${job.id}/${kind}`, { method: 'POST', body: JSON.stringify({ reasonCode, reference }) }); return retry ? 'Job reintentado en la misma versión.' : 'Job pendiente cancelado.'; } });
   }
-  return <><PageHeader eyebrow="OCR y extracción" title="Procesamiento" description="Cola durable, intentos y errores sanitizados. No se muestra texto OCR ni resultados salariales." />
-    {notice && <p className="message success" aria-live="polite">{notice}</p>}<QueryFilters action="/admin/processing" search={search}><SelectFilter name="state" label="Estado" values={['PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE', 'COMPLETED', 'FAILED', 'CANCELLED']} search={search} /><SelectFilter name="stage" label="Etapa" values={['SECURITY_VALIDATION', 'DOCUMENT_CLASSIFICATION', 'TEXT_EXTRACTION', 'OCR', 'PARSING', 'NORMALIZATION', 'VALIDATION', 'CLEANUP']} search={search} /></QueryFilters>
+  const summary = health.data?.summary;
+  return <><PageHeader eyebrow="OCR y extracción" title="Procesamiento" description={health.data ? `Salud del pipeline ${health.data.currentPipeline.parserVersion} · verificada ${date(health.data.checkedAt)}. Sin OCR ni resultados salariales.` : 'Cola durable, versiones, issues y errores sanitizados. No se muestra texto OCR ni resultados salariales.'} />
+    {notice && <p className="message success" aria-live="polite">{notice}</p>}
+    {health.loading ? <LoadingState /> : health.error || !health.data || !summary ? <ErrorState message={health.error} retry={health.reload} /> : <>
+      <section className="admin-kpi-grid processing-kpis" aria-label="Salud del procesamiento">
+        {[
+          ['Documentos', summary.totalDocuments, 'Con metadata estructurada'],
+          ['Completos', summary.completeDocuments, 'Sin issues activos'],
+          ['Con observaciones', summary.warningDocuments, 'Utilizables con advertencias'],
+          ['Mejora disponible', summary.candidateDocuments, 'Compatibles con el pipeline actual'],
+          ['Procesando', summary.processingDocuments, 'Runs candidatos en curso'],
+          ['Para revisar', summary.reviewRequiredDocuments, 'Requieren decisión humana'],
+          ['Fallidos', summary.failedDocuments, 'Runs con fallo controlado'],
+        ].map(([label, value, detail]) => <article className="admin-kpi" key={String(label)}><small>{label}</small><strong>{numberFormatter.format(Number(value))}</strong><span>{detail}</span></article>)}
+      </section>
+      <div className="admin-detail-grid processing-health-grid">
+        <section className="admin-card"><h2>Resultados por versión</h2><p>Pipeline actual: parser {health.data.currentPipeline.parserVersion} · schema {health.data.currentPipeline.resultSchemaVersion} · {health.data.currentPipeline.fingerprint.slice(0, 12)}…</p>{health.data.versions.items.length ? <ul className="admin-health-list">{health.data.versions.items.map((version) => <li key={`${version.pipelineFingerprint}-${version.parserVersion}-${version.status}-${version.promotionOutcome}`}><a href={`/admin/documents?parserVersion=${encodeURIComponent(version.parserVersion)}&runStatus=${encodeURIComponent(version.status)}&promotionOutcome=${encodeURIComponent(version.promotionOutcome)}`}><strong>parser {version.parserVersion}</strong><small>{version.pipelineFingerprint?.slice(0, 12) ?? 'sin fingerprint'} · {version.status} · {runOutcomeLabel(version.promotionOutcome)}</small></a><span>{numberFormatter.format(version.documents)}</span></li>)}</ul> : <EmptyState>No hay versiones procesadas.</EmptyState>}</section>
+        <section className="admin-card"><h2>Issues activos</h2>{health.data.issues.items.length ? <ul className="admin-health-list">{health.data.issues.items.map((issue) => <li key={`${issue.code}-${issue.severity}`}><a href={`/admin/documents?issueCode=${encodeURIComponent(issue.code)}`}><strong>{issue.code}</strong><small>{issue.severity} · {issue.candidates} candidato{issue.candidates === 1 ? '' : 's'}</small></a><span>{numberFormatter.format(issue.documents)}</span></li>)}</ul> : <EmptyState>No hay issues activos.</EmptyState>}</section>
+      </div>
+      <ProcessingHealthPagination versions={health.data.versions} issues={health.data.issues} search={search} />
+    </>}
+    <h2 className="admin-section-title">Jobs</h2>
+    <QueryFilters action="/admin/processing" search={search}><SelectFilter name="state" label="Estado" values={['PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE', 'COMPLETED', 'FAILED', 'CANCELLED']} search={search} /><SelectFilter name="stage" label="Etapa" values={['SECURITY_VALIDATION', 'DOCUMENT_CLASSIFICATION', 'TEXT_EXTRACTION', 'OCR', 'PARSING', 'NORMALIZATION', 'VALIDATION', 'CLEANUP', 'DOCUMENT_PIPELINE_V2']} search={search} /></QueryFilters>
     {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay jobs para estos filtros.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Job</th><th>Documento</th><th>Etapa</th><th>Estado</th><th>Intentos</th><th>Versión</th><th>Error</th><th>Disponible</th><th>Acciones</th></tr></thead><tbody>{state.data.items.map((job) => <tr key={job.id}><td data-label="Job">{shortId(job.id)}</td><td data-label="Documento"><a href={`/admin/documents/${job.documentId}`}>{shortId(job.documentId)}</a></td><td data-label="Etapa">{job.stage}</td><td data-label="Estado"><StatusBadge value={job.state} /></td><td data-label="Intentos">{job.attempt}/{job.maxAttempts}</td><td data-label="Versión">{job.processingVersion}</td><td data-label="Error">{job.errorCode ?? '—'}</td><td data-label="Disponible">{date(job.availableAt)}</td><td data-label="Acciones"><div className="row-actions">{permissions.includes('processing.retry') && job.state === 'RETRYABLE' && <button className="button compact secondary" onClick={() => jobAction(job, 'retry')}>Retry</button>}{permissions.includes('processing.cancel') && ['PENDING', 'PUBLISHED', 'RETRYABLE'].includes(job.state) && <button className="button compact danger-button" onClick={() => jobAction(job, 'cancel')}>Cancelar</button>}</div></td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/processing" search={search} /></>}
     {action && <ActionDialog action={action} onClose={() => setAction(null)} onDone={(message) => { setAction(null); setNotice(message); state.reload(); }} />}
   </>;
@@ -383,7 +554,7 @@ function EmployerPage({ id, adminRole }: { id: string; adminRole: AdminRole }) {
 function StoragePage({ search }: { search: URLSearchParams }) {
   const query = new URLSearchParams(search); query.set('pageSize', '25');
   const state = useRemote<StorageData>(`/admin/storage?${query}`);
-  return <><PageHeader eyebrow="Capacidad y abuso" title="Storage" description="Consumo agregado y anomalías determinísticas; ningún archivo ni URL de storage se expone." />{state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : <><section className="admin-kpi-grid"><article className="admin-kpi"><small>Uso total</small><strong>{bytes(state.data.summary.totalOriginalBytes)}</strong><span>{state.data.summary.documentCount} originales</span></article><article className="admin-kpi"><small>Usuarios</small><strong>{state.data.summary.usersWithOriginals}</strong><span>con originales disponibles</span></article><article className="admin-kpi"><small>Cuota por usuario</small><strong>{bytes(state.data.summary.quotaBytesPerUser)}</strong><span>límite server-side</span></article><article className="admin-kpi"><small>Borrados pendientes</small><strong>{state.data.summary.pendingDeletions}</strong><span>tombstones de storage</span></article></section>{!state.data.items.length ? <EmptyState>No hay consumo registrado.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Usuario</th><th>Storage</th><th>Cuota</th><th>Documentos</th><th>Mayor archivo</th><th>Señal</th></tr></thead><tbody>{state.data.items.map((item) => <tr key={item.userId}><td data-label="Usuario"><a href={`/admin/users/${item.userId}`}>{shortId(item.userId)}</a></td><td data-label="Storage">{bytes(item.originalBytes)}</td><td data-label="Cuota">{item.usagePercent}%</td><td data-label="Documentos">{item.documentCount}</td><td data-label="Mayor archivo">{bytes(item.largestDocumentBytes)}</td><td data-label="Señal">{item.anomalyFlags.length ? item.anomalyFlags.map((flag) => <StatusBadge key={flag} value={flag} />) : 'Normal'}</td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/storage" search={search} /></>}</>}</>;
+  return <><PageHeader eyebrow="Capacidad y abuso" title="Storage" description="Consumo agregado y anomalías determinísticas; ningún archivo ni URL de storage se expone." />{state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : <><section className="admin-kpi-grid"><article className="admin-kpi"><small>Uso total</small><strong>{bytes(state.data.summary.totalOriginalBytes)}</strong><span>{state.data.summary.documentCount} originales</span></article><article className="admin-kpi"><small>Usuarios</small><strong>{state.data.summary.usersWithOriginals}</strong><span>con originales disponibles</span></article><article className="admin-kpi"><small>Cuota por usuario</small><strong>{bytes(state.data.summary.quotaBytesPerUser)}</strong><span>límite server-side</span></article><article className="admin-kpi"><small>Borrados pendientes</small><strong>{state.data.summary.pendingDeletions}</strong><span>tombstones de storage</span></article><article className="admin-kpi"><small>Writes inciertos</small><strong>{state.data.summary.uncertainArtifactWrites}</strong><span>requieren verificación operativa</span></article></section>{!state.data.items.length ? <EmptyState>No hay consumo registrado.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Usuario</th><th>Storage</th><th>Cuota</th><th>Documentos</th><th>Mayor archivo</th><th>Señal</th></tr></thead><tbody>{state.data.items.map((item) => <tr key={item.userId}><td data-label="Usuario"><a href={`/admin/users/${item.userId}`}>{shortId(item.userId)}</a></td><td data-label="Storage">{bytes(item.originalBytes)}</td><td data-label="Cuota">{item.usagePercent}%</td><td data-label="Documentos">{item.documentCount}</td><td data-label="Mayor archivo">{bytes(item.largestDocumentBytes)}</td><td data-label="Señal">{item.anomalyFlags.length ? item.anomalyFlags.map((flag) => <StatusBadge key={flag} value={flag} />) : 'Normal'}</td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/storage" search={search} /></>}</>}</>;
 }
 
 function PrivacyPage({ search }: { search: URLSearchParams }) {

@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–019. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–020. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -9,7 +9,7 @@
 3. Verificación: corrección/confirmación humana con precedencia.
 4. Proyección: datos estructurados actuales usados por analytics.
 
-Cada procesamiento completado conserva su ExtractionRun. El reproceso explícito crea otra versión y hereda las correcciones humanas con linaje append-only según el ADR 0004.
+Cada intento conserva su `ExtractionRun`, incluso si falla. El reproceso crea otra versión y hereda las correcciones humanas con linaje append-only. `Document.activeExtractionRunId` decide qué resultado alimenta el producto; el número de versión no publica por sí solo una corrida.
 
 ## Relaciones
 
@@ -30,10 +30,15 @@ erDiagram
     EMPLOYER o|--o{ DOCUMENT : detected_in
     IMPORT_BATCH_ITEM o|--o| DOCUMENT : becomes
     DOCUMENT ||--o{ EXTRACTION_RUN : processed_as
+    DOCUMENT o|--|| EXTRACTION_RUN : activates
     DOCUMENT ||--o{ PROCESSING_JOB : schedules
+    USER ||--o{ REPROCESSING_BATCH : requests
+    REPROCESSING_BATCH o|--o{ PROCESSING_JOB : groups
     DOCUMENT ||--o{ PAYROLL_SETTLEMENT : supports
     EXTRACTION_RUN ||--o{ PAYROLL_SETTLEMENT : produces
     EXTRACTION_RUN ||--o{ EXTRACTED_FIELD : records
+    EXTRACTION_RUN ||--o{ EXTRACTION_RUN_ISSUE : reports
+    EXTRACTION_RUN ||--o{ PROCESSING_ARTIFACT : reuses
     EMPLOYMENT o|--o{ PAYROLL_SETTLEMENT : receives
     PAYROLL_SETTLEMENT ||--o{ PAYROLL_LINE_ITEM : contains
     USER ||--o{ USER_CORRECTION : makes
@@ -91,12 +96,17 @@ Autorización breve creada por la API y ligada a userId, batchId e items concret
 Registro durable que funciona como intent/outbox del trabajo asíncrono:
 
 - documentId, userId, stage y processingVersion;
+- trigger, actor opcional, corrida activa observada, fingerprint de pipeline y batch opcional;
 - idempotencyKey única;
 - PENDING, PUBLISHED, RUNNING, RETRYABLE, COMPLETED o FAILED;
 - availableAt, attempt, lease y timestamps;
 - errorCode sanitizado.
 
 Se inserta en la misma transacción que la transición que requiere trabajo. Un dispatcher publica su ID en Redis y un reconciliador recupera PENDING/PUBLISHED vencidos. El worker aplica compare-and-set/lease y sigue siendo idempotente ante delivery duplicado.
+
+### ReprocessingBatch
+
+Correlaciona jobs de reproceso de un único titular y conserva idempotencia, trigger, actor, estado y timestamps. No contiene PDFs ni resultados: progreso y resumen se derivan de sus jobs y corridas. Los lotes administrativos se separan por owner para no cruzar aislamiento ni fairness.
 
 ### Document
 
@@ -110,10 +120,10 @@ Metadata mínima:
 - declaredMimeType y detectedMimeType separados;
 - sizeBytes, pageCount y checksum;
 - securityStatus, classificationStatus, documentType y confidence;
-- processingStatus y retentionPolicy;
+- processingStatus, activeExtractionRunId y retentionPolicy;
 - createdAt, processedAt y deletedAt.
 
-El nombre visible del recibo se deriva de la proyección vigente (`payrollPeriod` y empresa efectiva); no reemplaza `originalFilename` ni la key opaca del objeto.
+El nombre visible del recibo se deriva exclusivamente de la corrida activa (`payrollPeriod` y empresa efectiva); no reemplaza `originalFilename` ni la key opaca del objeto. Una corrida candidata usa su propio estado/job y no cambia `processingStatus` hasta ser promovida.
 
 La asociación con Employment puede definirse al importar, resolverse de manera inequívoca durante el procesamiento o confirmarse después. El cambio actualiza en una sola transacción el ImportBatchItem, el Document y sus PayrollSettlement. Un nombre aislado nunca basta cuando hay más de un candidato.
 
@@ -160,13 +170,25 @@ Campos:
 Registro inmutable de cada procesamiento:
 
 - processingVersion;
-- parser/extractor/normalizer/classifier/OCR provider y versión;
+- trigger, actor opcional y corrida activa usada como baseline;
+- parser/extractor/normalizer/classifier/OCR provider, idioma y versiones reales;
+- versión del schema y fingerprint completo del pipeline;
+- `PROCESSING`, resultado completo, completo con observaciones, revisión requerida, fallo o cancelación;
+- outcome de promoción y resumen de diferencias sin valores;
 - startedAt y finishedAt;
-- confidence y resultado bruto permitido;
+- confidence;
 - errores sanitizados;
 - costo computacional aproximado.
 
-El resultado bruto no debe duplicar PII innecesaria. Los artefactos grandes o temporales no viven indefinidamente en PostgreSQL.
+El resultado bruto no debe duplicar PII innecesaria. PostgreSQL conserva resultados estructurados y metadata; el contenido del artefacto textual vive únicamente en storage privado cifrado.
+
+### ExtractionRunIssue
+
+Issue estructurado owner-scoped de una corrida: código, severidad, recuperabilidad, `affectedFieldPath` opcional y metadata allowlisted. Permite consultar candidatos por código/versión sin inspeccionar OCR ni importes. Una release sólo habilita reproceso cuando declara una corrección compatible para ese issue/campo.
+
+### ProcessingArtifact
+
+Metadata de un artefacto textual privado: key opaca, checksum, tamaño, fuente, completitud, estado del write y versiones de extracción/OCR. Se crea como `PENDING` antes del `PUT` y sólo pasa a `COMPLETED` después de una respuesta exitosa. El objeto comprimido puede reutilizarse internamente desde parsing sólo para el mismo titular/documento y con checksum y versiones compatibles. Se elimina junto con el original mediante el mismo tombstone durable.
 
 ### ExtractedField
 
@@ -218,7 +240,7 @@ MFAFactor conserva un secreto TOTP cifrado y versionado, estado pendiente/activo
 
 Session conserva UUID, hash irreversible del token, creación, última actividad, vencimiento, revocación y garantía. Para que el titular reconozca accesos sin fingerprinting, agrega sólo `deviceType`, `browserFamily` y `osFamily` dentro de vocabularios cerrados inferidos al crearla; no persiste user-agent crudo, versión, IP, geolocalización ni nombre del dispositivo. El listado devuelve sólo sesiones activas del owner e identifica la actual en servidor. La revocación individual exige step-up, no permite cerrar la actual por ese endpoint y es idempotente para una sesión propia ya terminada.
 
-StorageDeletionTombstone sobrevive a cascades y conserva únicamente las dos keys opacas necesarias para reconciliar un borrado físico. AccountDeletionReceipt conserva el hash de una constancia opaca y el estado de la baja sin email, nombre, userId ni FK personal después de completarse.
+StorageDeletionTombstone sobrevive a cascades y conserva las keys opacas del original, upload y artefactos necesarias para reconciliar un borrado físico. También conserva qué writes de artefacto quedaron inciertos: esas keys impiden cerrar automáticamente la baja. Dos pases de `DELETE` y un `HEAD` ausente confirman el resto. AccountDeletionReceipt conserva el hash de una constancia opaca y el estado de la baja sin email, nombre, userId ni FK personal después de completarse.
 
 ## Dinero
 
@@ -254,7 +276,7 @@ Las migraciones vigentes materializan:
 - intentos OIDC de un solo uso, expirables y ligados al navegador y propósito;
 - unique por userId + checksum para duplicado lógico vigente;
 - unique por documentId + processingVersion;
-- unique de ProcessingJob por documentId + processingVersion + stage;
+- unique de ProcessingJob por documentId + processingVersion + stage y, parcialmente, un único job activo por documento;
 - unique por extractionRunId + settlementOrdinal;
 - amount decimal y currencyCode obligatorio cuando existe monto;
 - endDate no anterior a startDate;
@@ -265,11 +287,12 @@ Las migraciones vigentes materializan:
 
 Índices:
 
-- Document por userId + createdAt y userId + processingStatus;
+- Document por userId + createdAt, userId + processingStatus y puntero activo;
 - Employment por userId + status;
 - PayrollSettlement por userId/employmentId + payrollPeriod;
 - ImportBatchItem por batchId + status;
-- ProcessingJob por state + availableAt y userId;
+- ProcessingJob por state + availableAt, userId y batch;
+- ExtractionRun por document/version y parser/status; issues por code/recoverability;
 - AuditEvent por userId + timestamp.
 - recorridos admin por estado/fecha de User, Document, ProcessingJob y PrivacyOperation; AdminAuditEvent por fecha, actor, sujeto y recurso.
 
@@ -287,7 +310,7 @@ Los detalles están en [Retención](../privacy/data-retention.md).
 
 ## Analytics
 
-Analytics sólo consume la última ExtractionRun `COMPLETED` de documentos PAYROLL cuyo estado también es `COMPLETED`; no abre PDFs ni texto OCR. Los documentos `NEEDS_REVIEW` aparecen en cobertura pendiente, pero sus importes quedan fuera de la proyección.
+Analytics selecciona únicamente `Document.activeExtractionRunId` y exige que el documento esté `COMPLETED`; no abre PDFs ni texto OCR. Una corrida candidata o fallida no afecta cálculos y un baseline activo que todavía requiere revisión queda fuera hasta que el titular la cierre. Los documentos sin resultado utilizable aparecen en cobertura pendiente, pero sus importes quedan fuera de la proyección.
 
 La proyección derivada declara `calculationVersion = salary-analytics-v1` y no persiste agregados. Segmenta estrictamente por contexto laboral y currencyCode. `comparableSalary` usa exclusivamente basicAmount cuando el período tiene una liquidación `NORMAL` recurrente verificada y un básico único; falta o ambigüedad producen N/D, sin fallback a bruto o neto. Las operaciones monetarias usan BigInt sobre centavos y los porcentajes se obtienen por variación compuesta `(final / inicial) - 1`, nunca sumando porcentajes; cada resultado conserva período inicial y final.
 

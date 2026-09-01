@@ -8,7 +8,7 @@
   },
   "scripts": {
     "migrate": "node --experimental-strip-types ./scripts/migrate.ts",
-    "test": "node --experimental-strip-types --test ./test/migrations.test.ts",
+    "test": "node --experimental-strip-types --test ./test/migrations.test.ts ./test/processing.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

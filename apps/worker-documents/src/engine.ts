@@ -301,6 +301,11 @@ export function applySettlementCorrections(
         throw new Error('INVALID_STORED_CORRECTION');
       }
       effective.settlementType = correctedValue as PayrollExtraction['settlementType'];
+    } else if (fieldPath === 'employer.name') {
+      if (typeof correctedValue !== 'string' || !correctedValue.trim() || correctedValue.trim().length > 200) {
+        throw new Error('INVALID_STORED_CORRECTION');
+      }
+      effective.employerName = correctedValue.trim();
     }
   }
   return effective;

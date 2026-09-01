@@ -751,6 +751,7 @@ test('omite evidencia ambigua y conserva el número real de página OCR', () => 
 test('materializa una nueva liquidación con las correcciones efectivas sin mutar la extracción', () => {
   const extraction = extractArgentinePayroll('RECIBO DE SUELDO\nTotal bruto $ 1.000,00', 'PDF_TEXT');
   const effective = applySettlementCorrections(extraction, [
+    { fieldPath: 'employer.name', correctedValue: '  Empresa Corregida SA  ' },
     { fieldPath: 'settlement.payrollPeriod', correctedValue: '2026-08' },
     { fieldPath: 'settlement.grossAmount', correctedValue: { amount: '1250.50', currencyCode: 'ARS' } },
     { fieldPath: 'settlement.remunerativeAmount', correctedValue: { amount: '900.00', currencyCode: 'ARS' } },
@@ -763,6 +764,7 @@ test('materializa una nueva liquidación con las correcciones efectivas sin muta
   assert.equal(extraction.grossAmount, '1000.00');
   assert.equal(extraction.settlementType, 'NORMAL');
   assert.equal(effective.payrollPeriod, '2026-08');
+  assert.equal(effective.employerName, 'Empresa Corregida SA');
   assert.equal(effective.grossAmount, '1250.50');
   assert.equal(effective.remunerativeAmount, '900.00');
   assert.equal(effective.nonRemunerativeAmount, '350.50');
@@ -804,4 +806,26 @@ test('recalcula revisión sobre valores efectivos y conserva aritmética decimal
       normalizedConceptCode: null, rawDescription: 'Crédito sintético',
     }],
   }), false);
+});
+
+test('un recibo NORMAL sin básico queda como advertencia y no fuerza revisión', () => {
+  const extraction = extractArgentinePayroll(`
+RECIBO DE SUELDO
+Empleador: Empresa Sintética S.A.
+Período de liquidación: 08/2026
+Presentismo $ 1.000,00
+Jubilación $ 110,00
+Obra social $ 70,00
+Total bruto $ 1.000,00
+Total descuentos $ 180,00
+Neto a cobrar $ 820,00
+`, 'PDF_TEXT');
+
+  assert.equal(extraction.settlementType, 'NORMAL');
+  assert.equal(extraction.basicAmount, null);
+  assert.equal(payrollExtractionNeedsReview(extraction), false);
+  assert.equal(
+    extraction.fields.find(({ fieldPath }) => fieldPath === 'settlement.basicAmount')?.signals?.missingReason,
+    'LABEL_OR_LAYOUT_NOT_RECOGNIZED',
+  );
 });

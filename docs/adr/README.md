@@ -9,7 +9,7 @@ Los ADR registran decisiones arquitectónicas materiales, no tareas ni preferenc
 - Superseded: reemplazada por otro ADR.
 - Rejected: evaluada y descartada.
 
-Los ADR 0001, 0002, 0007, 0008, 0009, 0010, 0011, 0012, 0013 y 0014 están Accepted y respaldados por el corte vertical. El ADR 0012 supersede sólo la parte administrativa del 0007; su decisión legal permanece vigente. El ADR 0014 supersede la exclusión de administración y merge de empleadores del 0012. Los ADR 0003, 0004, 0005 y 0006 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
+Los ADR 0001, 0002, 0004, 0007, 0008, 0009, 0010, 0011, 0012, 0013 y 0014 están Accepted y respaldados por el corte vertical. El ADR 0012 supersede sólo la parte administrativa del 0007; su decisión legal permanece vigente. El ADR 0014 supersede la exclusión de administración y merge de empleadores del 0012. Los ADR 0003, 0005, 0006 y 0015 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
 
 ## Índice
 
@@ -27,6 +27,7 @@ Los ADR 0001, 0002, 0007, 0008, 0009, 0010, 0011, 0012, 0013 y 0014 están Accep
 - [0012 — Consola administrativa granular y privada por defecto](0012-granular-admin-console.md)
 - [0013 — Analítica salarial derivada, exacta y contextual](0013-derived-salary-history-analytics.md)
 - [0014 — Empleador global, resolución conservadora y merge auditable](0014-global-employer-resolution.md)
+- [0015 — Resultado activo y recuperación versionada segura](0015-active-processing-runs-and-safe-recovery.md)
 
 ## Formato
 

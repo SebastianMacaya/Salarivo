@@ -4,6 +4,16 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { evidenceIdForPage, extractionRunChanged, reviewValueChanged } from './document-evidence';
 import { DocumentViewer } from './document-viewer';
 import { documentStatusLabel, money, periodLabel, settlementTypeLabel, timestampLabel } from './format';
+import {
+  analysisPresentation,
+  issueLabel,
+  runNeedsDecision,
+  runOutcomeLabel,
+  triggerLabel,
+  type DocumentAnalysis,
+  type ProcessingComparisonPreview,
+  type ProcessingRun,
+} from './reprocessing';
 import styles from './document-review.module.css';
 
 export type ExtractedFieldDetail = {
@@ -23,6 +33,7 @@ export type ExtractedFieldDetail = {
 };
 
 export type DocumentDetail = {
+  analysis?: DocumentAnalysis;
   classificationStatus: string | null;
   confidence: string | null;
   createdAt: string;
@@ -109,6 +120,7 @@ const missingReasons = {
   LABEL_OR_LAYOUT_NOT_RECOGNIZED: 'No reconocimos la etiqueta o la ubicación del dato.',
   VALUE_NOT_INTERPRETABLE: 'Reconocimos el campo, pero no pudimos interpretar el valor.',
 };
+const comparisonLabels: Record<string, string> = { ...labels, 'settlement.currencyCode': 'Moneda' };
 
 function filename(detail: DocumentDetail) { return detail.displayFilename || detail.originalFilename; }
 function bytes(value: number) {
@@ -126,6 +138,16 @@ function provenance(field: ExtractedFieldDetail) {
   if (field.source === 'PDF_TEXT') return 'Detectado en el PDF';
   if (field.source === 'MANUAL_REQUIRED') return 'Requiere carga manual';
   return field.source;
+}
+function comparisonValue(preview: ProcessingComparisonPreview, fieldPath: string, value: string | null, side: 'before' | 'after') {
+  if (value === null) return 'No disponible';
+  if (fieldPath === 'settlement.payrollPeriod') return periodLabel(value);
+  if (fieldPath === 'settlement.type') return settlementTypeLabel(value);
+  if (fieldPath.includes('Amount')) {
+    const currency = preview.fields.find((field) => field.fieldPath === 'settlement.currencyCode')?.[side] ?? 'ARS';
+    return money(value, currency);
+  }
+  return value;
 }
 
 function handleReviewKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
@@ -174,7 +196,13 @@ export function DocumentReview({
   onLocationChange,
   onNavigate,
   onReprocess,
+  onRunDecision,
   onSave,
+  processingRuns = [],
+  runPreviewErrors = {},
+  runPreviews = {},
+  runsError = '',
+  runsLoading = false,
 }: {
   detail: DocumentDetail;
   initialEvidenceId?: string;
@@ -197,8 +225,14 @@ export function DocumentReview({
   onDirtyChange: (dirty: boolean) => void;
   onLocationChange: (page: number, evidenceId?: string) => void;
   onNavigate: (direction: -1 | 1) => void;
-  onReprocess: () => Promise<void>;
+  onReprocess: (retry?: boolean) => Promise<void>;
+  onRunDecision: (run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE') => Promise<void>;
   onSave: (changes: Array<{ field: ExtractedFieldDetail; value: string }>, extractionRunId: string) => Promise<void>;
+  processingRuns?: ProcessingRun[];
+  runPreviewErrors?: Record<string, string>;
+  runPreviews?: Record<string, ProcessingComparisonPreview | null | undefined>;
+  runsError?: string;
+  runsLoading?: boolean;
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
@@ -224,6 +258,9 @@ export function DocumentReview({
   const acceptMismatch = acceptedMismatchRunId === currentRunId;
   const editingStale = editing && extractionRunChanged(editingRunId, currentRunId);
   const missing = detail.extractedFields.filter((field) => field.source === 'MANUAL_REQUIRED' && !savedValue(field));
+  const analysis = detail.analysis;
+  const analysisCopy = analysis ? analysisPresentation(analysis) : null;
+  const runTimeline = processingRuns.length ? processingRuns : analysis?.currentRun ? [analysis.currentRun] : [];
 
   useEffect(() => {
     if (!dirty) return;
@@ -298,10 +335,6 @@ export function DocumentReview({
   const reviewBlocked = missing.length > 0 || settlement?.totalsBalance === false
     || settlement?.componentsBalance === false
     || (settlement?.deductionsMatchTotal === false && !acceptMismatch);
-  const canReprocess = detail.originalAvailable
-    && detail.securityStatus === 'CLEAN'
-    && detail.documentType === 'PAYROLL'
-    && ['COMPLETED', 'NEEDS_REVIEW', 'FAILED_PERMANENT', 'CANCELLED'].includes(detail.processingStatus);
   const canDeleteOriginal = detail.originalAvailable
     && ['COMPLETED', 'NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION', 'REJECTED_UNSUPPORTED', 'QUARANTINED', 'FAILED_PERMANENT', 'CANCELLED'].includes(detail.processingStatus);
   const canEdit = ['COMPLETED', 'NEEDS_REVIEW'].includes(detail.processingStatus) && currentRunId !== null;
@@ -346,6 +379,14 @@ export function DocumentReview({
             {error && <p className={styles.error} role="alert">{error}</p>}
             <div className={styles.summary}><span>{documentStatusLabel(detail.processingStatus)}</span><p>{unsupported ? 'El documento quedó separado del historial salarial.' : detail.errorCode ? 'El procesamiento terminó con un error controlado.' : detail.lastReprocessError ? 'El último reprocesamiento no pudo completarse; conservamos la versión anterior.' : missing.length ? `Falta completar: ${missing.map((field) => labels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : settlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto.' : settlement?.componentsBalance === false ? 'Remunerativo más no remunerativo no coincide con el bruto.' : settlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total.' : 'Los cambios humanos quedan versionados y no se reemplazan en silencio.'}</p></div>
 
+            {analysis && analysisCopy && <section className={`${styles.analysis} ${styles[analysisCopy.tone]}`} aria-live="polite" aria-busy={analysis.reprocess.inProgress}>
+              <div className={styles.analysisHead}><div><span aria-hidden="true">{analysisCopy.tone === 'ready' ? '✓' : analysisCopy.tone === 'danger' ? '!' : '↻'}</span><h3>{analysisCopy.title}</h3></div>{analysis.reprocess.inProgress && <span className={styles.pulse}>Procesando</span>}</div>
+              <p>{analysisCopy.body}</p>
+              {analysis.issues.length > 0 && <ul>{analysis.issues.map((issue) => <li key={issue.id ?? `${issue.code}-${issue.affectedFieldPath}`}>{issueLabel(issue)}{issue.recoverable && <small> Se puede volver a analizar.</small>}</li>)}</ul>}
+              {(analysis.reprocess.available || analysis.reprocess.retryAvailable || analysis.reprocess.inProgress) && <p className={styles.preserved}>{analysis.activeRunId ? 'Tu análisis activo no se pierde durante el reprocesamiento.' : 'El reintento crea una versión nueva sin borrar el historial técnico.'}</p>}
+              {(analysis.reprocess.available || analysis.reprocess.retryAvailable) && <button type="button" disabled={busy || dirty || analysis.reprocess.inProgress} onClick={() => void run(() => onReprocess(analysis.reprocess.retryAvailable === true))}>{busy ? 'Iniciando…' : analysis.reprocess.retryAvailable ? 'Reintentar análisis' : 'Buscar mejora'}</button>}
+            </section>}
+
             {detail.processingStatus === 'NEEDS_TYPE_CONFIRMATION' && <section className={styles.callout}><h3>¿Es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente.</p><div><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('PAYROLL'))}>Sí, continuar</button><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('UNSUPPORTED'))}>No corresponde</button></div></section>}
             {unsupported && <section className={styles.callout}><h3>Tipo de documento no soportado</h3><p>{unsupportedReason} No volveremos a procesarlo automáticamente.</p></section>}
 
@@ -374,13 +415,37 @@ export function DocumentReview({
 
             {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li key={item.id}><span>{item.rawDescription}</span><strong>{item.amount} {item.currencyCode}</strong>{item.sourcePage && <small>Pág. {item.sourcePage}</small>}</li>)}</ul></section>}
 
+            {analysis && <details className={styles.timeline}>
+              <summary>Historial técnico del análisis ({runTimeline.length})</summary>
+              {runsError ? <p className={styles.error} role="alert">{runsError}</p> : runsLoading ? <p role="status">Cargando versiones y comparación…</p> : runTimeline.length ? <ol>{runTimeline.map((version) => {
+                const reviewCandidate = runNeedsDecision(version);
+                const preview = runPreviews[version.id];
+                const changedFields = preview?.fields.filter((field) => field.change !== 'UNCHANGED') ?? [];
+                const previewMatchesActive = preview?.baseRunId === analysis.activeRunId && preview.candidateRunId === version.id;
+                return <li key={version.id}>
+                  <div><strong>Versión {version.processingVersion}</strong>{version.active && <span>Activa</span>}</div>
+                  <p>{triggerLabel(version.triggerKind)} · parser {version.parserVersion} · {runOutcomeLabel(version.promotionOutcome)}</p>
+                  <small>{timestampLabel(version.finishedAt ?? version.startedAt)}{version.pipelineFingerprint ? ` · pipeline ${version.pipelineFingerprint.slice(0, 12)}` : ''}</small>
+                  {reviewCandidate && <div className={styles.comparison}>
+                    <h4>Comparación con la versión activa</h4>
+                    {runPreviewErrors[version.id] && <p className={styles.error} role="alert">{runPreviewErrors[version.id]}</p>}
+                    {preview === null && !runPreviewErrors[version.id] && <p>No hay una base comparable; esta versión no se puede activar desde acá.</p>}
+                    {preview && <>
+                      {changedFields.length ? <div className={styles.comparisonTable} role="region" aria-label={`Comparación de la versión ${version.processingVersion}`} tabIndex={0}><table><thead><tr><th>Dato</th><th>Activo</th><th>Nuevo</th></tr></thead><tbody>{changedFields.map((field) => <tr key={field.fieldPath}><th scope="row">{comparisonLabels[field.fieldPath] ?? field.fieldPath}</th><td>{comparisonValue(preview, field.fieldPath, field.before, 'before')}</td><td>{comparisonValue(preview, field.fieldPath, field.after, 'after')}</td></tr>)}</tbody></table></div> : <p>Los campos principales no cambian.</p>}
+                      {preview.lineItems.changed && <p>Conceptos detectados: {preview.lineItems.beforeCount} activos → {preview.lineItems.afterCount} nuevos.</p>}
+                    </>}
+                    <div className={styles.runActions}>{previewMatchesActive && <button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'PROMOTE'))}>Usar esta mejora</button>}<button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'KEEP_ACTIVE'))}>Conservar versión activa</button></div>
+                  </div>}
+                </li>;
+              })}</ol> : <p>No hay versiones registradas.</p>}
+            </details>}
+
             <details className={styles.metadata}><summary>Metadatos y trazabilidad</summary><dl><div><dt>Archivo original</dt><dd>{detail.originalFilename}</dd></div><div><dt>Tipo</dt><dd>{detail.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Importado</dt><dd>{timestampLabel(detail.createdAt)}</dd></div><div><dt>Páginas</dt><dd>{detail.pageCount ?? '—'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(detail.sizeBytes)}</dd></div><div><dt>Seguridad</dt><dd>{detail.securityStatus}</dd></div><div><dt>Clasificación</dt><dd>{detail.classificationStatus ?? '—'}</dd></div><div><dt>Extracción</dt><dd>{detail.extractionRun?.processingVersion ?? '—'}</dd></div><div><dt>Método</dt><dd>{detail.extractionRun?.ocrProvider ? `OCR · ${detail.extractionRun.ocrProvider}` : detail.extractionRun?.extractorName ?? '—'}</dd></div><div><dt>Procesado</dt><dd>{timestampLabel(detail.processedAt)}</dd></div><div><dt>Retención</dt><dd>{detail.retentionPolicy}</dd></div></dl></details>
 
             {detail.processingStatus === 'NEEDS_REVIEW' && settlement?.deductionsMatchTotal === false && <label className={styles.acceptance}><input type="checkbox" checked={acceptMismatch} onChange={(event) => setAcceptedMismatchRunId(event.target.checked ? currentRunId : null)} />Revisé los conceptos y acepto esta diferencia.</label>}
 
             <footer className={styles.actions}>
               {detail.processingStatus === 'NEEDS_REVIEW' && <button type="button" disabled={busy || reviewBlocked || dirty || !currentRunId} onClick={() => { if (currentRunId) void run(() => onCompleteReview(acceptMismatch, currentRunId)); }}>Finalizar revisión</button>}
-              <button type="button" disabled={busy || dirty || !canReprocess} onClick={() => void run(onReprocess)}>Reprocesar</button>
               <button type="button" disabled={busy || !originalViewable} onClick={() => void run(onDownload)}>Descargar PDF</button>
               <button type="button" disabled={busy || !canDeleteOriginal} onClick={() => void run(onDeleteOriginal)}>{detail.originalAvailable ? 'Eliminar sólo el PDF' : 'Original eliminado'}</button>
               <button type="button" disabled={busy} onClick={() => void run(onDeleteDocument)}>Eliminar PDF y datos</button>

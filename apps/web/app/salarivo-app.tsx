@@ -5,6 +5,15 @@ import Link from 'next/link';
 import { DocumentReview, type DocumentDetail, type ExtractedFieldDetail } from './document-review';
 import { fetchDocumentPrefix, readDocumentLocation, writeDocumentLocation, type CursorDocumentPage } from './document-evidence';
 import {
+  batchIsActive,
+  batchResolved,
+  type ProcessingComparisonPreview,
+  type ProcessingRun,
+  type ProcessingRunDetail,
+  type ReprocessingBatch,
+  type ReprocessingCandidate,
+} from './reprocessing';
+import {
   dateLabel,
   documentStatusLabel,
   employmentOptionLabel,
@@ -119,6 +128,7 @@ type MonthlyEvolution = {
   totals: SalaryAmounts;
   regular: SalaryAmounts;
   comparableSalary: string | null;
+  quality?: { incompleteDocuments: number; reprocessableDocuments: number };
 };
 type SalaryConcept = {
   period: string;
@@ -190,7 +200,7 @@ type SalaryContext = {
 type SalaryHistory = {
   calculationVersion: string;
   contexts: SalaryContext[];
-  coverage: { documents: number; activeEmployments: number; completedDocuments: number; needsReviewDocuments: number; pendingReviewDocuments: number; unassociatedDocuments: number; analyzedSettlements: number };
+  coverage: { documents: number; activeEmployments: number; completedDocuments: number; needsReviewDocuments: number; pendingReviewDocuments: number; unassociatedDocuments: number; analyzedSettlements: number; reprocessing?: { candidateDocuments: number; processingDocuments: number; reviewRequiredDocuments: number } };
   analytics: {
     settlementCount: number;
     documentCount: number;
@@ -1077,6 +1087,35 @@ function EmptyState({ title, body, action }: { title: string; body: string; acti
   return <div className="empty-state"><span className="empty-mark" aria-hidden="true">∿</span><h3>{title}</h3><p>{body}</p>{action}</div>;
 }
 
+function ReprocessingBanner({ availableCandidates, batch, batchLimit = 100, busy, candidates, error, loading, onRetry, onStart }: {
+  batch: ReprocessingBatch | null;
+  busy: boolean;
+  candidates: number;
+  availableCandidates: number;
+  batchLimit?: number;
+  error: string;
+  loading: boolean;
+  onRetry: () => void;
+  onStart: () => void;
+}) {
+  if (loading) return <aside className="reprocessing-banner quiet" role="status"><span className="loader" aria-hidden="true" /><div><strong>Consultando mejoras…</strong><small>Tu historial sigue disponible.</small></div></aside>;
+  if (error && !batch) return <aside className="reprocessing-banner partial" aria-live="polite"><div><strong>No pudimos actualizar las recomendaciones</strong><small>{error}</small></div><button type="button" className="button secondary" onClick={onRetry}>Reintentar</button></aside>;
+  const active = batchIsActive(batch);
+  const resolved = batch ? batchResolved(batch) : 0;
+  if (!batch && candidates === 0) return <aside className="reprocessing-banner quiet" aria-live="polite"><span aria-hidden="true">✓</span><div><strong>Análisis al día</strong><small>No hay documentos con una mejora compatible pendiente.</small></div></aside>;
+  if (!batch && availableCandidates === 0) return <aside className="reprocessing-banner" aria-live="polite" aria-busy="true"><span className="loader" aria-hidden="true" /><div><strong>Buscando mejoras</strong><small>Hay {candidates} documento{candidates === 1 ? '' : 's'} en proceso; cada análisis activo sigue disponible.</small></div></aside>;
+  const batchSize = Math.min(availableCandidates, batchLimit);
+  const outcome = batch && !active
+    ? `${batch.progress.improved} mejorado${batch.progress.improved === 1 ? '' : 's'} · ${batch.progress.unchanged} sin cambios · ${batch.progress.reviewRequired} para revisar · ${batch.progress.failed} con error · ${batch.progress.skipped} conservado${batch.progress.skipped === 1 ? '' : 's'}`
+    : null;
+  return <aside className={`reprocessing-banner${batch?.status === 'FAILED' ? ' failed' : batch?.status === 'PARTIAL' ? ' partial' : ''}`} aria-live="polite" aria-busy={active}>
+    <div><strong>{active ? 'Mejorando documentos' : candidates === 1 ? 'Hay una mejora disponible' : candidates > 1 ? `Hay mejoras para ${candidates} documentos` : 'Lote finalizado'}</strong><small>{active ? 'Cada resultado se compara por separado; el análisis activo no se pierde.' : outcome ?? 'Una versión nueva puede recuperar datos que hoy figuran como N/D.'}</small></div>
+    {error && <div><strong>No pudimos actualizar el progreso</strong><small>{error}</small><button type="button" className="text-button" onClick={onRetry}>Reintentar</button></div>}
+    {batch && <div className="reprocessing-progress"><progress max={Math.max(1, batch.progress.total)} value={resolved} aria-label="Progreso del reprocesamiento" /><span>{resolved}/{batch.progress.total}</span></div>}
+    {!active && availableCandidates > 0 && <button type="button" className="button primary" disabled={busy} onClick={onStart}>{busy ? 'Iniciando…' : batchSize === 1 ? 'Buscar mejora' : candidates > batchLimit ? `Mejorar ${batchSize} de los primeros ${batchLimit}` : `Mejorar ${batchSize} documentos`}</button>}
+  </aside>;
+}
+
 function salaryMoney(value: string | null | undefined, currency: string) {
   return value === null || value === undefined ? 'N/D' : money(value, currency);
 }
@@ -1127,7 +1166,9 @@ function SalaryContextNotice({ context }: { context: SalaryContext }) {
     : 'Este análisis contiene recibos sin empresa confirmada. No se compara con otros contextos hasta que los asocies.'}</p>;
 }
 
-function SalaryMetricGrid({ scope, context }: { scope: SalaryScopeAnalytics; context: SalaryContext }) {
+type SalaryRecoveryState = 'available' | 'processing' | 'partial';
+
+function SalaryMetricGrid({ scope, context, recoveryPeriods = new Map() }: { scope: SalaryScopeAnalytics; context: SalaryContext; recoveryPeriods?: Map<string, SalaryRecoveryState> }) {
   const current = scope.current;
   const currentYear = current?.period.slice(0, 4) ?? scope.annual[0]?.year;
   const annual = scope.annual.find((item) => item.year === currentYear) ?? null;
@@ -1135,17 +1176,23 @@ function SalaryMetricGrid({ scope, context }: { scope: SalaryScopeAnalytics; con
   const ytd = current?.changes.ytd ?? null;
   const coverage = scope.coverage;
   const coverageKnown = coverage && coverage.basis !== 'INDETERMINATE_CONTEXT';
+  const currentEvolution = current ? scope.evolution.find((point) => point.period === current.period) : undefined;
+  const currentRecovery = current
+    ? recoveryPeriods.get(current.period)
+      ?? (currentEvolution?.quality?.reprocessableDocuments ? 'available' : currentEvolution?.quality?.incompleteDocuments ? 'partial' : undefined)
+    : undefined;
+  const recoveryCount = scope.evolution.filter((point) => point.quality?.reprocessableDocuments || recoveryPeriods.has(point.period)).length;
   return <section className="metric-grid salary-metrics" aria-label="Indicadores salariales">
-    <article className="metric accent"><small>Básico comparable</small><strong>{salaryMoney(current?.comparableSalary, context.currencyCode)}</strong><span>{current ? periodLabel(current.period) : 'Sin período comparable'}</span></article>
+    <article className="metric accent"><small>Básico comparable</small><strong>{salaryMoney(current?.comparableSalary, context.currencyCode)}</strong><span>{currentRecovery && current?.comparableSalary === null ? currentRecovery === 'processing' ? 'Buscando el básico; el valor activo se conserva' : currentRecovery === 'partial' ? 'Análisis incompleto; requiere revisión' : `Podemos volver a buscarlo en ${periodLabel(current.period)}` : current ? periodLabel(current.period) : 'Sin período comparable'}</span></article>
     <article className="metric"><small>Neto actual</small><strong>{salaryMoney(current?.amounts.netAmount, context.currencyCode)}</strong><span>{current ? `${periodLabel(current.period)} · sueldo regular` : 'N/D'}</span></article>
-    <article className="metric"><small>Última variación</small><strong>{salaryPercentage(latest?.percentage)}</strong><span>{latest ? `${periodLabel(latest.fromPeriod)} → ${periodLabel(latest.toPeriod)}` : 'Sin dos períodos comparables'}</span></article>
-    <article className="metric"><small>Variación en el año</small><strong>{salaryPercentage(ytd?.percentage)}</strong><span>{ytd ? `Desde ${periodLabel(ytd.fromPeriod)}` : 'Sin base comparable en el año'}</span></article>
+    <article className="metric"><small>Última variación</small><strong>{salaryPercentage(latest?.percentage)}</strong><span>{latest ? `${periodLabel(latest.fromPeriod)} → ${periodLabel(latest.toPeriod)}` : recoveryCount ? `${recoveryCount} período${recoveryCount === 1 ? '' : 's'} con recuperación disponible` : 'Sin dos períodos comparables'}</span></article>
+    <article className="metric"><small>Variación en el año</small><strong>{salaryPercentage(ytd?.percentage)}</strong><span>{ytd ? `Desde ${periodLabel(ytd.fromPeriod)}` : recoveryCount ? 'Puede cambiar cuando terminen las mejoras' : 'Sin base comparable en el año'}</span></article>
     <article className="metric"><small>{annual ? `Cobrado en ${annual.year}` : 'Total anual'}</small><strong>{salaryMoney(annual?.totals.netAmount, context.currencyCode)}</strong><span>{annual ? `${annual.periodCount} período${annual.periodCount === 1 ? '' : 's'} · ${annual.settlementCount} ${annual.settlementCount === 1 ? 'liquidación' : 'liquidaciones'}` : 'N/D'}</span></article>
     <article className="metric"><small>Cobertura</small><strong>{coverageKnown ? `${coverage.availablePeriods.length}/${coverage.expectedPeriods.length}` : 'N/D'}</strong><span>{coverageKnown ? coverage.boundaryContradiction ? 'Límites laborales contradictorios' : coverage.possibleMissingPeriods.length ? `${coverage.possibleMissingPeriods.length} posible${coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : coverage.basis === 'OBSERVED' ? 'Rango basado en períodos observados' : 'Sin faltantes posibles en el rango' : 'No se puede determinar sin un contexto laboral'}</span></article>
   </section>;
 }
 
-function SalaryEvolution({ scope, year = 'all', limit }: { scope: SalaryScopeAnalytics; year?: string; limit?: number }) {
+function SalaryEvolution({ scope, year = 'all', limit, recoveryPeriods = new Map() }: { scope: SalaryScopeAnalytics; year?: string; limit?: number; recoveryPeriods?: Map<string, SalaryRecoveryState> }) {
   const filtered = year === 'all' ? scope.evolution : scope.evolution.filter((point) => point.period.startsWith(`${year}-`));
   const points = recentPeriodRange(filtered, limit);
   if (!points.length) return <EmptyState title="Sin evolución para mostrar" body="Elegí otro año o importá recibos con datos comparables." />;
@@ -1157,7 +1204,7 @@ function SalaryEvolution({ scope, year = 'all', limit }: { scope: SalaryScopeAna
   const visualMaximum = Math.max(1, ...visualValues);
   const visualHeight = (value: string) => `${Math.max(2, (Number(value) / visualMaximum) * 100)}%`;
   const currency = scope.currencyCode;
-  const exactTable = <div className="table-wrap salary-evolution-table" role="region" aria-label="Tabla desplazable de evolución salarial" tabIndex={0}><table><caption className="sr-only">Valores exactos de la evolución salarial</caption><thead><tr><th>Período</th><th>Básico comparable</th><th>Bruto total</th><th>Neto total</th><th>Descuentos / créditos</th></tr></thead><tbody>{points.map((point) => <tr key={point.period}><td>{periodLabel(point.period)}</td><td>{salaryMoney(point.comparableSalary, currency)}</td><td>{salaryMoney(point.totals.grossAmount, currency)}</td><td>{salaryMoney(point.totals.netAmount, currency)}</td><td>{deductionOrCredit(point.totals.deductionsAmount, currency)}</td></tr>)}</tbody></table></div>;
+  const exactTable = <div className="table-wrap salary-evolution-table" role="region" aria-label="Tabla desplazable de evolución salarial" tabIndex={0}><table><caption className="sr-only">Valores exactos de la evolución salarial</caption><thead><tr><th>Período</th><th>Básico comparable</th><th>Bruto total</th><th>Neto total</th><th>Descuentos / créditos</th></tr></thead><tbody>{points.map((point) => { const recovery = recoveryPeriods.get(point.period) ?? (point.quality?.reprocessableDocuments ? 'available' : point.quality?.incompleteDocuments ? 'partial' : undefined); return <tr key={point.period}><td>{periodLabel(point.period)}</td><td>{salaryMoney(point.comparableSalary, currency)}{point.comparableSalary === null && recovery && <small className="nd-context">{recovery === 'processing' ? 'Buscando una mejora…' : recovery === 'partial' ? 'Análisis incompleto' : 'Mejora disponible'}</small>}</td><td>{salaryMoney(point.totals.grossAmount, currency)}</td><td>{salaryMoney(point.totals.netAmount, currency)}</td><td>{deductionOrCredit(point.totals.deductionsAmount, currency)}</td></tr>; })}</tbody></table></div>;
   return <div className="salary-evolution">
     <div className="legend"><span className="comparable">Básico comparable</span><span className="net">Neto total</span></div>
     <div className="bar-chart salary-chart" role="img" aria-label="Gráfico de básico comparable y neto por período">{chartPoints.map((point) => <div className="bar-group" key={point.period} title={`${periodLabel(point.period)}: básico comparable ${salaryMoney(point.comparableSalary, currency)}, neto ${salaryMoney(point.totals.netAmount, currency)}`}><div className="bars">{point.comparableSalary !== null && <i className="bar comparable" style={{ height: visualHeight(point.comparableSalary) }} />}{point.totals.netAmount !== null && <i className="bar net" style={{ height: visualHeight(point.totals.netAmount) }} />}</div><small>{periodLabel(point.period)}</small></div>)}</div>
@@ -1566,6 +1613,18 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const [associating, setAssociating] = useState(false);
   const [selected, setSelected] = useState<DocumentItem | null>(null);
   const [detail, setDetail] = useState<DocumentDetail | null>(null);
+  const [processingRuns, setProcessingRuns] = useState<ProcessingRun[]>([]);
+  const [runPreviews, setRunPreviews] = useState<Record<string, ProcessingComparisonPreview | null | undefined>>({});
+  const [runPreviewErrors, setRunPreviewErrors] = useState<Record<string, string>>({});
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [runsError, setRunsError] = useState('');
+  const [reprocessingCandidates, setReprocessingCandidates] = useState<ReprocessingCandidate[]>([]);
+  const [reprocessingCandidateTotal, setReprocessingCandidateTotal] = useState(0);
+  const [reprocessingBatchLimit, setReprocessingBatchLimit] = useState(100);
+  const [reprocessingBatch, setReprocessingBatch] = useState<ReprocessingBatch | null>(null);
+  const [reprocessingLoading, setReprocessingLoading] = useState(true);
+  const [reprocessingBusy, setReprocessingBusy] = useState(false);
+  const [reprocessingError, setReprocessingError] = useState('');
   const [tab, setTab] = useState<HistoryTab>(initialTab);
   const [selectedScopeKey, setSelectedScopeKey] = useState('');
   const [yearFilter, setYearFilter] = useState('all');
@@ -1708,6 +1767,29 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     setComparison(null); setComparisonLoaded(false);
     return next;
   }, []);
+  const loadReprocessingCandidates = useCallback(async () => {
+    const next = await api<{ items: ReprocessingCandidate[]; total: number; batchLimit: number }>('/reprocessing/candidates?page=1&limit=100');
+    setReprocessingCandidates(next.items);
+    setReprocessingCandidateTotal(next.total);
+    setReprocessingBatchLimit(next.batchLimit);
+    return next;
+  }, []);
+  const loadRecovery = useCallback(async () => {
+    setReprocessingLoading(true); setReprocessingError('');
+    const [candidates, batch] = await Promise.allSettled([
+        api<{ items: ReprocessingCandidate[]; total: number; batchLimit: number }>('/reprocessing/candidates?page=1&limit=100'),
+        api<ReprocessingBatch | null>('/reprocessing-batches/latest'),
+      ]);
+    if (candidates.status === 'fulfilled') {
+      setReprocessingCandidates(candidates.value.items);
+      setReprocessingCandidateTotal(candidates.value.total);
+      setReprocessingBatchLimit(candidates.value.batchLimit);
+    }
+    if (batch.status === 'fulfilled') setReprocessingBatch(batch.value);
+    const failure = candidates.status === 'rejected' ? candidates.reason : batch.status === 'rejected' ? batch.reason : null;
+    if (failure) setReprocessingError(failure instanceof Error ? failure.message : 'No pudimos consultar todas las mejoras disponibles.');
+    setReprocessingLoading(false);
+  }, []);
   const load = useCallback(async () => {
     setLoading(true); setError('');
     const [historyResult, jobsResult] = await Promise.allSettled([
@@ -1726,7 +1808,30 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     setLoading(false);
   }, []);
   useEffect(() => { void Promise.resolve().then(load); }, [load]);
+  useEffect(() => { void Promise.resolve().then(loadRecovery); }, [loadRecovery]);
   useEffect(() => { void Promise.resolve().then(() => reloadDocuments()); }, [reloadDocuments]);
+  const activeReprocessingBatchId = reprocessingBatch && batchIsActive(reprocessingBatch) ? reprocessingBatch.id : null;
+  useEffect(() => {
+    if (!activeReprocessingBatchId) return;
+    const batchId = activeReprocessingBatchId;
+    let polling = false;
+    const timer = window.setInterval(async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const next = await api<ReprocessingBatch>(`/reprocessing-batches/${batchId}`);
+        setReprocessingError('');
+        setReprocessingBatch(next);
+        if (!batchIsActive(next)) {
+          window.clearInterval(timer);
+          await Promise.all([loadReprocessingCandidates(), loadSalary(), reloadDocuments(true)]);
+        }
+      } catch (caught) {
+        setReprocessingError(caught instanceof Error ? caught.message : 'No pudimos actualizar el lote.');
+      } finally { polling = false; }
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [activeReprocessingBatchId, loadReprocessingCandidates, loadSalary, reloadDocuments]);
   useEffect(() => {
     if (loadingMoreDocuments || !documents.some((document) => processingDocumentPattern.test(document.processingStatus))) return;
     const timer = window.setTimeout(async () => {
@@ -1760,6 +1865,35 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     }, 3_000);
     return () => window.clearTimeout(timer);
   }, [documents, applyDocuments, documentPendingReview, documentTotal, fetchDocumentPage, loadSalary, loadingMoreDocuments, selectedId]);
+  const loadProcessingRuns = useCallback(async () => {
+    if (!selectedId) { setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); return; }
+    const documentId = selectedId;
+    setRunsLoading(true); setRunsError('');
+    try {
+      const next = await api<{ items: ProcessingRun[] }>(`/documents/${documentId}/processing-runs?limit=20`);
+      const reviewRuns = next.items.filter((run) => !run.active && (run.status === 'REVIEW_REQUIRED' || run.promotionOutcome === 'REVIEW_REQUIRED'));
+      const details = await Promise.allSettled(reviewRuns.map((run) => api<ProcessingRunDetail>(`/documents/${documentId}/processing-runs/${run.id}`)));
+      if (activeDocumentId.current === documentId) {
+        const previews: Record<string, ProcessingComparisonPreview | null | undefined> = {};
+        const errors: Record<string, string> = {};
+        reviewRuns.forEach((run, index) => {
+          const result = details[index];
+          if (result?.status === 'fulfilled') previews[run.id] = result.value.comparisonPreview;
+          else if (result?.status === 'rejected') errors[run.id] = result.reason instanceof Error ? result.reason.message : 'No pudimos cargar la comparación.';
+        });
+        setProcessingRuns(next.items);
+        setRunPreviews(previews);
+        setRunPreviewErrors(errors);
+      }
+    } catch (caught) {
+      if (activeDocumentId.current === documentId) setRunsError(caught instanceof Error ? caught.message : 'No pudimos cargar el historial técnico.');
+    } finally {
+      if (activeDocumentId.current === documentId) setRunsLoading(false);
+    }
+  }, [selectedId]);
+  useEffect(() => {
+    if (selectedId) void Promise.resolve().then(loadProcessingRuns);
+  }, [loadProcessingRuns, selectedId]);
   useEffect(() => {
     if (!selectedId) return;
     const documentId = selectedId;
@@ -1781,7 +1915,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
       .catch(async (caught: unknown) => {
         if (stopped || activeDocumentId.current !== documentId) return;
         if (document.fullscreenElement) await document.exitFullscreen().catch(() => undefined);
-        if (!stopped && activeDocumentId.current === documentId) setDetailError(caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.');
+        if (!stopped && activeDocumentId.current === documentId) setDetailError(caught instanceof ApiError && caught.status === 404 ? 'Este documento fue eliminado o ya no está disponible.' : caught instanceof Error ? caught.message : 'No pudimos abrir el detalle.');
       });
     return () => { stopped = true; };
   }, [authorizePreview, detailReload, selectedId, selectedStatus]);
@@ -1791,7 +1925,31 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     const documentId = selectedId;
     const nextDetail = await api<DocumentDetail>(`/documents/${documentId}`);
     if (activeDocumentId.current === documentId) setDetail(nextDetail);
+    return nextDetail;
   }, [selectedId]);
+
+  useEffect(() => {
+    if (!selectedId || !detail?.analysis?.reprocess.inProgress) return;
+    const documentId = selectedId;
+    let polling = false;
+    const timer = window.setInterval(async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const next = await api<DocumentDetail>(`/documents/${documentId}`);
+        if (activeDocumentId.current !== documentId) return;
+        setDetail(next);
+        await loadProcessingRuns();
+        if (!next.analysis?.reprocess.inProgress) {
+          window.clearInterval(timer);
+          await Promise.all([loadSalary(), reloadDocuments(true), loadReprocessingCandidates()]);
+        }
+      } catch (caught) {
+        if (activeDocumentId.current === documentId) setDetailError(caught instanceof ApiError && caught.status === 404 ? 'Este documento fue eliminado mientras estaba abierto.' : caught instanceof Error ? caught.message : 'No pudimos actualizar el análisis.');
+      } finally { polling = false; }
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [detail?.analysis?.reprocess.inProgress, loadProcessingRuns, loadReprocessingCandidates, loadSalary, reloadDocuments, selectedId]);
 
   useEffect(() => {
     const syncFromHistory = () => {
@@ -1810,6 +1968,10 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
         invalidatePreview();
         setDetail(null);
         setDetailError('');
+        setProcessingRuns([]);
+        setRunPreviews({});
+        setRunPreviewErrors({});
+        setRunsError('');
       }
       setOpenedFromList(false);
       setLocationSeed(location ? { evidenceId: location.evidenceId, page: location.page } : {});
@@ -1831,6 +1993,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     invalidatePreview();
     opener.current = trigger;
     activeDocumentId.current = document.id;
+    setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); setRunsError('');
     setSelected(document); setDetail(null); setDetailError(''); setLocationSeed({}); setOpenedFromList(true); setError('');
     reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: document.id })}${window.location.hash}`;
     window.history.pushState(window.history.state, '', reviewUrl.current);
@@ -1938,21 +2101,57 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
     if (!next) return;
     invalidatePreview();
     activeDocumentId.current = next.id;
+    setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); setRunsError('');
     setSelected(next); setDetail(null); setDetailError(''); setLocationSeed({});
     reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: next.id })}${window.location.hash}`;
     window.history.replaceState(window.history.state, '', reviewUrl.current);
   }
 
-  async function reprocessDocument() {
-    if (!selected || !confirm('¿Reprocesar este PDF con la versión actual? Tus correcciones se conservarán.')) return;
-    invalidatePreview();
+  async function reprocessDocument(retry = false) {
+    if (!selected || !confirm(retry ? '¿Reintentar el análisis de este PDF? El intento fallido queda en el historial técnico.' : '¿Buscar una mejora con la versión actual? El análisis activo y tus correcciones se conservan mientras comparamos.')) return;
     await api(`/documents/${selected.id}/reprocess`, {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify(retry ? { retry: true } : {}),
       headers: { 'Idempotency-Key': browserOpaqueToken() },
     });
-    await reloadDocuments(true);
-    await refreshDetail();
+    await Promise.all([reloadDocuments(true), refreshDetail(), loadProcessingRuns(), loadReprocessingCandidates()]);
+  }
+  async function decideProcessingRun(run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE') {
+    if (!selected || !detail?.analysis) return;
+    try {
+      await api(`/documents/${selected.id}/processing-runs/${run.id}/decision`, {
+        method: 'POST',
+        body: JSON.stringify({ decision, expectedActiveRunId: detail.analysis.activeRunId }),
+      });
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.code === 'ACTIVE_RUN_CHANGED') {
+        await Promise.all([refreshDetail(), loadProcessingRuns()]);
+        throw new Error('El análisis activo fue actualizado en otra sesión. Recargamos el historial para que decidas sobre la versión vigente.');
+      }
+      throw caught;
+    }
+    await Promise.all([refreshDetail(), loadProcessingRuns(), loadReprocessingCandidates(), loadSalary(), reloadDocuments(true)]);
+  }
+  async function startReprocessingBatch() {
+    const availableCandidates = reprocessingCandidates.filter((candidate) => candidate.available).length;
+    if (reprocessingBusy || batchIsActive(reprocessingBatch) || !availableCandidates) return;
+    const batchSize = Math.min(availableCandidates, reprocessingBatchLimit);
+    const batchScope = reprocessingCandidateTotal > reprocessingBatchLimit
+      ? `; se procesarán ${batchSize} ahora de ${reprocessingCandidateTotal} candidatos`
+      : reprocessingCandidateTotal > batchSize ? `; ${reprocessingCandidateTotal - batchSize} ya están en proceso` : '';
+    if (!confirm(`¿Buscar mejoras en ${batchSize} documento${batchSize === 1 ? '' : 's'}${batchScope}? Los análisis activos se conservan hasta comparar cada resultado.`)) return;
+    setReprocessingBusy(true); setReprocessingError('');
+    try {
+      const next = await api<ReprocessingBatch>('/reprocessing-batches', {
+        method: 'POST',
+        body: '{}',
+        headers: { 'Idempotency-Key': browserOpaqueToken() },
+      });
+      setReprocessingBatch(next);
+      await loadReprocessingCandidates();
+    } catch (caught) {
+      setReprocessingError(caught instanceof Error ? caught.message : 'No pudimos iniciar el lote.');
+    } finally { setReprocessingBusy(false); }
   }
   async function associateDocuments() {
     if (!checkedDocumentIds.length || !employmentChoice || associating) return;
@@ -2090,6 +2289,18 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
   const assignableDocuments = documents.filter((document) => document.documentType === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus));
   const allAssignableSelected = assignableDocuments.length > 0
     && assignableDocuments.every((document) => checkedDocumentIds.includes(document.id));
+  const candidateByDocument = new Map(reprocessingCandidates.map((candidate) => [candidate.documentId, candidate]));
+  const candidatePeriods = new Map<string, 'available' | 'processing'>();
+  for (const document of documents) {
+    const candidate = candidateByDocument.get(document.id);
+    if (!candidate || !document.payrollPeriod || !context) continue;
+    const sameContext = context.employmentId
+      ? document.employmentId === context.employmentId
+      : context.employerName
+        ? document.employerName === context.employerName
+        : !document.employmentId;
+    if (sameContext) candidatePeriods.set(document.payrollPeriod, candidate.inProgress ? 'processing' : 'available');
+  }
   function documentRow(document: DocumentItem) {
     const showCheckbox = documentKind === 'PAYROLL';
     const assignable = document.documentType === 'PAYROLL' && associationReadyStatuses.has(document.processingStatus);
@@ -2099,13 +2310,15 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
       : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED'
         ? 'Documento no soportado'
         : 'Tipo pendiente de clasificación';
-    return <div className={`document-entry${showCheckbox ? '' : ' no-check'}`} key={document.id}>{showCheckbox && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${name}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{metadata}</small><small>Subido {timestampLabel(document.createdAt)}</small>{document.errorCode && document.errorCode !== 'DOCUMENT_DUPLICATE' && <small className="document-reason">{importErrorLabels[document.errorCode] ?? 'El documento no pudo procesarse.'}</small>}</span><DocumentStatusBadges document={document} /><span aria-hidden="true">›</span></button></div>;
+    const candidate = candidateByDocument.get(document.id);
+    return <div className={`document-entry${showCheckbox ? '' : ' no-check'}`} key={document.id}>{showCheckbox && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${name}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{metadata}</small><small>Subido {timestampLabel(document.createdAt)}</small>{candidate && <small className="document-improvement">{candidate.inProgress ? 'Buscando una mejora…' : 'Mejora disponible para datos faltantes'}</small>}{document.errorCode && document.errorCode !== 'DOCUMENT_DUPLICATE' && <small className="document-reason">{importErrorLabels[document.errorCode] ?? 'El documento no pudo procesarse.'}</small>}</span><span className="document-badges"><DocumentStatusBadges document={document} />{candidate && <span className={`status ${candidate.inProgress ? 'pending' : 'ready'}`}>{candidate.inProgress ? 'Procesando' : 'Mejora disponible'}</span>}</span><span aria-hidden="true">›</span></button></div>;
   }
   const selectedDocumentIndex = documents.findIndex(({ id }) => id === selected?.id);
 
   return (
     <div className="page" aria-busy={loading || documentsLoading || comparisonLoading || conceptLoading || conceptLoadingMore}>
       <PageHeader eyebrow="Datos estructurados" title="Historial salarial" />
+      <ReprocessingBanner availableCandidates={reprocessingCandidates.filter((candidate) => candidate.available).length} batch={reprocessingBatch} batchLimit={reprocessingBatchLimit} busy={reprocessingBusy} candidates={reprocessingCandidateTotal} error={reprocessingError} loading={reprocessingLoading} onRetry={() => void loadRecovery()} onStart={() => void startReprocessingBatch()} />
       <div className="tabs history-tabs" role="tablist" aria-label="Secciones del historial">{historyTabs.map(([value, label], index) => <button type="button" id={`history-tab-${value}`} role="tab" aria-controls={`history-panel-${value}`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className={tab === value ? 'active' : ''} onKeyDown={(event) => moveHistoryTab(event, index)} onClick={() => setTab(value)} key={value}>{label}</button>)}</div>
       {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
       {loading && !history && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando el historial salarial…</p></div>}
@@ -2117,7 +2330,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
       </>}
 
       {tab === 'summary' && <section id="history-panel-summary" role="tabpanel" aria-labelledby="history-tab-summary" tabIndex={0}>{history && context && scope ? <>
-        <SalaryMetricGrid scope={scope} context={context} />
+        <SalaryMetricGrid scope={scope} context={context} recoveryPeriods={candidatePeriods} />
         <div className="history-summary-grid">
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Últimos cambios</p><h2>Eventos informados</h2></div></div>{latestEvents.length ? <ul className="event-list">{latestEvents.map((event) => <li key={`${event.type}-${event.period}-${event.type === 'EXTRAORDINARY' ? event.settlementId : event.change.toPeriod}`}><span><strong>{event.type === 'COMPARABLE_INCREASE' ? 'Aumento comparable' : categoryLabels[event.category]}</strong><small>{periodLabel(event.period)}</small></span><strong>{event.type === 'COMPARABLE_INCREASE' ? salaryPercentage(event.change.percentage) : salaryMoney(event.amount, scope.currencyCode)}</strong></li>)}</ul> : <EmptyState title="Sin cambios informados" body="Hacen falta más períodos comparables o liquidaciones extraordinarias." />}</section>
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">Calidad del historial</p><h2>Cobertura</h2></div></div>{scope.coverage && scope.coverage.basis !== 'INDETERMINATE_CONTEXT' ? <><p className="coverage-total"><strong>{scope.coverage.availablePeriods.length}/{scope.coverage.expectedPeriods.length}</strong> períodos disponibles</p><p>{scope.coverage.possibleMissingPeriods.length ? `Posibles faltantes: ${scope.coverage.possibleMissingPeriods.map(periodLabel).join(', ')}.` : scope.coverage.basis === 'OBSERVED' ? 'Sin faltantes dentro del rango observado; no implica una relación laboral completa.' : 'No se detectaron posibles faltantes dentro del rango laboral.'}</p>{scope.coverage.boundaryContradiction && <p className="message warning" role="status">Las fechas del empleo contradicen períodos observados; se amplió el rango para no ocultarlos.</p>}</> : <p>N/D: sin contexto laboral suficiente para determinar períodos esperados.</p>}{possibleDuplicates.length > 0 && <p className="message warning" role="status">Hay {possibleDuplicates.length} período{possibleDuplicates.length === 1 ? '' : 's'} con posibles recibos duplicados para revisar.</p>}</section>
@@ -2125,7 +2338,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
         <section className="panel comparison-panel"><div className="panel-heading"><div><p className="eyebrow">Comparación exacta</p><h2>Dos períodos</h2></div></div>{periods.length > 1 ? <><div className="comparison-controls"><label>Desde<select value={selectedFromPeriod} onChange={(event) => { setFromPeriod(event.target.value); setComparisonLoaded(false); }} >{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><label>Hasta<select value={selectedToPeriod} onChange={(event) => { setToPeriod(event.target.value); setComparisonLoaded(false); }}>{periods.map((period) => <option value={period} key={period}>{periodLabel(period)}</option>)}</select></label><button type="button" className="button primary" disabled={comparisonLoading || selectedFromPeriod === selectedToPeriod} onClick={() => void comparePeriods()}>{comparisonLoading ? 'Comparando…' : 'Comparar'}</button></div>{comparison && <ComparisonResult comparison={comparison} />}{comparisonLoaded && !comparison && <EmptyState title="No se pueden comparar" body="No hay datos suficientes en uno de los períodos elegidos." />}</> : <EmptyState title="Falta otro período" body="La comparación necesita al menos dos períodos del mismo empleo y moneda." />}</section>
       </> : history && !loading ? <EmptyState title="Todavía no hay datos salariales" body="Importá recibos soportados y completá su revisión para construir el historial." /> : null}</section>}
 
-      {tab === 'evolution' && <section id="history-panel-evolution" role="tabpanel" aria-labelledby="history-tab-evolution" tabIndex={0}>{scope ? <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto</h2></div></div><SalaryEvolution scope={scope} limit={evolutionRanges.find(([value]) => value === evolutionRange)?.[2]} /></section> : history && !loading ? <EmptyState title="Sin evolución" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
+      {tab === 'evolution' && <section id="history-panel-evolution" role="tabpanel" aria-labelledby="history-tab-evolution" tabIndex={0}>{scope ? <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto</h2></div></div><SalaryEvolution scope={scope} limit={evolutionRanges.find(([value]) => value === evolutionRange)?.[2]} recoveryPeriods={candidatePeriods} /></section> : history && !loading ? <EmptyState title="Sin evolución" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
 
       {tab === 'annual' && <section id="history-panel-annual" role="tabpanel" aria-labelledby="history-tab-annual" tabIndex={0}>{scope ? <AnnualHistory rows={annualRows} scope={scope} category={categoryFilter} /> : history && !loading ? <EmptyState title="Sin resumen anual" body="Todavía no hay liquidaciones analizadas." /> : null}</section>}
 
@@ -2144,7 +2357,7 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
       </section>}
 
       {selected && (!detail || detailError) && <div className="modal-layer" role="presentation" onMouseDown={closeDetailState}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="document-loading-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleDialogKey(event, closeDetailState)} onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p className="eyebrow">Documento privado</p><h2 id="document-loading-title">{documentName(selected)}</h2></div><button className="icon-button" disabled={reviewBusy} onClick={closeDetailState} aria-label="Cerrar">×</button></div>{detailError ? <><p className="message error" role="alert">{detailError}</p><div className="modal-actions"><button type="button" className="button secondary" disabled={reviewBusy} onClick={closeDetailState}>Cerrar</button><button type="button" className="button primary" disabled={reviewBusy} onClick={() => setDetailReload((value) => value + 1)}>Reintentar</button></div></> : <p aria-live="polite">Cargando metadatos y datos extraídos…</p>}</section></div>}
-      {selected && detail && <DocumentReview
+      {selected && detail && !detailError && <DocumentReview
         key={selected.id}
         detail={detail}
         initialEvidenceId={locationSeed.evidenceId}
@@ -2168,7 +2381,13 @@ function History({ initialTab = 'summary', runSensitive }: { initialTab?: Histor
         onLocationChange={updateDocumentLocation}
         onNavigate={navigateDocument}
         onReprocess={reprocessDocument}
+        onRunDecision={decideProcessingRun}
         onSave={saveCorrections}
+        processingRuns={processingRuns}
+        runPreviewErrors={runPreviewErrors}
+        runPreviews={runPreviews}
+        runsError={runsError}
+        runsLoading={runsLoading}
       />}
     </div>
   );

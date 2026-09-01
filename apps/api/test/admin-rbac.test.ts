@@ -13,6 +13,8 @@ test("admin RBAC is fixed, explicit and deny-by-default", () => {
   assert.deepEqual(permissionsForAdminRole("UNKNOWN"), []);
   assert.equal(hasAdminPermission("READ_ONLY", "roles.manage"), false);
   assert.equal(hasAdminPermission("OPERATIONS", "processing.retry"), true);
+  assert.equal(hasAdminPermission("OPERATIONS", "processing.reprocess"), true);
+  assert.equal(hasAdminPermission("OPERATIONS", "processing.rollback"), false);
   assert.equal(hasAdminPermission("SUPPORT", "users.read_contact"), true);
   assert.equal(hasAdminPermission("SECURITY", "users.status.update"), true);
   assert.equal(hasAdminPermission("FINANCE", "users.read_metadata"), false);

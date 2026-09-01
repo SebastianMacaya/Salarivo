@@ -36,7 +36,7 @@ Metadata necesaria y datos estructurados. El CUIT se persiste sólo cifrado con 
 
 ### Object storage
 
-Originales y artefactos temporales privados, cifrados y con policy/lifecycle. Keys opacas sin nombre, CUIL, empleador ni período.
+Originales, artefactos de texto reutilizables y temporales privados, cifrados y con policy/lifecycle. Keys opacas sin nombre, CUIL, empleador ni período. El artefacto reutilizable conserva la clase Restricted del PDF, no tiene endpoint de descarga y se elimina durablemente con el original.
 
 ### Cola
 
