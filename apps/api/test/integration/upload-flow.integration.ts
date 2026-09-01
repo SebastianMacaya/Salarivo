@@ -3678,6 +3678,10 @@ test("upload privado crea un único documento y un único intent durable", async
     { outcome: "REVIEW_REQUIRED", status: "REVIEW_REQUIRED" },
   );
   const reprocessedRunId = reprocessedRun.rows[0]!.id;
+  await pool.query(
+    "UPDATE extraction_runs SET status = 'COMPLETED' WHERE id = $1",
+    [reprocessedRunId],
+  );
   const pendingReprocessingReviews = await app.inject({
     method: "GET",
     url: "/api/v1/documents?statusGroup=REVIEW",

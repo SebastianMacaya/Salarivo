@@ -396,7 +396,7 @@ const documentProjectionJoin = `
 
 const processingRunDecisionRequiredSql = (runAlias: "review_run" | "run") => `(
   ${runAlias}.id IS DISTINCT FROM document.active_extraction_run_id
-  AND ${runAlias}.status = 'REVIEW_REQUIRED'
+  AND ${runAlias}.status IN ('COMPLETED', 'COMPLETED_WITH_WARNINGS', 'REVIEW_REQUIRED')
   AND ${runAlias}.promotion_outcome = 'REVIEW_REQUIRED'
   AND ${runAlias}.pipeline_fingerprint = '${currentPipelineFingerprint}'
   AND ${runAlias}.base_extraction_run_id IS NOT DISTINCT FROM document.active_extraction_run_id

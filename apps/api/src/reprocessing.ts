@@ -429,7 +429,7 @@ export async function loadProcessingAnalysis(client: PoolClient, userId: string,
             ) AS has_active_job,
             (run.id = document.active_extraction_run_id) AS active,
             (run.id IS DISTINCT FROM document.active_extraction_run_id
-              AND run.status = 'REVIEW_REQUIRED'
+              AND run.status IN ('COMPLETED', 'COMPLETED_WITH_WARNINGS', 'REVIEW_REQUIRED')
               AND run.promotion_outcome = 'REVIEW_REQUIRED'
               AND run.pipeline_fingerprint = $3
               AND run.base_extraction_run_id IS NOT DISTINCT FROM document.active_extraction_run_id
@@ -695,8 +695,7 @@ export async function promoteProcessingRun(
     throw new ApiError(409, "RUN_NOT_PROMOTABLE", "El análisis todavía no puede activarse.");
   }
   if (input.requireReviewCandidate === true && (
-    run.rows[0].status !== "REVIEW_REQUIRED"
-    || run.rows[0].promotion_outcome !== "REVIEW_REQUIRED"
+    run.rows[0].promotion_outcome !== "REVIEW_REQUIRED"
     || (input.decision === "PROMOTE"
       && String(run.rows[0].base_extraction_run_id) !== String(input.expectedActiveRunId))
     || run.rows[0].pipeline_fingerprint !== currentPipelineFingerprint
