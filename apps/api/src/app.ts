@@ -55,6 +55,7 @@ type AuthUser = {
   authState: "AUTHENTICATED" | "MFA_REQUIRED" | "MFA_SETUP_REQUIRED";
   mfaEnabled: boolean;
   onboardingCompleted: boolean;
+  legalAcceptanceRequired: boolean;
   authMethods: "GOOGLE"[];
 };
 
@@ -185,7 +186,7 @@ const userSchema = {
   additionalProperties: false,
   required: [
     "id", "email", "displayName", "role", "adminRole", "permissions", "createdAt", "authState", "mfaEnabled",
-    "onboardingCompleted", "authMethods",
+    "onboardingCompleted", "legalAcceptanceRequired", "authMethods",
   ],
   properties: {
     id: { type: "string", pattern: UUID_PATTERN },
@@ -198,6 +199,7 @@ const userSchema = {
     authState: { type: "string", enum: ["AUTHENTICATED", "MFA_REQUIRED", "MFA_SETUP_REQUIRED"] },
     mfaEnabled: { type: "boolean" },
     onboardingCompleted: { type: "boolean" },
+    legalAcceptanceRequired: { type: "boolean" },
     authMethods: {
       type: "array",
       uniqueItems: true,
@@ -360,6 +362,7 @@ function userFrom(row: Record<string, unknown>): AuthUser {
     authState,
     mfaEnabled,
     onboardingCompleted: row.onboarding_completed_at !== null && row.onboarding_completed_at !== undefined,
+    legalAcceptanceRequired: row.legal_documents_acknowledged !== true,
     authMethods,
   };
 }
@@ -664,6 +667,20 @@ export async function buildApp(
               ) AS google_enabled,
               s.mfa_verified_at, s.step_up_expires_at,
               s.last_seen_at <= now() - interval '5 minutes' AS activity_touch_due,
+              (
+                SELECT count(*) = 2
+                  FROM (
+                    SELECT DISTINCT ON (version.document_type) version.id
+                      FROM legal_document_versions AS version
+                     WHERE version.document_type IN ('TERMS', 'PRIVACY_NOTICE')
+                       AND version.locale = 'es-AR'
+                       AND version.published_at <= now() AND version.effective_at <= now()
+                     ORDER BY version.document_type, version.effective_at DESC, version.published_at DESC
+                  ) AS current_version
+                  JOIN legal_acknowledgements AS acknowledgement
+                    ON acknowledgement.document_version_id = current_version.id
+                   AND acknowledgement.user_id = u.id
+              ) AS legal_documents_acknowledged,
               EXISTS (
                 SELECT 1 FROM mfa_factors factor
                  WHERE factor.user_id = u.id AND factor.status = 'ACTIVE'
@@ -698,13 +715,27 @@ export async function buildApp(
       && new Date(result.rows[0].step_up_expires_at) > new Date();
   }
 
-  async function requireAuth(request: FastifyRequest): Promise<void> {
+  async function requireAssuredAuth(request: FastifyRequest): Promise<void> {
     await requirePrimaryAuth(request);
     if (request.authUser!.authState === "MFA_REQUIRED") {
       throw new ApiError(403, "MFA_REQUIRED", "Ingresá el código de tu segundo factor para continuar.");
     }
     if (request.authUser!.authState === "MFA_SETUP_REQUIRED") {
       throw new ApiError(403, "MFA_SETUP_REQUIRED", "Configurá el segundo factor para continuar.");
+    }
+  }
+
+  async function requireAuth(request: FastifyRequest): Promise<void> {
+    await requireAssuredAuth(request);
+    if (request.authUser!.legalAcceptanceRequired) {
+      throw new ApiError(403, "LEGAL_ACCEPTANCE_REQUIRED", "Revisá y aceptá los documentos legales vigentes para continuar.");
+    }
+  }
+
+  async function requireAssuredStepUp(request: FastifyRequest): Promise<void> {
+    await requireAssuredAuth(request);
+    if (!request.authStepUp) {
+      throw new ApiError(403, "STEP_UP_REQUIRED", "Confirmá tu identidad para continuar.");
     }
   }
 
@@ -829,6 +860,72 @@ export async function buildApp(
     async (request) => ({ data: request.authUser }),
   );
 
+  app.post<{
+    Body: {
+      acceptedTerms: true;
+      acknowledgedPrivacy: true;
+      termsVersion: string;
+      privacyVersion: string;
+    };
+  }>(
+    "/api/v1/auth/legal-acknowledgements",
+    {
+      preHandler: requireAssuredAuth,
+      config: { rateLimit: { max: 10, timeWindow: "15 minutes" } },
+      schema: {
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["acceptedTerms", "acknowledgedPrivacy", "termsVersion", "privacyVersion"],
+          properties: {
+            acceptedTerms: { type: "boolean", const: true },
+            acknowledgedPrivacy: { type: "boolean", const: true },
+            termsVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+            privacyVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+          },
+        },
+        response: responses(200, userSchema),
+      },
+    },
+    async (request) => {
+      await withTransaction(async (client) => {
+        const legalDocuments = await client.query(
+          `SELECT DISTINCT ON (document_type) id, document_type, version, requires_acceptance, approved_for_production
+             FROM legal_document_versions
+            WHERE document_type IN ('TERMS', 'PRIVACY_NOTICE')
+              AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
+            ORDER BY document_type, effective_at DESC, published_at DESC`,
+        );
+        const { terms, privacy } = validateRegistrationLegalDocuments(config.appEnv, legalDocuments.rows);
+        if (
+          request.body.termsVersion !== String(terms.version)
+          || request.body.privacyVersion !== String(privacy.version)
+        ) {
+          throw new ApiError(409, "LEGAL_DOCUMENTS_CHANGED", "Los documentos legales cambiaron. Revisá las versiones vigentes antes de continuar.");
+        }
+        const inserted = await client.query(
+          `INSERT INTO legal_acknowledgements (user_id, document_version_id)
+           SELECT $1, unnest($2::uuid[])
+           ON CONFLICT DO NOTHING
+           RETURNING document_version_id`,
+          [request.authUser!.id, [terms.id, privacy.id]],
+        );
+        if (inserted.rowCount) {
+          await client.query(
+            `INSERT INTO audit_events (
+               id, user_id, actor_user_id, action, resource_type, resource_id, result, metadata_no_sensitive
+             ) VALUES ($1, $2, $2, 'LEGAL_DOCUMENTS_RECORDED', 'ACCOUNT', $2, 'SUCCESS', $3::jsonb)`,
+            [randomUUID(), request.authUser!.id, JSON.stringify({
+              termsAcceptedVersion: terms.version,
+              privacyAcknowledgedVersion: privacy.version,
+            })],
+          );
+        }
+      });
+      return { data: { ...request.authUser!, legalAcceptanceRequired: false } };
+    },
+  );
+
   app.post(
     "/api/v1/auth/onboarding/complete",
     {
@@ -860,7 +957,7 @@ export async function buildApp(
   app.get(
     "/api/v1/auth/sessions",
     {
-      preHandler: requireAuth,
+      preHandler: requireAssuredAuth,
       schema: { response: responses(200, { type: "array", items: sessionSchema }) },
     },
     async (request) => {
@@ -879,7 +976,7 @@ export async function buildApp(
   app.delete<{ Params: IdParams }>(
     "/api/v1/auth/sessions/:id",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAssuredStepUp,
       schema: {
         params: idParamsSchema,
         response: responses(200, {
@@ -932,7 +1029,7 @@ export async function buildApp(
   app.post(
     "/api/v1/auth/sessions/revoke-others",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAssuredStepUp,
       schema: {
         response: responses(200, {
           type: "object",
@@ -986,8 +1083,8 @@ export async function buildApp(
     config,
     ApiError,
     requirePrimaryAuth,
-    requireAuth,
-    requireStepUp,
+    requireAssuredAuth,
+    requireAssuredStepUp,
     setSession,
     userSchema,
   });
@@ -1713,6 +1810,8 @@ export async function buildApp(
     config,
     requireAuth,
     requireStepUp,
+    requireAssuredAuth,
+    requireAssuredStepUp,
     ApiError,
     provisionStorage: options.provisionStorage ?? config.appEnv !== "test",
     ...(options.storage ? { storage: options.storage } : {}),

@@ -545,6 +545,23 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
           );
         }
 
+        const legalStatus = await client.query(
+          `SELECT count(*) = 2 AS acknowledged
+             FROM (
+               SELECT DISTINCT ON (version.document_type) version.id
+                 FROM legal_document_versions AS version
+                WHERE version.document_type IN ('TERMS', 'PRIVACY_NOTICE')
+                  AND version.locale = 'es-AR'
+                  AND version.published_at <= now() AND version.effective_at <= now()
+                ORDER BY version.document_type, version.effective_at DESC, version.published_at DESC
+             ) AS current_version
+             JOIN legal_acknowledgements AS acknowledgement
+               ON acknowledgement.document_version_id = current_version.id
+              AND acknowledgement.user_id = $1`,
+          [row.id],
+        );
+        row.legal_documents_acknowledged = legalStatus.rows[0]?.acknowledged === true;
+
         await client.query(
           `INSERT INTO sessions (
              id, user_id, token_hash, expires_at, device_type, browser_family, os_family

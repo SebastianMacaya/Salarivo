@@ -19,8 +19,8 @@ type Options = {
   config: ApiConfig;
   ApiError: ErrorConstructor;
   requirePrimaryAuth: (request: FastifyRequest) => Promise<void>;
-  requireAuth: (request: FastifyRequest) => Promise<void>;
-  requireStepUp: (request: FastifyRequest) => Promise<void>;
+  requireAssuredAuth: (request: FastifyRequest) => Promise<void>;
+  requireAssuredStepUp: (request: FastifyRequest) => Promise<void>;
   setSession: (reply: FastifyReply, token: string) => void;
   userSchema: object;
 };
@@ -58,7 +58,7 @@ async function audit(client: PoolClient, userId: string, action: string, factorI
 type Verification = { ok: true; factorId: string } | { ok: false; locked: boolean } | { ok: false; missing: true };
 
 export async function registerMfaRoutes(app: FastifyInstance, options: Options): Promise<void> {
-  const { config, ApiError, requirePrimaryAuth, requireAuth, requireStepUp, setSession, userSchema } = options;
+  const { config, ApiError, requirePrimaryAuth, requireAssuredAuth, requireAssuredStepUp, setSession, userSchema } = options;
 
   async function verifyFactor(client: PoolClient, userId: string, code: string): Promise<Verification> {
     const result = await client.query(
@@ -381,7 +381,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
   app.post<{ Body: CodeBody }>(
     "/api/v1/auth/step-up",
     {
-      preHandler: requireAuth,
+      preHandler: requireAssuredAuth,
       config: { rateLimit: { max: 10, timeWindow: "15 minutes" } },
       schema: {
         body: codeBodySchema,
@@ -413,7 +413,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
   app.post(
     "/api/v1/auth/mfa/recovery-codes",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAssuredStepUp,
       schema: {
         response: {
           200: envelope({
@@ -456,7 +456,7 @@ export async function registerMfaRoutes(app: FastifyInstance, options: Options):
   app.delete(
     "/api/v1/auth/mfa",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAssuredStepUp,
       schema: { response: { 200: envelope({ type: "null" }) } },
     },
     async (request, reply) => {

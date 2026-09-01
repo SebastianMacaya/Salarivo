@@ -51,6 +51,8 @@ type RegisterOptions = {
   config: ApiConfig;
   requireAuth: (request: FastifyRequest) => Promise<void>;
   requireStepUp: (request: FastifyRequest) => Promise<void>;
+  requireAssuredAuth: (request: FastifyRequest) => Promise<void>;
+  requireAssuredStepUp: (request: FastifyRequest) => Promise<void>;
   ApiError: ErrorConstructor;
   provisionStorage: boolean;
   storage?: Storage;
@@ -1130,7 +1132,7 @@ function privacyExportStream(
 }
 
 export async function registerDataRoutes(app: FastifyInstance, options: RegisterOptions) {
-  const { config, requireAuth, requireStepUp, ApiError } = options;
+  const { config, requireAuth, requireStepUp, requireAssuredAuth, requireAssuredStepUp, ApiError } = options;
   const sessionCookie = sessionCookieName(config.appEnv);
   const rateKey = (request: FastifyRequest) => authenticatedRateKey(request, sessionCookie);
   const storage = options.storage ?? createStorage(config);
@@ -3830,7 +3832,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   app.post(
     "/api/v1/privacy/exports",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAssuredStepUp,
       config: { rateLimit: { max: 3, timeWindow: "15 minutes", keyGenerator: rateKey } },
     },
     async (request, reply) => {
@@ -3904,7 +3906,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
 
   app.get<{ Params: IdParams }>(
     "/api/v1/privacy/exports/:id",
-    { preHandler: requireAuth, schema: { params: idParamsSchema } },
+    { preHandler: requireAssuredAuth, schema: { params: idParamsSchema } },
     async (request) => {
       let result = await pool.query(
         `SELECT id, status, output_expires_at, created_at, updated_at, started_at, completed_at
@@ -3952,7 +3954,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   app.get<{ Params: IdParams }>(
     "/api/v1/privacy/exports/:id/download",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAssuredStepUp,
       config: { rateLimit: { max: 2, timeWindow: "15 minutes", keyGenerator: rateKey } },
       onResponse: async (request, reply) => {
         await settleExport(
@@ -4094,7 +4096,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
   app.delete<{ Body: { confirmation: string; receiptToken: string } }>(
     "/api/v1/privacy/account",
     {
-      preHandler: requireStepUp,
+      preHandler: requireAssuredStepUp,
       config: { rateLimit: { max: 3, timeWindow: "15 minutes", keyGenerator: rateKey } },
       schema: {
         body: {

@@ -54,6 +54,7 @@ type User = {
   authState: 'AUTHENTICATED' | 'MFA_REQUIRED' | 'MFA_SETUP_REQUIRED';
   mfaEnabled: boolean;
   onboardingCompleted: boolean;
+  legalAcceptanceRequired: boolean;
   authMethods: 'GOOGLE'[];
 };
 type MfaStatus = {
@@ -331,6 +332,12 @@ class ApiError extends Error {
   }
 }
 
+const LEGAL_ACCEPTANCE_REQUIRED_EVENT = 'salarivo:legal-acceptance-required';
+
+function notifyLegalAcceptanceRequired(code: string) {
+  if (code === 'LEGAL_ACCEPTANCE_REQUIRED') window.dispatchEvent(new Event(LEGAL_ACCEPTANCE_REQUIRED_EVENT));
+}
+
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_ROOT}${path}`, {
     ...init,
@@ -350,9 +357,18 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       ? body.error
       : body.error?.message ?? 'No pudimos completar la operación.';
     const code = typeof body.error === 'string' ? 'REQUEST_FAILED' : body.error?.code ?? 'REQUEST_FAILED';
+    notifyLegalAcceptanceRequired(code);
     throw new ApiError(message, response.status, code);
   }
   return (Object.prototype.hasOwnProperty.call(body, 'data') ? body.data : body) as T;
+}
+
+async function loadLegalVersions() {
+  const [terms, privacy] = await Promise.all([
+    api<LegalSummary>('/legal/terms', { cache: 'no-store' }),
+    api<LegalSummary>('/legal/privacy', { cache: 'no-store' }),
+  ]);
+  return { terms: terms.version, privacy: privacy.version };
 }
 
 async function redirectToGoogle(path: '/auth/google/start' | '/auth/google/step-up/start') {
@@ -370,7 +386,9 @@ async function downloadApiFile(path: string, filename: string) {
   const response = await fetch(apiUrl(path), { credentials: 'include' });
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as { error?: { code?: string; message?: string } };
-    throw new ApiError(body.error?.message ?? 'No pudimos descargar la exportación.', response.status, body.error?.code ?? 'REQUEST_FAILED');
+    const code = body.error?.code ?? 'REQUEST_FAILED';
+    notifyLegalAcceptanceRequired(code);
+    throw new ApiError(body.error?.message ?? 'No pudimos descargar la exportación.', response.status, code);
   }
   const url = URL.createObjectURL(await response.blob());
   const anchor = document.createElement('a');
@@ -551,6 +569,14 @@ export function SalarivoApp() {
   const [authNotice, setAuthNotice] = useState('');
 
   useEffect(() => {
+    const requireLegalAcceptance = () => setUser((current) => current
+      ? { ...current, legalAcceptanceRequired: true }
+      : current);
+    window.addEventListener(LEGAL_ACCEPTANCE_REQUIRED_EVENT, requireLegalAcceptance);
+    return () => window.removeEventListener(LEGAL_ACCEPTANCE_REQUIRED_EVENT, requireLegalAcceptance);
+  }, []);
+
+  useEffect(() => {
     let stopped = false;
     const auth = new URLSearchParams(window.location.search).get('auth');
 
@@ -614,6 +640,14 @@ export function SalarivoApp() {
       user={user}
       onAuthenticated={setUser}
       onLogout={() => setUser(null)}
+    />;
+  }
+  if (user.legalAcceptanceRequired) {
+    return <LegalAcceptanceScreen
+      user={user}
+      onAccepted={setUser}
+      onLogout={() => setUser(null)}
+      onDeletionRequested={(token, source) => { setDeletionReceiptEntry({ token, source }); setUser(null); }}
     />;
   }
   if (!user.onboardingCompleted) {
@@ -868,6 +902,101 @@ function OnboardingScreen({ user, onComplete, onLogout }: { user: User; onComple
   );
 }
 
+function LegalAcceptanceScreen({ user, onAccepted, onLogout, onDeletionRequested }: {
+  user: User;
+  onAccepted: (user: User) => void;
+  onLogout: () => void;
+  onDeletionRequested: (token: string, source: 'accepted' | 'ambiguous') => void;
+}) {
+  const [versions, setVersions] = useState<{ terms: string; privacy: string } | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [manageData, setManageData] = useState(false);
+  const sensitiveActions = useSensitiveActions();
+
+  useEffect(() => {
+    loadLegalVersions()
+      .then(setVersions)
+      .catch(() => setError('No pudimos cargar los documentos legales vigentes.'));
+  }, []);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    if (!versions) return;
+    setError(''); setBusy(true);
+    try {
+      onAccepted(await api<User>('/auth/legal-acknowledgements', {
+        method: 'POST',
+        body: JSON.stringify({
+          acceptedTerms: true,
+          acknowledgedPrivacy: true,
+          termsVersion: versions.terms,
+          privacyVersion: versions.privacy,
+        }),
+      }));
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.code === 'LEGAL_DOCUMENTS_CHANGED') {
+        try {
+          setVersions(await loadLegalVersions());
+          formElement.reset();
+        } catch {
+          setVersions(null);
+        }
+      }
+      setError(caught instanceof Error ? caught.message : 'No pudimos registrar tu decisión.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function logout() {
+    setError(''); setBusy(true);
+    try { await api('/auth/logout', { method: 'POST', body: '{}' }); onLogout(); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'No pudimos cerrar la sesión.'); }
+    finally { setBusy(false); }
+  }
+
+  if (manageData) {
+    return <div>
+      <main className="page narrow-page settings-page" inert={sensitiveActions.open ? true : undefined} aria-hidden={sensitiveActions.open || undefined}>
+        <header className="legal-header"><Brand /><button type="button" className="text-button" onClick={() => setManageData(false)}>Volver a los documentos</button></header>
+        <PageHeader eyebrow="Tus derechos" title="Gestionar mis datos" />
+        <p className="page-intro">Podés exportar tus datos o eliminar tu cuenta sin aceptar los documentos nuevos.</p>
+        <PrivacySettings runSensitive={sensitiveActions.runSensitive} />
+        <AccountSettings user={user} runSensitive={sensitiveActions.runSensitive} onDeletionRequested={onDeletionRequested} />
+        <button type="button" className="text-button" disabled={busy} onClick={logout}>Cerrar sesión</button>
+      </main>
+      {sensitiveActions.open && <StepUpDialog
+        mfaEnabled={Boolean(user.mfaEnabled)}
+        onClose={() => sensitiveActions.finish(false)}
+        onComplete={() => sensitiveActions.finish(true)}
+        returnFocus={sensitiveActions.returnFocus}
+      />}
+    </div>;
+  }
+
+  return (
+    <main className="access-layout">
+      <section className="access-story"><Brand /><div><p className="eyebrow">Tus datos, bajo tu control</p><h1>Actualizamos los documentos legales.</h1><p className="lead">Revisá las versiones vigentes antes de seguir usando Salarivo.</p></div></section>
+      <section className="access-panel" aria-labelledby="legal-acceptance-title"><div className="access-card stack-form">
+        <p className="eyebrow">{user.email}</p>
+        <h2 id="legal-acceptance-title">Revisá y aceptá los cambios</h2>
+        <form onSubmit={submit} className="stack-form">
+          <div className="legal-checks">
+            <div className="legal-check"><input id="accepted-current-terms" name="acceptedTerms" type="checkbox" required /><span><label htmlFor="accepted-current-terms">Acepto los Términos de uso{versions ? ` v${versions.terms}` : ''}.</label> <a href={versions ? `/terms?version=${encodeURIComponent(versions.terms)}` : '/terms'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
+            <div className="legal-check"><input id="acknowledged-current-privacy" name="acknowledgedPrivacy" type="checkbox" required /><span><label htmlFor="acknowledged-current-privacy">Confirmo que leí el Aviso de privacidad{versions ? ` v${versions.privacy}` : ''}.</label> <a href={versions ? `/privacy?version=${encodeURIComponent(versions.privacy)}` : '/privacy'} target="_blank" rel="noreferrer">Leer documento</a></span></div>
+          </div>
+          {error && <p className="message error" role="alert">{error}</p>}
+          <button className="button primary" disabled={busy || !versions}>{busy ? 'Guardando…' : 'Aceptar y continuar'}</button>
+        </form>
+        <button type="button" className="text-button" disabled={busy} onClick={() => setManageData(true)}>Gestionar mis datos sin aceptar</button>
+        <button className="text-button" disabled={busy} onClick={logout}>Cerrar sesión</button>
+      </div></section>
+    </main>
+  );
+}
+
 type AccessMode = 'login' | 'google-register' | 'deletion';
 
 function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegistrationCancelled, onReceiptToken }: {
@@ -886,8 +1015,8 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
   const legalRegistration = mode === 'google-register';
 
   useEffect(() => {
-    Promise.all([api<LegalSummary>('/legal/terms'), api<LegalSummary>('/legal/privacy')])
-      .then(([terms, privacy]) => setLegalVersions({ terms: terms.version, privacy: privacy.version }))
+    loadLegalVersions()
+      .then(setLegalVersions)
       .catch(() => setLegalError('No pudimos cargar los documentos legales vigentes.'));
   }, []);
 
@@ -928,8 +1057,7 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
     } catch (caught) {
       if (legalRegistration && caught instanceof ApiError && caught.status === 409) {
         try {
-          const [terms, privacy] = await Promise.all([api<LegalSummary>('/legal/terms'), api<LegalSummary>('/legal/privacy')]);
-          setLegalVersions({ terms: terms.version, privacy: privacy.version });
+          setLegalVersions(await loadLegalVersions());
           formElement.reset();
         } catch {
           setLegalError('No pudimos actualizar los documentos legales vigentes.');
@@ -974,6 +1102,7 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
           </form>
           <div className="access-actions">
             {mode === 'login' ? <button className="text-button" onClick={() => changeMode('deletion')}>Consultar una eliminación</button> : <button className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
+            <span><a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> · <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a></span>
           </div>
         </div>
       </section>
@@ -992,6 +1121,35 @@ const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'settings', label: 'Configuración', icon: '⚙' },
 ];
 
+function useSensitiveActions() {
+  const gate = useRef<StepUpGate | null>(null);
+  const returnFocus = useRef<HTMLElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const runSensitive = useCallback<RunSensitive>(async (action) => {
+    const callerFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    for (;;) {
+      try { await action(); return; }
+      catch (caught) {
+        if (!(caught instanceof ApiError) || caught.code !== 'STEP_UP_REQUIRED') throw caught;
+        if (document.fullscreenElement) await document.exitFullscreen().catch(() => undefined);
+        if (!gate.current) {
+          returnFocus.current = callerFocus;
+          gate.current = createStepUpGate();
+          setOpen(true);
+        }
+        if (!await gate.current.promise) return;
+      }
+    }
+  }, []);
+  const finish = useCallback((approved: boolean) => {
+    const current = gate.current;
+    gate.current = null;
+    setOpen(false);
+    current?.complete(approved);
+  }, []);
+  return { finish, open, returnFocus: returnFocus.current, runSensitive };
+}
+
 function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLogout, onDeletionRequested }: {
   user: User;
   authNotice: string;
@@ -1008,9 +1166,7 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
   const [menuOpen, setMenuOpen] = useState(false);
   const [mobileNavigation, setMobileNavigation] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-  const stepUpGate = useRef<StepUpGate | null>(null);
-  const stepUpReturnFocus = useRef<HTMLElement | null>(null);
-  const [stepUpOpen, setStepUpOpen] = useState(false);
+  const sensitiveActions = useSensitiveActions();
   const [importBusy, setImportBusy] = useState(false);
   const [logoutError, setLogoutError] = useState('');
   const [logoutBusy, setLogoutBusy] = useState(false);
@@ -1083,30 +1239,6 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
     setSection('history');
   }, []);
 
-  const runSensitive = useCallback<RunSensitive>(async (action) => {
-    const callerFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    for (;;) {
-      try { await action(); return; }
-      catch (caught) {
-        if (!(caught instanceof ApiError) || caught.code !== 'STEP_UP_REQUIRED') throw caught;
-        if (document.fullscreenElement) await document.exitFullscreen().catch(() => undefined);
-        if (!stepUpGate.current) {
-          stepUpReturnFocus.current = callerFocus;
-          stepUpGate.current = createStepUpGate();
-          setStepUpOpen(true);
-        }
-        if (!await stepUpGate.current.promise) return;
-      }
-    }
-  }, []);
-
-  const finishStepUp = useCallback((approved: boolean) => {
-    const gate = stepUpGate.current;
-    stepUpGate.current = null;
-    setStepUpOpen(false);
-    gate?.complete(approved);
-  }, []);
-
   async function logout() {
     setLogoutError(''); setLogoutBusy(true);
     try {
@@ -1118,7 +1250,7 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
 
   return (
     <div className="app-shell">
-      <aside id="private-navigation" className={menuOpen ? 'sidebar open' : 'sidebar'} inert={stepUpOpen || (mobileNavigation && !menuOpen) ? true : undefined} aria-hidden={stepUpOpen || (mobileNavigation && !menuOpen) || undefined}>
+      <aside id="private-navigation" className={menuOpen ? 'sidebar open' : 'sidebar'} inert={sensitiveActions.open || (mobileNavigation && !menuOpen) ? true : undefined} aria-hidden={sensitiveActions.open || (mobileNavigation && !menuOpen) || undefined}>
         <div className="sidebar-head"><Brand /><button className="icon-button mobile-only" onClick={() => setMenuOpen(false)} aria-label="Cerrar menú">×</button></div>
         <nav aria-label="Navegación principal">
           {visibleSections.map((item) => <button key={item.id} className={section === item.id ? 'nav-item active' : 'nav-item'} aria-current={section === item.id ? 'page' : undefined} disabled={importBusy} onClick={() => { navigate(item.id); setMenuOpen(false); }}><span aria-hidden="true">{item.icon}</span>{item.label}</button>)}
@@ -1133,20 +1265,20 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
         </div>
       </aside>
       {menuOpen && <button className="backdrop" aria-label="Cerrar menú" onClick={() => setMenuOpen(false)} />}
-      <main className="content" inert={stepUpOpen ? true : undefined} aria-hidden={stepUpOpen || undefined}>
+      <main className="content" inert={sensitiveActions.open ? true : undefined} aria-hidden={sensitiveActions.open || undefined}>
         <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú" aria-expanded={menuOpen} aria-controls="private-navigation">☰</button><Brand /><PrivacyToggle /></header>
         {authNotice && <p className="message success" aria-live="polite">{authNotice} <button type="button" className="text-button" onClick={onAuthNoticeDismiss}>Cerrar</button></p>}
         {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={navigate} />}
-        {section === 'jobs' && <Employments key={refreshKey} selectedLocation={ownerLocation} onNavigate={navigate} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={runSensitive} />}
+        {section === 'jobs' && <Employments key={refreshKey} selectedLocation={ownerLocation} onNavigate={navigate} onChanged={() => setRefreshKey((n) => n + 1)} runSensitive={sensitiveActions.runSensitive} />}
         {section === 'import' && <Importer onBusyChange={setImportBusy} onDone={() => setRefreshKey((n) => n + 1)} />}
-        {section === 'history' && <History key={refreshKey} initialLocation={ownerLocation} onLocationChange={updateHistoryLocation} runSensitive={runSensitive} />}
-        {section === 'settings' && <Settings user={user} onUserChanged={onUserChanged} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} />}
+        {section === 'history' && <History key={refreshKey} initialLocation={ownerLocation} onLocationChange={updateHistoryLocation} runSensitive={sensitiveActions.runSensitive} />}
+        {section === 'settings' && <Settings user={user} onUserChanged={onUserChanged} runSensitive={sensitiveActions.runSensitive} onDeletionRequested={onDeletionRequested} />}
       </main>
-      {stepUpOpen && <StepUpDialog
+      {sensitiveActions.open && <StepUpDialog
         mfaEnabled={Boolean(user.mfaEnabled)}
-        onClose={() => finishStepUp(false)}
-        onComplete={() => finishStepUp(true)}
-        returnFocus={stepUpReturnFocus.current}
+        onClose={() => sensitiveActions.finish(false)}
+        onComplete={() => sensitiveActions.finish(true)}
+        returnFocus={sensitiveActions.returnFocus}
       />}
     </div>
   );
@@ -3241,6 +3373,11 @@ function AccountSettings({ user, runSensitive, onDeletionRequested }: {
           });
           onDeletionRequested(receiptToken, 'accepted');
         } catch (caught) {
+          if (caught instanceof ApiError && caught.code === 'STEP_UP_REQUIRED') {
+            if (dialog.current?.open) dialog.current.close();
+            setOpen(false);
+            throw caught;
+          }
           if (!(caught instanceof ApiError) || caught.status >= 500) onDeletionRequested(receiptToken, 'ambiguous');
           else throw caught;
         }

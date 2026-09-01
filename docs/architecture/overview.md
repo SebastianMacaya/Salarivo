@@ -127,7 +127,7 @@ Recursos iniciales:
 
 | Recurso | Operaciones MVP |
 | --- | --- |
-| auth | alta e inicio/callback Google, onboarding, logout, listado y revocación owner-only de sesiones, MFA y step-up |
+| auth | alta e inicio/callback Google, aceptación y reaceptación legal versionada, onboarding, logout, listado y revocación owner-only de sesiones, MFA y step-up |
 | upload-sessions | crear y confirmar upload |
 | imports | crear, consultar, recuperar el lote activo y cancelar uploads pendientes; pausa/reanudación quedan pendientes |
 | documents | listar, consultar, asociar masivamente a un empleo, corregir, cerrar revisión, eliminar, confirmar tipo, reprocesar y consultar/decidir historial de corridas |
@@ -158,6 +158,8 @@ Google usa OIDC Authorization Code con PKCE, `state` y `nonce`; el callback es `
 La respuesta válida se resuelve por `(provider, sub)` en `auth_accounts`. El email recibido es un atributo verificable del perfil, no una clave de login ni de vinculación: una colisión nunca auto-vincula una cuenta. No se persisten access, refresh ni ID tokens. Google termina en el UUID y la sesión opaca interna ya usados por los guards y por ownership.
 
 Para una identidad nueva, el callback deja un onboarding pendiente, pero no crea una cuenta activa. El segundo paso crea usuario, aceptación legal, `auth_account`, sesión y auditoría en una única transacción. `BLOCKED` y `SUSPENDED` fallan cerrados. En una cuenta Google-only, el step-up inicia otra autorización con selección explícita de la misma cuenta, ligada a la sesión actual, y rota esa sesión cuando termina; la persona también puede revocar el resto de sus sesiones. [ADR 0010](../adr/0010-google-oidc-and-external-identities.md) conserva sin cambios el modelo de ownership.
+
+Cada sesión compara sus constancias con las dos versiones legales vigentes. Si falta alguna, MFA, step-up, sesiones, exportación y eliminación siguen disponibles, pero los recursos del producto responden `LEGAL_ACCEPTANCE_REQUIRED`. La reaceptación resuelve nuevamente las versiones en servidor y escribe evidencia append-only e idempotente; nunca altera una constancia previa.
 
 El titular puede listar sus sesiones activas y revocar una distinta de la actual o todas las demás. La API determina la sesión actual desde el token opaco ya autenticado y vuelve a validar ownership y step-up al revocar; nunca acepta un `userId` del navegador. La metadata visible se reduce a categorías allowlisted de dispositivo, navegador y sistema operativo, sin guardar user-agent crudo, versiones, IP, ubicación o fingerprint.
 

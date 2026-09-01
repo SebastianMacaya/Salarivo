@@ -86,6 +86,19 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
      VALUES ($1, $2, 'GOOGLE', $3)`,
     [randomUUID(), userId, `admin-employers-${suffix}`],
   );
+  const acknowledgements = await pool.query(
+    `INSERT INTO legal_acknowledgements (user_id, document_version_id)
+     SELECT $1, version.id
+       FROM (
+         SELECT DISTINCT ON (document_type) id, document_type
+           FROM legal_document_versions
+          WHERE document_type IN ('TERMS', 'PRIVACY_NOTICE')
+            AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
+          ORDER BY document_type, effective_at DESC, published_at DESC
+       ) AS version`,
+    [userId],
+  );
+  assert.equal(acknowledgements.rowCount, 2);
   await pool.query(
     `INSERT INTO sessions (
        id, user_id, token_hash, expires_at, mfa_verified_at, step_up_expires_at

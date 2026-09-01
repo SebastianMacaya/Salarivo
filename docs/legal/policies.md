@@ -6,6 +6,8 @@ Las versiones que muestra el producto viven en `legal_document_versions` y se cr
 
 Al registrar una cuenta, la API resuelve del lado servidor los Términos y el Aviso vigentes para `es-AR`. No se exponen alta, login ni recuperación por email y contraseña. En Google, el callback verifica la identidad y deja un intento de registro breve ligado al navegador, pero no crea una cuenta activa: el segundo paso crea usuario, aceptación/confirmación, relación `(provider, sub)`, sesión y auditoría en una sola transacción, con onboarding todavía pendiente. No se confía en un ID/version enviado por el navegador.
 
+El producto ya implementa la reaceptación necesaria para una versión posterior: si falta cualquiera de las dos constancias vigentes, la sesión conserva MFA, step-up, gestión de sesiones, exportación y baja, pero no puede usar el resto del producto hasta aceptar los Términos y confirmar el Aviso mostrados. El servidor vuelve a resolver ambas versiones, rechaza cambios concurrentes y registra sólo constancias nuevas; un reintento no duplica la auditoría. Este mecanismo no regulariza la operación actual mientras la 1.0 siga siendo la versión publicada.
+
 Google actúa sólo como proveedor de autenticación. Salarivo mantiene un UUID y una sesión propios, no usa el email para identificar ni auto-vincular cuentas y no persiste access, refresh ni ID tokens. La versión 1.0 describe este destinatario y flujo mínimo de datos y fue aprobada expresamente para la instancia privada; esa aprobación no autoriza abrir cuentas al público.
 
 La versión 1.0 limita expresamente su alcance al titular y distingue tres usos:
