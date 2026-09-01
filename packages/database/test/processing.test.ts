@@ -25,11 +25,11 @@ const completeSnapshot: ProcessingSnapshot = {
   issueCodes: [],
 };
 
-test("the catalog matches the parser 6 basic-layout fix", () => {
+test("the catalog matches the parser 7 basic-layout fix", () => {
   assert.deepEqual(processingPipelineVersions, {
     classifier: "6",
     extractor: "6",
-    parser: "6",
+    parser: "7",
     normalizer: "6",
     resultSchema: "1",
   });
@@ -37,7 +37,7 @@ test("the catalog matches the parser 6 basic-layout fix", () => {
   assert.deepEqual(parserFixCatalog, [{
     issueCode: "LABEL_OR_LAYOUT_NOT_RECOGNIZED",
     affectedFieldPath: "settlement.basicAmount",
-    introducedInParserVersion: "6",
+    introducedInParserVersion: "7",
   }]);
 });
 
@@ -45,7 +45,7 @@ test("migration 020 fences pre-versioning workers", () => {
   const migration = readFileSync(new URL("../migrations/020_versioned_reprocessing.sql", import.meta.url), "utf8");
   assert.ok(migration.includes("PROCESSING_WORKER_DRAIN_REQUIRED"));
   assert.ok(migration.includes("DOCUMENT_PIPELINE_V2"));
-  assert.ok(migration.includes(currentPipelineFingerprint));
+  assert.ok(migration.includes("c4a5bc3169eed176ddfe8b26239c5b496a4c36901827145a4b60c67c6ad92f41"));
 });
 
 test("basic amount is critical only for normal settlements", () => {

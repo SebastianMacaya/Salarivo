@@ -485,6 +485,16 @@ test('lee tablas alineadas a derecha y deriva el neto sólo con evidencia sufici
   );
   assert.equal(basicBeforeTable.basicAmount, '700.00');
 
+  const basicInEmployeeHeader = extractArgentinePayroll(
+    receipt.replace('Período: 08/2026', [
+      'Período: 08/2026',
+      'Legajo       Apellido y nombres       Fecha de ingreso       Sueldo Basico',
+      '0001         Persona Sintética       01/01/2020             700,00',
+    ].join('\n')),
+    'PDF_TEXT',
+  );
+  assert.equal(basicInEmployeeHeader.basicAmount, '700.00');
+
   const withoutNetEvidence = extractArgentinePayroll(receipt.replace('\nSON PESOS UN MILLÓN NETO A', ''), 'PDF_TEXT');
   assert.equal(withoutNetEvidence.netAmount, null);
   assert.equal(withoutNetEvidence.needsReview, true);
@@ -519,6 +529,7 @@ test('separa descuentos del empleado de contribuciones y minimiza cada deducció
     row('2003 Obra social', '1.000.000,00', '', '40.000,00', '60.000,00'),
     row('2004 Imp. a los Ingresos Personales', '1.000.000,00', '', '50.000,00'),
     row('2999 Seguro colectivo', '1.000.000,00', '', '20.000,00'),
+    row('11100 Contribución Jubilación', '0,00', '', '', '180.000,00'),
     row('Totales', '1.200.000,00', '50.000,00', '250.000,00', '470.000,00'),
     'Neto a cobrar $ 1.000.000,00',
   ].join('\n');
@@ -532,6 +543,7 @@ test('separa descuentos del empleado de contribuciones y minimiza cada deducció
   assert.ok(deductions.every(({ normalizedConceptCode, rawDescription, isRecurring }) =>
     normalizedConceptCode === null && rawDescription === 'Deducción' && isRecurring === null));
   assert.equal(deductions.some(({ amount }) => amount === '180000.00'), false);
+  assert.equal(result.lineItems.some(({ rawDescription }) => /contribución/i.test(rawDescription)), false);
 
   const narrowRow = (description: string, remunerative = '', nonRemunerative = '', deduction = '') =>
     `${description.padEnd(28)}${remunerative.padEnd(17)}${nonRemunerative.padEnd(17)}${deduction}`;
@@ -608,6 +620,22 @@ test('preserva haberes desconocidos y normaliza extraordinarios sin cambiar una 
   assert.equal(extractArgentinePayroll(`${receipt}\nTipo de liquidación: AJUSTE A FAVOR`, 'PDF_TEXT').settlementType, 'REINTEGRO');
   assert.equal(extractArgentinePayroll(`${receipt}\nTipo de liquidación: DEVOLUCIÓN`, 'PDF_TEXT').settlementType, 'REINTEGRO');
   assert.equal(extractArgentinePayroll(`${receipt}\nTipo de liquidación: CRÉDITO`, 'PDF_TEXT').settlementType, 'REINTEGRO');
+  const specialReceipt = (description: string) => [
+    'RECIBO DE HABERES',
+    'Período: 06/2026',
+    row('Concepto', 'Remunerativos', 'No remunerativos', 'Descuentos'),
+    row(description, '100.000,00'),
+    row('Totales', '100.000,00', '0,00', '0,00'),
+    'Neto a cobrar $ 100.000,00',
+  ].join('\n');
+  assert.equal(extractArgentinePayroll(specialReceipt('02009 Sueldo Anual Complementario'), 'PDF_TEXT').settlementType, 'SAC');
+  assert.equal(extractArgentinePayroll(specialReceipt('08325 Anticipo Vacacional'), 'PDF_TEXT').settlementType, 'VACACIONES');
+  assert.equal(extractArgentinePayroll([
+    'RECIBO DE HABERES',
+    'Período: 06/2026',
+    '02009 Sueldo Anual Complementario $ 100.000,00',
+    '09000 Haber no catalogado $ 50.000,00',
+  ].join('\n'), 'PDF_TEXT').settlementType, 'NORMAL');
 
   const collisions = extractArgentinePayroll([
     'RECIBO DE HABERES',

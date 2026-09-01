@@ -4,6 +4,7 @@ import {
   analysisPresentation,
   batchIsActive,
   batchResolved,
+  batchWasDismissed,
   issueLabel,
   processingHealthPage,
   processingHealthPagination,
@@ -52,6 +53,9 @@ test('resume el lote incluyendo resultados conservados', () => {
   assert.equal(batchIsActive(batch), false);
   assert.equal(batchResolved(batch), 8);
   assert.equal(batchIsActive({ ...batch, status: 'RUNNING' }), true);
+  assert.equal(batchWasDismissed(batch, batch.id), true);
+  assert.equal(batchWasDismissed({ ...batch, status: 'RUNNING' }, batch.id), false);
+  assert.equal(batchWasDismissed(batch, null), false);
 });
 
 test('recupera el lote activo sólo ante el conflicto esperado', () => {
@@ -82,8 +86,8 @@ test('pagina juntas las versiones e issues de health hasta cubrir la lista más 
 test('traduce issues y outcomes sin mostrar códigos internos al owner', () => {
   assert.equal(issueLabel({ affectedFieldPath: 'settlement.basicAmount' }), 'No pudimos identificar el sueldo básico de este recibo.');
   assert.equal(runOutcomeLabel('REJECTED_REGRESSION'), 'Se conservó la versión anterior');
-  assert.equal(runNeedsDecision({ active: false, promotionOutcome: 'REVIEW_REQUIRED' }), true);
-  assert.equal(runNeedsDecision({ active: false, promotionOutcome: 'REJECTED_REGRESSION' }), false);
+  assert.equal(runNeedsDecision({ decisionRequired: true }), true);
+  assert.equal(runNeedsDecision({ decisionRequired: false }), false);
   assert.equal(triggerLabel('LEGACY_UNKNOWN'), 'Análisis anterior');
   assert.equal(triggerLabel('USER_TYPE_CONFIRMATION'), 'Confirmación del tipo de documento');
 });

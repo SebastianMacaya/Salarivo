@@ -394,6 +394,24 @@ const documentProjectionJoin = `
        AND field.extraction_run_id = document.active_extraction_run_id
   ) projection ON true`;
 
+const processingRunDecisionRequiredSql = (runAlias: "review_run" | "run") => `(
+  ${runAlias}.id IS DISTINCT FROM document.active_extraction_run_id
+  AND ${runAlias}.status = 'REVIEW_REQUIRED'
+  AND ${runAlias}.promotion_outcome = 'REVIEW_REQUIRED'
+  AND ${runAlias}.pipeline_fingerprint = '${currentPipelineFingerprint}'
+  AND ${runAlias}.base_extraction_run_id IS NOT DISTINCT FROM document.active_extraction_run_id
+)`;
+
+const documentDecisionRequiredSql = `EXISTS (
+    SELECT 1 FROM extraction_runs review_run
+     WHERE review_run.user_id = document.user_id
+       AND review_run.document_id = document.id
+       AND ${processingRunDecisionRequiredSql("review_run")}
+  )`;
+
+const documentNeedsReviewSql = `(document.processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION')
+  OR ${documentDecisionRequiredSql})`;
+
 function importItem(row: Record<string, unknown>) {
   return {
     id: String(row.id),
@@ -447,7 +465,8 @@ function documentView(row: Record<string, unknown>) {
     confidence: value(row, "classification_confidence"),
     errorCode: value(row, "error_code"),
     originalAvailable: row.original_deleted_at === null && row.deleted_at === null,
-    needsReview: row.processing_status === "NEEDS_REVIEW",
+    needsReview: row.processing_status === "NEEDS_REVIEW" || row.decision_required === true,
+    decisionRequired: row.decision_required === true,
   };
 }
 
@@ -2045,7 +2064,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 run.parser_version, run.result_schema_version, run.pipeline_fingerprint,
                 run.promotion_outcome, run.comparison_summary, run.promoted_at,
                 run.started_at, run.finished_at,
-                (run.id = document.active_extraction_run_id) AS active
+                (run.id = document.active_extraction_run_id) AS active,
+                ${processingRunDecisionRequiredSql("run")} AS decision_required
            FROM documents document
            JOIN extraction_runs run
              ON run.user_id = document.user_id AND run.document_id = document.id
@@ -2088,7 +2108,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                   run.parser_version, run.result_schema_version, run.pipeline_fingerprint,
                   run.promotion_outcome, run.comparison_summary, run.promoted_at,
                   run.started_at, run.finished_at,
-                  (run.id = document.active_extraction_run_id) AS active
+                  (run.id = document.active_extraction_run_id) AS active,
+                  ${processingRunDecisionRequiredSql("run")} AS decision_required
              FROM documents document
              JOIN extraction_runs run
                ON run.user_id = document.user_id AND run.document_id = document.id
@@ -2237,10 +2258,10 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       if (request.query.employmentId === "unassociated") conditions.push("document.employment_id IS NULL");
       else if (request.query.employmentId) conditions.push(`document.employment_id = ${parameter(request.query.employmentId)}::uuid`);
       if (request.query.processingStatus) conditions.push(`document.processing_status = ${parameter(request.query.processingStatus)}`);
-      if (request.query.statusGroup === "READY") conditions.push("document.processing_status = 'COMPLETED'");
-      if (request.query.statusGroup === "REVIEW") {
-        conditions.push("document.processing_status IN ('NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION')");
+      if (request.query.statusGroup === "READY") {
+        conditions.push(`document.processing_status = 'COMPLETED' AND NOT ${documentNeedsReviewSql}`);
       }
+      if (request.query.statusGroup === "REVIEW") conditions.push(documentNeedsReviewSql);
       if (request.query.statusGroup === "PROCESSING") {
         conditions.push(`document.processing_status IN (
           'CREATED', 'UPLOADED', 'SECURITY_VALIDATION', 'DOCUMENT_CLASSIFICATION',
@@ -2282,7 +2303,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 document.classification_confidence, document.original_deleted_at,
                 document.deleted_at, item.error_code, projection.payroll_period, projection.settlement_type,
                 COALESCE(employer.name, projection.corrected_employer_name,
-                         projection.extracted_employer_name) AS employer_name
+                         projection.extracted_employer_name) AS employer_name,
+                ${documentDecisionRequiredSql} AS decision_required
            ${from}
           WHERE ${pageConditions.join(" AND ")}
           ORDER BY document.created_at DESC, document.id DESC LIMIT $${pageParameters.length}`,
@@ -2290,9 +2312,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       );
       const counts = await client.query(
         `SELECT count(*)::integer AS total,
-                count(*) FILTER (WHERE document.processing_status IN (
-                  'NEEDS_REVIEW', 'NEEDS_TYPE_CONFIRMATION'
-                ))::integer AS pending_review
+                count(*) FILTER (WHERE ${documentNeedsReviewSql})::integer AS pending_review
            ${countFrom}
           WHERE ${conditions.join(" AND ")}`,
         parameters,
@@ -2987,20 +3007,6 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           if (!corrected || corrected.length > 200) {
             throw new ApiError(400, "INVALID_EMPLOYER_NAME", "El nombre del empleador no es válido.");
           }
-          try {
-            resolvedEmployer = await resolveEmployer(client, {
-              name: corrected,
-              countryCode: "AR",
-              createdByUserId: request.authUser!.id,
-              createdSource: "DOCUMENT",
-            });
-          } catch (error) {
-            if (!(error instanceof EmployerResolutionError)) throw error;
-            if (error.code === "INVALID_NAME") {
-              throw new ApiError(400, "INVALID_EMPLOYER_NAME", "El nombre del empleador no es válido.");
-            }
-            resolutionError = error;
-          }
           const observedEmploymentId = observedDocument.rows[0].employment_id === null
             ? null
             : String(observedDocument.rows[0].employment_id);
@@ -3024,6 +3030,21 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
               throw new ApiError(409, "EMPLOYMENT_CHANGED", "El empleo cambió; recargá e intentá nuevamente.");
             }
             currentCanonicalEmployerId = currentEmployer?.id ?? null;
+          }
+          try {
+            resolvedEmployer = await resolveEmployer(client, {
+              name: corrected,
+              countryCode: "AR",
+              createdByUserId: request.authUser!.id,
+              createdSource: "DOCUMENT",
+              ...(currentCanonicalEmployerId ? { preferredEmployerId: currentCanonicalEmployerId } : {}),
+            });
+          } catch (error) {
+            if (!(error instanceof EmployerResolutionError)) throw error;
+            if (error.code === "INVALID_NAME") {
+              throw new ApiError(400, "INVALID_EMPLOYER_NAME", "El nombre del empleador no es válido.");
+            }
+            resolutionError = error;
           }
         }
         const correctionDocument = await client.query(

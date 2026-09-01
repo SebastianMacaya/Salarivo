@@ -33,6 +33,8 @@ Toda creación de un empleo y toda detección del worker pasan por un único res
 
 La normalización Unicode, espacios y puntuación sólo produce candidatos; no se eliminan sufijos societarios. No existe fuzzy merge automático ni una restricción global por nombre normalizado: dos organizaciones homónimas son válidas. Una ambigüedad queda pendiente para revisión.
 
+Una asociación owner-scoped ya existente puede aportar un `preferredEmployerId`: sólo desambigua cuando, después de seguir merges, ese Employer canónico integra los candidatos exactos de nombre o alias. Nunca elige un Employer ajeno a esos candidatos, no reemplaza la precedencia del identificador fiscal y no autoriza un merge por nombre.
+
 La migración conserva cada empleador previo como una fila global `PENDING`; no fusiona por nombre. De este modo cambia el modelo sin reatribuir historia existente.
 
 ### Asociación de recibos

@@ -22,6 +22,7 @@ export type ProcessingRun = {
   startedAt: string | null;
   finishedAt: string | null;
   active: boolean;
+  decisionRequired: boolean;
 };
 
 export type ProcessingComparisonPreview = {
@@ -131,6 +132,10 @@ export function batchResolved(batch: ReprocessingBatch) {
   return improved + unchanged + reviewRequired + failed + skipped;
 }
 
+export function batchWasDismissed(batch: ReprocessingBatch | null, dismissedBatchId: string | null) {
+  return batch !== null && !batchIsActive(batch) && batch.id === dismissedBatchId;
+}
+
 export function shouldHydrateActiveBatch(errorCode: string) {
   return errorCode === 'REPROCESSING_BATCH_ALREADY_ACTIVE';
 }
@@ -153,8 +158,8 @@ export function processingHealthPagination(
   return { page, pages, hasPrevious: page > 1, hasNext: page < pages };
 }
 
-export function runNeedsDecision(run: Pick<ProcessingRun, 'active' | 'promotionOutcome'>) {
-  return !run.active && run.promotionOutcome === 'REVIEW_REQUIRED';
+export function runNeedsDecision(run: Pick<ProcessingRun, 'decisionRequired'>) {
+  return run.decisionRequired;
 }
 
 export function runOutcomeLabel(outcome: string) {

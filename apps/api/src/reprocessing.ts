@@ -427,7 +427,13 @@ export async function loadProcessingAnalysis(client: PoolClient, userId: string,
                  AND (active_job.state IN ('PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE')
                       OR active_job.execution_owner IS NOT NULL)
             ) AS has_active_job,
-            (run.id = document.active_extraction_run_id) AS active
+            (run.id = document.active_extraction_run_id) AS active,
+            (run.id IS DISTINCT FROM document.active_extraction_run_id
+              AND run.status = 'REVIEW_REQUIRED'
+              AND run.promotion_outcome = 'REVIEW_REQUIRED'
+              AND run.pipeline_fingerprint = $3
+              AND run.base_extraction_run_id IS NOT DISTINCT FROM document.active_extraction_run_id
+            ) AS decision_required
        FROM documents document
        LEFT JOIN LATERAL (
          SELECT current.* FROM extraction_runs current
@@ -435,7 +441,7 @@ export async function loadProcessingAnalysis(client: PoolClient, userId: string,
           ORDER BY current.processing_version DESC, current.id DESC LIMIT 1
        ) run ON true
       WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL`,
-    [documentId, userId],
+    [documentId, userId, currentPipelineFingerprint],
   );
   const issues = await client.query(
     `SELECT issue.id, issue.code, issue.severity, issue.recoverable,
@@ -523,6 +529,7 @@ export function processingRunView(row: Record<string, unknown>) {
     startedAt: timestamp(row.started_at),
     finishedAt: timestamp(row.finished_at),
     active: row.active === true,
+    decisionRequired: row.decision_required === true,
   };
 }
 

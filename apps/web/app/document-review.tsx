@@ -415,7 +415,7 @@ export function DocumentReview({
 
             {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li key={item.id}><span>{item.rawDescription}</span><strong>{item.amount} {item.currencyCode}</strong>{item.sourcePage && <small>Pág. {item.sourcePage}</small>}</li>)}</ul></section>}
 
-            {analysis && <details className={styles.timeline}>
+            {analysis && <details className={styles.timeline} open={runTimeline.some(runNeedsDecision) || undefined}>
               <summary>Historial técnico del análisis ({runTimeline.length})</summary>
               {runsError ? <p className={styles.error} role="alert">{runsError}</p> : runsLoading ? <p role="status">Cargando versiones y comparación…</p> : runTimeline.length ? <ol>{runTimeline.map((version) => {
                 const reviewCandidate = runNeedsDecision(version);

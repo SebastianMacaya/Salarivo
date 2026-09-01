@@ -557,6 +557,7 @@ function extractEmployer(lines: string[]): EmployerCandidate | null {
 }
 
 const basicAmountLabels = [
+  /(?:^|\s{2,})(?:\d{1,8}\s+)?(?:sueldo|salario|haber|remuneracion)\s+basic[oa]\s*$/,
   /^\s*(?:\d{1,8}\s+)?(?:sueldo|salario|haber|remuneracion)\s+basic[oa]\b/,
   /^\s*(?:\d{1,8}\s+)?basic[oa]\b/,
   /^\s*(?:\d{1,8}\s+)?salario\s+base\b/,
@@ -790,7 +791,11 @@ function extractStackedAmount(lines: string[], labels: RegExp[], table: PayrollT
   return null;
 }
 
-function settlementType(text: string): PayrollExtraction['settlementType'] {
+function settlementType(
+  text: string,
+  lineItems: PayrollLineItem[],
+  completeLineItems: boolean,
+): PayrollExtraction['settlementType'] {
   const descriptors = text.split(/\r?\n/)
     .map((line) => fold(line).trim())
     .filter((line) => /^(?:tipo\s+(?:de\s+)?liquidacion|liquidacion|recibo\s+de)\b/.test(line)
@@ -806,6 +811,20 @@ function settlementType(text: string): PayrollExtraction['settlementType'] {
   if (/\bhoras?\s+extra\b/.test(descriptors)) return 'HORAS_EXTRA';
   if (/\b(?:reintegro|devolucion|credito|ajuste\s+a\s+favor)\b/.test(descriptors)) return 'REINTEGRO';
   if (/\bajuste\b/.test(descriptors)) return 'AJUSTE';
+  const earnings = lineItems.filter(({ itemType }) => itemType === 'EARNING');
+  const codes = new Set(earnings.map(({ normalizedConceptCode }) => normalizedConceptCode));
+  if (completeLineItems && earnings.length
+    && earnings.every(({ isRecurring }) => isRecurring === false) && codes.size === 1) {
+    switch (earnings[0]?.normalizedConceptCode) {
+      case 'SAC': return 'SAC';
+      case 'VACATION': return 'VACACIONES';
+      case 'BONUS': return 'BONO';
+      case 'RETROACTIVE': return 'RETROACTIVO';
+      case 'COMMISSION': return 'COMISION';
+      case 'OVERTIME': return 'HORAS_EXTRA';
+      case 'REIMBURSEMENT': return 'REINTEGRO';
+    }
+  }
   return 'NORMAL';
 }
 
@@ -820,9 +839,9 @@ const concepts: Array<{
   { code: 'PAMI', pattern: /(?:ley\s*19\.?032|pami)/, recurring: true, type: 'DEDUCTION' },
   { code: 'INCOME_TAX', pattern: /(?:ganancias|impuesto\s+a\s+las\s+ganancias|(?:imp\.?|impuesto)\s+a\s+los\s+ingresos\s+personales)/, recurring: true, type: 'DEDUCTION' },
   { code: 'UNION_DUES', pattern: /(?:sindicato|cuota\s+sindical)/, recurring: true, type: 'DEDUCTION' },
-  { code: 'SAC', pattern: /\b(?:sac|aguinaldo)\b/, recurring: false, type: 'EARNING' },
+  { code: 'SAC', pattern: /\b(?:sac|aguinaldo|sueldo\s+anual\s+complementario)\b/, recurring: false, type: 'EARNING' },
   { code: 'RETROACTIVE', pattern: /\bretroactiv[oa]s?\b/, recurring: false, type: 'EARNING' },
-  { code: 'VACATION', pattern: /\bvacacion(?:es)?\b/, recurring: false, type: 'EARNING' },
+  { code: 'VACATION', pattern: /\bvacacion(?:es|al)?\b/, recurring: false, type: 'EARNING' },
   { code: 'BONUS', pattern: /\b(?:bonos?|premios?)\b/, recurring: false, type: 'EARNING' },
   { code: 'COMMISSION', pattern: /\bcomision(?:es)?\b/, recurring: false, type: 'EARNING' },
   { code: 'OVERTIME', pattern: /horas?\s+extra/, recurring: false, type: 'EARNING' },
@@ -843,6 +862,7 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
     for (let index = table.headerIndex; index < table.totalIndex; index += 1) {
       const line = lines[index] ?? '';
       const normalized = fold(line);
+      if (/^\s*(?:\d{1,8}\s+)?contrib/.test(normalized)) continue;
       const mapped = mapTableAmounts(line, table);
       const rawDescription = lineDescription(line, table.descriptionEnd);
       if (!rawDescription) continue;
@@ -877,7 +897,7 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
   const items: PayrollLineItem[] = [];
   for (const line of lines) {
     const normalized = fold(line);
-    if (/^\s*contrib/.test(normalized)) continue;
+    if (/^\s*(?:\d{1,8}\s+)?contrib/.test(normalized)) continue;
     const concept = concepts.find(({ pattern }) => pattern.test(normalized));
     const rawAmount = concept ? amountAtEnd.exec(line)?.[0]?.trim() : undefined;
     const amount = rawAmount ? parseArgentineAmount(rawAmount) : null;
@@ -988,7 +1008,8 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
   } : null);
   const employer = extractEmployer(lines);
   const employerName = employer?.value ?? null;
-  const type = settlementType(text);
+  const lineItems = extractLineItems(lines, payrollTable);
+  const type = settlementType(text, lineItems, payrollTable !== null);
   const fields: ExtractedField[] = [{
     confidence: 0.8,
     fieldPath: 'settlement.type',
@@ -1023,8 +1044,6 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
       fields.push(missingField(fieldPath, labelFound));
     }
   }
-
-  const lineItems = extractLineItems(lines, payrollTable);
 
   return {
     basicAmount: basic?.value ?? null,

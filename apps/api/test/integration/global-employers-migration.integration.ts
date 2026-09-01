@@ -320,6 +320,49 @@ test("migration 019 upgrades legacy data fail-closed and keeps employer resoluti
     assert.equal(whitespacePadded.id, whitespacePlain.id);
     assert.equal(whitespacePlain.name, "Empresa Con Bordes");
 
+    const preferredEmployerId = randomUUID();
+    const homonymEmployerId = randomUUID();
+    await successful.client.query(
+      `INSERT INTO employers (id, created_by_user_id, name, country_code, status, created_source)
+       VALUES ($1, $3, 'Empresa Homónima Sintética SA', 'AR', 'PENDING', 'MANUAL'),
+              ($2, $4, 'Empresa Homónima Sintética SA', 'AR', 'PENDING', 'MANUAL')`,
+      [preferredEmployerId, homonymEmployerId, userId, secondUserId],
+    );
+    await assert.rejects(
+      resolveInSchema(pool, successful.name, {
+        name: "Empresa Homónima Sintética SA", countryCode: "AR",
+        createdByUserId: userId, createdSource: "DOCUMENT",
+      }),
+      /AMBIGUOUS/,
+    );
+    const preferredHomonym = await resolveInSchema(pool, successful.name, {
+      name: "Empresa Homónima Sintética SA", countryCode: "AR",
+      createdByUserId: userId, createdSource: "DOCUMENT", preferredEmployerId,
+    });
+    assert.equal(preferredHomonym.id, preferredEmployerId);
+    await assert.rejects(
+      resolveInSchema(pool, successful.name, {
+        name: "Empresa Homónima Sintética SA", countryCode: "AR",
+        createdByUserId: userId, createdSource: "DOCUMENT", preferredEmployerId: whitespacePlain.id,
+      }),
+      /AMBIGUOUS/,
+    );
+
+    const mergedPreferredSourceId = randomUUID();
+    const mergedPreferredHomonymId = randomUUID();
+    await successful.client.query(
+      `INSERT INTO employers (
+         id, created_by_user_id, name, country_code, status, created_source, merged_into_employer_id
+       ) VALUES ($1, $3, 'Empresa Histórica Sintética SA', 'AR', 'MERGED', 'ADMIN', $4),
+                ($2, $3, 'Empresa Histórica Sintética SA', 'AR', 'PENDING', 'MANUAL', NULL)`,
+      [mergedPreferredSourceId, mergedPreferredHomonymId, userId, preferredEmployerId],
+    );
+    const preferredThroughMerge = await resolveInSchema(pool, successful.name, {
+      name: "Empresa Histórica Sintética SA", countryCode: "AR",
+      createdByUserId: userId, createdSource: "DOCUMENT", preferredEmployerId,
+    });
+    assert.equal(preferredThroughMerge.id, preferredEmployerId);
+
     const plus = await resolveInSchema(pool, successful.name, {
       name: "Empresa+Norte", countryCode: "AR", createdByUserId: userId, createdSource: "MANUAL",
     });

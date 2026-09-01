@@ -1588,6 +1588,7 @@ export async function buildApp(
             countryCode: nextCountry,
             createdByUserId: userId,
             createdSource: "MANUAL",
+            preferredEmployerId: String(beforeLock.employer_id),
           }, request)).id;
         } else if (request.body.employerId !== undefined) {
           const canonical = await followMergedEmployer(client, request.body.employerId);

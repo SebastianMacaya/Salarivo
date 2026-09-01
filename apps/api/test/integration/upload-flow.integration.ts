@@ -53,6 +53,11 @@ function syntheticPayrollPdf(): Uint8Array<ArrayBuffer> {
 }
 
 test("upload privado crea un único documento y un único intent durable", async (context) => {
+  type IntegrationExtraction = {
+    employerName: string | null;
+    fields: Array<Record<string, unknown> & { fieldPath: string }>;
+    [key: string]: unknown;
+  };
   type IntegrationJobRow = {
     attempt: number;
     base_extraction_run_id: string | null;
@@ -74,7 +79,7 @@ test("upload privado crea un único documento y un único intent durable", async
   const [
     { buildApp },
     { loadConfig },
-    { pool, withTransaction },
+    { currentPipelineFingerprint, pool, processingPipelineVersions, withTransaction },
     { generateTotpCode },
     { opaqueToken, sessionCookieName, tokenHash },
     workerModule,
@@ -110,7 +115,7 @@ test("upload privado crea un único documento y un único intent durable", async
     setDocumentStage: (job: IntegrationJobRow, processingStatus: string, values?: Record<string, unknown>) => Promise<void>;
   };
   const { extractArgentinePayroll } = extractionEngineModule as {
-    extractArgentinePayroll: (text: string, source: "PDF_TEXT" | "OCR") => unknown;
+    extractArgentinePayroll: (text: string, source: "PDF_TEXT" | "OCR") => IntegrationExtraction;
   };
   const config = loadConfig({
     ...process.env,
@@ -3673,12 +3678,62 @@ test("upload privado crea un único documento y un único intent durable", async
     { outcome: "REVIEW_REQUIRED", status: "REVIEW_REQUIRED" },
   );
   const reprocessedRunId = reprocessedRun.rows[0]!.id;
+  const pendingReprocessingReviews = await app.inject({
+    method: "GET",
+    url: "/api/v1/documents?statusGroup=REVIEW",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(pendingReprocessingReviews.statusCode, 200, pendingReprocessingReviews.body);
+  const pendingReprocessingDocument = pendingReprocessingReviews.json().data.items.find(
+    (document: { id: string }) => document.id === documentId,
+  );
+  assert.deepEqual(
+    { decisionRequired: pendingReprocessingDocument?.decisionRequired, needsReview: pendingReprocessingDocument?.needsReview },
+    { decisionRequired: true, needsReview: true },
+  );
+  assert.equal(
+    pendingReprocessingReviews.json().data.pendingReview,
+    pendingReprocessingReviews.json().data.total,
+  );
+  assert.deepEqual(
+    (await app.inject({ method: "GET", url: "/api/v1/documents?statusGroup=REVIEW", headers: { cookie: cookieB } })).json().data,
+    { items: [], total: 0, pendingReview: 0, nextCursor: null },
+  );
+  await pool.query(
+    "UPDATE extraction_runs SET pipeline_fingerprint = $2 WHERE id = $1",
+    [reprocessedRunId, "d".repeat(64)],
+  );
+  const staleReprocessingReviews = await app.inject({
+    method: "GET",
+    url: "/api/v1/documents?statusGroup=REVIEW",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(staleReprocessingReviews.statusCode, 200, staleReprocessingReviews.body);
+  assert.equal(
+    staleReprocessingReviews.json().data.items.some((document: { id: string }) => document.id === documentId),
+    false,
+  );
+  const staleProcessingRuns = await app.inject({
+    method: "GET",
+    url: `/api/v1/documents/${documentId}/processing-runs`,
+    headers: { cookie: cookieA },
+  });
+  assert.equal(staleProcessingRuns.statusCode, 200, staleProcessingRuns.body);
+  assert.equal(
+    staleProcessingRuns.json().data.items.find((run: { id: string }) => run.id === reprocessedRunId)?.decisionRequired,
+    false,
+  );
+  await pool.query(
+    "UPDATE extraction_runs SET pipeline_fingerprint = $2 WHERE id = $1",
+    [reprocessedRunId, currentPipelineFingerprint],
+  );
   const reviewCandidateDetail = await app.inject({
     method: "GET",
     url: `/api/v1/documents/${documentId}/processing-runs/${reprocessedRunId}`,
     headers: { cookie: cookieA },
   });
   assert.equal(reviewCandidateDetail.statusCode, 200, reviewCandidateDetail.body);
+  assert.equal(reviewCandidateDetail.json().data.decisionRequired, true);
   assert.deepEqual(
     reviewCandidateDetail.json().data.comparisonPreview.fields.find(
       (field: { fieldPath: string }) => field.fieldPath === "employer.name",
@@ -4206,24 +4261,24 @@ test("upload privado crea un único documento y un único intent durable", async
     [crypto.randomUUID(), userId, documentId, reviewReprocessedRunId],
   );
   await pool.query(
-    "UPDATE extraction_runs SET parser_version = '6', pipeline_fingerprint = $2 WHERE id = $1",
-    [reviewReprocessedRunId, "e".repeat(64)],
+    "UPDATE extraction_runs SET parser_version = $2, pipeline_fingerprint = $3 WHERE id = $1",
+    [reviewReprocessedRunId, processingPipelineVersions.parser, "e".repeat(64)],
   );
-  const parserSixCandidates = await app.inject({
+  const currentParserCandidates = await app.inject({
     method: "GET",
     url: "/api/v1/reprocessing/candidates",
     headers: { cookie: cookieA },
   });
-  assert.equal(parserSixCandidates.statusCode, 200, parserSixCandidates.body);
+  assert.equal(currentParserCandidates.statusCode, 200, currentParserCandidates.body);
   assert.equal(
-    parserSixCandidates.json().data.items.some(
+    currentParserCandidates.json().data.items.some(
       (candidate: { documentId: string }) => candidate.documentId === documentId,
     ),
     false,
   );
   await pool.query(
-    "UPDATE extraction_runs SET parser_version = '6.1.0', pipeline_fingerprint = $2 WHERE id = $1",
-    [reviewReprocessedRunId, "f".repeat(64)],
+    "UPDATE extraction_runs SET parser_version = $2, pipeline_fingerprint = $3 WHERE id = $1",
+    [reviewReprocessedRunId, `${processingPipelineVersions.parser}.1.0`, "f".repeat(64)],
   );
   const textualVersionCandidates = await app.inject({
     method: "GET",
@@ -4733,6 +4788,29 @@ test("upload privado crea un único documento y un único intent durable", async
     },
   );
 
+  const preferredBatchEmployerId = crypto.randomUUID();
+  const homonymBatchEmployerId = crypto.randomUUID();
+  const preferredBatchEmploymentId = crypto.randomUUID();
+  const preferredBatchEmployerName = "Empresa Preferida Sintética SA";
+  await pool.query(
+    `INSERT INTO employers (id, created_by_user_id, name, country_code, status, created_source)
+     VALUES ($1, $3, $5, 'AR', 'PENDING', 'MANUAL'),
+            ($2, $4, $5, 'AR', 'PENDING', 'MANUAL')`,
+    [preferredBatchEmployerId, homonymBatchEmployerId, userId, userIdB, preferredBatchEmployerName],
+  );
+  await pool.query(
+    `INSERT INTO employments (
+       id, user_id, employer_id, status, start_date, country_code, currency_code
+     ) VALUES ($1, $2, $3, 'ACTIVE', '2026-01-01', 'AR', 'ARS')`,
+    [preferredBatchEmploymentId, userId, preferredBatchEmployerId],
+  );
+  const preferredBatchExtraction = {
+    ...balancedReviewExtraction,
+    employerName: preferredBatchEmployerName,
+    fields: balancedReviewExtraction.fields.map((field) => field.fieldPath === "employer.name"
+      ? { ...field, interpretedValue: preferredBatchEmployerName, rawValue: preferredBatchEmployerName }
+      : field),
+  };
   const batchFixtureIds = [listFixtures[0]!.id, listFixtures[3]!.id];
   const batchBaselineRunIds = new Map<string, string>();
   for (const [index, batchDocumentId] of batchFixtureIds.entries()) {
@@ -4760,18 +4838,24 @@ test("upload privado crea un único documento y un único intent durable", async
     );
     await pool.query(
       `UPDATE documents
-          SET active_extraction_run_id = $1, employment_id = NULL,
-              detected_employer_id = NULL, processing_status = 'COMPLETED',
+          SET active_extraction_run_id = $1, employment_id = $4,
+              detected_employer_id = $5, processing_status = 'COMPLETED',
               security_status = 'CLEAN', classification_status = 'SUPPORTED',
               document_type = 'PAYROLL', classification_confidence = 0.7
         WHERE id = $2 AND user_id = $3`,
-      [baselineRunId, batchDocumentId, userId],
+      [
+        baselineRunId,
+        batchDocumentId,
+        userId,
+        index === 0 ? preferredBatchEmploymentId : null,
+        index === 0 ? preferredBatchEmployerId : null,
+      ],
     );
     await pool.query(
       `UPDATE import_batch_items
-          SET employment_id = NULL, status = 'COMPLETED', error_code = NULL, updated_at = now()
+          SET employment_id = $3, status = 'COMPLETED', error_code = NULL, updated_at = now()
         WHERE id = (SELECT import_batch_item_id FROM documents WHERE id = $1 AND user_id = $2)`,
-      [batchDocumentId, userId],
+      [batchDocumentId, userId, index === 0 ? preferredBatchEmploymentId : null],
     );
   }
   await pool.query(
@@ -4911,11 +4995,32 @@ test("upload privado crea un único documento y un único intent durable", async
       documentType: "PAYROLL",
       signals: ["synthetic_batch_integration"],
     },
-    balancedReviewExtraction,
+    preferredBatchExtraction,
     "PDF_TEXT",
     false,
     1,
   ), "COMPLETED");
+  const preferredBatchProjection = (await pool.query(
+    `SELECT document.employment_id, document.detected_employer_id,
+            run.detected_employer_id AS run_employer_id, run.promotion_outcome,
+            NOT EXISTS (
+              SELECT 1 FROM extraction_run_issues issue
+               WHERE issue.user_id = run.user_id AND issue.document_id = run.document_id
+                 AND issue.extraction_run_id = run.id
+                 AND issue.code = 'EMPLOYER_ASSOCIATION_REVIEW'
+            ) AS employer_is_unambiguous
+       FROM documents document
+       JOIN extraction_runs run ON run.id = document.active_extraction_run_id
+      WHERE document.id = $1 AND document.user_id = $2`,
+    [batchFixtureIds[0], userId],
+  )).rows[0];
+  assert.deepEqual(preferredBatchProjection, {
+    employment_id: preferredBatchEmploymentId,
+    detected_employer_id: preferredBatchEmployerId,
+    run_employer_id: preferredBatchEmployerId,
+    promotion_outcome: "PROMOTED",
+    employer_is_unambiguous: true,
+  });
   await pool.query(
     "UPDATE processing_jobs SET execution_owner = NULL, updated_at = now() WHERE id = $1",
     [improvingBatchJobId],

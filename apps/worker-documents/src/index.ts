@@ -2001,22 +2001,6 @@ export async function persistExtraction(
         fieldPath: correction.field_path,
       })),
     );
-    let resolvedEmployer: Awaited<ReturnType<typeof resolveEmployer>> | null = null;
-    let employerResolutionError: EmployerResolutionError | null = null;
-    if (anticipatedExtraction.employerName) {
-      try {
-        resolvedEmployer = await resolveEmployer(db, {
-          name: anticipatedExtraction.employerName,
-          countryCode: 'AR',
-          createdByUserId: job.user_id,
-          createdSource: 'DOCUMENT',
-        });
-      } catch (error) {
-        if (!(error instanceof EmployerResolutionError)) throw error;
-        employerResolutionError = error;
-      }
-    }
-
     const observedEmploymentId = observedDocument.rows[0]?.employment_id ?? null;
     let currentCanonicalEmployerId: string | null = null;
     if (observedEmploymentId) {
@@ -2039,6 +2023,23 @@ export async function persistExtraction(
         throw new WorkerError('EMPLOYMENT_ASSOCIATION_CHANGED', true);
       }
       currentCanonicalEmployerId = currentEmployer?.id ?? null;
+    }
+
+    let resolvedEmployer: Awaited<ReturnType<typeof resolveEmployer>> | null = null;
+    let employerResolutionError: EmployerResolutionError | null = null;
+    if (anticipatedExtraction.employerName) {
+      try {
+        resolvedEmployer = await resolveEmployer(db, {
+          name: anticipatedExtraction.employerName,
+          countryCode: 'AR',
+          createdByUserId: job.user_id,
+          createdSource: 'DOCUMENT',
+          ...(currentCanonicalEmployerId ? { preferredEmployerId: currentCanonicalEmployerId } : {}),
+        });
+      } catch (error) {
+        if (!(error instanceof EmployerResolutionError)) throw error;
+        employerResolutionError = error;
+      }
     }
 
     let automaticEmploymentId: string | null = null;
@@ -2246,7 +2247,7 @@ export async function persistExtraction(
                     detectedEmployerId: resolvedEmployer.id,
                     preservedEmploymentId: employmentId,
                     matchRule: 'EMPLOYER_CHANGED_ON_REPROCESS',
-                    resolverVersion: 'employer-resolver-v1',
+                    resolverVersion: 'employer-resolver-v2',
                     source: 'WORKER',
                   }),
                 ],
@@ -2256,7 +2257,7 @@ export async function persistExtraction(
                 detectedEmployerId: resolvedEmployer.id,
                 preservedEmploymentId: employmentId,
                 matchRule: 'EMPLOYER_CHANGED_ON_REPROCESS',
-                resolverVersion: 'employer-resolver-v1',
+                resolverVersion: 'employer-resolver-v2',
                 source: 'WORKER',
                  userId: job.user_id,
                });
@@ -2297,7 +2298,7 @@ export async function persistExtraction(
                   employerId: resolvedEmployer.id,
                   employmentId,
                   matchRule: automaticMatchRule,
-                  resolverVersion: 'employer-resolver-v1',
+                  resolverVersion: 'employer-resolver-v2',
                   source: 'WORKER',
                 }),
               ],
@@ -2307,7 +2308,7 @@ export async function persistExtraction(
               employerId: resolvedEmployer.id,
               employmentId,
               matchRule: automaticMatchRule ?? 'UNKNOWN',
-              resolverVersion: 'employer-resolver-v1',
+              resolverVersion: 'employer-resolver-v2',
               source: 'WORKER',
               userId: job.user_id,
             });

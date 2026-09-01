@@ -37,7 +37,7 @@ export type PromotionOutcome = (typeof promotionOutcomes)[number];
 export const processingPipelineVersions = {
   classifier: "6",
   extractor: "6",
-  parser: "6",
+  parser: "7",
   normalizer: "6",
   resultSchema: "1",
 } as const;
@@ -50,7 +50,7 @@ export const parserFixCatalog = [
   {
     issueCode: "LABEL_OR_LAYOUT_NOT_RECOGNIZED",
     affectedFieldPath: "settlement.basicAmount",
-    introducedInParserVersion: "6",
+    introducedInParserVersion: "7",
   },
 ] as const;
 

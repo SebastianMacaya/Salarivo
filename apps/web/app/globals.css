@@ -323,6 +323,7 @@ dialog.modal-layer::backdrop { background: transparent; }
 .reprocessing-banner small { margin-top: 4px; color: currentColor; font-size: 10px; line-height: 1.45; opacity: .82; }
 .reprocessing-progress { display: grid; grid-template-columns: minmax(100px, 180px) auto; align-items: center; gap: 8px; font-size: 10px; font-weight: 800; }
 .reprocessing-progress progress { width: 100%; accent-color: var(--green); }
+.reprocessing-actions { display: flex; align-items: center; gap: 8px; }
 .scope-control { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: 14px; background: white; padding: 15px 18px; }
 .scope-control > div:first-child { display: grid; gap: 6px; }
 .scope-control label { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
@@ -533,6 +534,7 @@ td { border-top: 1px solid #edf1ee; padding: 14px 15px; white-space: nowrap; }
   .reprocessing-banner > div:first-of-type { grid-column: auto; }
   .reprocessing-banner:not(.quiet) > div:first-of-type, .reprocessing-banner .button { grid-column: 1; width: 100%; }
   .reprocessing-progress { grid-template-columns: 1fr auto; }
+  .reprocessing-actions { align-items: stretch; flex-direction: column; }
   .field-row { grid-template-columns: 1fr; }
   .employment-card { grid-template-columns: 42px minmax(0, 1fr); padding: 16px; }
   .employer-avatar { width: 42px; height: 42px; }

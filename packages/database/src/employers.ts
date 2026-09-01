@@ -42,6 +42,7 @@ export type ResolveEmployerInput = Readonly<{
   createdByUserId: string | null;
   createdSource: EmployerSource;
   identifier?: ProtectedEmployerIdentifier;
+  preferredEmployerId?: string;
 }>;
 
 export type EmployerResolution = ResolvedEmployer & Readonly<{
@@ -171,6 +172,25 @@ async function uniqueCanonicalEmployer(
   return employer ? { kind: "one", employer } : { kind: "none" };
 }
 
+async function preferredCanonicalCandidate(
+  client: PoolClient,
+  employerIds: readonly string[],
+  preferredEmployerId: string | undefined,
+): Promise<ResolvedEmployer | null> {
+  if (!preferredEmployerId || employerIds.length === 0) return null;
+  const preferred = await followMergedEmployer(client, preferredEmployerId);
+  if (!preferred) return null;
+  if (employerIds.includes(preferredEmployerId) || employerIds.includes(preferred.id)) return preferred;
+  const merged = await client.query<{ id: string }>(
+    "SELECT id FROM employers WHERE id = ANY($1::uuid[]) AND status = 'MERGED'",
+    [employerIds],
+  );
+  for (const candidate of merged.rows) {
+    if ((await followMergedEmployer(client, candidate.id))?.id === preferred.id) return preferred;
+  }
+  return null;
+}
+
 async function nameCandidates(
   client: PoolClient,
   countryCode: string,
@@ -288,7 +308,11 @@ export async function resolveEmployer(
   const matched = await nameCandidates(
     client, normalizedInput.countryCode, normalizedName, normalizedInput.name, true,
   );
-  const exactMatch = await uniqueCanonicalEmployer(client, matched.map(({ employer_id }) => employer_id));
+  const matchedIds = matched.map(({ employer_id }) => employer_id);
+  const preferred = await preferredCanonicalCandidate(client, matchedIds, normalizedInput.preferredEmployerId);
+  const exactMatch = preferred
+    ? { kind: "one" as const, employer: preferred }
+    : await uniqueCanonicalEmployer(client, matchedIds);
   if (exactMatch.kind === "ambiguous") throw new EmployerResolutionError("AMBIGUOUS");
   if (exactMatch.kind === "one") {
     const conflictingIdentifier = normalizedInput.identifier ? await client.query(
