@@ -2,7 +2,16 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { publishedLegalDocuments, type PublishedLegalDocument } from './legal-documents';
+
+type PublishedLegalDocument = {
+  documentType: 'TERMS' | 'PRIVACY_NOTICE';
+  version: string;
+  locale: 'es-AR';
+  title: string;
+  content: string;
+  effectiveAt: string;
+  requiresAcceptance: boolean;
+};
 
 const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
   ?? (process.env.NODE_ENV === 'production' ? '/api/v1' : 'http://localhost:3001/api/v1');
@@ -12,9 +21,10 @@ export function LegalPage({ type }: { type: 'terms' | 'privacy' }) {
   const [error, setError] = useState('');
 
   useEffect(() => {
+    const controller = new AbortController();
     const version = new URLSearchParams(window.location.search).get('version');
     const query = version ? `?version=${encodeURIComponent(version)}` : '';
-    fetch(`${API_ROOT}/legal/${type}${query}`)
+    fetch(`${API_ROOT}/legal/${type}${query}`, { cache: 'no-store', signal: controller.signal })
       .then(async (response) => {
         const body = await response.json() as { data?: PublishedLegalDocument; error?: { message?: string } };
         if (!response.ok) throw new Error(body?.error?.message ?? 'No pudimos cargar el documento.');
@@ -23,10 +33,10 @@ export function LegalPage({ type }: { type: 'terms' | 'privacy' }) {
       })
       .then(setDocument)
       .catch((caught) => {
-        const fallback = publishedLegalDocuments[type];
-        if (!version || version === fallback.version) setDocument(fallback);
-        else setError(caught instanceof Error ? caught.message : 'No pudimos cargar el documento.');
+        if (caught instanceof DOMException && caught.name === 'AbortError') return;
+        setError(caught instanceof Error ? caught.message : 'No pudimos cargar el documento.');
       });
+    return () => controller.abort();
   }, [type]);
 
   return (
@@ -37,7 +47,7 @@ export function LegalPage({ type }: { type: 'terms' | 'privacy' }) {
       {document && <article className="legal-document">
         <p className="eyebrow">Documento legal · versión {document.version}</p>
         <h1>{document.title}</h1>
-        <p className="legal-effective">Vigente desde {new Intl.DateTimeFormat('es-AR', { dateStyle: 'long', timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date(document.effectiveAt))}</p>
+        <p className="legal-effective">Fecha de vigencia: {new Intl.DateTimeFormat('es-AR', { dateStyle: 'long', timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date(document.effectiveAt))}</p>
         <div className="legal-content">{document.content}</div>
       </article>}
     </main>

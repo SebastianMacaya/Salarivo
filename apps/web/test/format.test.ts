@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   amountFromCents,
+  buenosAiresDateTimeIso,
   dateLabel,
   documentStatusLabel,
   economicStatusMessage,
@@ -63,6 +64,12 @@ test('separa fechas calendario de instantes en Buenos Aires', () => {
   assert.equal(timestampLabel('2026-08-31T03:30:00.000Z'), '31 de ago de 2026, 00:30');
   assert.equal(timestampLabel('2026-08-31'), '—');
   assert.equal(timestampLabel('invalid'), '—');
+});
+
+test('convierte la vigencia administrativa desde Buenos Aires sin normalizar fechas inválidas', () => {
+  assert.equal(buenosAiresDateTimeIso('2026-09-02T10:30'), '2026-09-02T13:30:00.000Z');
+  assert.equal(buenosAiresDateTimeIso('2026-02-30T10:30'), null);
+  assert.equal(buenosAiresDateTimeIso('invalid'), null);
 });
 
 test('distingue episodios laborales y contextos salariales en selectores', () => {

@@ -8,7 +8,7 @@ La consola de plataforma usa dos controles server-side: `users.role = 'ADMIN'` h
 
 | Rol | Alcance principal |
 | --- | --- |
-| `SUPER_ADMIN` | todas las capacidades actuales, administración de roles y revisión de empleadores |
+| `SUPER_ADMIN` | todas las capacidades actuales, administración de roles, revisión de empleadores y publicación legal |
 | `OPERATIONS` | diagnóstico de documentos/jobs y recuperación acotada |
 | `SUPPORT` | metadata de usuario y contacto excepcional auditado |
 | `SECURITY` | estados de cuenta, sesiones, cuarentena y eventos de seguridad |
@@ -19,11 +19,13 @@ La asignación exacta vive en `apps/api/src/admin-rbac.ts`; esta tabla sólo res
 
 ## Superficie actual
 
-Las rutas `/api/v1/admin` cubren dashboard, usuarios, metadata de documentos y empleadores, jobs, salud/versiones/issues del pipeline, storage, operaciones de privacidad, seguridad, auditoría, configuración sanitizada y health. Listas y búsqueda usan filtros allowlisted, paginación server-side e índices; no cargan datasets completos en el navegador.
+Las rutas `/api/v1/admin` cubren dashboard, usuarios, metadata de documentos y empleadores, jobs, salud/versiones/issues del pipeline, storage, operaciones de privacidad, seguridad, auditoría, historial/adopción legal, configuración sanitizada y health. Las listas operativas y búsquedas usan filtros allowlisted, paginación server-side e índices; el historial legal, de volumen excepcionalmente bajo, se carga completo para no agregar otro endpoint.
 
 Los comandos actuales se limitan a estado de cuenta, revocación de sesiones, cambio de rol, cuarentena sin ejecución activa, retry de un job `RETRYABLE` en la misma versión, cancelación de jobs que aún no ejecutan, reproceso de candidatos, rollback a una corrida previamente activa y revisión de empleadores. `processing.reprocess` y `processing.rollback` están separados de lectura/retry/cancelación. Motivo y referencia son tipados; la mutación y su `admin_audit_events` se confirman en una transacción.
 
 `employers.manage` pertenece sólo a `SUPER_ADMIN` y permite aprobar, rechazar, renombrar, agregar aliases, agregar/corregir CUIT y fusionar. Cada operación exige step-up y auditoría atómica. El CUIT se valida server-side, se cifra con AES-256-GCM y se busca mediante HMAC-SHA-256 con otra clave; la consola sólo recibe el sufijo enmascarado. El merge conserva el origen como `MERGED`, sigue el destino canónico, bloquea identificadores incompatibles o legacy no comparables y resuelve antes cualquier Employment exactamente redundante sin abrir documentos ni modificar montos.
+
+`legal.manage` también pertenece sólo a `SUPER_ADMIN`. Permite programar una o dos versiones legales en un lote atómico con una vigencia compartida de entre un minuto y un año, número estrictamente creciente y confirmación explícita de aprobación profesional. Una corrección previa a la activación usa una versión superior con la misma vigencia; el número superior gana el desempate. Las versiones permanecen append-only; no hay edición, borrado, drafts ni rollback. La auditoría conserva tipo, versión, vigencia y flags, nunca título o contenido. La consola muestra el historial, las constancias por versión y el texto exacto programado antes de hacerlo público; ese conteo representa cuentas existentes, no un total histórico inmutable.
 
 Un administrador debe ser deprovisionado por otra persona autorizada antes de usar la baja personal. El flujo de privacidad rechaza cuentas que todavía conservan `role = 'ADMIN'`, por lo que tampoco puede retirar indirectamente al último `SUPER_ADMIN`.
 
@@ -38,10 +40,10 @@ Nunca se serializan a la consola:
 - CUIT/CUIL/DNI completos u otros identificadores fiscales;
 - tokens, cookies, secretos MFA, credenciales o configuración secreta.
 
-`admin_audit_events` es append-only y conserva metadata allowlisted sin payload libre. Los comandos rechazados o fallidos registran sólo actor, capacidad, recurso, resultado y motivo validado; nunca el body ni el error. Los errores HTTP no exponen SQL, stack, paths ni detalles de proveedores.
+`admin_audit_events` es append-only y conserva metadata allowlisted sin payload libre. Los comandos rechazados o fallidos después de autenticar registran sólo actor, capacidad, recurso, resultado y motivo validado; nunca el body ni el error. Los errores de parsing previos a la autenticación no se atribuyen a una cuenta. Los errores HTTP no exponen SQL, stack, paths ni detalles de proveedores.
 
 ## Operaciones no disponibles
 
 No hay break-glass, impersonación, acceso al original o artefactos, inspección administrativa de resultados salariales, cancelación de jobs `RUNNING`, retry de fallos permanentes, baja administrativa de cuenta, tickets, flags ni settings editables. Reproceso y rollback operan sobre metadata y punteros validados, no conceden acceso al contenido. Queue, storage, OCR y OAuth se muestran como `UNKNOWN` cuando no existe una señal segura y comprobable; la UI no inventa telemetría.
 
-Agregar cualquiera de esas operaciones requiere preservar las máquinas de estado, definir la base de autorización, minimizar el DTO y dejar una prueba que cubra permiso, IDOR, concurrencia y auditoría. Ver [ADR 0012](../adr/0012-granular-admin-console.md), [ADR 0014](../adr/0014-global-employer-resolution.md) y [ADR 0015](../adr/0015-active-processing-runs-and-safe-recovery.md).
+Agregar cualquiera de esas operaciones requiere preservar las máquinas de estado, definir la base de autorización, minimizar el DTO y dejar una prueba que cubra permiso, IDOR, concurrencia y auditoría. Ver [ADR 0012](../adr/0012-granular-admin-console.md), [ADR 0014](../adr/0014-global-employer-resolution.md), [ADR 0015](../adr/0015-active-processing-runs-and-safe-recovery.md) y [ADR 0017](../adr/0017-guarded-admin-legal-publication.md).

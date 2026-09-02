@@ -583,7 +583,7 @@ export async function buildApp(
   });
 
   app.addHook("onSend", async (request, reply, payload) => {
-    if (request.url.startsWith("/api/v1/") && !request.url.startsWith("/api/v1/legal/")) {
+    if (request.url.startsWith("/api/v1/")) {
       reply.header("Cache-Control", "no-store");
     }
     return payload;
@@ -689,7 +689,10 @@ export async function buildApp(
                      WHERE version.document_type IN ('TERMS', 'PRIVACY_NOTICE')
                        AND version.locale = 'es-AR'
                        AND version.published_at <= now() AND version.effective_at <= now()
-                     ORDER BY version.document_type, version.effective_at DESC, version.published_at DESC
+                     ORDER BY version.document_type, version.effective_at DESC,
+                              split_part(version.version, '.', 1)::numeric DESC,
+                              split_part(version.version, '.', 2)::numeric DESC,
+                              version.published_at DESC
                   ) AS current_version
                   JOIN legal_acknowledgements AS acknowledgement
                     ON acknowledgement.document_version_id = current_version.id
@@ -822,7 +825,7 @@ export async function buildApp(
         response: responses(200, legalDocumentSchema),
       },
     },
-    async (request, reply) => {
+    async (request) => {
       const documentType = request.params.type === "terms" ? "TERMS" : "PRIVACY_NOTICE";
       const values: unknown[] = [documentType];
       let versionFilter = "";
@@ -836,12 +839,14 @@ export async function buildApp(
           WHERE document_type = $1 AND locale = 'es-AR'
             AND published_at <= now() AND effective_at <= now()
             ${versionFilter}
-          ORDER BY effective_at DESC, published_at DESC
+          ORDER BY effective_at DESC,
+                   split_part(version, '.', 1)::numeric DESC,
+                   split_part(version, '.', 2)::numeric DESC,
+                   published_at DESC
           LIMIT 1`,
         values,
       );
       if (result.rowCount !== 1) throw new ApiError(404, "LEGAL_DOCUMENT_NOT_FOUND", "Documento legal no encontrado.");
-      reply.header("Cache-Control", "public, max-age=300");
       return { data: legalDocumentFrom(result.rows[0]) };
     },
   );
@@ -908,7 +913,10 @@ export async function buildApp(
              FROM legal_document_versions
             WHERE document_type IN ('TERMS', 'PRIVACY_NOTICE')
               AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
-            ORDER BY document_type, effective_at DESC, published_at DESC`,
+            ORDER BY document_type, effective_at DESC,
+                     split_part(version, '.', 1)::numeric DESC,
+                     split_part(version, '.', 2)::numeric DESC,
+                     published_at DESC`,
         );
         const { terms, privacy } = validateRegistrationLegalDocuments(config.appEnv, legalDocuments.rows);
         if (

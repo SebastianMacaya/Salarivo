@@ -80,6 +80,17 @@ type ProcessingRunParams = { id: string; runId: string };
 type AdminReprocessBody = Reason & { retry?: boolean };
 type AdminReprocessingBatchBody = Reason & { userId: string; documentIds?: string[] };
 type ActiveReprocessingBatchQuery = { userId: string };
+type LegalDocumentType = "TERMS" | "PRIVACY_NOTICE";
+type LegalPublicationBody = Reason & {
+  approvedForProduction: true;
+  effectiveAt: string;
+  documents: Array<{
+    documentType: LegalDocumentType;
+    version: string;
+    title: string;
+    content: string;
+  }>;
+};
 type AdminAuditConfig = {
   capability: AdminPermission;
   action: string;
@@ -129,6 +140,7 @@ const employerIdentifierSchema = {
 
 const uuidRegex = new RegExp(UUID_PATTERN, "i");
 const referenceRegex = new RegExp(REFERENCE_PATTERN);
+const legalVersionRegex = /^[0-9]+\.[0-9]+$/;
 
 const paginationFields = {
   page: { type: "integer", minimum: 1 },
@@ -150,6 +162,39 @@ const reprocessingBatchSchema = {
         "total", "queued", "processing", "improved", "unchanged", "reviewRequired", "failed", "skipped",
       ].map((key) => [key, { type: "integer", minimum: 0 }])),
     },
+  },
+};
+
+const legalAdminVersionSchema = {
+  type: "object", additionalProperties: false,
+  required: [
+    "id", "documentType", "version", "title", "publishedAt", "effectiveAt", "requiresAcceptance",
+    "approvedForProduction", "acknowledgementCount", "status",
+  ],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN },
+    documentType: { type: "string", enum: ["TERMS", "PRIVACY_NOTICE"] },
+    version: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+    title: { type: "string" },
+    publishedAt: { type: "string" },
+    effectiveAt: { type: "string" },
+    requiresAcceptance: { type: "boolean" },
+    approvedForProduction: { type: "boolean" },
+    acknowledgementCount: { type: "integer", minimum: 0 },
+    status: { type: "string", enum: ["CURRENT", "SCHEDULED", "SUPERSEDED"] },
+  },
+};
+
+const legalAdminDocumentSchema = {
+  type: "object", additionalProperties: false,
+  required: ["id", "documentType", "version", "title", "content", "effectiveAt"],
+  properties: {
+    id: { type: "string", pattern: UUID_PATTERN },
+    documentType: { type: "string", enum: ["TERMS", "PRIVACY_NOTICE"] },
+    version: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+    title: { type: "string" },
+    content: { type: "string" },
+    effectiveAt: { type: "string" },
   },
 };
 
@@ -232,6 +277,39 @@ async function totalForPage(sql: string, values: unknown[], current: unknown, of
 
 function text(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
+}
+
+export function isNewerLegalVersion(next: string, current: string): boolean {
+  if (!legalVersionRegex.test(next) || !legalVersionRegex.test(current)) return false;
+  const [nextMajor, nextMinor] = next.split(".").map(BigInt);
+  const [currentMajor, currentMinor] = current.split(".").map(BigInt);
+  return nextMajor! > currentMajor! || (nextMajor === currentMajor && nextMinor! > currentMinor!);
+}
+
+export function hasInternalLegalReviewLanguage(content: string): boolean {
+  return /(?:^|\n)\s*(?:BORRADOR|TODO)\b|revisi[oó]n legal (?:antes|pendiente)|pendiente de revisi[oó]n|texto operativo inicial/iu.test(content);
+}
+
+export function legalAdminVersionItems(rows: Array<Record<string, unknown>>) {
+  const currentTypes = new Set<string>();
+  const scheduledSlots = new Set<string>();
+  return rows.map((row) => {
+    const documentType = String(row.document_type);
+    const effectiveAt = timestamp(row.effective_at as Date | string | null)!;
+    const available = Boolean(row.available);
+    const scheduledSlot = `${documentType}:${effectiveAt}`;
+    const status = available
+      ? currentTypes.has(documentType) ? "SUPERSEDED" : "CURRENT"
+      : scheduledSlots.has(scheduledSlot) ? "SUPERSEDED" : "SCHEDULED";
+    if (status === "CURRENT") currentTypes.add(documentType);
+    if (status === "SCHEDULED") scheduledSlots.add(scheduledSlot);
+    return {
+      id: String(row.id), documentType, version: String(row.version), title: String(row.title),
+      publishedAt: timestamp(row.published_at as Date | string | null)!, effectiveAt,
+      requiresAcceptance: Boolean(row.requires_acceptance), approvedForProduction: Boolean(row.approved_for_production),
+      acknowledgementCount: integer(row.acknowledgement_count), status,
+    };
+  });
 }
 
 export function maskEmployerIdentifier(suffix: unknown): string {
@@ -501,6 +579,109 @@ async function audit(
   );
 }
 
+export async function publishLegalDocuments(
+  client: PoolClient,
+  request: FastifyRequest,
+  body: LegalPublicationBody,
+  ApiError: ApiErrorConstructor,
+) {
+  // ponytail: one global lock serializes rare legal publications; split by type only if contention is measured.
+  await client.query("SELECT pg_advisory_xact_lock(713, 12017)");
+  const clock = await client.query<{ minimum_effective_at: Date | string; maximum_effective_at: Date | string }>(
+    `SELECT clock_timestamp() + interval '1 minute' AS minimum_effective_at,
+            clock_timestamp() + interval '1 year' AS maximum_effective_at`,
+  );
+  const actorRole = await lockActor(client, request, "legal.manage", ApiError);
+  const effectiveAt = new Date(body.effectiveAt);
+  const minimumEffectiveAt = new Date(clock.rows[0]!.minimum_effective_at);
+  if (!Number.isFinite(effectiveAt.getTime()) || effectiveAt.getTime() < minimumEffectiveAt.getTime()) {
+    throw new ApiError(400, "LEGAL_EFFECTIVE_AT_INVALID", "La vigencia debe programarse con al menos un minuto de anticipación.");
+  }
+  if (effectiveAt.getTime() > new Date(clock.rows[0]!.maximum_effective_at).getTime()) {
+    throw new ApiError(400, "LEGAL_EFFECTIVE_AT_TOO_FAR", "La vigencia no puede programarse con más de un año de anticipación.");
+  }
+  if (new Set(body.documents.map(({ documentType }) => documentType)).size !== body.documents.length) {
+    throw new ApiError(400, "LEGAL_DOCUMENT_TYPE_DUPLICATED", "Cada tipo de documento puede publicarse una sola vez por lote.");
+  }
+
+  const published = [];
+  for (const document of body.documents) {
+    const title = document.title.trim();
+    const content = document.content.trim();
+    if (title.length < 3 || title.length > 160 || content.length < 100 || content.length > 50_000) {
+      throw new ApiError(400, "VALIDATION_ERROR", "El título o el texto legal no tienen una longitud válida.");
+    }
+    if (hasInternalLegalReviewLanguage(content)) {
+      throw new ApiError(400, "LEGAL_REVIEW_LANGUAGE", "El texto contiene marcas internas de borrador o revisión.");
+    }
+    const latest = await client.query<{ version: string; max_effective_at: Date | string }>(
+      `SELECT version, max(effective_at) OVER () AS max_effective_at
+         FROM legal_document_versions
+        WHERE document_type = $1 AND locale = 'es-AR'
+        ORDER BY split_part(version, '.', 1)::numeric DESC,
+                 split_part(version, '.', 2)::numeric DESC
+        LIMIT 1`,
+      [document.documentType],
+    );
+    const currentVersion = latest.rows[0]?.version;
+    if (currentVersion && !isNewerLegalVersion(document.version, currentVersion)) {
+      throw new ApiError(
+        409,
+        document.version === currentVersion ? "LEGAL_VERSION_EXISTS" : "LEGAL_VERSION_NOT_INCREMENTAL",
+        document.version === currentVersion
+          ? "Esa versión ya existe."
+          : `La versión debe ser posterior a ${currentVersion}.`,
+      );
+    }
+    const latestEffectiveAt = latest.rows[0]?.max_effective_at;
+    if (latestEffectiveAt && effectiveAt.getTime() < new Date(latestEffectiveAt).getTime()) {
+      throw new ApiError(409, "LEGAL_EFFECTIVE_AT_NOT_INCREMENTAL", "La vigencia no puede ser anterior a una versión ya publicada.");
+    }
+
+    const id = randomUUID();
+    const requiresAcceptance = document.documentType === "TERMS";
+    const result = await client.query<{ published_at: Date | string }>(
+      `INSERT INTO legal_document_versions (
+         id, document_type, version, locale, title, content, published_at,
+         effective_at, requires_acceptance, approved_for_production
+       ) VALUES ($1, $2, $3, 'es-AR', $4, $5, clock_timestamp(), $6, $7, true)
+       RETURNING published_at`,
+      [id, document.documentType, document.version, title, content, effectiveAt, requiresAcceptance],
+    );
+    await audit(
+      client,
+      request,
+      actorRole,
+      "legal.manage",
+      "LEGAL_DOCUMENT_VERSION_PUBLISHED",
+      "LEGAL_DOCUMENT_VERSION",
+      id,
+      null,
+      body,
+      {
+        documentType: document.documentType,
+        version: document.version,
+        effectiveAt: effectiveAt.toISOString(),
+        requiresAcceptance,
+        approvedForProduction: true,
+      },
+    );
+    published.push({
+      id,
+      documentType: document.documentType,
+      version: document.version,
+      title,
+      publishedAt: timestamp(result.rows[0]!.published_at)!,
+      effectiveAt: effectiveAt.toISOString(),
+      requiresAcceptance,
+      approvedForProduction: true,
+      acknowledgementCount: 0,
+      status: "SCHEDULED",
+    });
+  }
+  return published;
+}
+
 async function protectLastSuperAdmin(client: PoolClient, target: Record<string, unknown>, ApiError: ApiErrorConstructor) {
   if (target.role !== "ADMIN" || target.admin_role !== "SUPER_ADMIN" || target.status !== "ACTIVE") return;
   const remaining = await client.query(
@@ -585,7 +766,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get(
     "/api/v1/admin/context",
     {
-      preHandler: guard("dashboard.read"),
+      preValidation: guard("dashboard.read"),
       schema: ok({
         type: "object",
         additionalProperties: false,
@@ -615,7 +796,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: { range?: "TODAY" | "7D" | "30D" } }>(
     "/api/v1/admin/overview",
     {
-      preHandler: guard("dashboard.read"),
+      preValidation: guard("dashboard.read"),
       schema: {
         querystring: {
           type: "object",
@@ -647,19 +828,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
             },
             legalDocuments: {
               type: "array",
-              items: {
-                type: "object",
-                additionalProperties: false,
-                required: ["documentType", "version", "effectiveAt", "requiresAcceptance", "approvedForProduction", "acknowledgementCount"],
-                properties: {
-                  documentType: { type: "string", enum: ["TERMS", "PRIVACY_NOTICE"] },
-                  version: { type: "string" },
-                  effectiveAt: { type: "string" },
-                  requiresAcceptance: { type: "boolean" },
-                  approvedForProduction: { type: "boolean" },
-                  acknowledgementCount: { type: "integer", minimum: 0 },
-                },
-              },
+              items: legalAdminVersionSchema,
             },
           },
         }),
@@ -701,17 +870,23 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           [range],
         ),
         pool.query(
-          `SELECT version.document_type, version.version, version.effective_at, version.requires_acceptance,
+          `SELECT version.id, version.document_type, version.version, version.title,
+                  version.published_at, version.effective_at, version.requires_acceptance,
                   version.approved_for_production,
+                  version.published_at <= now() AND version.effective_at <= now() AS available,
                   count(acknowledgement.user_id)::integer AS acknowledgement_count
              FROM legal_document_versions AS version
              LEFT JOIN legal_acknowledgements AS acknowledgement ON acknowledgement.document_version_id = version.id
             GROUP BY version.id
-            ORDER BY version.document_type, version.effective_at DESC`,
+            ORDER BY version.document_type, version.effective_at DESC,
+                     split_part(version.version, '.', 1)::numeric DESC,
+                     split_part(version.version, '.', 2)::numeric DESC,
+                     version.published_at DESC`,
         ),
       ]);
       const m = metrics.rows[0];
       const a = activity.rows[0];
+      const legalDocumentItems = legalAdminVersionItems(legalDocuments.rows);
       return {
         data: {
           range,
@@ -726,21 +901,80 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
             retryableJobs: integer(a.retryable_jobs), quarantinedDocuments: integer(a.quarantined_documents),
             pendingPrivacyOperations: integer(a.pending_privacy_operations),
           },
-          legalDocuments: legalDocuments.rows.map((row) => ({
-            documentType: String(row.document_type), version: String(row.version),
-            effectiveAt: timestamp(row.effective_at)!, requiresAcceptance: Boolean(row.requires_acceptance),
-            approvedForProduction: Boolean(row.approved_for_production),
-            acknowledgementCount: integer(row.acknowledgement_count),
-          })),
+          legalDocuments: legalDocumentItems,
         },
       };
+    },
+  );
+
+  app.post<{ Body: LegalPublicationBody }>(
+    "/api/v1/admin/legal-documents",
+    {
+      config: { adminAudit: { capability: "legal.manage", action: "LEGAL_DOCUMENT_VERSIONS_PUBLISHED", resourceType: "LEGAL_DOCUMENT_VERSION" } },
+      preValidation: guard("legal.manage", true),
+      schema: {
+        body: {
+          type: "object", additionalProperties: false,
+          required: ["documents", "effectiveAt", "approvedForProduction", "reasonCode", "reference"],
+          properties: {
+            documents: {
+              type: "array", minItems: 1, maxItems: 2,
+              items: {
+                type: "object", additionalProperties: false,
+                required: ["documentType", "version", "title", "content"],
+                properties: {
+                  documentType: { type: "string", enum: ["TERMS", "PRIVACY_NOTICE"] },
+                  version: { type: "string", pattern: "^[0-9]+\\.[0-9]+$", maxLength: 32 },
+                  title: { type: "string", minLength: 3, maxLength: 160 },
+                  content: { type: "string", minLength: 100, maxLength: 50_000 },
+                },
+              },
+            },
+            effectiveAt: { type: "string", format: "date-time" },
+            approvedForProduction: { type: "boolean", const: true },
+            ...reasonProperties,
+          },
+        },
+        ...ok({
+          type: "object", additionalProperties: false, required: ["items"],
+          properties: { items: { type: "array", minItems: 1, maxItems: 2, items: legalAdminVersionSchema } },
+        }),
+      },
+    },
+    async (request) => ({
+      data: { items: await withTransaction((client) => publishLegalDocuments(client, request, request.body, ApiError)) },
+    }),
+  );
+
+  app.get<{ Params: IdParams }>(
+    "/api/v1/admin/legal-documents/:id",
+    {
+      preValidation: guard("legal.manage"),
+      schema: {
+        params: { type: "object", additionalProperties: false, required: ["id"], properties: { id: { type: "string", pattern: UUID_PATTERN } } },
+        ...ok(legalAdminDocumentSchema),
+      },
+    },
+    async (request) => {
+      const result = await pool.query(
+        `SELECT id, document_type, version, title, content, effective_at
+           FROM legal_document_versions
+          WHERE id = $1 AND locale = 'es-AR'`,
+        [request.params.id],
+      );
+      if (result.rowCount !== 1) throw new ApiError(404, "LEGAL_DOCUMENT_NOT_FOUND", "Documento legal no encontrado.");
+      const row = result.rows[0]!;
+      return { data: {
+        id: String(row.id), documentType: String(row.document_type), version: String(row.version),
+        title: String(row.title), content: String(row.content), effectiveAt: timestamp(row.effective_at)!,
+      } };
     },
   );
 
   app.get(
     "/api/v1/admin/roles",
     {
-      preHandler: guard("roles.manage"),
+      preValidation: guard("roles.manage"),
       schema: ok({
         type: "array",
         items: {
@@ -778,7 +1012,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: ListQuery & { status?: string; role?: "USER" | "ADMIN"; adminRole?: AdminRole } }>(
     "/api/v1/admin/users",
     {
-      preHandler: guard("users.read_metadata"),
+      preValidation: guard("users.read_metadata"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -834,7 +1068,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Params: IdParams }>(
     "/api/v1/admin/users/:id",
     {
-      preHandler: guard("users.read_metadata"),
+      preValidation: guard("users.read_metadata"),
       schema: {
         params: idParamsSchema,
         ...ok({
@@ -924,7 +1158,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/users/:id/contact",
     {
       config: { adminAudit: { capability: "users.read_contact", action: "USER_CONTACT_REVEALED", resourceType: "USER", subjectIsResource: true } },
-      preHandler: guard("users.read_contact", true),
+      preValidation: guard("users.read_contact", true),
       schema: {
         params: idParamsSchema,
         querystring: { type: "object", additionalProperties: false, required: ["reasonCode", "reference"], properties: reasonProperties },
@@ -952,7 +1186,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/users/:id/status",
     {
       config: { adminAudit: { capability: "users.status.update", action: "USER_STATUS_UPDATED", resourceType: "USER", subjectIsResource: true } },
-      preHandler: guard("users.status.update", true),
+      preValidation: guard("users.status.update", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -995,7 +1229,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/employers/:id/identifiers/cuit",
     {
       config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_IDENTIFIER_SET", resourceType: "EMPLOYER" } },
-      preHandler: guard("employers.manage", true),
+      preValidation: guard("employers.manage", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -1105,7 +1339,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/users/:id/revoke-sessions",
     {
       config: { adminAudit: { capability: "sessions.revoke", action: "USER_SESSIONS_REVOKED", resourceType: "USER", subjectIsResource: true } },
-      preHandler: guard("sessions.revoke", true),
+      preValidation: guard("sessions.revoke", true),
       schema: {
         params: idParamsSchema, body: reasonBodySchema,
         ...ok({
@@ -1136,7 +1370,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/users/:id/role",
     {
       config: { adminAudit: { capability: "roles.manage", action: "USER_ROLE_UPDATED", resourceType: "USER", subjectIsResource: true } },
-      preHandler: guard("roles.manage", true),
+      preValidation: guard("roles.manage", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -1236,7 +1470,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: DocumentQuery }>(
     "/api/v1/admin/documents",
     {
-      preHandler: guard("documents.read_metadata"),
+      preValidation: guard("documents.read_metadata"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -1344,7 +1578,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Params: IdParams }>(
     "/api/v1/admin/documents/:id",
     {
-      preHandler: guard("documents.read_metadata"),
+      preValidation: guard("documents.read_metadata"),
       schema: {
         params: idParamsSchema,
         ...ok({
@@ -1493,7 +1727,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/documents/:id/reprocess",
     {
       config: { adminAudit: { capability: "processing.reprocess", action: "DOCUMENT_REPROCESS_REQUESTED", resourceType: "DOCUMENT" } },
-      preHandler: guard("processing.reprocess", true),
+      preValidation: guard("processing.reprocess", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -1539,7 +1773,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/reprocessing-batches",
     {
       config: { adminAudit: { capability: "processing.reprocess", action: "REPROCESSING_BATCH_REQUESTED", resourceType: "REPROCESSING_BATCH" } },
-      preHandler: guard("processing.reprocess", true),
+      preValidation: guard("processing.reprocess", true),
       schema: {
         body: {
           type: "object", additionalProperties: false,
@@ -1623,7 +1857,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: ActiveReprocessingBatchQuery }>(
     "/api/v1/admin/reprocessing-batches/active",
     {
-      preHandler: guard("processing.read"),
+      preValidation: guard("processing.read"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false, required: ["userId"],
@@ -1655,7 +1889,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Params: IdParams }>(
     "/api/v1/admin/reprocessing-batches/:id",
     {
-      preHandler: guard("processing.read"),
+      preValidation: guard("processing.read"),
       schema: {
         params: idParamsSchema,
         ...ok(reprocessingBatchSchema),
@@ -1674,7 +1908,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/documents/:id/processing-runs/:runId/rollback",
     {
       config: { adminAudit: { capability: "processing.rollback", action: "PROCESSING_RUN_ROLLED_BACK", resourceType: "EXTRACTION_RUN" } },
-      preHandler: guard("processing.rollback", true),
+      preValidation: guard("processing.rollback", true),
       schema: {
         params: {
           type: "object", additionalProperties: false, required: ["id", "runId"],
@@ -1739,7 +1973,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/documents/:id/quarantine",
     {
       config: { adminAudit: { capability: "documents.quarantine", action: "DOCUMENT_QUARANTINED", resourceType: "DOCUMENT" } },
-      preHandler: guard("documents.quarantine", true),
+      preValidation: guard("documents.quarantine", true),
       schema: {
         params: idParamsSchema, body: reasonBodySchema,
         ...ok({
@@ -1830,7 +2064,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: JobQuery }>(
     "/api/v1/admin/jobs",
     {
-      preHandler: guard("processing.read"),
+      preValidation: guard("processing.read"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -1885,7 +2119,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/jobs/:id/retry",
     {
       config: { adminAudit: { capability: "processing.retry", action: "PROCESSING_JOB_RETRY_ADVANCED", resourceType: "PROCESSING_JOB" } },
-      preHandler: guard("processing.retry", true),
+      preValidation: guard("processing.retry", true),
       schema: {
         params: idParamsSchema, body: reasonBodySchema,
         ...ok({
@@ -1960,7 +2194,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/jobs/:id/cancel",
     {
       config: { adminAudit: { capability: "processing.cancel", action: "PROCESSING_JOB_CANCELLED", resourceType: "PROCESSING_JOB" } },
-      preHandler: guard("processing.cancel", true),
+      preValidation: guard("processing.cancel", true),
       schema: {
         params: idParamsSchema, body: reasonBodySchema,
         ...ok({
@@ -2119,7 +2353,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: EmployerQuery }>(
     "/api/v1/admin/employers",
     {
-      preHandler: guard("employers.read_metadata"),
+      preValidation: guard("employers.read_metadata"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -2191,7 +2425,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Params: IdParams }>(
     "/api/v1/admin/employers/:id",
     {
-      preHandler: guard("employers.read_metadata"),
+      preValidation: guard("employers.read_metadata"),
       schema: {
         params: idParamsSchema,
         ...ok({
@@ -2365,7 +2599,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/employers/:id/approve",
     {
       config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_APPROVED", resourceType: "EMPLOYER" } },
-      preHandler: guard("employers.manage", true),
+      preValidation: guard("employers.manage", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -2435,7 +2669,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/employers/:id/rename",
     {
       config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_RENAMED", resourceType: "EMPLOYER" } },
-      preHandler: guard("employers.manage", true),
+      preValidation: guard("employers.manage", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -2492,7 +2726,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/employers/:id/aliases",
     {
       config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_ALIAS_ADDED", resourceType: "EMPLOYER" } },
-      preHandler: guard("employers.manage", true),
+      preValidation: guard("employers.manage", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -2547,7 +2781,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/employers/:id/reject",
     {
       config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_REJECTED", resourceType: "EMPLOYER" } },
-      preHandler: guard("employers.manage", true),
+      preValidation: guard("employers.manage", true),
       schema: { params: idParamsSchema, body: reasonBodySchema, ...ok(employerStateSchema) },
     },
     async (request) => withTransaction(async (client) => {
@@ -2601,7 +2835,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
     "/api/v1/admin/employers/:id/merge",
     {
       config: { adminAudit: { capability: "employers.manage", action: "EMPLOYER_MERGED", resourceType: "EMPLOYER" } },
-      preHandler: guard("employers.manage", true),
+      preValidation: guard("employers.manage", true),
       schema: {
         params: idParamsSchema,
         body: {
@@ -2861,7 +3095,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: ListQuery }>(
     "/api/v1/admin/storage",
     {
-      preHandler: guard("storage.read"),
+      preValidation: guard("storage.read"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -2958,7 +3192,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: ListQuery & { operationType?: string; status?: string; userId?: string } }>(
     "/api/v1/admin/privacy",
     {
-      preHandler: guard("privacy.read"),
+      preValidation: guard("privacy.read"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -3024,7 +3258,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get(
     "/api/v1/admin/security",
     {
-      preHandler: guard("security.read"),
+      preValidation: guard("security.read"),
       schema: ok({
         type: "object", additionalProperties: false,
         required: ["activeSessions", "recentlyRevokedSessions", "adminsWithoutMfa", "suspendedUsers", "blockedUsers", "quarantinedDocuments", "securityErrors", "adminMutations24h"],
@@ -3059,7 +3293,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: ListQuery & { action?: string; result?: string; actorUserId?: string; subjectUserId?: string; resourceType?: string; reasonCode?: ReasonCode } }>(
     "/api/v1/admin/audit",
     {
-      preHandler: guard("audit.read"),
+      preValidation: guard("audit.read"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -3128,7 +3362,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get<{ Querystring: PageQuery }>(
     "/api/v1/admin/processing/health",
     {
-      preHandler: guard("processing.read"),
+      preValidation: guard("processing.read"),
       schema: {
         querystring: {
           type: "object", additionalProperties: false,
@@ -3209,7 +3443,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get(
     "/api/v1/admin/settings",
     {
-      preHandler: guard("settings.read"),
+      preValidation: guard("settings.read"),
       schema: ok({
         type: "object", additionalProperties: false, required: ["environment", "authentication", "limits", "storage", "features"],
         properties: {
@@ -3255,7 +3489,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
   app.get(
     "/api/v1/admin/system/health",
     {
-      preHandler: guard("system.health.read"),
+      preValidation: guard("system.health.read"),
       schema: ok({
         type: "object", additionalProperties: false, required: ["overall", "components", "checkedAt"],
         properties: {

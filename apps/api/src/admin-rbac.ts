@@ -28,6 +28,7 @@ export const adminPermissions = [
   "privacy.read",
   "security.read",
   "audit.read",
+  "legal.manage",
   "settings.read",
   "system.health.read",
   "roles.manage",

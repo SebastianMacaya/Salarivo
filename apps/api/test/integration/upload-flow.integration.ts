@@ -748,6 +748,7 @@ test("upload privado crea un único documento y un único intent durable", async
   const featureRemoteAddress = "198.51.100.23";
   const publicTerms = await app.inject({ method: "GET", url: "/api/v1/legal/terms" });
   assert.equal(publicTerms.statusCode, 200, publicTerms.body);
+  assert.equal(publicTerms.headers["cache-control"], "no-store");
   assert.equal(publicTerms.json().data.version, "1.0");
   assert.doesNotMatch(publicTerms.json().data.content, /(?:^|\n)(?:BORRADOR|TODO)\b|revisión legal antes de producción/i);
   const publicPrivacy = await app.inject({ method: "GET", url: "/api/v1/legal/privacy" });
@@ -759,6 +760,14 @@ test("upload privado crea un único documento y un único intent durable", async
     () => pool.query("UPDATE legal_document_versions SET title = title WHERE document_type = 'TERMS' AND version = '1.0'"),
     /append-only/,
   );
+  const truncateClient = await pool.connect();
+  try {
+    await truncateClient.query("BEGIN");
+    await assert.rejects(() => truncateClient.query("TRUNCATE legal_document_versions CASCADE"), /append-only/);
+  } finally {
+    await truncateClient.query("ROLLBACK");
+    truncateClient.release();
+  }
   const approvedDocuments = await pool.query(
     `SELECT document_type, version, approved_for_production
        FROM legal_document_versions
@@ -1586,6 +1595,36 @@ test("upload privado crea un único documento y un único intent durable", async
 
   await pool.query("UPDATE users SET admin_role = 'SUPER_ADMIN', updated_at = now() WHERE id = $1", [userIdA]);
   await grantStepUp(cookieA);
+  const invalidLegalReference = `LEGAL-${suffix}`;
+  const invalidLegalPublication = await app.inject({
+    method: "POST",
+    url: "/api/v1/admin/legal-documents",
+    headers: { origin, cookie: cookieA },
+    payload: {
+      documents: [{
+        documentType: "TERMS", version: "1.1", title: "Texto sintético",
+        content: "Contenido legal sintético aprobado para verificar el rechazo de esquema. ".repeat(2),
+      }],
+      effectiveAt: new Date(Date.now() + 86_400_000).toISOString(),
+      approvedForProduction: false,
+      reasonCode: "OPERATIONAL_RECOVERY",
+      reference: invalidLegalReference,
+    },
+  });
+  assert.equal(invalidLegalPublication.statusCode, 400, invalidLegalPublication.body);
+  assert.equal(invalidLegalPublication.json().error.code, "VALIDATION_ERROR");
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT result, actor_admin_role, reason_code, reference
+         FROM admin_audit_events
+        WHERE actor_user_id = $1 AND action = 'LEGAL_DOCUMENT_VERSIONS_PUBLISHED'`,
+      [userIdA],
+    )).rows,
+    [{
+      result: "DENIED", actor_admin_role: "SUPER_ADMIN",
+      reason_code: "OPERATIONAL_RECOVERY", reference: invalidLegalReference,
+    }],
+  );
   const revokedDisposableSessions = await app.inject({
     method: "POST",
     url: `/api/v1/admin/users/${disposableAdminTargetId}/revoke-sessions`,
@@ -1616,6 +1655,12 @@ test("upload privado crea un único documento y un único intent durable", async
     Object.keys(adminOverview.json().data.metrics).sort(),
     ["activeImports", "activeUsers", "failedDocuments", "pendingReview", "totalDocuments", "totalUsers"].sort(),
   );
+  const currentTerms = adminOverview.json().data.legalDocuments.find((item: { documentType: string; status: string }) => item.documentType === "TERMS" && item.status === "CURRENT");
+  assert.ok(currentTerms?.id);
+  const legalPreview = await app.inject({ method: "GET", url: `/api/v1/admin/legal-documents/${currentTerms.id}`, headers: { cookie: cookieA } });
+  assert.equal(legalPreview.statusCode, 200, legalPreview.body);
+  assert.equal(legalPreview.json().data.version, currentTerms.version);
+  assert.ok(legalPreview.json().data.content.length >= 100);
   for (const forbidden of ["password_hash", "original_filename", "gross_amount", "net_amount", "object_key"]) {
     assert.equal(adminOverview.body.includes(forbidden), false);
   }

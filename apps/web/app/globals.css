@@ -845,7 +845,16 @@ td { border-top: 1px solid #edf1ee; padding: 14px 15px; white-space: nowrap; }
 .admin-dialog .modal-head h2 { margin: 0; font-family: Georgia, serif; font-size: 28px; font-weight: 500; }
 .admin-dialog > form > p { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .admin-dialog label { margin-top: 14px; }
-.admin-dialog input, .admin-dialog select { width: 100%; }
+.admin-dialog input, .admin-dialog select, .admin-dialog textarea { width: 100%; }
+.admin-dialog textarea { min-height: 180px; border: 1px solid #cfd8d2; border-radius: 10px; padding: 10px 13px; color: var(--ink); resize: vertical; }
+.admin-dialog textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgb(23 108 74 / 10%); outline: 0; }
+.admin-legal-fields { display: grid; gap: 14px; }
+.admin-legal-fields fieldset { display: grid; gap: 12px; border: 1px solid #dce5df; border-radius: 12px; margin: 0; padding: 14px; }
+.admin-legal-fields legend { padding: 0 6px; font-size: 12px; font-weight: 800; }
+.admin-dialog .admin-attestation { grid-template-columns: 18px 1fr; align-items: start; color: #39463f; font-size: 11px; line-height: 1.45; text-transform: none; }
+.admin-dialog .admin-attestation input { width: 17px; min-height: 17px; height: 17px; margin: 0; accent-color: var(--green); }
+.admin-legal-preview { width: min(calc(100% - 28px), 760px); max-height: min(90vh, 900px); overflow: auto; }
+.admin-legal-preview .legal-content { white-space: pre-wrap; }
 .admin-dialog:focus-visible, .admin-nav:focus-visible, .admin-tabs a:focus-visible, .entity-link:focus-visible { outline: 3px solid #8fc7a8; outline-offset: 3px; }
 
 @media (max-width: 1050px) {

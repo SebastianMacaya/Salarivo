@@ -2,6 +2,7 @@
 
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import { buenosAiresDateTimeIso } from './format';
 import {
   batchIsActive,
   batchResolved,
@@ -23,7 +24,7 @@ type Permission =
   | 'dashboard.read' | 'users.read_metadata' | 'users.read_contact' | 'users.status.update'
   | 'sessions.revoke' | 'documents.read_metadata' | 'documents.quarantine'
   | 'employers.read_metadata' | 'processing.read' | 'processing.retry' | 'processing.cancel' | 'processing.reprocess' | 'processing.rollback'
-  | 'storage.read' | 'privacy.read' | 'security.read' | 'audit.read' | 'settings.read'
+  | 'storage.read' | 'privacy.read' | 'security.read' | 'audit.read' | 'legal.manage' | 'settings.read'
   | 'system.health.read' | 'roles.manage';
 type SessionUser = {
   id: string;
@@ -44,7 +45,14 @@ type Overview = {
     newUsers: number; documentsCreated: number; completedDocuments: number; failedJobs: number;
     retryableJobs: number; quarantinedDocuments: number; pendingPrivacyOperations: number;
   };
+  legalDocuments: LegalDocumentVersion[];
 };
+type LegalDocumentVersion = {
+  id: string; documentType: 'TERMS' | 'PRIVACY_NOTICE'; version: string; title: string;
+  publishedAt: string; effectiveAt: string; requiresAcceptance: boolean; approvedForProduction: boolean;
+  acknowledgementCount: number; status: 'CURRENT' | 'SCHEDULED' | 'SUPERSEDED';
+};
+type LegalDocumentPreview = Pick<LegalDocumentVersion, 'id' | 'documentType' | 'version' | 'title' | 'effectiveAt'> & { content: string };
 type AdminUser = {
   id: string; maskedEmail: string; status: string; role: 'USER' | 'ADMIN'; adminRole: AdminRole | null;
   mfaEnabled: boolean; activeSessions: number; documentCount: number; employerCount?: number;
@@ -160,9 +168,9 @@ function bytes(value: number | null | undefined) {
 }
 function shortId(value: string) { return `${value.slice(0, 8)}…`; }
 function tone(status: string) {
-  if (['ACTIVE', 'READY', 'SUCCEEDED', 'PROCESSED', 'COMPLETED', 'HEALTHY', 'SUCCESS', 'CLEAN', 'VERIFIED', 'PROMOTED', 'UNCHANGED'].includes(status)) return 'ready';
+  if (['ACTIVE', 'READY', 'SUCCEEDED', 'PROCESSED', 'COMPLETED', 'HEALTHY', 'SUCCESS', 'CLEAN', 'VERIFIED', 'PROMOTED', 'UNCHANGED', 'CURRENT'].includes(status)) return 'ready';
   if (['FAILED', 'FAILED_PERMANENT', 'ERROR', 'REJECTED', 'REJECTED_UNSUPPORTED', 'BLOCKED', 'DOWN', 'UNAVAILABLE', 'QUARANTINED', 'OVER_QUOTA', 'CANCELLED'].includes(status)) return 'danger';
-  if (['PENDING', 'PUBLISHED', 'PROCESSING', 'RUNNING', 'RETRYABLE', 'FAILED_RETRYABLE', 'RETRY_SCHEDULED', 'DEGRADED', 'SUSPENDED', 'NEAR_QUOTA', 'COMPLETED_WITH_WARNINGS', 'REVIEW_REQUIRED', 'NOT_EVALUATED'].includes(status)) return 'pending';
+  if (['PENDING', 'PUBLISHED', 'PROCESSING', 'RUNNING', 'RETRYABLE', 'FAILED_RETRYABLE', 'RETRY_SCHEDULED', 'DEGRADED', 'SUSPENDED', 'NEAR_QUOTA', 'COMPLETED_WITH_WARNINGS', 'REVIEW_REQUIRED', 'NOT_EVALUATED', 'SCHEDULED'].includes(status)) return 'pending';
   return '';
 }
 
@@ -176,11 +184,14 @@ const navigation: Array<{ label: string; href: string; permission: Permission; m
   { label: 'Privacidad', href: '/admin/privacy', permission: 'privacy.read', mark: '07' },
   { label: 'Seguridad', href: '/admin/security', permission: 'security.read', mark: '08' },
   { label: 'Auditoría', href: '/admin/audit', permission: 'audit.read', mark: '09' },
-  { label: 'Accesos', href: '/admin/access', permission: 'roles.manage', mark: '10' },
-  { label: 'Sistema', href: '/admin/system', permission: 'system.health.read', mark: '11' },
+  { label: 'Políticas', href: '/admin/legal', permission: 'legal.manage', mark: '10' },
+  { label: 'Accesos', href: '/admin/access', permission: 'roles.manage', mark: '11' },
+  { label: 'Sistema', href: '/admin/system', permission: 'system.health.read', mark: '12' },
 ];
 
 function StatusBadge({ value }: { value: string }) { return <span className={`status ${tone(value)}`}>{value.replaceAll('_', ' ')}</span>; }
+function legalDocumentLabel(value: LegalDocumentVersion['documentType']) { return value === 'TERMS' ? 'Términos y condiciones' : 'Aviso de privacidad'; }
+function legalStatusLabel(value: LegalDocumentVersion['status']) { return value === 'CURRENT' ? 'Vigente' : value === 'SCHEDULED' ? 'Programada' : 'Reemplazada'; }
 function LoadingState() { return <div className="admin-loading" role="status"><span className="loader" />Cargando datos operativos…</div>; }
 function ErrorState({ message, retry }: { message: string; retry?: () => void }) { const denied = message.startsWith('No tenés permiso'); return <div className="message error" role="alert"><strong>{denied ? 'Acceso denegado.' : 'No pudimos mostrar esta sección.'}</strong><br />{message}{retry && !denied && <><br /><button className="text-button danger-text" onClick={retry}>Reintentar</button></>}</div>; }
 function EmptyState({ children }: { children: ReactNode }) { return <div className="admin-empty"><span aria-hidden="true">✓</span><strong>{children}</strong><small>No hay trabajo operativo para mostrar con estos filtros.</small></div>; }
@@ -563,6 +574,72 @@ function PrivacyPage({ search }: { search: URLSearchParams }) {
   return <><PageHeader eyebrow="Derechos y retención" title="Privacidad" description="Seguimiento de exportaciones y eliminaciones. La ejecución sigue en workers durables, no desde el panel." /><QueryFilters action="/admin/privacy" search={search}><SelectFilter name="status" label="Estado" values={['PENDING', 'RUNNING', 'READY', 'COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED']} search={search} /><SelectFilter name="operationType" label="Tipo" values={['DATA_EXPORT', 'ACCOUNT_DELETION']} search={search} /></QueryFilters>{state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay operaciones de privacidad.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Operación</th><th>Usuario</th><th>Tipo</th><th>Estado</th><th>Solicitud</th><th>Finalización</th><th>Salida</th><th>Error</th></tr></thead><tbody>{state.data.items.map((item) => <tr key={item.id}><td data-label="Operación">{shortId(item.id)}</td><td data-label="Usuario"><a href={`/admin/users/${item.userId}`}>{item.maskedEmail}</a></td><td data-label="Tipo">{item.operationType}</td><td data-label="Estado"><StatusBadge value={item.status} /></td><td data-label="Solicitud">{date(item.createdAt)}</td><td data-label="Finalización">{date(item.completedAt)}</td><td data-label="Salida">{item.hasOutput ? `Disponible hasta ${date(item.outputExpiresAt)}` : 'No disponible'}</td><td data-label="Error">{item.errorCode ?? '—'}</td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/privacy" search={search} /></>}</>;
 }
 
+function LegalPublicationFields() {
+  const [scope, setScope] = useState<'BOTH' | LegalDocumentVersion['documentType']>('BOTH');
+  return <div className="admin-legal-fields">
+    <label>Documentos<select name="scope" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="BOTH">Términos y privacidad</option><option value="TERMS">Sólo términos</option><option value="PRIVACY_NOTICE">Sólo privacidad</option></select></label>
+    <label>Vigencia (Buenos Aires, UTC−3)<input name="effectiveAt" type="datetime-local" step="60" required /></label>
+    <p className="admin-footnote">La vigencia debe tener entre un minuto y un año de anticipación. Para cambiar ambos documentos, publicalos juntos con la misma fecha. Al activarse, cada cuenta deberá aceptar los Términos y/o confirmar el nuevo Aviso antes de seguir usando el producto. Las versiones publicadas no se editan ni se eliminan.</p>
+    {scope !== 'PRIVACY_NOTICE' && <fieldset><legend>Términos y condiciones</legend>
+      <label>Versión<input name="termsVersion" inputMode="decimal" pattern="[0-9]+[.][0-9]+" placeholder="1.1" required /></label>
+      <label>Título<input name="termsTitle" minLength={3} maxLength={160} required /></label>
+      <label>Texto aprobado<textarea name="termsContent" minLength={100} maxLength={50000} rows={12} required /></label>
+    </fieldset>}
+    {scope !== 'TERMS' && <fieldset><legend>Aviso de privacidad</legend>
+      <label>Versión<input name="privacyVersion" inputMode="decimal" pattern="[0-9]+[.][0-9]+" placeholder="1.1" required /></label>
+      <label>Título<input name="privacyTitle" minLength={3} maxLength={160} required /></label>
+      <label>Texto aprobado<textarea name="privacyContent" minLength={100} maxLength={50000} rows={12} required /></label>
+    </fieldset>}
+    <label className="admin-attestation"><input name="approvedForProduction" type="checkbox" required />Confirmo que el texto fue aprobado para producción por la revisión profesional correspondiente y que versión, alcance y fecha son correctos.</label>
+  </div>;
+}
+
+function LegalPreviewDialog({ version, onClose }: { version: LegalDocumentVersion; onClose: () => void }) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const state = useRemote<LegalDocumentPreview>(`/admin/legal-documents/${version.id}`);
+  useEffect(() => { ref.current?.showModal(); }, []);
+  return <dialog className="admin-dialog admin-legal-preview" ref={ref} onCancel={onClose} aria-labelledby="legal-preview-title">
+    <div className="modal-head"><div><p className="eyebrow">Versión inmutable guardada</p><h2 id="legal-preview-title">{legalDocumentLabel(version.documentType)} · v{version.version}</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Cerrar">×</button></div>
+    {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : <><p>Fecha de vigencia: {date(state.data.effectiveAt)}</p><div className="legal-content">{state.data.content}</div></>}
+    <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cerrar</button></div>
+  </dialog>;
+}
+
+function LegalPage() {
+  const state = useRemote<Overview>('/admin/overview?range=30D');
+  const [action, setAction] = useState<AdminAction | null>(null);
+  const [preview, setPreview] = useState<LegalDocumentVersion | null>(null);
+  const [notice, setNotice] = useState('');
+  function openPublication() {
+    setAction({
+      title: 'Publicar nuevas versiones',
+      description: 'La operación agrega versiones inmutables, exige una vigencia futura y queda auditada sin copiar el texto legal al log.',
+      button: 'Programar publicación',
+      fields: <LegalPublicationFields />,
+      execute: async (reasonCode, reference, values) => {
+        const effectiveAt = buenosAiresDateTimeIso(values.effectiveAt);
+        if (!effectiveAt) throw new Error('Elegí una fecha y hora de vigencia válidas.');
+        const documents: Array<{ documentType: LegalDocumentVersion['documentType']; version: string; title: string; content: string }> = [];
+        if (values.scope !== 'PRIVACY_NOTICE') documents.push({ documentType: 'TERMS', version: values.termsVersion.trim(), title: values.termsTitle.trim(), content: values.termsContent.trim() });
+        if (values.scope !== 'TERMS') documents.push({ documentType: 'PRIVACY_NOTICE', version: values.privacyVersion.trim(), title: values.privacyTitle.trim(), content: values.privacyContent.trim() });
+        const result = await api<{ items: LegalDocumentVersion[] }>('/admin/legal-documents', { method: 'POST', body: JSON.stringify({ documents, effectiveAt, approvedForProduction: values.approvedForProduction === 'on', reasonCode, reference }) });
+        return `${result.items.length === 1 ? 'Versión programada' : 'Versiones programadas'} para ${date(result.items[0]?.effectiveAt)}.`;
+      },
+    });
+  }
+  return <><PageHeader eyebrow="Políticas públicas" title="Términos y privacidad" description="Historial append-only, vigencia y constancias por versión. Una corrección siempre se publica como una versión nueva." actions={<button className="button primary" onClick={openPublication}>Publicar versiones</button>} />
+    {notice && <p className="message success" role="status">{notice}</p>}
+    {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : <>
+      <section className="admin-kpi-grid" aria-label="Adopción de políticas vigentes">{state.data.legalDocuments.filter((item) => item.status === 'CURRENT').map((item) => <article className="admin-kpi" key={item.id}><small>{legalDocumentLabel(item.documentType)}</small><strong>v{item.version}</strong><span>{numberFormatter.format(item.acknowledgementCount)} constancias de cuentas existentes</span></article>)}</section>
+      <section className="admin-card"><h2>Historial de versiones</h2><p>Las programadas todavía no son públicas. El conteo baja cuando se elimina una cuenta y sus constancias.</p>
+        <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Documento</th><th>Versión</th><th>Estado</th><th>Vigencia</th><th>Publicación</th><th>Acción de la cuenta</th><th>Constancias</th><th>Texto</th></tr></thead><tbody>{state.data.legalDocuments.map((item) => <tr key={item.id}><td data-label="Documento"><strong>{legalDocumentLabel(item.documentType)}</strong><small className="cell-note">{item.title}</small></td><td data-label="Versión">v{item.version}</td><td data-label="Estado"><span className={`status ${tone(item.status)}`}>{legalStatusLabel(item.status)}</span></td><td data-label="Vigencia">{date(item.effectiveAt)}</td><td data-label="Publicación">{date(item.publishedAt)}</td><td data-label="Acción de la cuenta">{item.requiresAcceptance ? 'Aceptar términos' : 'Confirmar lectura'}</td><td data-label="Constancias">{numberFormatter.format(item.acknowledgementCount)}</td><td data-label="Texto">{item.status === 'SCHEDULED' ? <button type="button" className="text-button" onClick={() => setPreview(item)}>Ver texto guardado</button> : <a href={`${item.documentType === 'TERMS' ? '/terms' : '/privacy'}?version=${encodeURIComponent(item.version)}`}>Ver versión pública</a>}</td></tr>)}</tbody></table></div>
+      </section>
+    </>}
+    {action && <ActionDialog action={action} onClose={() => setAction(null)} onDone={(message) => { setAction(null); setNotice(message); state.reload(); }} />}
+    {preview && <LegalPreviewDialog version={preview} onClose={() => setPreview(null)} />}
+  </>;
+}
+
 function SecurityPage() {
   const state = useRemote<SecurityData>('/admin/security');
   return <><PageHeader eyebrow="Least privilege" title="Seguridad" description="Postura administrativa, sesiones y eventos sanitizados. Sin IPs completas, tokens ni detalles internos." />{state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : <><section className="admin-kpi-grid">{[['Sesiones activas', state.data.activeSessions, `${state.data.recentlyRevokedSessions} revocadas en 24 h`], ['Admins sin MFA', state.data.adminsWithoutMfa, 'requieren remediación'], ['Cuentas restringidas', state.data.blockedUsers + state.data.suspendedUsers, `${state.data.blockedUsers} bloqueadas`], ['En cuarentena', state.data.quarantinedDocuments, `${state.data.securityErrors} errores de seguridad`], ['Mutaciones admin', state.data.adminMutations24h, 'últimas 24 horas']].map(([label, value, detail]) => <article className="admin-kpi" key={label}><small>{label}</small><strong>{value}</strong><span>{detail}</span></article>)}</section><section className="admin-card"><h2>Lectura operativa</h2><p>Los eventos administrativos detallados están en Auditoría. Esta vista no replica logs, direcciones IP ni identificadores de sesión.</p></section></>}</>;
@@ -629,7 +706,7 @@ export function AdminApp() {
   const requiredPermission: Partial<Record<string, Permission>> = {
     dashboard: 'dashboard.read', users: 'users.read_metadata', documents: 'documents.read_metadata',
     employers: 'employers.read_metadata', processing: 'processing.read', storage: 'storage.read',
-    privacy: 'privacy.read', security: 'security.read', audit: 'audit.read', access: 'roles.manage',
+    privacy: 'privacy.read', security: 'security.read', audit: 'audit.read', legal: 'legal.manage', access: 'roles.manage',
     system: 'system.health.read',
   };
   if (requiredPermission[section] && !user.permissions.includes(requiredPermission[section]!)) page = <><PageHeader eyebrow="Administración" title="Permiso insuficiente" description="Tu rol no incluye esta capacidad. El servidor también rechazó cualquier acceso directo." /><Link className="button primary" href="/admin">Volver al panel</Link></>;
@@ -645,6 +722,7 @@ export function AdminApp() {
   else if (section === 'privacy') page = <PrivacyPage search={search} />;
   else if (section === 'security') page = <SecurityPage />;
   else if (section === 'audit') page = <AuditPage search={search} />;
+  else if (section === 'legal') page = <LegalPage />;
   else if (section === 'access') page = <AccessPage />;
   else if (section === 'system') page = <SystemPage permissions={user.permissions} />;
   else page = <><PageHeader eyebrow="Administración" title="Sección no encontrada" description="La ruta solicitada no existe o todavía no está habilitada." /><Link className="button primary" href="/admin">Volver al panel</Link></>;

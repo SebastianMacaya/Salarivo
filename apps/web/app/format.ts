@@ -182,6 +182,15 @@ export function timestampLabel(value?: string | null) {
   return Number.isNaN(date.getTime()) ? '—' : timestampFormatter.format(date);
 }
 
+export function buenosAiresDateTimeIso(value?: string | null) {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value ?? '')) return null;
+  const date = new Date(`${value}:00-03:00`);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Date(date.getTime() - 3 * 60 * 60 * 1000).toISOString().slice(0, 16) === value
+    ? date.toISOString()
+    : null;
+}
+
 const documentStatusLabels: Record<string, string> = {
   CREATED: 'Preparando',
   UPLOADED: 'Recibido',

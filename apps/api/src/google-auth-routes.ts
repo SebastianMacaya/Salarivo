@@ -503,7 +503,10 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
                FROM legal_document_versions
               WHERE document_type IN ('TERMS', 'PRIVACY_NOTICE')
                 AND locale = 'es-AR' AND published_at <= now() AND effective_at <= now()
-              ORDER BY document_type, effective_at DESC, published_at DESC`,
+              ORDER BY document_type, effective_at DESC,
+                       split_part(version, '.', 1)::numeric DESC,
+                       split_part(version, '.', 2)::numeric DESC,
+                       published_at DESC`,
           );
           const { terms, privacy } = validateLegalDocuments(config.appEnv, legalDocuments.rows);
           if (
@@ -553,7 +556,10 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
                 WHERE version.document_type IN ('TERMS', 'PRIVACY_NOTICE')
                   AND version.locale = 'es-AR'
                   AND version.published_at <= now() AND version.effective_at <= now()
-                ORDER BY version.document_type, version.effective_at DESC, version.published_at DESC
+                ORDER BY version.document_type, version.effective_at DESC,
+                         split_part(version.version, '.', 1)::numeric DESC,
+                         split_part(version.version, '.', 2)::numeric DESC,
+                         version.published_at DESC
              ) AS current_version
              JOIN legal_acknowledgements AS acknowledgement
                ON acknowledgement.document_version_id = current_version.id

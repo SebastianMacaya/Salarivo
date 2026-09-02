@@ -9,7 +9,7 @@ Los ADR registran decisiones arquitectónicas materiales, no tareas ni preferenc
 - Superseded: reemplazada por otro ADR.
 - Rejected: evaluada y descartada.
 
-Los ADR 0001, 0002, 0004, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015 y 0016 están Accepted y respaldados por el corte vertical. El ADR 0012 supersede sólo la parte administrativa del 0007; su decisión legal permanece vigente. El ADR 0014 supersede la exclusión de administración y merge de empleadores del 0012. El ADR 0016 extiende el 0013 y reemplaza únicamente su exclusión provisional de IPC y contexto económico. Los ADR 0003, 0005 y 0006 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
+Los ADR 0001, 0002, 0004, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016 y 0017 están Accepted y respaldados por el corte vertical. El ADR 0012 supersede sólo la parte administrativa del 0007 y el ADR 0017 sólo su restricción de publicación mediante migraciones; el resto de la decisión legal permanece vigente. El ADR 0014 supersede la exclusión de administración y merge de empleadores del 0012. El ADR 0016 extiende el 0013 y reemplaza únicamente su exclusión provisional de IPC y contexto económico. Los ADR 0003, 0005 y 0006 siguen Proposed hasta cubrir todos sus criterios con fixtures y tests.
 
 ## Índice
 
@@ -29,6 +29,7 @@ Los ADR 0001, 0002, 0004, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015 y
 - [0014 — Empleador global, resolución conservadora y merge auditable](0014-global-employer-resolution.md)
 - [0015 — Resultado activo y recuperación versionada segura](0015-active-processing-runs-and-safe-recovery.md)
 - [0016 — Datos económicos globales y contexto salarial derivado](0016-global-economic-data-and-derived-context.md)
+- [0017 — Publicación legal administrativa protegida](0017-guarded-admin-legal-publication.md)
 
 ## Formato
 

@@ -1,6 +1,8 @@
 # Auditoría de privacidad y seguridad — 2026-08-30
 
 > Actualización operativa (2026-09-01): después de este corte, Salarivo fue desplegado en producción y hoy tiene múltiples cuentas activas de personas reales. Esto registra únicamente el estado operativo posterior, no demuestra que los P0 identificados abajo hayan sido cerrados; mientras no exista evidencia posterior, deben tratarse como riesgos activos en producción.
+>
+> Actualización técnica (2026-09-02): la reaceptación ante cualquiera de las dos versiones legales vigentes ya falla cerrada y tiene cobertura de integración. Ese P1 se retiró de la lista pendiente; los demás hallazgos conservan su estado.
 
 ## Veredicto
 
@@ -50,7 +52,6 @@ La evaluación jurídica es técnica e informativa. Fuentes oficiales consultada
 
 ## Mejoras P1
 
-- Forzar reaceptación cuando una nueva versión legal material lo requiera.
 - Agregar workflow interno para solicitudes de acceso/rectificación/supresión y comunicación a cesionarios; el autoservicio no reemplaza esa operación.
 - Usar rate limit compartido y validar `trustProxy` antes de ejecutar múltiples réplicas; el límite actual es por proceso.
 - Auditar de forma durable intentos MFA denegados/bloqueados, con alertas sanitizadas.

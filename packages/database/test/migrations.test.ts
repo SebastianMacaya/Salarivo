@@ -23,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 24);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 24 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 25);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 25 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 24, name: "favorite_employers" },
+    { version: 25, name: "legal_document_versions_no_truncate" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -315,6 +315,15 @@ test("favorite employers stay owner-scoped without changing global employer iden
   assert.match(migration.sql, /PRIMARY KEY \(user_id, employer_id\)/);
   assert.match(migration.sql, /user_favorite_employers_employer_idx/);
   assert.doesNotMatch(migration.sql, /ALTER TABLE employers[\s\S]+favorite/i);
+});
+
+test("legal document versions reject truncate without rewriting history", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 25);
+  assert.ok(migration);
+  assert.equal(migration.name, "legal_document_versions_no_truncate");
+  assert.match(migration.sql, /BEFORE TRUNCATE ON legal_document_versions/);
+  assert.match(migration.sql, /FOR EACH STATEMENT EXECUTE FUNCTION reject_legal_document_version_mutation\(\)/);
+  assert.doesNotMatch(migration.sql, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE TABLE|DROP)\b/i);
 });
 
 test("employer normalization aligns legal suffix punctuation without retaining punctuation-only input", () => {

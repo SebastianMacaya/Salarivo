@@ -23,7 +23,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - borrado separado de original o documento completo;
 - MFA TOTP, recovery codes y step-up de acciones sensibles; MFA obligatorio para administración;
 - exportación JSON legible de los datos de la persona, sin IDs internos ni metadata operativa, y eliminación durable de cuenta con constancia consultable;
-- páginas públicas de Términos/Privacidad y consola admin granular con metadata operativa, comandos acotados y auditoría append-only;
+- páginas públicas e historial de Términos/Privacidad, con publicación futura protegida desde la consola admin, metadata operativa, comandos acotados y auditoría append-only;
 - reglas para agentes y mejora supervisada en [AGENTS.md](AGENTS.md).
 
 El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argentinos y produce como máximo una liquidación por PDF; ampliar tipos, países o múltiples liquidaciones exige fixtures y tests nuevos.

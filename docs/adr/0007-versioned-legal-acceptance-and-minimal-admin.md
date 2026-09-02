@@ -5,6 +5,7 @@
 
 > La decisión de aceptación legal continúa vigente. La administración mínima fue supersedida el 2026-08-30 por el [ADR 0012](0012-granular-admin-console.md).
 > Actualización 2026-09-01: se incorpora reaceptación obligatoria ante versiones vigentes no reconocidas; esta capacidad no publica por sí sola una versión nueva.
+> Actualización 2026-09-02: el [ADR 0017](0017-guarded-admin-legal-publication.md) supersede únicamente la restricción de crear versiones nuevas sólo mediante migraciones.
 
 ## Contexto
 
@@ -18,7 +19,7 @@ Una sesión que no reconoció ambas versiones vigentes puede consultar su estado
 
 `USER` y `ADMIN` son los únicos roles actuales. Cada request de administración vuelve a leer el rol desde PostgreSQL. El panel inicial es sólo lectura y expone conteos operativos y adopción de versiones legales; excluye personas, emails, documentos, filenames, OCR, importes, conceptos, identificadores fiscales, tokens y URLs. El rol no se puede solicitar durante el registro ni administrar desde la API.
 
-Las nuevas versiones se incorporan por migración revisada. No se agrega publicación desde UI, soporte ni impersonación. MFA quedó fuera de esta decisión y fue incorporado después por el [ADR 0008](0008-session-assurance-and-totp-mfa.md); RBAC por capacidades fue incorporado por el [ADR 0012](0012-granular-admin-console.md).
+La decisión original incorporaba versiones nuevas sólo por migración revisada y excluía publicación desde UI; ese canal fue reemplazado por la publicación protegida del [ADR 0017](0017-guarded-admin-legal-publication.md). Soporte e impersonación continúan fuera de alcance. MFA quedó fuera de esta decisión y fue incorporado después por el [ADR 0008](0008-session-assurance-and-totp-mfa.md); RBAC por capacidades fue incorporado por el [ADR 0012](0012-granular-admin-console.md).
 
 ## Consecuencias
 

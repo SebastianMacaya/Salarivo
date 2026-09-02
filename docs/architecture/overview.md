@@ -76,7 +76,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 - economic-data: series y observaciones globales revisionadas, perfiles por país/moneda, sincronización y `economic-analytics-v1` derivado;
 - privacy: preferencias, exportación y eliminación;
 - audit: eventos sensibles sin payload salarial.
-- admin: consultas transversales de metadata, capacidades fijas y comandos operativos auditados.
+- admin: consultas transversales de metadata, capacidades fijas, publicación legal versionada y comandos operativos auditados.
 
 Las dependencias apuntan hacia adentro:
 
@@ -137,7 +137,7 @@ Recursos iniciales:
 | salary-history | resumen, evolución y anual agregados; comparación y conceptos paginados owner-only; perspectivas nominal, USD histórico y poder adquisitivo cuando el perfil económico aplica |
 | exports | solicitar y consultar export privado |
 | privacy | eliminar cuenta; preferencias de retención editables quedan pendientes |
-| admin | dashboard, metadata paginada, salud del pipeline, reproceso/rollback auditados, revisión/merge de Employer y comandos acotados por capacidad; sin acceso a contenido privado |
+| admin | dashboard, metadata paginada, salud del pipeline, reproceso/rollback auditados, revisión/merge de Employer, historial/publicación legal y comandos acotados por capacidad; sin acceso a contenido privado |
 
 Los errores usan códigos de dominio estables y mensajes sanitizados. Cuando se incorpore OpenAPI describirá auth, schemas, límites y respuestas; los detalles de proveedor quedarán fuera del contrato HTTP.
 

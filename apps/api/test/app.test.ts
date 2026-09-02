@@ -45,6 +45,15 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
   assert.equal(rejected.json().error.code, "UNTRUSTED_ORIGIN");
   assert.equal(rejected.headers["cache-control"], "no-store");
 
+  const anonymousAdminMutation = await app.inject({
+    method: "POST",
+    url: "/api/v1/admin/users/00000000-0000-4000-8000-000000000001/status",
+    headers: { origin: "http://localhost:3000" },
+    payload: {},
+  });
+  assert.equal(anonymousAdminMutation.statusCode, 401);
+  assert.equal(anonymousAdminMutation.json().error.code, "AUTHENTICATION_REQUIRED");
+
   const googleUnavailable = await app.inject({
     method: "POST",
     url: "/api/v1/auth/google/start",
