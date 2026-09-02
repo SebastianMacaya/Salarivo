@@ -133,6 +133,10 @@ input:hover, select:hover { border-color: #aab8b0; }
 input:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgb(23 108 74 / 10%); outline: 0; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .access-actions { display: flex; justify-content: space-between; gap: 16px; margin-top: 20px; }
+.access-footer { display: grid; justify-items: center; gap: 4px; border-top: 1px solid var(--line); margin-top: 24px; padding-top: 14px; font-size: 13px; line-height: 1.5; text-align: center; }
+.access-footer nav { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0 16px; }
+.access-footer .inline-link, .access-footer .text-button { min-height: 32px; display: inline-flex; align-items: center; font-size: inherit; font-weight: 650; }
+.access-panel button:focus-visible, .access-panel a:focus-visible { outline-color: var(--green); }
 
 .button {
   min-height: 44px;
@@ -683,6 +687,7 @@ td { border-top: 1px solid #edf1ee; padding: 14px 15px; white-space: nowrap; }
   .danger-zone > .button { width: 100%; }
   .settings-tabs { margin-right: -20px; padding-right: 20px; }
   .text-button { min-height: 44px; display: inline-flex; align-items: center; }
+  .access-footer .inline-link, .access-footer .text-button { min-height: 44px; }
   .access-actions { align-items: flex-start; flex-direction: column; }
 }
 

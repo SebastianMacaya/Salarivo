@@ -1090,7 +1090,7 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
       <section className="access-panel" aria-labelledby="access-title">
         <div className="access-card">
           <p className="eyebrow">Espacio privado</p>
-          <h2 id="access-title">{mode === 'google-register' ? 'Completá tu registro' : mode === 'deletion' ? 'Consultá una eliminación' : 'Ingresá a Salarivo'}</h2>
+          <h2 id="access-title">{mode === 'google-register' ? 'Completá tu registro' : mode === 'deletion' ? 'Comprobante de eliminación' : 'Ingresá a Salarivo'}</h2>
           <form onSubmit={submit} className="stack-form">
             {mode === 'login' && <><button type="button" className="button secondary google-button" disabled={googleBusy || busy} onClick={startGoogle}><GoogleIcon />{googleBusy ? 'Abriendo Google…' : 'Continuar con Google'}</button><p className="auth-hint">Usá Google para ingresar o crear tu cuenta.</p></>}
             {mode === 'google-register' && <p>Google verificó tu identidad. Revisá los documentos vigentes para crear tu cuenta.</p>}
@@ -1103,10 +1103,10 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
             {error && <p className="message error" role="alert">{error}</p>}
             {mode !== 'login' && <button className="button primary" disabled={busy || googleBusy || (legalRegistration && !legalVersions)}>{busy ? 'Procesando…' : mode === 'google-register' ? 'Aceptar y crear cuenta' : 'Consultar estado'}</button>}
           </form>
-          <div className="access-actions">
-            {mode === 'login' ? <button className="text-button" onClick={() => changeMode('deletion')}>Consultar una eliminación</button> : <button className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
-            <span><a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a> · <a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a></span>
-          </div>
+          <footer className="access-footer">
+            {mode === 'login' ? <button type="button" className="text-button" onClick={() => changeMode('deletion')}>Consultar comprobante de eliminación</button> : <button type="button" className="text-button" onClick={() => changeMode('login')}>Volver al ingreso</button>}
+            <nav aria-label="Documentos legales"><a className="inline-link" href="/terms" target="_blank" rel="noreferrer">Términos de uso</a><a className="inline-link" href="/privacy" target="_blank" rel="noreferrer">Aviso de privacidad</a></nav>
+          </footer>
         </div>
       </section>
     </main>
