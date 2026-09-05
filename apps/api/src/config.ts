@@ -210,7 +210,16 @@ function employerIdentifierProtection(
   return Object.freeze({ encryptionKeyVersion, encryptionKey: identifierEncryptionKey, fingerprintKey });
 }
 
+export function externalOcrEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const enabled = env.OCR_ENABLED?.trim() || "true";
+  const provider = env.OCR_PROVIDER?.trim() || "tesseract";
+  if (!["true", "false"].includes(enabled)) throw new Error("OCR_ENABLED must be true or false");
+  if (!["disabled", "tesseract", "zai"].includes(provider)) throw new Error("Invalid OCR_PROVIDER");
+  return enabled === "true" && provider === "zai";
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
+  externalOcrEnabled(env);
   const configuredAppEnv = env.APP_ENV?.trim();
   if (env.NODE_ENV === "production" && configuredAppEnv && configuredAppEnv !== "production") {
     throw new Error("APP_ENV cannot override NODE_ENV=production");

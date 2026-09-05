@@ -60,7 +60,7 @@ PostgreSQL conserva el estado recuperable. Al confirmar un upload, la misma tran
 3. Navegador a storage: autorización por objeto, método, tamaño y expiración.
 4. Storage a worker: el objeto sigue siendo hostil hasta completar seguridad.
 5. Worker a parser/OCR: ejecución con CPU, RAM, tiempo, filesystem y red limitados.
-6. Aplicación a proveedor externo: salida mínima, redactada y autorizada; Economic Data envía sólo identificador de serie, rango y opciones técnicas fijas.
+6. Aplicación a proveedor externo: cada integración limita su salida a la función autorizada. Economic Data envía sólo identificador de serie, rango y opciones técnicas fijas. El fallback opcional GLM-OCR envía el PDF completo, sin redacción previa, después de seguridad, clasificación barata y comprobación de la aceptación legal vigente del propietario; límites, cache y validación posterior se describen en [OCR externo](ocr.md).
 7. Aplicación a observabilidad: sólo IDs internos, códigos y métricas no sensibles.
 8. Navegador/API a Google OIDC: `state`, `nonce` y PKCE por intento; callback, issuer, audience y redirects validados server-side.
 9. Administrador a API: MFA y capacidad explícita por request; un rol administrativo nunca reemplaza ownership ni habilita payload Restricted.
@@ -215,7 +215,7 @@ El benchmark futuro agregará, fuera del historial privado, sólo contribuciones
 
 ## Degradación
 
-- OCR caído: API disponible; jobs quedan retryable.
+- OCR local caído: API disponible y fallos transitorios de jobs reintentables. El fallback externo opcional usa retries acotados y termina en revisión o confirmación cuando no puede recuperar información; ver [OCR externo](ocr.md).
 - Cola caída: uploads ya confirmados permanecen en DB/storage y se reconcilian.
 - Worker caído: el lease lógico expira, pero el marcador de ejecución queda fail-closed y bloquea retry y baja hasta verificar que el proceso y su temporal terminaron; la recuperación operativa segura sigue pendiente.
 - Proveedor económico caído: upload y nominal siguen disponibles; se conserva last-known-good y lo faltante queda `PARTIAL`, `PENDING` o `UNAVAILABLE`.

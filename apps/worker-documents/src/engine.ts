@@ -1,3 +1,5 @@
+import { validateLayoutAliases, type LayoutAliases } from '@salarivo/database/document-layouts';
+
 export type FieldSource = 'PDF_TEXT' | 'OCR' | 'RULE';
 
 export type MissingFieldReason = 'VALUE_NOT_INTERPRETABLE' | 'LABEL_OR_LAYOUT_NOT_RECOGNIZED';
@@ -972,19 +974,60 @@ function missingField(fieldPath: string, fieldRecognized: boolean): ExtractedFie
   };
 }
 
-export function extractArgentinePayroll(text: string, source: Exclude<FieldSource, 'RULE'>): PayrollExtraction {
+function aliasValues(lines: string[], aliases: readonly string[] | undefined): string[] {
+  if (!aliases) return [];
+  const labels = aliases.map((alias) => fold(alias).replace(/[.:]+$/, '').trim());
+  return lines.flatMap((line, index) => {
+    const trimmed = line.trim();
+    const normalized = fold(trimmed);
+    const label = labels.find((entry) => normalized.startsWith(entry)
+      && (!normalized[entry.length] || /[\s:\-]/.test(normalized[entry.length]!)));
+    if (!label) return [];
+    // Folding removes combining marks, so slice the original only after locating the literal label boundary.
+    let end = 0;
+    while (end < trimmed.length && fold(trimmed.slice(0, end)).length < label.length) end++;
+    const inline = trimmed.slice(end).replace(/^[\s:]+/, '').trim();
+    return [inline || lines[index + 1]?.trim() || ''];
+  });
+}
+
+function extractAliasAmount(lines: string[], aliases: readonly string[] | undefined): Amount | null {
+  const candidates = aliasValues(lines, aliases).flatMap((value) => {
+    const match = value.match(amountAtEnd);
+    if (!match || match.index !== 0 || !hasMoneyFormatting(value)) return [];
+    const amounts = amountsInLine(value);
+    return amounts.length === 1 ? [{ raw: value, value: amounts[0]!.value, confidence: 0.88 }] : [];
+  });
+  // Repeated contradictory labels require review; never select the first convenient amount.
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
+function extractAliasPeriod(lines: string[], aliases: readonly string[] | undefined): { raw: string; value: string } | null {
+  const candidates = aliasValues(lines, aliases).flatMap((raw) => {
+    const monthYear = /^(0?[1-9]|1[0-2])\/(20\d{2})$/.exec(raw);
+    if (monthYear) return [{ raw, value: `${monthYear[2]}-${monthYear[1]!.padStart(2, '0')}` }];
+    return /^20\d{2}-(0[1-9]|1[0-2])$/.test(raw) ? [{ raw, value: raw }] : [];
+  });
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
+export function extractArgentinePayroll(text: string, source: Exclude<FieldSource, 'RULE'>, layoutAliases?: LayoutAliases): PayrollExtraction {
+  const aliases = validateLayoutAliases(layoutAliases) ?? {};
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
-  const period = extractPeriod(text);
+  const period = extractPeriod(text) ?? extractAliasPeriod(lines, aliases['settlement.payrollPeriod']);
   const payrollTable = findPayrollTable(lines);
   const tableTotals = extractTotalsTable(payrollTable);
   const linesOutsideTable = payrollTable
     ? lines.map((line, index) => index >= payrollTable.headerIndex && index < payrollTable.totalIndex ? '' : line)
     : lines;
-  const basic = extractTableBasic(lines, payrollTable) ?? extractAmount(linesOutsideTable, basicAmountLabels);
+  const basic = extractTableBasic(lines, payrollTable) ?? extractAmount(linesOutsideTable, basicAmountLabels)
+    ?? extractAliasAmount(linesOutsideTable, aliases['settlement.basicAmount']);
   const remunerative = tableTotals?.remunerative
-    ?? extractStackedAmount(lines, remunerativeAmountLabels, payrollTable);
+    ?? extractStackedAmount(lines, remunerativeAmountLabels, payrollTable)
+    ?? extractAliasAmount(linesOutsideTable, aliases['settlement.remunerativeAmount']);
   const nonRemunerative = tableTotals?.nonRemunerative
-    ?? extractStackedAmount(lines, nonRemunerativeAmountLabels, payrollTable);
+    ?? extractStackedAmount(lines, nonRemunerativeAmountLabels, payrollTable)
+    ?? extractAliasAmount(linesOutsideTable, aliases['settlement.nonRemunerativeAmount']);
   const summarizedGrossValue = remunerative && nonRemunerative
     ? addAmounts(remunerative.value, nonRemunerative.value)
     : null;
@@ -994,8 +1037,10 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
     source: 'RULE' as const,
     value: summarizedGrossValue,
   } : null;
-  const gross = tableTotals?.gross ?? extractAmount(lines, grossAmountLabels) ?? summarizedGross;
-  const deductions = tableTotals?.deductions ?? extractAmount(lines, deductionAmountLabels) ?? null;
+  const gross = tableTotals?.gross ?? extractAmount(lines, grossAmountLabels) ?? summarizedGross
+    ?? extractAliasAmount(linesOutsideTable, aliases['settlement.grossAmount']);
+  const deductions = tableTotals?.deductions ?? extractAmount(lines, deductionAmountLabels)
+    ?? extractAliasAmount(linesOutsideTable, aliases['settlement.deductionsAmount']);
   const netLabelFound = hasAmountLabel(lines, netAmountLabels);
   const derivedNet = payrollTable && gross && deductions && netLabelFound
     ? subtractAmounts(gross.value, deductions.value)
@@ -1005,7 +1050,7 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
     raw: `${gross!.raw} - ${deductions!.raw}`,
     source: 'RULE' as const,
     value: derivedNet,
-  } : null);
+  } : null) ?? extractAliasAmount(linesOutsideTable, aliases['settlement.netAmount']);
   const employer = extractEmployer(lines);
   const employerName = employer?.value ?? null;
   const lineItems = extractLineItems(lines, payrollTable);
@@ -1019,7 +1064,8 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
   }];
 
   if (period) fields.push({ confidence: 0.92, fieldPath: 'settlement.payrollPeriod', interpretedValue: period.value, rawValue: period.raw, source });
-  else fields.push(missingField('settlement.payrollPeriod', /\b(?:periodo(?:\s+de\s+liquidacion)?|mes)\b/.test(fold(text))));
+  else fields.push(missingField('settlement.payrollPeriod', /\b(?:periodo(?:\s+de\s+liquidacion)?|mes)\b/.test(fold(text))
+    || aliasValues(lines, aliases['settlement.payrollPeriod']).length > 0));
   if (employer) fields.push({ confidence: employer.confidence, fieldPath: 'employer.name', interpretedValue: employer.value, rawValue: employer.raw, source });
   else fields.push(missingField('employer.name', lines.some((line) => /^\s*(?:empleador|razon\s+social|empresa)\s*[:\-]/.test(fold(line)))));
   const splitTable = Boolean(payrollTable && !payrollTable.combinedEarnings);
@@ -1041,7 +1087,7 @@ export function extractArgentinePayroll(text: string, source: Exclude<FieldSourc
         source: amount.source ?? source,
       });
     } else {
-      fields.push(missingField(fieldPath, labelFound));
+      fields.push(missingField(fieldPath, labelFound || aliasValues(lines, aliases[fieldPath]).length > 0));
     }
   }
 

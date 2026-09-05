@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { loadConfig } from "../src/config.ts";
+import { externalOcrEnabled, loadConfig } from "../src/config.ts";
+
+test("OCR discovery shares explicit server flags without needing provider credentials", () => {
+  assert.equal(externalOcrEnabled({}), false);
+  assert.equal(externalOcrEnabled({ OCR_ENABLED: "true", OCR_PROVIDER: "zai" }), true);
+  assert.equal(externalOcrEnabled({ OCR_ENABLED: "false", OCR_PROVIDER: "zai" }), false);
+  assert.throws(() => loadConfig({ OCR_ENABLED: "yes" }), /OCR_ENABLED/);
+  assert.throws(() => loadConfig({ OCR_PROVIDER: "unknown" }), /OCR_PROVIDER/);
+});
 
 const productionEnv = (overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
   APP_ENV: "production",

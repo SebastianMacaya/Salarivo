@@ -20,6 +20,7 @@ export const adminPermissions = [
   "employers.read_metadata",
   "employers.manage",
   "processing.read",
+  "layouts.manage",
   "processing.retry",
   "processing.reprocess",
   "processing.rollback",

@@ -36,8 +36,8 @@ export type PromotionOutcome = (typeof promotionOutcomes)[number];
 
 export const processingPipelineVersions = {
   classifier: "6",
-  extractor: "6",
-  parser: "7",
+  extractor: "7",
+  parser: "8",
   normalizer: "6",
   resultSchema: "1",
 } as const;
@@ -45,6 +45,12 @@ export const processingPipelineVersions = {
 export const currentPipelineFingerprint = createHash("sha256")
   .update(JSON.stringify(processingPipelineVersions))
   .digest("hex");
+
+export const retryableOcrIssueCodes = [
+  "OCR_DISABLED", "OCR_TIMEOUT", "OCR_RATE_LIMITED", "OCR_PROVIDER_UNAVAILABLE",
+  "OCR_BUDGET_EXCEEDED", "OCR_CONCURRENCY_LIMIT", "OCR_CIRCUIT_OPEN",
+  "OCR_ALREADY_ATTEMPTED", "OCR_AUTH_FAILED", "OCR_LEGAL_ACCEPTANCE_REQUIRED",
+] as const;
 
 export const parserFixCatalog = [
   {

@@ -11,7 +11,8 @@
     "start": "node src/index.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test test/*.test.ts"
+    "test": "node --import ../../scripts/test-no-external-ocr.mjs --test test/*.test.ts",
+    "test:ocr:live": "node --env-file=../../.env scripts/ocr-live-smoke.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1120.0",

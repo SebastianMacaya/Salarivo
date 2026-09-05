@@ -11,10 +11,13 @@ import {
   currentPipelineFingerprint,
   EmployerResolutionError,
   followMergedEmployer,
+  findApprovedDocumentLayout,
+  hasNewDocumentLayoutSql,
   lockEmployerMutation,
   migrate,
   pool,
   processingPipelineVersions,
+  retryableOcrIssueCodes,
   resolveEmployer,
   withTransaction,
   type ProcessingSnapshot,
@@ -23,7 +26,7 @@ import {
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createReadStream } from 'node:fs';
-import { mkdtemp, open, rm } from 'node:fs/promises';
+import { mkdtemp, open, readFile, rm } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -36,7 +39,6 @@ import type { PoolClient } from 'pg';
 import { createClient } from 'redis';
 import {
   applySettlementCorrections,
-  attachSpatialEvidence,
   classifyPayrollText,
   extractArgentinePayroll,
   hasPdfMagic,
@@ -54,7 +56,12 @@ import {
   type PayrollExtraction,
   type TextEvidencePage,
 } from './engine.ts';
-import { runtimeEnvironment, type RuntimeEnvironment } from './environment.ts';
+import { loadOcrConfig, runtimeEnvironment, type RuntimeEnvironment } from './environment.ts';
+import { DisabledOCRProvider, isOCRResult, MAX_OCR_RETRY_DELAY_MS, OCRProviderError, type OCRConfig, type OCRResult } from './ocr-provider.ts';
+import { ZaiGlmOcrProvider } from './zai-ocr-provider.ts';
+import { ocrEvidence, orchestrateExtraction, type ExtractionLayout, type OCRTriggerReason } from './extraction-orchestrator.ts';
+import { fingerprintLayout } from './layout-fingerprint.ts';
+import { recordOcrCacheHit, runBudgetedOcr } from './ocr-usage.ts';
 import {
   assertProductionStorageConfig,
   objectStorageProvider,
@@ -71,6 +78,7 @@ let startupStage = 'configuration';
 
 type WorkerConfig = {
   appEnv: RuntimeEnvironment;
+  ocr: OCRConfig;
   clamavHost: string;
   clamavPort: number;
   classificationHighThreshold: number;
@@ -212,7 +220,7 @@ function probability(name: string, localDefault: number): number {
   return value;
 }
 
-function loadConfig(): WorkerConfig {
+export function loadConfig(): WorkerConfig {
   const appEnv = runtimeEnvironment();
   const storageProvider = objectStorageProvider(process.env.OBJECT_STORAGE_PROVIDER, appEnv === 'production');
   const localStorageAliases = appEnv === 'production' ? [] : ['MINIO_ROOT_USER'];
@@ -222,6 +230,7 @@ function loadConfig(): WorkerConfig {
   if (low >= high) throw new Error('CLASSIFICATION_LOW_THRESHOLD must be lower than CLASSIFICATION_HIGH_THRESHOLD');
   const config = {
     appEnv,
+    ocr: loadOcrConfig(),
     clamavHost: env('CLAMAV_HOST', '127.0.0.1'),
     clamavPort: positiveInt('CLAMAV_PORT', 3310, 1, 65_535),
     classificationHighThreshold: high,
@@ -262,6 +271,11 @@ function loadConfig(): WorkerConfig {
   }
   if (config.jobLeaseMs <= config.maxOcrTimeMs * 2 + config.maxParseTimeMs * 6) {
     throw new Error('JOB_TIMEOUT_MS must cover OCR and parser timeouts');
+  }
+  if (config.ocr.enabled && config.ocr.provider === 'zai'
+    && config.jobLeaseMs <= config.maxOcrTimeMs * 2 + config.maxParseTimeMs * 6
+      + config.ocr.timeoutMs * (config.ocr.maxRetries + 1) + config.ocr.maxRetries * MAX_OCR_RETRY_DELAY_MS) {
+    throw new Error('JOB_TIMEOUT_MS must cover local and external OCR timeouts');
   }
   if (appEnv === 'production') {
     if (new URL(config.queueUrl).protocol !== 'rediss:') throw new Error('QUEUE_URL must use TLS in production');
@@ -462,9 +476,12 @@ async function inspectActiveContent(path: string, config: WorkerConfig): Promise
 
 type TextExtraction = { evidence: TextEvidencePage[]; text: string };
 type StoredTextArtifact = TextExtraction & {
+  pageCount?: number;
+  ocr?: OCRResult;
+  reviewRequired: boolean;
   partialOcr: boolean;
   source: Exclude<FieldSource, 'RULE'>;
-  version: 1;
+  version: 2;
 };
 type ProcessingArtifactRow = {
   artifact_type: 'PDF_TEXT' | 'OCR_TEXT' | 'OCR_LAYOUT';
@@ -473,6 +490,8 @@ type ProcessingArtifactRow = {
   object_key: string;
   page_count: number | null;
   size_bytes: string;
+  producer_name: string;
+  producer_version: string;
 };
 const evidenceOutputLimit = (config: WorkerConfig) => Math.min(16 * 1024 * 1024, config.maxTextBytes * 4);
 
@@ -486,13 +505,17 @@ function parseStoredTextArtifact(value: unknown, config: WorkerConfig): StoredTe
   }
   const artifact = value as Partial<StoredTextArtifact>;
   if (
-    artifact.version !== 1
+    artifact.version !== 2
     || (artifact.source !== 'PDF_TEXT' && artifact.source !== 'OCR')
     || typeof artifact.partialOcr !== 'boolean'
+    || typeof artifact.reviewRequired !== 'boolean'
     || typeof artifact.text !== 'string'
     || Buffer.byteLength(artifact.text) > config.maxTextBytes
     || !Array.isArray(artifact.evidence)
   ) throw new WorkerError('ARTIFACT_INTEGRITY_FAILED', false);
+  if (artifact.ocr !== undefined && !isOCRResult(artifact.ocr, config.maxTextBytes)) {
+    throw new WorkerError('ARTIFACT_INTEGRITY_FAILED', false);
+  }
   for (const page of artifact.evidence) {
     if (
       typeof page !== 'object' || page === null || Array.isArray(page)
@@ -565,28 +588,45 @@ async function readArtifactBytes(
   return compressed;
 }
 
-async function loadCompatibleTextArtifact(
+export async function loadCompatibleTextArtifact(
   s3: S3Client,
   config: WorkerConfig,
   job: JobRow,
 ): Promise<StoredTextArtifact | null> {
   const artifact = await pool.query<ProcessingArtifactRow>(
     `SELECT artifact.artifact_type, artifact.content_sha256, artifact.extraction_run_id,
-            artifact.object_key, artifact.page_count, artifact.size_bytes
+            artifact.object_key, artifact.page_count, artifact.size_bytes,
+            artifact.producer_name, artifact.producer_version
        FROM processing_artifacts AS artifact
        JOIN documents AS document
          ON document.id = artifact.document_id AND document.user_id = artifact.user_id
       WHERE artifact.user_id = $1 AND artifact.document_id = $2
-        AND artifact.extraction_run_id = COALESCE($3::uuid, document.active_extraction_run_id)
+        AND document.security_status = 'CLEAN' AND document.deleted_at IS NULL AND document.original_deleted_at IS NULL
+        AND (artifact.extraction_run_id = COALESCE($3::uuid, document.active_extraction_run_id,
+               CASE WHEN $9 THEN (SELECT id FROM extraction_runs
+                 WHERE user_id = $1 AND document_id = $2 AND processing_version < $5
+                 ORDER BY processing_version DESC LIMIT 1) ELSE NULL END)
+             OR artifact.extraction_run_id IN (
+               SELECT id FROM extraction_runs WHERE document_id = $2 AND user_id = $1 AND processing_version = $5
+             ))
         AND artifact.artifact_type IN ('PDF_TEXT', 'OCR_TEXT', 'OCR_LAYOUT')
-        AND artifact.producer_name IN ('salarivo-pdf-text', 'salarivo-ocr-text')
+        AND artifact.producer_name IN ('salarivo-pdf-text', 'salarivo-ocr-text', 'salarivo-provider-ocr')
         AND artifact.producer_version = $4
-        AND artifact.metadata_no_sensitive @> '{"complete":true,"payloadVersion":1}'::jsonb
-      ORDER BY CASE artifact.artifact_type WHEN 'OCR_LAYOUT' THEN 0 WHEN 'OCR_TEXT' THEN 1 ELSE 2 END,
+        AND artifact.metadata_no_sensitive @> '{"complete":true,"payloadVersion":2}'::jsonb
+        AND (artifact.producer_name <> 'salarivo-provider-ocr' OR (
+          artifact.metadata_no_sensitive ->> 'provider' = $6
+          AND artifact.metadata_no_sensitive ->> 'model' = $7
+          AND artifact.metadata_no_sensitive ->> 'providerVersion' = $8
+          AND artifact.metadata_no_sensitive ->> 'documentSha256' = document.sha256
+        ))
+      ORDER BY CASE artifact.producer_name WHEN 'salarivo-provider-ocr' THEN 0 ELSE 1 END,
+               CASE artifact.artifact_type WHEN 'OCR_LAYOUT' THEN 0 WHEN 'OCR_TEXT' THEN 1 ELSE 2 END,
                artifact.created_at DESC
       LIMIT 1`,
     [job.user_id, job.document_id, job.base_extraction_run_id ?? null,
-      processingPipelineVersions.extractor],
+      processingPipelineVersions.extractor, job.processing_version,
+      config.ocr.provider, config.ocr.model, new ZaiGlmOcrProvider(config.ocr).providerVersion,
+      jobTrigger(job) === 'USER_TYPE_CONFIRMATION'],
   );
   const row = artifact.rows[0];
   if (!row) return null;
@@ -605,14 +645,19 @@ async function loadCompatibleTextArtifact(
   try {
     const parsed = parseStoredTextArtifact(JSON.parse(raw.toString('utf8')), config);
     if (parsed.partialOcr) throw new WorkerError('ARTIFACT_INTEGRITY_FAILED', false);
-    return parsed;
+    if (Boolean(parsed.ocr) !== (row.producer_name === 'salarivo-provider-ocr')
+      || (parsed.ocr && (parsed.source !== 'OCR' || parsed.text !== parsed.ocr.text
+        || parsed.ocr.provider !== config.ocr.provider || parsed.ocr.model !== config.ocr.model))) {
+      throw new WorkerError('ARTIFACT_INTEGRITY_FAILED', false);
+    }
+    return { ...parsed, pageCount: row.page_count ?? Math.max(parsed.evidence.length, 1) };
   } catch (error) {
     if (error instanceof WorkerError) throw error;
     throw new WorkerError('ARTIFACT_INTEGRITY_FAILED', false);
   }
 }
 
-async function persistTextArtifact(
+export async function persistTextArtifact(
   s3: S3Client,
   config: WorkerConfig,
   job: JobRow,
@@ -621,11 +666,13 @@ async function persistTextArtifact(
   source: Exclude<FieldSource, 'RULE'>,
   partialOcr: boolean,
   pages: number,
+  ocr?: OCRResult,
+  reviewRequired = false,
 ): Promise<void> {
   const artifactType = source === 'OCR' ? 'OCR_LAYOUT' : 'PDF_TEXT';
-  const producerName = source === 'OCR' ? 'salarivo-ocr-text' : 'salarivo-pdf-text';
+  const producerName = ocr ? 'salarivo-provider-ocr' : source === 'OCR' ? 'salarivo-ocr-text' : 'salarivo-pdf-text';
   const producerVersion = processingPipelineVersions.extractor;
-  const ocrLanguage = source === 'OCR' ? 'spa' : null;
+  const ocrLanguage = source === 'OCR' && !ocr ? 'spa' : null;
   const ownsJob = async () => (await pool.query(
     `SELECT 1 FROM processing_jobs
       WHERE id = $1 AND user_id = $2 AND document_id = $3
@@ -636,9 +683,11 @@ async function persistTextArtifact(
   const payload: StoredTextArtifact = {
     evidence: extraction.evidence,
     partialOcr,
+    reviewRequired,
     source,
     text: extraction.text,
-    version: 1,
+    version: 2,
+    ...(ocr ? { ocr } : {}),
   };
   const compressed = await gzipAsync(Buffer.from(JSON.stringify(payload)), { level: 9 });
   const contentSha256 = createHash('sha256').update(compressed).digest('hex');
@@ -651,7 +700,7 @@ async function persistTextArtifact(
        content_sha256, size_bytes, page_count, producer_name, producer_version,
        ocr_language, metadata_no_sensitive
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-       '{"complete":false,"payloadVersion":1,"writeState":"PENDING"}'::jsonb)
+       '{"complete":false,"payloadVersion":2,"writeState":"PENDING"}'::jsonb)
      ON CONFLICT (extraction_run_id, artifact_type, producer_name, producer_version, ocr_language)
        DO NOTHING`,
     [randomUUID(), job.user_id, job.document_id, runId, artifactType, objectKey,
@@ -701,12 +750,15 @@ async function persistTextArtifact(
     `UPDATE processing_artifacts
         SET metadata_no_sensitive = jsonb_build_object(
               'complete', $3::boolean,
-              'payloadVersion', 1,
-              'writeState', 'COMPLETED'
+              'payloadVersion', 2,
+              'writeState', 'COMPLETED',
+              'provider', $4::text, 'model', $5::text, 'providerVersion', $6::text,
+              'documentSha256', (SELECT sha256 FROM documents WHERE id = $7 AND user_id = $8)
             )
       WHERE id = $1 AND content_sha256 = $2
         AND metadata_no_sensitive @> '{"complete":false,"writeState":"PENDING"}'::jsonb`,
-    [artifact.id, contentSha256, !partialOcr],
+    [artifact.id, contentSha256, !partialOcr, ocr?.provider ?? null, ocr?.model ?? null,
+      ocr?.providerVersion ?? null, job.document_id, job.user_id],
   );
   if (!completed.rowCount) throw new WorkerError('ARTIFACT_INTEGRITY_FAILED', false);
 }
@@ -1433,7 +1485,7 @@ async function refreshReprocessingBatch(db: PoolClient, job: Pick<JobRow, 'repro
   );
 }
 
-async function claimJob(jobId: string, workerId: string, config: WorkerConfig): Promise<{ document: DocumentRow; job: JobRow } | null> {
+export async function claimJob(jobId: string, workerId: string, config: WorkerConfig): Promise<{ document: DocumentRow; job: JobRow } | null> {
   return await withTransaction(async (db: PoolClient) => {
     const owner = await db.query<{ user_id: string }>(
       `SELECT user_id FROM processing_jobs WHERE id = $1`,
@@ -1523,14 +1575,21 @@ async function claimJob(jobId: string, workerId: string, config: WorkerConfig): 
     }
     if (isReprocessingJob(job) && job.pipeline_fingerprint) {
       const alreadyProcessed = await db.query(
-        `SELECT 1 FROM extraction_runs
-          WHERE user_id = $1 AND document_id = $2 AND pipeline_fingerprint = $3
-            AND processing_version <> $4
-            AND status IN (
+        `SELECT 1 FROM extraction_runs prior_run
+          WHERE prior_run.user_id = $1 AND prior_run.document_id = $2 AND prior_run.pipeline_fingerprint = $3
+            AND prior_run.processing_version <> $4
+            AND prior_run.status IN (
               'COMPLETED', 'COMPLETED_WITH_WARNINGS', 'REVIEW_REQUIRED'
             )
+            AND NOT EXISTS (
+              SELECT 1 FROM extraction_run_issues issue
+               WHERE issue.user_id = prior_run.user_id AND issue.document_id = prior_run.document_id
+                 AND issue.extraction_run_id = prior_run.id AND issue.recoverable AND issue.code = ANY($5::text[])
+            )
+            AND NOT (${hasNewDocumentLayoutSql('prior_run')})
           LIMIT 1`,
-        [job.user_id, job.document_id, job.pipeline_fingerprint, job.processing_version],
+        [job.user_id, job.document_id, job.pipeline_fingerprint, job.processing_version,
+          config.ocr.enabled && config.ocr.provider === 'zai' ? retryableOcrIssueCodes : []],
       );
       if (alreadyProcessed.rowCount) {
         await db.query(
@@ -1891,6 +1950,7 @@ async function finishClassification(
   classification: Classification,
   source: FieldSource,
   computeMs: number,
+  ocr?: OCRResult,
 ): Promise<void> {
   const processingStatus = classification.decision === 'UNSUPPORTED' ? 'REJECTED_UNSUPPORTED' : 'NEEDS_TYPE_CONFIRMATION';
   await withTransaction(async (db: PoolClient) => {
@@ -1927,9 +1987,9 @@ async function finishClassification(
               comparison_summary = $9::jsonb
         WHERE id = $1 AND user_id = $2 AND document_id = $3 AND status = 'PROCESSING'`,
       [runId, job.user_id, job.document_id, classification.confidence, computeMs,
-        source === 'OCR' ? 'tesseract' : null,
-        null,
-        source === 'OCR' ? 'spa' : null,
+        ocr?.provider ?? (source === 'OCR' ? 'tesseract' : null),
+        ocr?.providerVersion ?? null,
+        source === 'OCR' && !ocr ? 'spa' : null,
         JSON.stringify({ issueCodes: [issueCode], reason: 'CLASSIFICATION_NOT_SUPPORTED' })],
     );
     if (!isReprocessingJob(job)) {
@@ -2141,6 +2201,7 @@ export async function persistExtraction(
   source: FieldSource,
   partialOcr: boolean,
   computeMs: number,
+  details: { ocr?: OCRResult | undefined; issues?: readonly string[]; layout?: ExtractionLayout } = {},
 ): Promise<'COMPLETED' | 'NEEDS_REVIEW' | null> {
   return await withTransaction(async (db: PoolClient) => {
     await lockEmployerMutation(db);
@@ -2586,6 +2647,18 @@ export async function persistExtraction(
     }
 
     const issues = extractionIssues(effectiveExtraction, partialOcr, employerAssociationNeedsReview);
+    if (details.layout?.profile && details.layout.fingerprint) {
+      const approved = extraction.employerName ? await findApprovedDocumentLayout(db, {
+        employerName: extraction.employerName, fingerprint: details.layout.fingerprint,
+        fingerprintVersion: details.layout.fingerprintVersion,
+      }) : null;
+      if (approved?.id !== details.layout.profile.id) {
+        issues.push({ affectedFieldPath: null, code: 'LAYOUT_APPROVAL_CHANGED', recoverable: true, severity: 'ERROR' });
+      }
+    }
+    for (const code of details.issues ?? []) {
+      issues.push({ affectedFieldPath: null, code, recoverable: true, severity: 'ERROR' });
+    }
     for (const issue of issues) {
       await db.query(
         `INSERT INTO extraction_run_issues (
@@ -2641,21 +2714,24 @@ export async function persistExtraction(
               ocr_language = $15, detected_employer_id = $16,
               promotion_outcome = $17, comparison_summary = $18::jsonb,
               promoted_at = CASE WHEN $17 = 'PROMOTED' THEN now() ELSE NULL END,
-              error_code = NULL
+              error_code = NULL, layout_fingerprint = $19, layout_fingerprint_version = $20,
+              document_layout_version_id = $21
         WHERE id = $1 AND user_id = $2 AND document_id = $3`,
       [runId, job.user_id, job.document_id, runStatus, classification.confidence, computeMs,
         processingPipelineVersions.classifier, processingPipelineVersions.extractor,
         processingPipelineVersions.parser, processingPipelineVersions.normalizer,
         processingPipelineVersions.resultSchema,
         job.pipeline_fingerprint ?? currentPipelineFingerprint,
-        source === 'OCR' ? 'tesseract' : null, null,
-        source === 'OCR' ? 'spa' : null, resolvedEmployer?.id ?? null,
+        details.ocr?.provider ?? (source === 'OCR' ? 'tesseract' : null), details.ocr?.providerVersion ?? null,
+        source === 'OCR' && !details.ocr ? 'spa' : null, resolvedEmployer?.id ?? null,
         promotionOutcome,
         JSON.stringify({
           comparison,
           issueCodes: candidateSnapshot.issueCodes,
           previousRunPresent: previousRunId !== null,
-        })],
+        }), details.layout?.fingerprint ?? null,
+        details.layout?.fingerprint ? details.layout.fingerprintVersion : null,
+        details.layout?.profile?.id ?? null],
     );
     if (promotionOutcome === 'PROMOTED') {
       const promoted = await db.query(
@@ -2862,6 +2938,41 @@ export async function failJob(job: JobRow, rawError: unknown): Promise<void> {
   log('job_failed', { errorCode, jobId: job.id, retryable: retryable ? 1 : 0 });
 }
 
+async function processingRunId(job: JobRow): Promise<string> {
+  const result = await pool.query<{ id: string }>(
+    `SELECT id FROM extraction_runs
+      WHERE user_id = $1 AND document_id = $2 AND processing_version = $3 AND status = 'PROCESSING'`,
+    [job.user_id, job.document_id, job.processing_version],
+  );
+  const runId = result.rows[0]?.id;
+  if (!runId) throw new WorkerError('EXTRACTION_PERSISTENCE_CONFLICT', true);
+  return runId;
+}
+
+export async function resolveDocumentLayout(
+  job: Pick<JobRow, 'id' | 'user_id' | 'document_id' | 'lease_owner'>,
+  text: string,
+  employerName: string,
+  pageCount: number,
+) {
+  const fingerprint = fingerprintLayout(text, pageCount);
+  if (!fingerprint) return null;
+  return withTransaction(async (db) => {
+    const authorized = await db.query(
+      `SELECT 1 FROM processing_jobs job
+         JOIN documents document ON document.id = job.document_id AND document.user_id = job.user_id
+         JOIN users owner ON owner.id = document.user_id
+        WHERE job.id = $1 AND job.user_id = $2 AND job.document_id = $3
+          AND job.state = 'RUNNING' AND job.lease_owner = $4 AND job.execution_owner = $4
+          AND document.security_status = 'CLEAN' AND document.deleted_at IS NULL
+          AND document.original_deleted_at IS NULL AND owner.status = 'ACTIVE'`,
+      [job.id, job.user_id, job.document_id, job.lease_owner],
+    );
+    if (!authorized.rowCount) return null;
+    return findApprovedDocumentLayout(db, { employerName, fingerprint, fingerprintVersion: '1' });
+  });
+}
+
 async function processJob(
   jobId: string,
   workerId: string,
@@ -2876,9 +2987,16 @@ async function processJob(
   let checksum: string | null = null;
   let duplicateChecksum: string | null = null;
   try {
-    if (isReprocessingJob(job)) {
+    if (isReprocessingJob(job) || jobTrigger(job) === 'USER_TYPE_CONFIRMATION' || job.attempt > 1) {
       const artifact = await loadCompatibleTextArtifact(s3, config, job);
-      if (artifact) {
+      const cachedPageCount = artifact?.pageCount ?? Math.max(artifact?.evidence.length ?? 0, 1);
+      const resolveCachedLayout = (text: string, employerName: string) => resolveDocumentLayout(job, text, employerName, cachedPageCount);
+      const deterministic = artifact ? await orchestrateExtraction(artifact, {
+        pageCount: cachedPageCount, resolveLayout: resolveCachedLayout,
+      }) : null;
+      const needsExternalRecovery = artifact && !artifact.ocr && config.ocr.enabled && config.ocr.provider === 'zai'
+        && deterministic?.triggerReason;
+      if (artifact && !needsExternalRecovery) {
         const automaticClassification = classifyPayrollText(
           artifact.text,
           config.classificationLowThreshold,
@@ -2891,17 +3009,29 @@ async function processJob(
           signals: [...automaticClassification.signals, 'compatible_text_artifact'],
         };
         await setDocumentStage(job, 'PARSING');
-        const extraction = attachSpatialEvidence(
-          extractArgentinePayroll(artifact.text, artifact.source),
-          artifact.evidence,
-        );
+        const outcome = await orchestrateExtraction(artifact, {
+          pageCount: cachedPageCount, resolveLayout: resolveCachedLayout,
+          cachedOcr: artifact.ocr,
+          fallback: !config.ocr.enabled
+            ? async () => new DisabledOCRProvider().extract({ bytes: new Uint8Array(), mimeType: 'application/pdf', pageCount: 1 })
+            : undefined,
+        });
+        if (artifact.reviewRequired) outcome.issues.push('OCR_RESULT_CONFLICT');
+        if (artifact.ocr) {
+          const currentRunId = await processingRunId(job);
+          await recordOcrCacheHit({ job, runId: currentRunId, triggerReason: 'CACHE_REUSE',
+            provider: { providerName: artifact.ocr.provider, model: artifact.ocr.model, providerVersion: artifact.ocr.providerVersion }, config: config.ocr });
+          await persistTextArtifact(s3, config, job, currentRunId, artifact, artifact.source, false,
+            artifact.ocr.pages.length, artifact.ocr, artifact.reviewRequired);
+        }
         const result = await persistExtraction(
           job,
           classification,
-          extraction,
+          outcome.extraction,
           artifact.source,
           false,
           Date.now() - started,
+          { ocr: outcome.ocrResult, issues: outcome.issues, layout: outcome.layout },
         );
         log('job_completed', { jobId: job.id, result: result ?? 'STALE' });
         return;
@@ -2922,15 +3052,52 @@ async function processJob(
 
     let source: FieldSource = 'PDF_TEXT';
     let sample = await extractPdfText(pdfPath, Math.min(2, pages), config);
-    if (sample.text.length < 80) {
+    const nativeTextPoor = sample.text.length < 80;
+    const requestExternalOcr = async (triggerReason: OCRTriggerReason) => {
+      await setDocumentStage(job, 'OCR');
+      const provider = new ZaiGlmOcrProvider(config.ocr);
+      if (pages > config.ocr.maxPdfPages) throw new OCRProviderError('OCR_PAGE_LIMIT');
+      if (Number(document.size_bytes) > config.ocr.maxFileBytes) throw new OCRProviderError('OCR_FILE_TOO_LARGE');
+      const bytes = await readFile(pdfPath);
+      const runId = await processingRunId(job);
+      return runBudgetedOcr({ job, runId, triggerReason, provider, config: config.ocr },
+        (requestId) => provider.extract({ bytes, mimeType: 'application/pdf', pageCount: pages }, { requestId }));
+    };
+    if (nativeTextPoor) {
       source = 'OCR';
-      sample = await extractOcrText(pdfPath, 1, directory, config);
+      try {
+        sample = await extractOcrText(pdfPath, 1, directory, config);
+      } catch (error) {
+        if (!config.ocr.enabled || config.ocr.provider !== 'zai' || !(error instanceof WorkerError)
+          || !['OCR_TEMPORARILY_UNAVAILABLE', 'PROCESSING_TIMEOUT'].includes(error.code)) throw error;
+      }
     }
-    const automaticClassification = classifyPayrollText(
+    let automaticClassification = classifyPayrollText(
       sample.text,
       config.classificationLowThreshold,
       config.classificationHighThreshold,
     );
+    let classificationOcr: OCRResult | undefined;
+    if (nativeTextPoor && automaticClassification.decision !== 'SUPPORTED'
+      && !automaticClassification.signals.some((signal) => ['documento_comercial', 'certificado_laboral', 'documento_fiscal'].includes(signal))
+      && config.ocr.enabled && config.ocr.provider === 'zai') {
+      try {
+        classificationOcr = await requestExternalOcr('NO_NATIVE_TEXT');
+        sample = { text: classificationOcr.text, evidence: ocrEvidence(classificationOcr) };
+        automaticClassification = classifyPayrollText(sample.text,
+          config.classificationLowThreshold, config.classificationHighThreshold);
+        if (automaticClassification.decision === 'UNSUPPORTED'
+          && !automaticClassification.signals.some((signal) => ['documento_comercial', 'certificado_laboral', 'documento_fiscal'].includes(signal))) {
+          automaticClassification = { ...automaticClassification, decision: 'NEEDS_CONFIRMATION' };
+        }
+      } catch (error) {
+        if (!(error instanceof OCRProviderError)) throw error;
+        if (jobTrigger(job) !== 'USER_TYPE_CONFIRMATION') {
+          await finishClassification(job, { ...automaticClassification, decision: 'NEEDS_CONFIRMATION' }, source, Date.now() - started);
+          return;
+        }
+      }
+    }
     const classification: Classification = jobTrigger(job) === 'USER_TYPE_CONFIRMATION'
       ? {
           ...automaticClassification,
@@ -2940,7 +3107,10 @@ async function processJob(
         }
       : automaticClassification;
     if (classification.decision !== 'SUPPORTED') {
-      await finishClassification(job, classification, source, Date.now() - started);
+      if (classificationOcr && classification.decision === 'NEEDS_CONFIRMATION') {
+        await persistTextArtifact(s3, config, job, await processingRunId(job), sample, 'OCR', false, pages, classificationOcr);
+      }
+      await finishClassification(job, classification, source, Date.now() - started, classificationOcr);
       log('job_completed', { jobId: job.id, result: classification.decision });
       return;
     }
@@ -2952,41 +3122,54 @@ async function processJob(
     });
     let partialOcr = false;
     let extracted: TextExtraction;
-    if (source === 'OCR') {
+    if (classificationOcr) {
+      extracted = sample;
+    } else if (source === 'OCR' && config.ocr.enabled) {
       if (pages === 1) {
         extracted = sample;
       } else {
-        const ocr = await extractOcrText(pdfPath, pages, directory, config);
-        extracted = ocr;
-        partialOcr = ocr.partial;
+        try {
+          const ocr = await extractOcrText(pdfPath, pages, directory, config);
+          extracted = ocr;
+          partialOcr = ocr.partial;
+        } catch (error) {
+          if (config.ocr.provider !== 'zai' || !(error instanceof WorkerError)
+            || !['OCR_TEMPORARILY_UNAVAILABLE', 'PROCESSING_TIMEOUT'].includes(error.code)) throw error;
+          extracted = sample;
+          partialOcr = true;
+        }
       }
-    } else {
+    } else if (source === 'PDF_TEXT') {
       extracted = pages <= 2 ? sample : await extractPdfText(pdfPath, pages, config);
-      if (extracted.text.length < 80) {
+      if (extracted.text.length < 80 && config.ocr.enabled) {
         source = 'OCR';
         const ocr = await extractOcrText(pdfPath, pages, directory, config);
         extracted = ocr;
         partialOcr = ocr.partial;
       }
+    } else {
+      extracted = sample;
     }
-    if (extracted.text.length < 40) throw new WorkerError('DOCUMENT_TEXT_UNREADABLE', false);
-
-    const run = await pool.query<{ id: string }>(
-      `SELECT id FROM extraction_runs
-        WHERE user_id = $1 AND document_id = $2 AND processing_version = $3
-          AND status = 'PROCESSING'`,
-      [job.user_id, job.document_id, job.processing_version],
-    );
-    const runId = run.rows[0]?.id;
-    if (!runId) throw new WorkerError('EXTRACTION_PERSISTENCE_CONFLICT', true);
-    await persistTextArtifact(s3, config, job, runId, extracted,
-      source === 'OCR' ? 'OCR' : 'PDF_TEXT', partialOcr, pages);
+    const runId = await processingRunId(job);
     await setDocumentStage(job, 'PARSING');
-    const extraction = attachSpatialEvidence(
-      extractArgentinePayroll(extracted.text, source === 'OCR' ? 'OCR' : 'PDF_TEXT'),
-      extracted.evidence,
-    );
-    const result = await persistExtraction(job, classification, extraction, source, partialOcr, Date.now() - started);
+    const fallback = !config.ocr.enabled || config.ocr.provider === 'disabled'
+      ? async () => new DisabledOCRProvider().extract({ bytes: new Uint8Array(), mimeType: 'application/pdf', pageCount: pages })
+      : config.ocr.provider === 'zai'
+        ? requestExternalOcr
+        : undefined;
+    const outcome = await orchestrateExtraction({ ...extracted, source: source === 'OCR' ? 'OCR' : 'PDF_TEXT' }, {
+      pageCount: pages, resolveLayout: (text, employerName) => resolveDocumentLayout(job, text, employerName, pages),
+      fallback, classificationLowThreshold: config.classificationLowThreshold,
+      classificationHighThreshold: config.classificationHighThreshold,
+      cachedOcr: classificationOcr,
+      requiredReason: nativeTextPoor && !config.ocr.enabled ? 'NO_NATIVE_TEXT'
+        : partialOcr ? 'PARSER_PARTIAL_RESULT' : undefined,
+    });
+    if (outcome.ocrResult) partialOcr = false;
+    await persistTextArtifact(s3, config, job, runId, outcome,
+      outcome.source, partialOcr, pages, outcome.ocrResult, outcome.issues.includes('OCR_RESULT_CONFLICT'));
+    const result = await persistExtraction(job, classification, outcome.extraction, outcome.source,
+      partialOcr, Date.now() - started, { ocr: outcome.ocrResult, issues: outcome.issues, layout: outcome.layout });
     log('job_completed', { jobId: job.id, result: result ?? 'STALE' });
   } catch (error) {
     const normalized = normalizeError(error);

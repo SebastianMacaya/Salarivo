@@ -40,7 +40,7 @@ Nunca se usa originalFilename como key. Nunca se acepta una key enviada libremen
 8. malware;
 9. objetos activos, adjuntos y acciones;
 10. clasificación salarial barata;
-11. extracción/OCR sólo si fue aceptado.
+11. extracción/OCR salarial cuando la clasificación lo admite; un scan ambiguo puede usar el rescate OCR acotado descrito abajo y debe volver a clasificarse.
 
 El orden elimina barato antes de ejecutar componentes caros o complejos.
 
@@ -94,7 +94,7 @@ Una confirmación del usuario no convierte INFECTED en aceptado.
 
 ## Clasificación y override
 
-La clasificación combina señales y confidence. Un archivo probable factura/UNKNOWN se rechaza antes de OCR completo. El mensaje no afirma un tipo si el confidence no alcanza.
+La clasificación combina señales y confidence. Un tipo no salarial reconocido se rechaza antes de OCR completo. Si un scan queda ambiguo por texto insuficiente, el fallback GLM-OCR puede recuperar texto después de seguridad y del descarte barato de señales comerciales, fiscales o de certificados. Requiere configuración habilitada, aceptación legal vigente del propietario y admisión presupuestaria; envía el PDF completo sin redacción previa y vuelve a clasificar y validar el resultado. Una ambigüedad restante conserva confirmación o revisión, sin afirmar un tipo con confianza insuficiente. Ver [OCR externo](../architecture/ocr.md).
 
 El usuario puede indicar “sí es un recibo” sólo después de seguridad. Esa acción queda auditada y habilita el procesamiento salarial; no habilita otros tipos documentales.
 

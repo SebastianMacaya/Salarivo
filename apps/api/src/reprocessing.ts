@@ -2,12 +2,15 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   currentPipelineFingerprint,
   followMergedEmployer,
+  hasNewDocumentLayoutSql,
   lockEmployerMutation,
   parserFixCatalog,
   processingPipelineVersions,
+  retryableOcrIssueCodes,
   type PoolClient,
   type ProcessingTriggerKind,
 } from "@salarivo/database";
+import { externalOcrEnabled } from "./config.ts";
 
 export type ReprocessingCandidate = {
   documentId: string;
@@ -42,6 +45,34 @@ const reprocessTriggers = new Set<ProcessingTriggerKind>([
   "AUTOMATIC_RECOVERY",
 ]);
 
+function ocrRecoverySql(runAlias: string, issueAlias: string): string {
+  if (!externalOcrEnabled()) return "false";
+  return `(${issueAlias}.code IN (${retryableOcrIssueCodes.map((code) => `'${code}'`).join(",")}) OR (${issueAlias}.code IN (
+    'UNKNOWN_LAYOUT', 'CRITICAL_FIELD_MISSING', 'BASIC_AMOUNT_MISSING',
+    'LABEL_OR_LAYOUT_NOT_RECOGNIZED', 'OCR_PARTIAL'
+  ) AND CASE WHEN ${runAlias}.extractor_version ~ '^[0-9]{1,8}$'
+      THEN ${runAlias}.extractor_version::integer < ${Number(processingPipelineVersions.extractor)}
+      ELSE false END))`;
+}
+
+function ocrRetrySql(runAlias: string): string {
+  if (!externalOcrEnabled()) return "false";
+  return `EXISTS (SELECT 1 FROM extraction_run_issues ocr_retry
+    WHERE ocr_retry.user_id = ${runAlias}.user_id AND ocr_retry.document_id = ${runAlias}.document_id
+      AND ocr_retry.extraction_run_id = ${runAlias}.id AND ocr_retry.recoverable
+      AND ocr_retry.code IN (${retryableOcrIssueCodes.map((code) => `'${code}'`).join(",")}))`;
+}
+
+function layoutObservationSql(runAlias: string, issueAlias: string): string {
+  // Parser 8 first records structural observations. This is a bounded discovery pass,
+  // not a claim that an unapproved layout has a parser fix.
+  return `(${runAlias}.layout_fingerprint IS NULL
+    AND CASE WHEN ${runAlias}.parser_version ~ '^[0-9]{1,8}$'
+      THEN ${runAlias}.parser_version::integer < 8 ELSE false END
+    AND ${issueAlias}.code IN ('UNKNOWN_LAYOUT', 'LABEL_OR_LAYOUT_NOT_RECOGNIZED',
+      'BASIC_AMOUNT_MISSING', 'CRITICAL_FIELD_MISSING'))`;
+}
+
 export function reprocessingCandidateExistsSql(
   documentAlias: string,
   fixesExpression: string,
@@ -62,7 +93,7 @@ export function reprocessingCandidateExistsSql(
          AND candidate_issue.document_id = candidate_run.document_id
          AND candidate_issue.extraction_run_id = candidate_run.id
          AND candidate_issue.recoverable
-        JOIN jsonb_to_recordset(${fixesExpression}::jsonb) AS candidate_fix(
+        LEFT JOIN jsonb_to_recordset(${fixesExpression}::jsonb) AS candidate_fix(
           "issueCode" text,
           "affectedFieldPath" text,
           "introducedInParserVersion" text
@@ -78,19 +109,22 @@ export function reprocessingCandidateExistsSql(
        WHERE candidate_run.id = ${documentAlias}.active_extraction_run_id
          AND candidate_run.user_id = ${documentAlias}.user_id
          AND candidate_run.document_id = ${documentAlias}.id
-         AND candidate_run.pipeline_fingerprint IS DISTINCT FROM ${fingerprintExpression}
-         AND CASE
+         AND (candidate_run.pipeline_fingerprint IS DISTINCT FROM ${fingerprintExpression}
+              OR ${ocrRetrySql("candidate_run")} OR ${hasNewDocumentLayoutSql("candidate_run")})
+         AND ((candidate_fix."issueCode" IS NOT NULL AND CASE
            WHEN candidate_run.parser_version ~ '^[0-9]+$'
              AND candidate_fix."introducedInParserVersion" ~ '^[0-9]+$'
              THEN candidate_run.parser_version::integer < candidate_fix."introducedInParserVersion"::integer
            ELSE candidate_run.parser_version IS DISTINCT FROM candidate_fix."introducedInParserVersion"
-         END
+         END) OR ${ocrRecoverySql("candidate_run", "candidate_issue")} OR ${hasNewDocumentLayoutSql("candidate_run")}
+           OR ${layoutObservationSql("candidate_run", "candidate_issue")})
          AND NOT EXISTS (
            SELECT 1 FROM extraction_runs attempted_run
             WHERE attempted_run.user_id = candidate_run.user_id
               AND attempted_run.document_id = candidate_run.document_id
               AND attempted_run.base_extraction_run_id = candidate_run.id
               AND attempted_run.pipeline_fingerprint = ${fingerprintExpression}
+              AND NOT (${ocrRetrySql("attempted_run")} OR ${hasNewDocumentLayoutSql("attempted_run")})
               AND (
                 attempted_run.status = 'REVIEW_REQUIRED'
                 OR attempted_run.promotion_outcome IN ('PROMOTED', 'UNCHANGED', 'REVIEW_REQUIRED', 'REJECTED_REGRESSION')
@@ -141,7 +175,7 @@ export async function findReprocessingCandidates(
         AND issue.document_id = run.document_id
         AND issue.extraction_run_id = run.id
         AND issue.recoverable
-       JOIN fixes fix
+       LEFT JOIN fixes fix
          ON fix."issueCode" = issue.code
         AND fix."affectedFieldPath" IS NOT DISTINCT FROM issue.affected_field_path
         AND CASE
@@ -161,18 +195,20 @@ export async function findReprocessingCandidates(
         AND document.document_type = 'PAYROLL'
         AND ($2::uuid IS NULL OR document.id = $2)
         AND ($6::uuid[] IS NULL OR document.id = ANY($6::uuid[]))
-        AND run.pipeline_fingerprint IS DISTINCT FROM $5
-        AND CASE
+        AND (run.pipeline_fingerprint IS DISTINCT FROM $5 OR ${ocrRetrySql("run")} OR ${hasNewDocumentLayoutSql("run")})
+        AND ((fix."issueCode" IS NOT NULL AND CASE
           WHEN run.parser_version ~ '^[0-9]+$' AND fix."introducedInParserVersion" ~ '^[0-9]+$'
             THEN run.parser_version::integer < fix."introducedInParserVersion"::integer
           ELSE run.parser_version IS DISTINCT FROM fix."introducedInParserVersion"
-        END
+        END) OR ${ocrRecoverySql("run", "issue")} OR ${hasNewDocumentLayoutSql("run")}
+          OR ${layoutObservationSql("run", "issue")})
         AND NOT EXISTS (
           SELECT 1 FROM extraction_runs attempted_run
            WHERE attempted_run.user_id = run.user_id
              AND attempted_run.document_id = run.document_id
              AND attempted_run.base_extraction_run_id = run.id
              AND attempted_run.pipeline_fingerprint = $5
+             AND NOT (${ocrRetrySql("attempted_run")} OR ${hasNewDocumentLayoutSql("attempted_run")})
              AND (
                attempted_run.status = 'REVIEW_REQUIRED'
                OR attempted_run.promotion_outcome IN ('PROMOTED', 'UNCHANGED', 'REVIEW_REQUIRED', 'REJECTED_REGRESSION')

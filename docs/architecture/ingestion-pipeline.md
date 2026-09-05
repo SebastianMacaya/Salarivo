@@ -1,6 +1,6 @@
 # Pipeline de ingestión
 
-> Estado: corte vertical implementado para PDF salarial argentino, con progreso recuperable, cancelación de uploads pendientes, revisión manual y reproceso explícito versionado. Pausa/reanudación, LLM y otros tipos siguen fuera del MVP.
+> Estado: corte vertical implementado para PDF salarial argentino, con progreso recuperable, cancelación de uploads pendientes, revisión manual, reproceso explícito versionado y fallback OCR opcional con GLM-OCR. Pausa/reanudación, LLM semántico y otros tipos siguen fuera del MVP. La integración externa y sus límites se documentan en [OCR externo](ocr.md).
 
 ## Objetivo
 
@@ -135,15 +135,17 @@ stateDiagram-v2
 | 6 | inspección activa | rechazar JavaScript, adjuntos y acciones no permitidas |
 | 7 | clasificación barata | texto mínimo o primera página limitada |
 | 8 | extracción directa | preferida si existe texto confiable; conserva página/región de coincidencias literales únicas |
-| 9 | OCR | sólo para páginas necesarias y con budget; conserva TSV espacial cuando existe |
+| 9 | OCR local | Tesseract acotado por páginas, tiempo y tamaño; conserva TSV espacial cuando existe |
 | 10 | parsing/normalización | determinístico y versionado |
-| 11 | IA futura | fallback mínimo, redactado y presupuestado |
+| 11 | GLM-OCR opcional | fallback presupuestado: PDF completo sin redacción previa, aceptación legal vigente del propietario y revalidación con el mismo parser |
 | 12 | validación | corrida completa, completa con observaciones o que requiere revisión |
 | 13 | comparación/promoción | promover sólo baseline válido o mejora sin regresiones |
 
 El parser no inventa montos. El neto sólo puede derivarse de los totales de una tabla salarial reconocida cuando además existe una etiqueta explícita de neto, siempre con aritmética decimal exacta. Un valor ausente queda como issue trazable. La completitud depende del tipo: un `NORMAL` sin básico queda con observaciones; si bruto, descuentos y neto no balancean, el candidato requiere revisión y no desplaza al activo.
 
 Confirmar manualmente el tipo nunca salta malware, límites ni parse seguro.
+
+Un scan cuya muestra local no permite clasificar puede usar el fallback después de seguridad y del descarte barato de señales comerciales, fiscales o de certificados. El texto recuperado se vuelve a clasificar; un tipo no salarial reconocido se rechaza y una ambigüedad conserva confirmación o revisión. La aceptación legal del administrador que solicita un reproceso no reemplaza la del propietario. Ver [OCR externo](ocr.md).
 
 ## Resolución de empleador y empleo
 
@@ -154,6 +156,8 @@ El Employer detectado queda en Document como procedencia aunque `employment_id` 
 Si un reproceso detecta otro Employer para un documento ya asociado, no borra la decisión existente ni modifica la detección activa: conserva el candidato como `REVIEW_REQUIRED`. La comparación owner-only muestra el empleador detectado en ambas corridas; una promoción explícita cambia la detección activa bajo lock, pero preserva la asociación laboral confirmada.
 
 ## Clasificación por costo
+
+El corte actual conserva texto nativo y muestra Tesseract local antes del trabajo completo. Con Z.ai habilitado, un scan todavía inconcluso puede consultar OCR externo tras seguridad y descarte de señales comerciales/fiscales/certificados, y vuelve a clasificarse. Esa recuperación no equivale a una clasificación salarial positiva previa al envío. La secuencia más estricta descrita a continuación sigue siendo objetivo de clasificación:
 
 1. Extraer una muestra de texto ya presente y combinar múltiples señales laborales.
 2. Si no hay texto, renderizar una primera página/thumbnail dentro de límites y ejecutar OCR ligero.
@@ -211,7 +215,7 @@ La implementación actual aplica:
 - timeout por etapa;
 - retry con backoff y jitter.
 
-Quedan como objetivo la prioridad por etapa, dead-letter y budgets de costo por documento, usuario y batch.
+Z.ai agrega admisión transaccional por proveedor, presupuesto diario/mensual UTC, reserva de todos los intentos posibles y circuito de errores recientes. Quedan como objetivo la prioridad por etapa, dead-letter y budgets específicos por documento, usuario y batch.
 
 No se crean 400 procesos OCR para 400 archivos. Se crean items persistentes y una cantidad acotada de jobs ejecutables.
 
@@ -245,6 +249,8 @@ Los detalles internos se sanitizan. La UI traduce códigos; no muestra sólo err
 Temporales, renders y OCR intermedio tienen TTL corto y owner/documentId. Al cancelar o borrar se cierran sesiones y jobs pendientes. En R2, el delete fuerte del marcador/objeto invalida el `If-Match` y permite cerrar el cleanup tras confirmar el borrado; AWS/local conserva el reborrado hasta vencer TTL y gracia. Cada acción registra auditoría sin contenido sensible. La política completa está en [Retención](../privacy/data-retention.md).
 
 ## Observabilidad
+
+`ocr_provider_usage` registra metadata de cada operación Z.ai o reutilización de cache; `ocr_provider_daily_costs` conserva el costo diario agregado sin IDs incluso después de una baja. La consola administrativa consulta métricas mensuales paginadas y salud basada en respuestas reales. Los errores y límites de esta ruta están en [OCR externo](ocr.md); no se confunden con salarios ni con contenido del artefacto.
 
 Se registran IDs internos, stage, versión, duración, costo aproximado, resultado y errorCode. Nunca contenido, salario, identificadores fiscales, texto OCR o URL firmada.
 

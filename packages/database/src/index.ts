@@ -3,6 +3,11 @@ import { assertSecureDatabaseUrl } from "./database-url.ts";
 import { runMigrations } from "./migrations.ts";
 
 export { loadMigrations, type Migration } from "./migrations.ts";
+export { currentLegalAcknowledgementsSql } from "./legal-acceptance.ts";
+export {
+  layoutAliasFields, validateLayoutAliases, findApprovedDocumentLayout, hasNewDocumentLayoutSql,
+  type LayoutAliasField, type LayoutAliases, type ApprovedDocumentLayout,
+} from "./document-layouts.ts";
 
 export {
   employerSources,
@@ -31,6 +36,7 @@ export {
   extractionRunStatuses,
   parserFixCatalog,
   processingPipelineVersions,
+  retryableOcrIssueCodes,
   processingTriggerKinds,
   promotionOutcomes,
   settlementTypes,

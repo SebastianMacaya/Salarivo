@@ -25,11 +25,11 @@ const completeSnapshot: ProcessingSnapshot = {
   issueCodes: [],
 };
 
-test("the catalog matches the parser 7 basic-layout fix", () => {
+test("parser 8 supports approved aliases and preserves the parser 7 basic-layout fix catalog", () => {
   assert.deepEqual(processingPipelineVersions, {
     classifier: "6",
-    extractor: "6",
-    parser: "7",
+    extractor: "7",
+    parser: "8",
     normalizer: "6",
     resultSchema: "1",
   });

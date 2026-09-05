@@ -27,7 +27,7 @@ type Permission =
   | 'sessions.revoke' | 'documents.read_metadata' | 'documents.quarantine'
   | 'employers.read_metadata' | 'processing.read' | 'processing.retry' | 'processing.cancel' | 'processing.reprocess' | 'processing.rollback'
   | 'storage.read' | 'privacy.read' | 'security.read' | 'audit.read' | 'legal.manage' | 'settings.read'
-  | 'system.health.read' | 'roles.manage';
+  | 'system.health.read' | 'roles.manage' | 'layouts.manage';
 type SessionUser = {
   id: string;
   displayName: string | null;
@@ -81,9 +81,26 @@ type DocumentDetail = {
   employmentId: string | null;
   importBatchId: string;
   activeRunId: string | null;
-  processingRuns: ProcessingRun[];
+  processingRuns: Array<ProcessingRun & { ocr: OcrUsage | null }>;
   issues: Array<ProcessingIssue & { id: string; runId: string; createdAt: string }>;
   recentJobs: Array<Pick<AdminJob, 'id' | 'stage' | 'processingVersion' | 'state' | 'attempt' | 'maxAttempts' | 'errorCode' | 'updatedAt'>>;
+};
+type OcrUsage = {
+  provider: string; model: string; providerVersion: string; triggerReason: string; status: string;
+  inputTokens: string | null; outputTokens: string | null; cachedTokens: string | null; totalTokens: string | null;
+  estimatedCostUsd: string | null; accountedCostUsd: string; durationMs: number | null; retryCount: number; errorCode: string | null;
+};
+type OcrHealth = {
+  periodStart: string;
+  summary: {
+    operations: number; calls: number; succeeded: number; failed: number; blocked: number; cacheHits: number; timeouts: number;
+    retries: number; documents: number; reviewRequiredDocuments: number; reportedTotalTokens: string; missingTokenReports: number;
+    estimatedCostUsd: string; accountedCostUsd: string; averageDurationMs: number | null;
+    processedDocuments: number; withoutOcrDocuments: number; zaiDocuments: number; unknownLayoutDocuments: number;
+  };
+  providers: Array<{ provider: string; model: string; health: string; lastRequestAt: string | null; lastErrorCode: string | null; succeeded: number; failed: number; blocked: number }>;
+  users: Paged<{ userId: string; documents: number; reportedTotalTokens: string; estimatedCostUsd: string; accountedCostUsd: string }>;
+  checkedAt: string;
 };
 type ProcessingHealth = {
   summary: {
@@ -228,9 +245,9 @@ function QueryFilters({ action, search, children, searchPlaceholder = 'UUID exac
 function SelectFilter({ name, label, values, search }: { name: string; label: string; values: string[]; search: URLSearchParams }) {
   return <label>{label}<select name={name} defaultValue={search.get(name) ?? ''}><option value="">Todos</option>{values.map((value) => <option key={value}>{value}</option>)}</select></label>;
 }
-function Pagination({ result, path, search }: { result: { page: number; pageSize: number; total: number }; path: string; search: URLSearchParams }) {
+function Pagination({ result, path, search, pageParam = 'page' }: { result: { page: number; pageSize: number; total: number }; path: string; search: URLSearchParams; pageParam?: string }) {
   const pages = Math.max(1, Math.ceil(result.total / result.pageSize));
-  function href(page: number) { const next = new URLSearchParams(search); next.set('page', String(page)); return `${path}?${next}`; }
+  function href(page: number) { const next = new URLSearchParams(search); next.set(pageParam, String(page)); return `${path}?${next}`; }
   return <nav className="admin-pagination" aria-label="Paginación"><span>{numberFormatter.format(result.total)} resultados · página {result.page} de {pages}</span><div>{result.page > 1 && <a className="button secondary compact" href={href(result.page - 1)}>Anterior</a>}{result.page < pages && <a className="button secondary compact" href={href(result.page + 1)}>Siguiente</a>}</div></nav>;
 }
 
@@ -480,7 +497,7 @@ function DocumentPage({ id, permissions }: { id: string; permissions: Permission
     <PageHeader eyebrow="Documentos" title={shortId(document.id)} description="Diagnóstico sin exponer el contenido privado." crumbs={[["Admin", "/admin"], ["Documentos", "/admin/documents"], [shortId(id)]]} actions={headerActions} />
     {notice && <p className="message success" aria-live="polite">{notice}</p>}
     <div className="admin-detail-grid"><section className="admin-card"><h2>Metadata</h2><dl className="admin-definition"><div><dt>ID</dt><dd>{document.id}</dd></div><div><dt>Usuario</dt><dd><a href={`/admin/users/${document.userId}`}>{document.maskedEmail}</a></dd></div><div><dt>Tipo</dt><dd>{document.documentType ?? 'Sin confirmar'}</dd></div><div><dt>Tamaño</dt><dd>{bytes(document.sizeBytes)}</dd></div><div><dt>Páginas</dt><dd>{document.pageCount ?? 'Sin dato'}</dd></div><div><dt>Empleo</dt><dd>{employmentId ? shortId(employmentId) : 'Sin asociación'}</dd></div><div><dt>Importación</dt><dd>{shortId(importBatchId)}</dd></div><div><dt>Retención</dt><dd>{document.retentionPolicy}</dd></div></dl></section><section className="admin-card"><h2>Diagnóstico</h2><dl className="admin-definition"><div><dt>Procesamiento</dt><dd><StatusBadge value={document.processingStatus} /></dd></div><div><dt>Seguridad</dt><dd><StatusBadge value={document.securityStatus} /></dd></div><div><dt>Análisis activo</dt><dd>{document.activeRunStatus ? <StatusBadge value={document.activeRunStatus} /> : 'Sin análisis'}</dd></div><div><dt>Parser activo</dt><dd>{document.activeParserVersion ?? '—'}</dd></div><div><dt>Issues activos</dt><dd>{document.issueCount}</dd></div><div><dt>Mejora</dt><dd>{document.reprocessAvailable ? 'Disponible' : inProgress ? 'Procesando' : 'No disponible'}</dd></div><div><dt>Original</dt><dd>{document.originalAvailable ? 'Disponible bajo autorización del usuario' : 'No disponible'}</dd></div><div><dt>Procesado</dt><dd>{date(document.processedAt)}</dd></div></dl></section></div>
-    <section className="admin-card"><h2>Versiones de análisis</h2><p>Timeline técnico sanitizado: versiones y decisiones, sin PDF, OCR ni importes.</p>{processingRuns.length ? <ol className="admin-run-list">{processingRuns.map((run) => <li key={run.id}><div><strong>Versión {run.processingVersion}</strong>{run.active && <StatusBadge value="ACTIVE" />}</div><span><StatusBadge value={run.status} /> · {triggerLabel(run.triggerKind)} · parser {run.parserVersion}</span><small>{runOutcomeLabel(run.promotionOutcome)} · {date(run.finishedAt ?? run.startedAt)}</small>{permissions.includes('processing.rollback') && !run.active && run.promotionOutcome === 'PROMOTED' && run.promotedAt && !inProgress && <button className="button compact danger-button" onClick={() => rollback(run)}>Rollback</button>}</li>)}</ol> : <EmptyState>No hay análisis registrados.</EmptyState>}</section>
+    <section className="admin-card"><h2>Versiones de análisis</h2><p>Timeline técnico sanitizado: versiones y decisiones, sin PDF, OCR ni importes.</p>{processingRuns.length ? <ol className="admin-run-list">{processingRuns.map((run) => <li key={run.id}><div><strong>Versión {run.processingVersion}</strong>{run.active && <StatusBadge value="ACTIVE" />}</div><span><StatusBadge value={run.status} /> · {triggerLabel(run.triggerKind)} · parser {run.parserVersion}</span><small>{runOutcomeLabel(run.promotionOutcome)} · {date(run.finishedAt ?? run.startedAt)}</small>{run.ocr && <small>OCR {run.ocr.provider} · {run.ocr.model} · {run.ocr.status} · {run.ocr.triggerReason} · {run.ocr.totalTokens ?? 'N/D'} tokens · USD {run.ocr.estimatedCostUsd ?? 'N/D'} · {run.ocr.durationMs ?? 'N/D'} ms · {run.ocr.retryCount} reintentos{run.ocr.errorCode ? ` · ${run.ocr.errorCode}` : ''}</small>}{permissions.includes('processing.rollback') && !run.active && run.promotionOutcome === 'PROMOTED' && run.promotedAt && !inProgress && <button className="button compact danger-button" onClick={() => rollback(run)}>Rollback</button>}</li>)}</ol> : <EmptyState>No hay análisis registrados.</EmptyState>}</section>
     <section className="admin-card"><h2>Issues estructurados</h2>{issues.length ? <div className="admin-table-wrap"><table className="admin-table" role="table"><thead><tr><th scope="col">Código</th><th scope="col">Severidad</th><th scope="col">Campo</th><th scope="col">Recuperable</th><th scope="col">Versión</th><th scope="col">Fecha</th></tr></thead><tbody>{issues.map((issue) => <tr key={issue.id}><td data-label="Código">{issue.code}</td><td data-label="Severidad"><StatusBadge value={issue.severity} /></td><td data-label="Campo">{issue.affectedFieldPath ?? 'General'}</td><td data-label="Recuperable">{issue.recoverable ? 'Sí' : 'No'}</td><td data-label="Versión">{processingRuns.find((run) => run.id === issue.runId)?.processingVersion ?? '—'}</td><td data-label="Fecha">{date(issue.createdAt)}</td></tr>)}</tbody></table></div> : <EmptyState>No hay issues registrados.</EmptyState>}</section>
     <section className="admin-card"><h2>Jobs relacionados</h2>{!permissions.includes('processing.read') ? <p>Tu rol no incluye metadata de procesamiento.</p> : recentJobs.length ? <ul className="admin-event-list">{recentJobs.map((job) => <li key={job.id}><a href={`/admin/processing?search=${job.id}`}>{shortId(job.id)}</a><StatusBadge value={job.state} /><span>{job.stage} · v{job.processingVersion} · {job.attempt}/{job.maxAttempts} intentos</span></li>)}</ul> : <EmptyState>No hay jobs relacionados.</EmptyState>}</section>
     {activeRunId === null && <p className="admin-footnote">El documento todavía no tiene un análisis activo.</p>}
@@ -488,8 +505,81 @@ function DocumentPage({ id, permissions }: { id: string; permissions: Permission
   </>;
 }
 
+function OcrUsageSection({ search }: { search: URLSearchParams }) {
+  const state = useRemote<OcrHealth>(`/admin/processing/ocr?page=${processingHealthPage(search.get('ocrPage'))}&pageSize=25`);
+  if (state.loading) return <LoadingState />;
+  if (state.error || !state.data) return <ErrorState message={state.error} retry={state.reload} />;
+  const { summary, providers, users, periodStart } = state.data;
+  const completed = summary.succeeded + summary.failed;
+  return <section className="admin-card"><h2>Uso de OCR</h2><p>Mes UTC desde {periodStart.slice(0, 10)}. Costos de procesamiento estimados; los consumos sin reporte conservan la reserva presupuestaria.</p>
+    <dl className="admin-definition">
+      <div><dt>Analizados / sin OCR / con Z.ai</dt><dd>{summary.processedDocuments} / {summary.withoutOcrDocuments} / {summary.zaiDocuments}{summary.processedDocuments > 0 ? ` · ${(summary.zaiDocuments * 100 / summary.processedDocuments).toFixed(1)}% con Z.ai` : ''}</dd></div>
+      <div><dt>Layout desconocido</dt><dd>{summary.unknownLayoutDocuments}</dd></div>
+      <div><dt>Documentos con operación OCR</dt><dd>{summary.documents}</dd></div>
+      <div><dt>Llamadas / aciertos de caché</dt><dd>{summary.calls} / {summary.cacheHits}</dd></div>
+      <div><dt>Éxito / fallos / bloqueos</dt><dd>{summary.succeeded} / {summary.failed} / {summary.blocked}{completed > 0 ? ` · ${(summary.succeeded * 100 / completed).toFixed(1)}% de éxito` : ''}</dd></div>
+      <div><dt>Timeouts / reintentos</dt><dd>{summary.timeouts} / {summary.retries}</dd></div>
+      <div><dt>Para revisar tras OCR</dt><dd>{summary.reviewRequiredDocuments}</dd></div>
+      <div><dt>Tokens reportados</dt><dd>{summary.reportedTotalTokens} · {summary.missingTokenReports} operaciones sin reporte</dd></div>
+      <div><dt>Duración media</dt><dd>{summary.averageDurationMs === null ? 'Sin dato' : `${summary.averageDurationMs} ms`}</dd></div>
+      <div><dt>Costo estimado / reservado y consumido</dt><dd>USD {summary.estimatedCostUsd} / USD {summary.accountedCostUsd}</dd></div>
+    </dl>
+    <h3>Proveedores observados</h3><p>La última respuesta en 24 horas determina la salud observada; no prueba la configuración actual ni genera llamadas al proveedor.</p>
+    {providers.length ? <ul className="admin-event-list">{providers.map((provider) => <li key={`${provider.provider}-${provider.model}`}><strong>{provider.provider} · {provider.model}</strong><StatusBadge value={provider.health} /><span>{date(provider.lastRequestAt)} · {provider.lastErrorCode ?? 'Sin error registrado'}</span></li>)}</ul> : <EmptyState>Sin operaciones OCR registradas este mes; estado desconocido.</EmptyState>}
+    <h3>Consumo por cuenta</h3>{users.items.length ? <div className="admin-table-wrap"><table className="admin-table" role="table"><thead><tr><th scope="col">Cuenta</th><th scope="col">Documentos</th><th scope="col">Tokens reportados</th><th scope="col">Estimado USD</th><th scope="col">Reservado y consumido USD</th></tr></thead><tbody>{users.items.map((user) => <tr key={user.userId}><td data-label="Cuenta">{user.userId}</td><td data-label="Documentos">{user.documents}</td><td data-label="Tokens reportados">{user.reportedTotalTokens}</td><td data-label="Estimado USD">{user.estimatedCostUsd}</td><td data-label="Reservado y consumido USD">{user.accountedCostUsd}</td></tr>)}</tbody></table></div> : <EmptyState>Sin consumo registrado.</EmptyState>}
+    <Pagination result={users} path="/admin/processing" search={search} pageParam="ocrPage" />
+  </section>;
+}
+
+const layoutFieldLabels = [
+  ['settlement.basicAmount', 'Básico'], ['settlement.grossAmount', 'Bruto'], ['settlement.netAmount', 'Neto'],
+  ['settlement.remunerativeAmount', 'Remunerativo'], ['settlement.nonRemunerativeAmount', 'No remunerativo'],
+  ['settlement.deductionsAmount', 'Descuentos'], ['settlement.payrollPeriod', 'Período'],
+] as const;
+type LayoutVersion = { id: string; version: number; enabled: boolean; aliases: Record<string, string[]>; approvedAt: string };
+type LayoutCandidate = { employerId: string; fingerprint: string; fingerprintVersion: '1'; observedRuns: number;
+  lastSeenAt: string | null; layoutId: string | null; versions: LayoutVersion[]; versionCount: number };
+
+function DocumentLayoutsSection({ search, permissions }: { search: URLSearchParams; permissions: Permission[] }) {
+  const state = useRemote<Paged<LayoutCandidate>>(`/admin/processing/layouts?page=${processingHealthPage(search.get('layoutPage'))}&pageSize=25`);
+  const [action, setAction] = useState<AdminAction | null>(null);
+  const [notice, setNotice] = useState('');
+  function approve(candidate: LayoutCandidate, enabled: boolean) {
+    const current = candidate.versions[0];
+    setAction({ title: enabled ? 'Aprobar versión del formato' : 'Desactivar formato',
+      description: enabled ? 'Ingresá etiquetas genéricas revisadas del formato. Sólo completan campos ausentes; cada recibo conserva sus validaciones. No ingreses nombres, importes ni contenido de un documento.' : 'Una nueva versión desactivada detiene la reutilización futura. Conserva el historial y los resultados existentes.',
+      button: enabled ? 'Aprobar versión' : 'Desactivar',
+      fields: enabled ? <><p>Hasta cuatro etiquetas literales por campo, separadas por punto y coma. No se admiten números, URLs ni expresiones.</p>{layoutFieldLabels.map(([field, label]) => <label key={field}>{label}<input name={field} defaultValue={current?.aliases[field]?.join('; ') ?? ''} maxLength={246} autoComplete="off" placeholder="Etiqueta del formato" /></label>)}</> : undefined,
+      execute: async (reasonCode, reference, values) => {
+        const aliases = enabled ? Object.fromEntries(layoutFieldLabels.flatMap(([field]) => {
+          const labels = (values[field] ?? '').split(';').map((label) => label.trim()).filter(Boolean);
+          return labels.length ? [[field, labels]] : [];
+        })) : {};
+        await api('/admin/processing/layouts/approve', { method: 'POST', body: JSON.stringify({
+          employerId: candidate.employerId, fingerprint: candidate.fingerprint, fingerprintVersion: candidate.fingerprintVersion,
+          aliases, enabled, reasonCode, reference,
+        }) });
+        return enabled ? 'Versión aprobada. Los próximos análisis pueden reutilizar sus etiquetas.' : 'Formato desactivado para nuevos análisis.';
+      },
+    });
+  }
+  return <section className="admin-card"><h2>Formatos revisados</h2><p>Huellas de estructura observadas en revisión, por empleador verificado. La aprobación configura etiquetas; no valida importes ni reemplaza correcciones humanas.</p>
+    {notice && <p className="message success" aria-live="polite">{notice}</p>}
+    {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay formatos pendientes ni aprobados para empleadores verificados.</EmptyState> : <>
+      <div className="admin-table-wrap"><table className="admin-table" role="table"><thead><tr><th scope="col">Empleador</th><th scope="col">Estructura</th><th scope="col">Observaciones</th><th scope="col">Versiones</th><th scope="col">Acciones</th></tr></thead><tbody>{state.data.items.map((candidate) => <tr key={`${candidate.employerId}-${candidate.fingerprint}`}>
+        <td data-label="Empleador"><a href={`/admin/employers/${candidate.employerId}`}>{shortId(candidate.employerId)}</a></td>
+        <td data-label="Estructura"><code title={candidate.fingerprint}>{candidate.fingerprint.slice(0, 16)}…</code><small> · huella v{candidate.fingerprintVersion}</small></td>
+        <td data-label="Observaciones">{candidate.observedRuns} en revisión<br />{date(candidate.lastSeenAt)}</td>
+        <td data-label="Versiones">{candidate.versions.length ? <details><summary>v{candidate.versions[0].version} · {candidate.versions[0].enabled ? 'Habilitada' : 'Desactivada'}</summary><p>{candidate.versionCount} versiones; se muestran las últimas 20.</p>{candidate.versions.map((version) => <div key={version.id}><strong>v{version.version} · {version.enabled ? 'Habilitada' : 'Desactivada'}</strong><p>{date(version.approvedAt)}</p><ul>{layoutFieldLabels.filter(([field]) => version.aliases[field]).map(([field, label]) => <li key={field}>{label}: {version.aliases[field].join('; ')}</li>)}</ul></div>)}</details> : 'Pendiente de aprobación'}</td>
+        <td data-label="Acciones">{permissions.includes('layouts.manage') ? <div className="admin-actions"><button type="button" className="button compact secondary" onClick={() => approve(candidate, true)}>Aprobar versión</button>{candidate.versions[0]?.enabled && <button type="button" className="button compact secondary" onClick={() => approve(candidate, false)}>Desactivar</button>}</div> : 'Sólo lectura'}</td>
+      </tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/processing" search={search} pageParam="layoutPage" />
+    </>}
+    {action && <ActionDialog action={action} onClose={() => setAction(null)} onDone={(message) => { setAction(null); setNotice(message); state.reload(); }} />}
+  </section>;
+}
+
 function ProcessingPage({ search, permissions }: { search: URLSearchParams; permissions: Permission[] }) {
-  const query = new URLSearchParams(search); query.delete('healthPage'); query.set('pageSize', '25');
+  const query = new URLSearchParams(search); query.delete('healthPage'); query.delete('ocrPage'); query.delete('layoutPage'); query.set('pageSize', '25');
   const state = useRemote<Paged<AdminJob>>(`/admin/jobs?${query}`);
   const healthPage = processingHealthPage(search.get('healthPage'));
   const health = useRemote<ProcessingHealth>(`/admin/processing/health?page=${healthPage}&pageSize=25`);
@@ -520,6 +610,8 @@ function ProcessingPage({ search, permissions }: { search: URLSearchParams; perm
       </div>
       <ProcessingHealthPagination versions={health.data.versions} issues={health.data.issues} search={search} />
     </>}
+    <OcrUsageSection search={search} />
+    <DocumentLayoutsSection search={search} permissions={permissions} />
     <h2 className="admin-section-title">Jobs</h2>
     <QueryFilters action="/admin/processing" search={search}><SelectFilter name="state" label="Estado" values={['PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE', 'COMPLETED', 'FAILED', 'CANCELLED']} search={search} /><SelectFilter name="stage" label="Etapa" values={['SECURITY_VALIDATION', 'DOCUMENT_CLASSIFICATION', 'TEXT_EXTRACTION', 'OCR', 'PARSING', 'NORMALIZATION', 'VALIDATION', 'CLEANUP', 'DOCUMENT_PIPELINE_V2']} search={search} /></QueryFilters>
     {state.loading ? <LoadingState /> : state.error || !state.data ? <ErrorState message={state.error} retry={state.reload} /> : !state.data.items.length ? <EmptyState>No hay jobs para estos filtros.</EmptyState> : <><div className="admin-table-wrap"><table className="admin-table" role="table"><thead><tr><th scope="col">Job</th><th scope="col">Documento</th><th scope="col">Etapa</th><th scope="col">Estado</th><th scope="col">Intentos</th><th scope="col">Versión</th><th scope="col">Error</th><th scope="col">Disponible</th><th scope="col">Acciones</th></tr></thead><tbody>{state.data.items.map((job) => <tr key={job.id}><td data-label="Job">{shortId(job.id)}</td><td data-label="Documento"><a href={`/admin/documents/${job.documentId}`}>{shortId(job.documentId)}</a></td><td data-label="Etapa">{job.stage}</td><td data-label="Estado"><StatusBadge value={job.state} /></td><td data-label="Intentos">{job.attempt}/{job.maxAttempts}</td><td data-label="Versión">{job.processingVersion}</td><td data-label="Error">{job.errorCode ?? '—'}</td><td data-label="Disponible">{date(job.availableAt)}</td><td data-label="Acciones"><div className="row-actions">{permissions.includes('processing.retry') && job.state === 'RETRYABLE' && <button className="button compact secondary" onClick={() => jobAction(job, 'retry')}>Retry</button>}{permissions.includes('processing.cancel') && ['PENDING', 'PUBLISHED', 'RETRYABLE'].includes(job.state) && <button className="button compact danger-button" onClick={() => jobAction(job, 'cancel')}>Cancelar</button>}</div></td></tr>)}</tbody></table></div><Pagination result={state.data} path="/admin/processing" search={search} /></>}

@@ -12,6 +12,8 @@ import {
 } from "@salarivo/database";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
+import { adminOcrUsageSchema, adminOcrUsageView, registerAdminOcrRoutes } from "./admin-ocr.ts";
+import { registerAdminLayoutRoutes } from "./admin-layouts.ts";
 import {
   adminPermissions,
   adminRoles,
@@ -357,7 +359,7 @@ function employerStateDto(row: Record<string, unknown>) {
   };
 }
 
-async function lockActor(
+export async function lockActor(
   client: PoolClient,
   request: FastifyRequest,
   permission: AdminPermission,
@@ -555,7 +557,7 @@ async function assertEmployerNameAvailable(
   }
 }
 
-async function audit(
+export async function audit(
   client: PoolClient,
   request: FastifyRequest,
   actorRole: AdminRole,
@@ -732,6 +734,7 @@ async function scheduleOriginalDeletion(client: PoolClient, document: Record<str
 }
 
 export async function registerAdminRoutes(app: FastifyInstance, dependencies: AdminRouteDependencies): Promise<void> {
+  await registerAdminOcrRoutes(app, dependencies);
   const { config, ApiError, requireAdminPermission } = dependencies;
   const guard = (permission: AdminPermission, stepUp = false) =>
     (request: FastifyRequest) => requireAdminPermission(request, permission, stepUp);
@@ -762,6 +765,8 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
       request.log.warn({ errorCode: "ADMIN_AUDIT_WRITE_FAILED" }, "admin audit write failed");
     }
   });
+
+  await registerAdminLayoutRoutes(app, dependencies);
 
   app.get(
     "/api/v1/admin/context",
@@ -1606,7 +1611,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
                 required: [
                   "id", "processingVersion", "status", "triggerKind", "parserVersion",
                   "resultSchemaVersion", "pipelineFingerprint", "promotionOutcome",
-                  "promotedAt", "startedAt", "finishedAt", "active",
+                  "promotedAt", "startedAt", "finishedAt", "active", "ocr",
                 ],
                 properties: {
                   id: { type: "string", pattern: UUID_PATTERN }, processingVersion: { type: "integer", minimum: 1 },
@@ -1617,6 +1622,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
                   promotedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
                   startedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
                   finishedAt: { anyOf: [{ type: "string" }, { type: "null" }] }, active: { type: "boolean" },
+                  ocr: { anyOf: [adminOcrUsageSchema, { type: "null" }] },
                 },
               },
             },
@@ -1666,10 +1672,21 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
           `SELECT run.id, run.processing_version, run.status, run.trigger_kind,
                   run.parser_version, run.result_schema_version, run.pipeline_fingerprint,
                   run.promotion_outcome, run.promoted_at, run.started_at, run.finished_at,
-                  (run.id = document.active_extraction_run_id) AS active
+                  (run.id = document.active_extraction_run_id) AS active,
+                  ocr.provider, ocr.model, ocr.provider_version, ocr.trigger_reason, ocr.status AS ocr_status,
+                  ocr.input_tokens, ocr.output_tokens, ocr.cached_tokens, ocr.total_tokens,
+                  ocr.estimated_cost_usd, ocr.accounted_cost_usd, ocr.duration_ms, ocr.retry_count, ocr.error_code
              FROM documents document
              JOIN extraction_runs run
                ON run.user_id = document.user_id AND run.document_id = document.id
+             LEFT JOIN LATERAL (
+               SELECT usage.provider, usage.model, usage.provider_version, usage.trigger_reason, usage.status,
+                      usage.input_tokens, usage.output_tokens, usage.cached_tokens, usage.total_tokens,
+                      usage.estimated_cost_usd, usage.accounted_cost_usd, usage.duration_ms, usage.retry_count, usage.error_code
+                 FROM ocr_provider_usage usage
+                WHERE usage.user_id = run.user_id AND usage.document_id = run.document_id AND usage.extraction_run_id = run.id
+                ORDER BY usage.created_at DESC, usage.id DESC LIMIT 1
+             ) ocr ON true
             WHERE document.id = $1 AND document.deleted_at IS NULL AND $2::boolean
             ORDER BY run.processing_version DESC, run.id DESC LIMIT 25`,
           [request.params.id, canReadProcessing],
@@ -1711,6 +1728,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
               resultSchemaVersion: view.resultSchemaVersion, pipelineFingerprint: view.pipelineFingerprint,
               promotionOutcome: view.promotionOutcome, promotedAt: view.promotedAt,
               startedAt: view.startedAt, finishedAt: view.finishedAt, active: view.active,
+              ocr: run.provider === null ? null : adminOcrUsageView({ ...run, status: run.ocr_status }),
             };
           }),
           issues: issues.rows.map((issue) => ({

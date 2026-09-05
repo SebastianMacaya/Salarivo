@@ -92,6 +92,10 @@ export async function runMigrations(database: Pool): Promise<void> {
     for (const migration of pending) {
       await client.query("BEGIN");
       try {
+        // Legacy 020 backfills newly deferred job FKs before altering the same table.
+        // Check each statement now so populated databases have no pending FK events;
+        // the persisted constraints remain DEFERRABLE INITIALLY DEFERRED after commit.
+        if (migration.version === 20) await client.query("SET CONSTRAINTS ALL IMMEDIATE");
         await client.query(migration.sql);
         await client.query(
           "INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)",

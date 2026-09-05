@@ -15,6 +15,10 @@ import {
 import { createStorage } from "../../src/storage.ts";
 
 const origin = "http://localhost:3000";
+// This regression suite spawns real workers; it must never inherit a paid external provider.
+process.env.OCR_ENABLED = "true";
+process.env.OCR_PROVIDER = "tesseract";
+delete process.env.ZAI_API_KEY;
 
 function syntheticPayrollPdf(): Uint8Array<ArrayBuffer> {
   const lines = [
@@ -5309,6 +5313,17 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.ok(processingHealth.json().data.versions.items.length <= 1);
   assert.ok(processingHealth.json().data.issues.items.length <= 1);
   assert.doesNotMatch(processingHealth.body, /1000\.00|1234567\.89|Empresa|recibo-sintetico/i);
+  const ocrHealth = await app.inject({
+    remoteAddress: featureRemoteAddress,
+    method: "GET",
+    url: "/api/v1/admin/processing/ocr?page=1&pageSize=1",
+    headers: { cookie: cookieA },
+  });
+  assert.equal(ocrHealth.statusCode, 200, ocrHealth.body);
+  assert.equal(ocrHealth.json().data.users.pageSize, 1);
+  assert.ok(ocrHealth.json().data.users.items.length <= 1);
+  assert.match(ocrHealth.json().data.summary.accountedCostUsd, /^\d+(?:\.\d+)?$/);
+  assert.doesNotMatch(ocrHealth.body, /1000\.00|1234567\.89|Empresa|recibo-sintetico/i);
   await pool.query(
     "UPDATE extraction_runs SET parser_version = $2, pipeline_fingerprint = $3 WHERE id = $1",
     [reviewReprocessedRunId, pipelineBeforeSemverProbe.parser_version, pipelineBeforeSemverProbe.pipeline_fingerprint],

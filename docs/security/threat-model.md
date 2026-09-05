@@ -49,7 +49,7 @@ flowchart LR
     Storage --> Worker
     Worker --> DB
     Worker --> Sandbox[Parsers / OCR aislados]
-    Worker -. fragmento minimizado .-> Vendor[OCR / IA externa]
+    Worker -. PDF completo con fallback habilitado .-> Vendor[GLM-OCR externo]
     Worker -. serie pública + rango .-> Economic[Datos Argentina]
     API --> Telemetry[Logs / métricas sanitizados]
     Worker --> Telemetry
@@ -98,7 +98,7 @@ Nada que cruce desde Internet, navegador, storage, documento o proveedor económ
 | Reidentificación en benchmark futuro | feature apagada; antes de habilitar: cohortes amplias predefinidas, k mínimo, redondeo, demora, anti-differencing, query budget, mitigación Sybil/poisoning y opt-in separado | ataques de membership inference y consultas diferenciales no recuperan aportes individuales |
 | Supply chain | lockfile, versiones evaluadas, SCA/SAST, imágenes/versiones reproducibles | scans bloqueantes y actualización controlada |
 | Borrado incompleto | orquestación idempotente sobre DB/storage/cache/cola/temporales/backups; marcador de ejecución hasta limpiar temporales | prueba de account deletion, job activo y reconciliación |
-| Prompt injection / exfiltración IA | documentos como datos, prompts fijos, tool allowlist, minimización/redacción, sin secretos | fixture con órdenes no cambia flujo ni herramientas |
+| Prompt injection / exfiltración OCR | documentos como datos, endpoint/modelo allowlisted, sin seguir URLs ni ejecutar instrucciones; respuesta acotada y validada antes del parser | fixture con órdenes no cambia flujo ni herramientas y URLs del proveedor no se solicitan |
 
 ## Riesgos de privacidad específicos
 
@@ -110,7 +110,7 @@ Nada que cruce desde Internet, navegador, storage, documento o proveedor económ
 - Una métrica con labels libres puede filtrar salario o identidad.
 - Un export o share puede sobrevivir a una revocación si no se coordina el cleanup.
 
-Por defecto se minimiza payload, se evita IA externa y se separa el lifecycle del original. Todo proveedor requiere evaluación de retención, región, entrenamiento, subprocesadores y borrado; la evidencia que falte debe tratarse como riesgo activo en producción.
+La configuración por defecto mantiene OCR local. Habilitar GLM-OCR permite enviar el PDF completo sin redacción previa, sólo como fallback tras seguridad y clasificación barata, con aceptación legal vigente del propietario comprobada en la admisión del worker. El reproceso administrativo no sustituye esa aceptación. Presupuesto diario/mensual, concurrencia compartida, límites, cache privada y revalidación reducen costo y exposición; no eliminan el contenido sensible del PDF enviado. La copia local sigue el lifecycle del original. Retención, región, entrenamiento, subprocesadores y borrado remoto requieren evaluación del proveedor; la evidencia que falta sigue siendo un riesgo activo y no se acredita por la publicación legal 1.1. Ver [OCR externo](../architecture/ocr.md).
 
 ## Alertas mínimas
 

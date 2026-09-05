@@ -46,8 +46,14 @@ Nunca se serializan a la consola:
 
 `admin_audit_events` es append-only y conserva metadata allowlisted sin payload libre. Los comandos rechazados o fallidos después de autenticar registran sólo actor, capacidad, recurso, resultado y motivo validado; nunca el body ni el error. Los errores de parsing previos a la autenticación no se atribuyen a una cuenta. Los errores HTTP no exponen SQL, stack, paths ni detalles de proveedores.
 
+## Diagnóstico OCR
+
+El diagnóstico de OCR se consulta con `processing.read` en `/api/v1/admin/processing/ocr` y se muestra en Procesamiento. Agrega el mes UTC actual: resultados y cobertura por documento, errores, bloqueos, cache, tokens reportados, reportes ausentes, duración y costos de infraestructura. El detalle por cuenta usa sólo UUID internos y se pagina; los tokens y costos viajan como strings exactos. El total presupuestario diario sobrevive a las bajas sin mantener IDs, por lo que puede superar la suma de cuentas todavía existentes. Cada corrida muestra su última operación OCR, sin respuesta externa ni identificador de request. Ver [OCR externo](ocr.md).
+
+La salud del proveedor se infiere de la última respuesta real en 24 horas: éxito `HEALTHY`, fallo `DEGRADED`, ausencia o antigüedad `UNKNOWN`. No acredita configuración viva ni genera llamadas de health. No hay comando para forzar una nueva llamada paga ni saltear cache.
+
 ## Operaciones no disponibles
 
-No hay break-glass, impersonación, acceso al original o artefactos, inspección administrativa de resultados salariales, cancelación de jobs `RUNNING`, retry de fallos permanentes, baja administrativa de cuenta, tickets, flags ni settings editables. Reproceso y rollback operan sobre metadata y punteros validados, no conceden acceso al contenido. Queue, storage, OCR y OAuth se muestran como `UNKNOWN` cuando no existe una señal segura y comprobable; la UI no inventa telemetría.
+No hay break-glass, impersonación, acceso al original o artefactos, inspección administrativa de resultados salariales, cancelación de jobs `RUNNING`, retry de fallos permanentes, baja administrativa de cuenta, tickets, flags ni settings editables. Reproceso y rollback operan sobre metadata y punteros validados, no conceden acceso al contenido. Queue, storage y OAuth se muestran como `UNKNOWN` cuando no existe una señal segura y comprobable; la UI no inventa telemetría.
 
 Agregar cualquiera de esas operaciones requiere preservar las máquinas de estado, definir la base de autorización, minimizar el DTO y dejar una prueba que cubra permiso, IDOR, concurrencia y auditoría. Ver [ADR 0012](../adr/0012-granular-admin-console.md), [ADR 0014](../adr/0014-global-employer-resolution.md), [ADR 0015](../adr/0015-active-processing-runs-and-safe-recovery.md) y [ADR 0017](../adr/0017-guarded-admin-legal-publication.md).

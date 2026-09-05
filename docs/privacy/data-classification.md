@@ -82,22 +82,22 @@ La sincronización económica puede registrar código interno de serie, rango, j
 
 Datos Argentina recibe exclusivamente el identificador de una serie pública, fechas `start`/`end` y opciones técnicas fijas de respuesta. La conversión y el ajuste ocurren dentro de Salarivo: usuario, PII, empleador, salario, documento y OCR nunca forman parte del request. Fuente, atribución y licencia CC BY 4.0 se conservan con la observación.
 
-Por defecto no se envía información Restricted. Una operación habilitada debe:
+La configuración por defecto conserva Tesseract local. El fallback opcional GLM-OCR envía el PDF completo a Z.ai, sin redacción previa: conserva su clase Restricted y puede contener datos personales o sensibles incidentales. Sólo se utiliza cuando el procesamiento local requiere recuperación. Una llamada externa debe:
 
-- tener purpose explícito y consentimiento/configuración correspondiente;
-- enviar el fragmento mínimo redactado;
-- usar un proveedor evaluado por región, retención, entrenamiento y borrado;
+- tener finalidad de OCR, configuración habilitada y constancias de los Términos y el Aviso vigentes del propietario, comprobadas por el worker antes de reservar presupuesto;
+- pasar seguridad y clasificación barata; un scan ambiguo admite recuperación sólo después de descartar señales no salariales reconocidas y debe volver a clasificarse;
+- limitarse al PDF requerido, sin agregar filename, userId ni URL firmada al payload; el endpoint y el modelo son allowlisted;
 - registrar proveedor, versión, purpose, costo e IDs internos, no el payload;
 - respetar budget y timeout;
 - permitir deshabilitar el proveedor sin tumbar el producto.
 
-Ejemplo aceptable futuro: interpretar un concepto aislado y pseudonimizado. Enviar el PDF completo a un LLM por conveniencia no es aceptable.
+El resultado externo es entrada no confiable, vuelve al parser determinístico y no autoriza por sí solo promoción ni reemplazo de correcciones humanas. La cache privada evita repetir transferencias compatibles y se elimina con el original. La evaluación de región, retención, entrenamiento y borrado del proveedor requiere evidencia propia: la integración y la publicación legal 1.1 no acreditan DPA, ubicación efectiva, no entrenamiento ni eliminación remota. Ver [OCR externo](../architecture/ocr.md).
 
 Google recibe únicamente los parámetros y scopes necesarios para autenticar. El canje de código y la validación de tokens ocurren server-side; Salarivo no reutiliza esos tokens para acceder a otros productos de Google ni los conserva para uso posterior.
 
 ## Entrenamiento
 
-Documentos, datos salariales y correcciones no se usan para entrenar modelos por defecto. Cualquier aprendizaje futuro usa datos sintéticos o anonimización irreversible; un consentimiento separado, explícito y revocable requiere revisión legal y de producto.
+Salarivo no usa documentos, datos salariales ni correcciones para entrenar modelos por defecto. Los aliases de formatos son configuración genérica escrita y aprobada por un operador, no aprendizaje automático de documentos. Cualquier aprendizaje futuro usa datos sintéticos o anonimización irreversible; un consentimiento separado, explícito y revocable requiere revisión legal y de producto. Esta regla interna no acredita las condiciones de entrenamiento o retención de un proveedor externo.
 
 ## Entornos y fixtures
 

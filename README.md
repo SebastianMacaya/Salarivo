@@ -4,7 +4,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 
 > Estado operativo (2026-09-01): Salarivo está desplegado en producción en [www.salarivo.cloud](https://www.salarivo.cloud/) con web, API, worker, PostgreSQL y object storage privado activos. Existen múltiples cuentas activas de personas reales. Esta evidencia reemplaza el estado anterior de preview frontend/local-only, pero no constituye certificación de seguridad ni de cumplimiento legal y no cierra por sí sola los P0 documentados.
 >
-> Brecha legal conocida: los Términos y el Aviso 1.0 que hoy registran aceptaciones fueron aprobados para una instancia privada de una única persona y contienen afirmaciones que ya no describen la operación multiusuario actual. Como son append-only, no deben reescribirse retroactivamente: hace falta una versión nueva aprobada para producción, revisión profesional y reaceptación cuando corresponda. Ver [Políticas legales](docs/legal/policies.md) y la [actualización de la auditoría](docs/security/privacy-security-audit-2026-08-30.md).
+> Actualización legal (2026-09-05): los Términos y el Aviso 1.1 reemplazan la versión 1.0 mediante registros nuevos en local y producción, con reaceptación y constancias anteriores intactas. Los textos fueron provistos y autorizados para publicación por el operador; esto no acredita revisión profesional ni cierra por sí solo los riesgos legales documentados. Ver [Políticas legales](docs/legal/policies.md).
 
 ## Qué funciona
 
@@ -26,7 +26,7 @@ Aplicación privada para convertir recibos de sueldo en un historial salarial y 
 - páginas públicas e historial de Términos/Privacidad, con publicación futura protegida desde la consola admin, metadata operativa, comandos acotados y auditoría append-only;
 - reglas para agentes y mejora supervisada en [AGENTS.md](AGENTS.md).
 
-El MVP no usa LLM ni datos reales para entrenar modelos. Soporta recibos argentinos y produce como máximo una liquidación por PDF; ampliar tipos, países o múltiples liquidaciones exige fixtures y tests nuevos.
+El MVP prioriza extracción determinística y Tesseract local. Puede habilitar GLM-OCR como fallback externo, con aceptación legal vigente del propietario, límites y validación posterior; el envío incluye el PDF completo y no lo redacta previamente. Salarivo no usa documentos ni correcciones de usuarios para entrenar modelos. Soporta recibos argentinos y produce como máximo una liquidación por PDF; ampliar tipos, países o múltiples liquidaciones exige fixtures y tests nuevos. Ver [OCR externo](docs/architecture/ocr.md).
 
 El historial `salary-analytics-v1` usa únicamente la corrida activa explícita de documentos `COMPLETED`; un resultado pendiente de revisión y un reproceso pendiente, fallido o dudoso no alteran los cálculos. El salario comparable inicial es sólo el básico de una liquidación `NORMAL` recurrente dentro de un contexto laboral y una moneda; ante falta o ambigüedad devuelve N/D y, si existe una recuperación compatible, la UI lo informa sin inventar un monto. Un segundo upload con el mismo SHA-256 del mismo titular se descarta por completo; los posibles duplicados estructurales siguen siendo advertencias para revisión, nunca borrados automáticos.
 
@@ -47,7 +47,7 @@ La gestión de sesiones muestra únicamente categoría de dispositivo, navegador
 
 ## Preparación local
 
-Requiere Node.js 24+, npm y Docker Desktop. Los servicios sólo publican puertos en `127.0.0.1`.
+Requiere Node.js 24+, npm y Docker Desktop. En Windows usá Node.js 24.16 o posterior: la integración reproduce un cierre nativo con 24.15 y pasa con 24.16, consistente con [Node #63620](https://github.com/nodejs/node/issues/63620). Los servicios sólo publican puertos en `127.0.0.1`.
 
 ~~~powershell
 Copy-Item .env.example .env
@@ -74,7 +74,7 @@ El rol `ADMIN` nunca se acepta desde registro ni desde la web. Antes de promover
 docker compose exec postgres psql -U salarivo -d salarivo -c "UPDATE users SET role = 'ADMIN', admin_role = 'SUPER_ADMIN', updated_at = now() WHERE email = 'tu-email@example.com' AND role = 'USER' AND status = 'ACTIVE' AND EXISTS (SELECT 1 FROM mfa_factors WHERE user_id = users.id AND status = 'ACTIVE');"
 ~~~
 
-La versión legal 1.0 sigue cerrada y vigente, pero su aprobación para una vista privada individual ya no cubre el uso multiusuario actual. No se corrige editando el texto aceptado: requiere una versión nueva con identidad, domicilio, canal, destinatarios/proveedores, retención y operación de derechos acordes al servicio real, además de revisión profesional y reaceptación cuando corresponda.
+La versión legal 1.1 está publicada en las bases local y productiva. Las cuentas deben aceptar los nuevos Términos y confirmar el Aviso; la versión 1.0 permanece disponible como historial. Las instalaciones nuevas siguen inicializando los textos de las migraciones y requieren publicar la versión vigente mediante el mecanismo administrativo.
 
 Para detener todo sin borrar los volúmenes:
 
@@ -122,6 +122,7 @@ npm run test:integration
 - [Alcance](docs/product-scope.md)
 - [Arquitectura](docs/architecture/overview.md)
 - [Pipeline de ingestión](docs/architecture/ingestion-pipeline.md)
+- [OCR externo opcional: GLM-OCR, límites, cache y diagnóstico](docs/architecture/ocr.md)
 - [Modelo de dominio](docs/architecture/domain-model.md)
 - [Datos económicos](docs/architecture/economic-data.md)
 - [Consola administrativa](docs/architecture/admin-console.md)

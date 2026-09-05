@@ -6,6 +6,7 @@ import helmet from "@fastify/helmet";
 import rateLimit, { normalizeIP } from "@fastify/rate-limit";
 import {
   EmployerResolutionError,
+  currentLegalAcknowledgementsSql,
   followMergedEmployer,
   lockEmployerMutation,
   pool,
@@ -681,23 +682,7 @@ export async function buildApp(
               ) AS google_enabled,
               s.mfa_verified_at, s.step_up_expires_at,
               s.last_seen_at <= now() - interval '5 minutes' AS activity_touch_due,
-              (
-                SELECT count(*) = 2
-                  FROM (
-                    SELECT DISTINCT ON (version.document_type) version.id
-                      FROM legal_document_versions AS version
-                     WHERE version.document_type IN ('TERMS', 'PRIVACY_NOTICE')
-                       AND version.locale = 'es-AR'
-                       AND version.published_at <= now() AND version.effective_at <= now()
-                     ORDER BY version.document_type, version.effective_at DESC,
-                              split_part(version.version, '.', 1)::numeric DESC,
-                              split_part(version.version, '.', 2)::numeric DESC,
-                              version.published_at DESC
-                  ) AS current_version
-                  JOIN legal_acknowledgements AS acknowledgement
-                    ON acknowledgement.document_version_id = current_version.id
-                   AND acknowledgement.user_id = u.id
-              ) AS legal_documents_acknowledged,
+              ${currentLegalAcknowledgementsSql("u")} AS legal_documents_acknowledged,
               EXISTS (
                 SELECT 1 FROM mfa_factors factor
                  WHERE factor.user_id = u.id AND factor.status = 'ACTIVE'
