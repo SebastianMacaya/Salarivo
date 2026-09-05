@@ -25,7 +25,7 @@ export function PwaControls({ children }: { children: ReactNode }) {
     const connectionChanged = () => setOffline(!navigator.onLine);
     const showInstall = (event: Event) => {
       event.preventDefault();
-      setInstallPrompt(event as InstallPrompt);
+      if (ios || /Android/.test(navigator.userAgent)) setInstallPrompt(event as InstallPrompt);
     };
     const installed = () => { setInstallPrompt(null); setIosInstall(false); };
     const displayMode = window.matchMedia('(display-mode: standalone)');

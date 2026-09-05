@@ -49,7 +49,7 @@ Alta, edición y asociación de empleos comparan los campos con sus valores inic
 
 ## PWA, sesión y rendimiento
 
-La decisión y la allowlist se describen en [ADR 0018](../adr/0018-private-pwa.md). `PwaControls` monta instalación contextual, aviso de actualización y estado offline. El build genera el worker; no se registra en desarrollo. Se cachean únicamente código, estilos y fuentes públicas del compilador, marca, manifest y página offline. No se cachean respuestas de API, HTML/RSC de la aplicación, PDFs, salarios, metadata privada, credenciales, URLs firmadas, queries ni escrituras.
+La decisión y la allowlist se describen en [ADR 0018](../adr/0018-private-pwa.md). `PwaControls` ofrece instalación contextual sólo en Android, iPhone e iPad, incluido iPad con user-agent de escritorio. Achicar una ventana de escritorio no habilita esa invitación. El aviso de actualización y el estado offline se conservan en todas las plataformas. El build genera el worker; no se registra en desarrollo. Se cachean únicamente código, estilos y fuentes públicas del compilador, marca, manifest y página offline. No se cachean respuestas de API, HTML/RSC de la aplicación, PDFs, salarios, metadata privada, credenciales, URLs firmadas, queries ni escrituras.
 
 Offline oculta e inhabilita la pantalla y los dialogs, incluso si terminan de abrirse por una respuesta pendiente. Los formularios permanecen en memoria de la página; no existe persistencia privada ni cola de escrituras offline. Reintentar/reconectar permite continuar sin recargar automáticamente. La nueva versión espera una confirmación y exige cerrar otras ventanas para evitar interrumpirlas.
 

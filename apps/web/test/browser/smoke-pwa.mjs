@@ -126,13 +126,17 @@ try {
 
   // Chromium property emulation covers progressive enhancement branches, not Safari or OS installation.
   for (const scenario of [
-    { name: 'iPhone instructions without install API', userAgent: 'iPhone', platform: 'iPhone', instructions: true },
-    { name: 'iPad desktop user-agent instructions', userAgent: 'Macintosh', platform: 'MacIntel', touch: 5, instructions: true },
+    { name: 'iPhone instructions without install API', userAgent: 'iPhone', platform: 'iPhone', width: 390, instructions: true },
+    { name: 'iPad desktop user-agent instructions', userAgent: 'Macintosh', platform: 'MacIntel', touch: 5, width: 1024, instructions: true },
     { name: 'iOS navigator.standalone', userAgent: 'iPhone', platform: 'iPhone', standalone: true },
-    { name: 'standalone display mode', userAgent: 'iPhone', platform: 'iPhone', displayMode: true },
+    { name: 'Android standalone display mode', userAgent: 'Linux; Android; Mobile', displayMode: true },
     { name: 'web without serviceWorker', noWorker: true },
-    { name: 'explicit install prompt', install: true },
+    { name: 'Android phone explicit install prompt', userAgent: 'Linux; Android; Mobile', width: 390, install: true },
+    { name: 'Android tablet explicit install prompt', userAgent: 'Linux; Android', width: 1024, install: true },
+    { name: 'wide desktop suppresses install invitation', userAgent: 'Windows NT 10.0; Win64; x64', platform: 'Win32', width: 1280, desktop: true },
+    { name: 'narrow desktop suppresses install invitation', userAgent: 'Windows NT 10.0; Win64; x64', platform: 'Win32', width: 320, desktop: true },
   ]) {
+    await browser.command('Emulation.setDeviceMetricsOverride', { width: scenario.width || 320, height: 640, deviceScaleFactor: 1, mobile: !scenario.desktop });
     const { identifier } = await browser.command('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
       const scenario = ${JSON.stringify(scenario)};
       Object.defineProperty(navigator, 'userAgent', { value: scenario.userAgent || 'Synthetic Chromium' });
@@ -154,8 +158,8 @@ try {
         assert.equal(await browser.evaluate('Array.from(document.querySelectorAll("details[open] p")).some(item => item.textContent.includes("Compartir") && item.getBoundingClientRect().height > 0)'), true, scenario.name);
       }
       if (scenario.noWorker) assert.equal(await browser.evaluate('"serviceWorker" in navigator'), false);
-      if (scenario.install || scenario.standalone || scenario.displayMode) {
-        await browser.evaluate(`(() => { window.__pwaPromptCalls = 0; const event = new Event('beforeinstallprompt', { cancelable: true }); event.syntheticProbe = true; event.prompt = async () => { window.__pwaPromptCalls += 1; }; event.userChoice = Promise.resolve({ outcome: 'dismissed' }); window.dispatchEvent(event); })()`);
+      if (scenario.install || scenario.standalone || scenario.displayMode || scenario.desktop) {
+        await browser.evaluate(`(() => { window.__pwaPromptCalls = 0; const event = new Event('beforeinstallprompt', { cancelable: true }); event.syntheticProbe = true; event.prompt = async () => { window.__pwaPromptCalls += 1; }; event.userChoice = Promise.resolve({ outcome: 'dismissed' }); window.dispatchEvent(event); window.__pwaPromptPrevented = event.defaultPrevented; })()`);
         if (scenario.install) {
           await until('Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Instalar Salarivo")', 'Install button appears only after an available prompt');
           assert.equal(await browser.evaluate('window.__pwaPromptCalls'), 0, 'Installation never opens automatically');
@@ -165,13 +169,17 @@ try {
           await browser.evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
           assert.equal(await browser.evaluate('Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Instalar Salarivo")'), false, scenario.name);
           assert.equal(await browser.evaluate('window.__pwaPromptCalls'), 0, scenario.name);
+          if (scenario.desktop) {
+            assert.equal(await browser.evaluate('window.__pwaPromptPrevented'), true, `${scenario.name}: native invitation suppressed`);
+            assert.equal(await browser.evaluate(`Boolean(document.querySelector('aside[aria-label="Aplicación Salarivo"]'))`), false, `${scenario.name}: no empty invitation band`);
+          }
         }
       } else assert.equal(await browser.evaluate('Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Instalar Salarivo")'), false, scenario.name);
     } finally {
       await browser.command('Page.removeScriptToEvaluateOnNewDocument', { identifier });
     }
   }
-  console.log('PWA browser smoke passed: manifest, public-only cache, offline modal/draft/deep link, reconnect, controlled multi-window update and six emulated progressive enhancement scenarios.');
+  console.log('PWA browser smoke passed: manifest, public-only cache, offline modal/draft/deep link, reconnect, controlled multi-window update and nine emulated progressive enhancement scenarios.');
 } finally {
   await browser.close();
   server.closeAllConnections();
