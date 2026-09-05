@@ -30,6 +30,7 @@ Los ADR 0001, 0002, 0004, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 
 - [0015 — Resultado activo y recuperación versionada segura](0015-active-processing-runs-and-safe-recovery.md)
 - [0016 — Datos económicos globales y contexto salarial derivado](0016-global-economic-data-and-derived-context.md)
 - [0017 — Publicación legal administrativa protegida](0017-guarded-admin-legal-publication.md)
+- [0018 — PWA instalable con caché pública explícita (Proposed)](0018-private-pwa.md)
 
 ## Formato
 

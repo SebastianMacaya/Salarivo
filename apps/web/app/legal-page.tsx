@@ -19,6 +19,7 @@ const API_ROOT = process.env.NEXT_PUBLIC_API_BASE_URL
 export function LegalPage({ type }: { type: 'terms' | 'privacy' }) {
   const [document, setDocument] = useState<PublishedLegalDocument | null>(null);
   const [error, setError] = useState('');
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -37,12 +38,12 @@ export function LegalPage({ type }: { type: 'terms' | 'privacy' }) {
         setError(caught instanceof Error ? caught.message : 'No pudimos cargar el documento.');
       });
     return () => controller.abort();
-  }, [type]);
+  }, [type, attempt]);
 
   return (
     <main className="legal-layout">
       <header className="legal-header"><Link className="brand" href="/"><span className="brand-mark" aria-hidden="true">S</span><span>Salarivo</span></Link><Link className="button secondary" href="/">Volver</Link></header>
-      {error && <p className="message error" role="alert">{error}</p>}
+      {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" onClick={() => { setError(''); setAttempt((value) => value + 1); }}>Reintentar</button></p>}
       {!document && !error && <div className="loader" role="status" aria-label="Cargando documento" />}
       {document && <article className="legal-document">
         <p className="eyebrow">Documento legal · versión {document.version}</p>

@@ -125,6 +125,7 @@ npm run test:integration
 - [Modelo de dominio](docs/architecture/domain-model.md)
 - [Datos económicos](docs/architecture/economic-data.md)
 - [Consola administrativa](docs/architecture/admin-console.md)
+- [Frontend mobile y PWA: patrones y pruebas locales](docs/architecture/frontend.md)
 - [Threat model](docs/security/threat-model.md)
 - [Auditoría de privacidad y seguridad 2026-08-30](docs/security/privacy-security-audit-2026-08-30.md)
 - [Seguridad de upload](docs/security/file-upload.md)

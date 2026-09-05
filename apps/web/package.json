@@ -10,9 +10,17 @@
     "dev": "vinext dev",
     "prebuild": "node scripts/copy-pdfjs-assets.mjs",
     "build": "vinext build",
+    "postbuild": "node scripts/build-pwa.mjs",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern public/pdfjs",
     "test": "node --test test/*.test.ts",
+    "test:browser": "node test/browser/smoke.mjs",
+    "test:browser:navigation": "node test/browser/navigation-smoke.mjs",
+    "test:browser:admin": "node test/browser/admin-smoke.mjs",
+    "test:browser:webkit": "node test/browser/webkit-smoke.mjs",
+    "test:browser:loading": "node test/browser/loading-smoke.mjs",
+    "test:pwa:browser": "node test/browser/smoke-pwa.mjs",
+    "test:pwa:install": "node test/browser/install-pwa-smoke.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

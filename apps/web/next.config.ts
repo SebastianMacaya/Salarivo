@@ -34,7 +34,14 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   async headers() {
-    return [{ source: '/(.*)', headers: securityHeaders }];
+    return [
+      { source: '/(.*)', headers: securityHeaders },
+      { source: '/sw.js', headers: [{ key: 'Cache-Control', value: 'no-cache, no-store, must-revalidate' }, { key: 'Service-Worker-Allowed', value: '/' }] },
+      { source: '/manifest.webmanifest', headers: [{ key: 'Cache-Control', value: 'no-cache' }] },
+      { source: '/', headers: [{ key: 'Cache-Control', value: 'no-store' }] },
+      { source: '/admin', headers: [{ key: 'Cache-Control', value: 'no-store' }] },
+      { source: '/admin/:path*', headers: [{ key: 'Cache-Control', value: 'no-store' }] },
+    ];
   },
 };
 

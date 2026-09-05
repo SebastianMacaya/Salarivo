@@ -163,7 +163,7 @@ function handleReviewKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
   }
   if (event.key !== 'Tab') return;
   const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
-    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]',
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], summary, [tabindex]:not([tabindex="-1"])',
   )).filter((element) => element.getClientRects().length > 0);
   const first = focusable[0];
   const last = focusable.at(-1);
@@ -241,6 +241,8 @@ export function DocumentReview({
   runsLoading?: boolean;
 }) {
   const { enabled: privacyEnabled } = usePrivacyMode();
+  const workspaceRef = useRef<HTMLElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
   const [editingRunId, setEditingRunId] = useState<string | null>(null);
@@ -248,7 +250,7 @@ export function DocumentReview({
   const [selectedEvidenceId, setSelectedEvidenceId] = useState(
     evidenceIdForPage(initialEvidenceId, initialPage, detail.extractedFields),
   );
-  const [mobileTab, setMobileTab] = useState<'data' | 'document'>('document');
+  const [mobileTab, setMobileTab] = useState<'data' | 'document'>(initialEvidenceId || initialPage > 1 ? 'document' : 'data');
   const [acceptedMismatchRunId, setAcceptedMismatchRunId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -277,6 +279,14 @@ export function DocumentReview({
   const currencyCode = detail.settlement?.currencyCode ?? 'ARS';
 
   useEffect(() => {
+    const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    workspaceRef.current?.focus();
+    return () => { dialog?.close(); if (returnFocus?.isConnected) returnFocus.focus(); };
+  }, []);
+
+  useEffect(() => {
     if (!dirty) return;
     const protect = (event: BeforeUnloadEvent) => event.preventDefault();
     window.addEventListener('beforeunload', protect);
@@ -289,12 +299,12 @@ export function DocumentReview({
   useEffect(() => { onLocationChange(page, selectedEvidenceId); }, [onLocationChange, page, selectedEvidenceId]);
   useEffect(() => {
     if (mobileTab === 'data' && selectedEvidenceId) {
-      document.getElementById(`field-${selectedEvidenceId}`)?.scrollIntoView({ block: 'center' });
+      document.getElementById(`field-${selectedEvidenceId}`)?.scrollIntoView({ block: 'nearest' });
     }
   }, [mobileTab, selectedEvidenceId]);
   useEffect(() => {
     const target = pendingMobileFocus.current;
-    if (target !== mobileTab || !window.matchMedia('(max-width: 760px), (max-height: 500px) and (orientation: landscape)').matches) return;
+    if (target !== mobileTab || window.matchMedia('(min-width: 1024px) and (min-height: 501px)').matches) return;
     pendingMobileFocus.current = null;
     const frame = window.requestAnimationFrame(() => {
       const element = target === 'data' && selectedEvidenceId
@@ -360,8 +370,8 @@ export function DocumentReview({
     : 'Este PDF fue confirmado como un tipo de documento que Salarivo todavía no procesa.';
 
   return (
-    <div className={styles.layer} role="presentation">
-      <section className={styles.workspace} role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} autoFocus onKeyDown={(event) => handleReviewKey(event, close)}>
+    <dialog ref={dialogRef} className={styles.layer} aria-labelledby="review-title" onCancel={(event) => { event.preventDefault(); close(); }}>
+      <section ref={workspaceRef} className={styles.workspace} tabIndex={-1} onKeyDown={(event) => handleReviewKey(event, close)}>
         <header className={styles.header}>
           <div className={styles.heading}><span className={styles.fileIcon}>PDF</span><div><p>{position.current === null ? 'Documento fuera del listado actual' : `Documento ${position.current} de ${position.total}`}</p><h2 id="review-title" title={visibleFilename}>{visibleFilename}</h2></div></div>
           <PrivacyToggle className={styles.privacyControl} />
@@ -422,9 +432,11 @@ export function DocumentReview({
                   ? monetary
                     ? <MoneyValue className={styles.maskedEditor} value={value || null} currency={currencyCode} />
                     : <PercentageValue className={styles.maskedEditor} value={value || null} />
+                  : !editing || !isEditable
+                  ? <span className={styles.maskedEditor}>{monetary ? <MoneyValue value={value || null} currency={currencyCode} /> : field.fieldPath === 'settlement.type' ? settlementTypeLabel(value) : value || 'No disponible'}</span>
                   : field.fieldPath === 'settlement.type'
-                  ? <select disabled={!editing || !isEditable} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))}>{settlementTypes.map((type) => <option key={type}>{type}</option>)}</select>
-                  : <input disabled={!editing || !isEditable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={monetary ? 'decimal' : undefined} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))} />;
+                  ? <select disabled={!editing || !isEditable} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))}>{settlementTypes.map((type) => <option value={type} key={type}>{settlementTypeLabel(type)}</option>)}</select>
+                  : <input disabled={!editing || !isEditable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={monetary ? 'decimal' : undefined} autoComplete="off" value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))} />;
                 return <article id={field.id ? `field-${field.id}` : undefined} tabIndex={-1} key={field.fieldPath} className={`${styles.field}${selectedEvidenceId === field.id ? ` ${styles.selectedField}` : ''}`} onMouseEnter={() => { if (field.id && field.pageNumber === page) setSelectedEvidenceId(field.id); }}>
                   <label><span>{labels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label>
                   <div className={styles.provenance}><span>{provenance(field)}</span>{field.source !== 'MANUAL_REQUIRED' && Number.isFinite(percent) && confidence < .9 && <strong className={confidence < .7 ? styles.low : ''}>{confidence < .7 ? 'Confianza baja' : 'Confianza media'} · {percent}%</strong>}{field.pageNumber && <button type="button" onClick={() => showSource(field)}>Ver fuente · pág. {field.pageNumber}</button>}</div>
@@ -432,6 +444,7 @@ export function DocumentReview({
                   {(field.rawValue || field.correction) && (editing || field.correction) && <details><summary>Comparar con dato detectado</summary>{field.rawValue && <p>Texto fuente: <SensitiveValue value={field.rawValue} mask={monetary ? `${currencyCode} ${MONEY_MASK}` : salaryPercentage ? PERCENTAGE_MASK : 'Dato oculto'} /></p>}{field.correction && <><small>Interpretado: {monetary || salaryPercentage ? <SensitiveValue value={field.interpretedValue} missing="No disponible" mask={monetary ? `${currencyCode} ${MONEY_MASK}` : PERCENTAGE_MASK} /> : field.interpretedValue ?? 'No disponible'}</small><small>Corrección v{field.correction.version} · {timestampLabel(field.correction.correctedAt)}</small></>}</details>}
                 </article>;
               })}</div>
+              {!detail.extractedFields.length && <p className={styles.privacyNotice}>{unsupported ? 'Este tipo de documento no genera datos salariales.' : ['COMPLETED', 'NEEDS_REVIEW'].includes(detail.processingStatus) ? 'No hay campos detectados. Revisá el estado del análisis para continuar.' : 'Todavía no hay campos disponibles. El estado del análisis indica el próximo paso.'}</p>}
               {editingStale && <p className={styles.error} role="alert">El documento fue reprocesado durante la edición. Cancelá y revisá la nueva extracción antes de volver a guardar.</p>}
               {editing && <div className={styles.editActions}><button type="button" disabled={busy || editingStale || !editingRunId || !correctionsDirty || privacyBlocksSave || changes.some(({ value }) => !value.trim())} onClick={() => { if (!editingRunId || editingStale || privacyBlocksSave) return; void run(async () => { await onSave(changes, editingRunId); setDrafts({}); setEditingRunId(null); setEditing(false); }); }}>{busy ? 'Guardando…' : `Guardar ${changes.length || ''} cambio${changes.length === 1 ? '' : 's'}`}</button><button type="button" disabled={busy} onClick={() => { setDrafts({}); setEditingRunId(null); setEditing(false); }}>Cancelar</button></div>}
             </section>
@@ -454,7 +467,7 @@ export function DocumentReview({
                     {runPreviewErrors[version.id] && <p className={styles.error} role="alert">{runPreviewErrors[version.id]}</p>}
                     {preview === null && !runPreviewErrors[version.id] && <p>No hay una base comparable; esta versión no se puede activar desde acá.</p>}
                     {preview && <>
-                      {changedFields.length ? <div className={styles.comparisonTable} role="region" aria-label={`Comparación de la versión ${version.processingVersion}`} tabIndex={0}><table><thead><tr><th>Dato</th><th>Activo</th><th>Nuevo</th></tr></thead><tbody>{changedFields.map((field) => <tr key={field.fieldPath}><th scope="row">{comparisonLabels[field.fieldPath] ?? field.fieldPath}</th><td>{comparisonValue(preview, field.fieldPath, field.before, 'before')}</td><td>{comparisonValue(preview, field.fieldPath, field.after, 'after')}</td></tr>)}</tbody></table></div> : <p>Los campos principales no cambian.</p>}
+                      {changedFields.length ? <div className={styles.comparisonTable} role="region" aria-label={`Comparación de la versión ${version.processingVersion}`} tabIndex={0}><table><thead><tr><th scope="col">Dato</th><th scope="col">Activo</th><th scope="col">Nuevo</th></tr></thead><tbody>{changedFields.map((field) => <tr key={field.fieldPath}><th scope="row">{comparisonLabels[field.fieldPath] ?? field.fieldPath}</th><td data-label="Activo">{comparisonValue(preview, field.fieldPath, field.before, 'before')}</td><td data-label="Nuevo">{comparisonValue(preview, field.fieldPath, field.after, 'after')}</td></tr>)}</tbody></table></div> : <p>Los campos principales no cambian.</p>}
                       {preview.lineItems.changed && <p>Conceptos detectados: {preview.lineItems.beforeCount} activos → {preview.lineItems.afterCount} nuevos.</p>}
                     </>}
                     <div className={styles.runActions}>{previewMatchesActive && <button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'PROMOTE'))}>Usar esta mejora</button>}<button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'KEEP_ACTIVE'))}>Conservar versión activa</button></div>
@@ -476,6 +489,6 @@ export function DocumentReview({
           </aside>
         </div>
       </section>
-    </div>
+    </dialog>
   );
 }

@@ -52,6 +52,7 @@ export function DocumentViewer({
   const [rotation, setRotation] = useState<0 | 90 | 180 | 270>(0);
   const [fit, setFit] = useState<'page' | 'width'>('width');
   const [fullscreen, setFullscreen] = useState(false);
+  const [fullscreenAvailable, setFullscreenAvailable] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [viewportSize, setViewportSize] = useState({ height: 0, width: 0 });
   const [rendering, setRendering] = useState(false);
@@ -61,7 +62,13 @@ export function DocumentViewer({
   useEffect(() => {
     const node = viewportRef.current;
     if (!node) return;
-    const update = () => setViewportSize({ height: node.clientHeight, width: node.clientWidth });
+    const update = () => {
+      const padding = window.getComputedStyle(node);
+      setViewportSize({
+        height: node.clientHeight - parseFloat(padding.paddingTop) - parseFloat(padding.paddingBottom),
+        width: node.clientWidth - parseFloat(padding.paddingLeft) - parseFloat(padding.paddingRight),
+      });
+    };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(node);
@@ -69,6 +76,7 @@ export function DocumentViewer({
   }, []);
 
   useEffect(() => {
+    setFullscreenAvailable(Boolean(document.fullscreenEnabled && viewerRef.current?.requestFullscreen));
     const update = () => setFullscreen(document.fullscreenElement === viewerRef.current);
     document.addEventListener('fullscreenchange', update);
     return () => document.removeEventListener('fullscreenchange', update);
@@ -132,8 +140,8 @@ export function DocumentViewer({
       if (stopped || !canvasRef.current) return;
       const pageRotation = (pdfPage.rotate + rotation) % 360;
       const base = pdfPage.getViewport({ scale: 1, rotation: pageRotation });
-      const availableWidth = Math.max(200, viewportSize.width - 32);
-      const availableHeight = Math.max(240, viewportSize.height - 32);
+      const availableWidth = Math.max(1, viewportSize.width);
+      const availableHeight = Math.max(1, viewportSize.height);
       const desiredScale = (fit === 'width'
         ? availableWidth / base.width
         : Math.min(availableWidth / base.width, availableHeight / base.height)) * zoom;
@@ -180,7 +188,7 @@ export function DocumentViewer({
   }, [rendering, selectedEvidenceId]);
 
   function setPage(next: number) {
-    if (pageCount) onPageChange(Math.min(pageCount, Math.max(1, next)));
+    if (pageCount && Number.isInteger(next)) onPageChange(Math.min(pageCount, Math.max(1, next)));
   }
 
   async function toggleFullscreen() {
@@ -198,27 +206,32 @@ export function DocumentViewer({
       <div className={styles.toolbar}>
         <div className={styles.controlGroup}>
           <button type="button" onClick={() => setPage(page - 1)} disabled={page <= 1} aria-label="Página anterior">‹</button>
-          <label>Página <input aria-label="Número de página" type="number" min={1} max={pageCount || 1} value={page} onChange={(event) => setPage(Number(event.target.value))} /> <span>de {pageCount || '—'}</span></label>
+          <label>Página <input aria-label="Número de página" type="number" inputMode="numeric" min={1} max={pageCount || 1} disabled={!pageCount} value={page} onChange={(event) => setPage(event.target.valueAsNumber)} /> <span>de {pageCount || '—'}</span></label>
           <button type="button" onClick={() => setPage(page + 1)} disabled={!pageCount || page >= pageCount} aria-label="Página siguiente">›</button>
         </div>
         <div className={styles.controlGroup}>
-          <button type="button" onClick={() => setZoom((value) => Math.max(.5, value - .1))} aria-label="Alejar">−</button>
+          <button type="button" onClick={() => setZoom((value) => Math.max(.5, value - .1))} disabled={!pdf || zoom <= .5} aria-label="Alejar">−</button>
           <button type="button" onClick={() => setZoom(1)} aria-label="Restablecer zoom" aria-live="polite">{Math.round(zoom * 100)}%</button>
-          <button type="button" onClick={() => setZoom((value) => Math.min(3, value + .1))} aria-label="Acercar">+</button>
-          <button type="button" className={fit === 'width' ? styles.active : ''} onClick={() => { setFit('width'); setZoom(1); }}>Ancho</button>
-          <button type="button" className={fit === 'page' ? styles.active : ''} onClick={() => { setFit('page'); setZoom(1); }}>Página</button>
-          <button type="button" onClick={() => setRotation((value) => ((value + 90) % 360) as 0 | 90 | 180 | 270)} aria-label="Rotar página">↻</button>
-          <button type="button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? 'Salir de pantalla completa' : 'Pantalla completa'}>⛶</button>
-          <button type="button" onClick={onDownload} disabled={!originalViewable}>Descargar</button>
+          <button type="button" onClick={() => setZoom((value) => Math.min(3, value + .1))} disabled={!pdf || zoom >= 3} aria-label="Acercar">+</button>
         </div>
+        <details className={styles.options}>
+          <summary>Vista y descarga</summary>
+          <div className={styles.controlGroup}>
+            <button type="button" className={fit === 'width' ? styles.active : ''} aria-pressed={fit === 'width'} onClick={() => { setFit('width'); setZoom(1); }}>Ajustar ancho</button>
+            <button type="button" className={fit === 'page' ? styles.active : ''} aria-pressed={fit === 'page'} onClick={() => { setFit('page'); setZoom(1); }}>Página completa</button>
+            <button type="button" onClick={() => setRotation((value) => ((value + 90) % 360) as 0 | 90 | 180 | 270)} aria-label="Rotar página">↻</button>
+            {fullscreenAvailable && <button type="button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? 'Salir de pantalla completa' : 'Pantalla completa'} aria-pressed={fullscreen}>⛶</button>}
+            <button type="button" onClick={onDownload} disabled={!originalViewable}>Descargar</button>
+          </div>
+        </details>
       </div>
       {controlError && <p className={styles.controlError} role="alert">{controlError}</p>}
-      <div className={styles.viewport} ref={viewportRef}>
+      <div className={styles.viewport} ref={viewportRef} role="region" aria-label="Página del PDF. Usá los controles para ampliar y desplazate para ver el documento." tabIndex={0}>
         {!source && !visibleError && <div className={styles.empty}>{originalViewable ? <><p>{sourceBusy ? 'Autorizando vista privada…' : 'La vista privada necesita autorización reciente.'}</p><button type="button" onClick={onAuthorize} disabled={sourceBusy}>{sourceBusy ? 'Autorizando…' : 'Mostrar PDF'}</button></> : <p>{originalAvailable ? 'El original no está habilitado para vista previa.' : 'El archivo original fue eliminado según la política de retención.'} Los datos extraídos siguen disponibles.</p>}</div>}
         {visibleError && <div className={styles.empty} role="alert"><p>{visibleError}</p><div><button type="button" onClick={onAuthorize} disabled={sourceBusy || !originalViewable}>Mostrar PDF</button> <button type="button" onClick={onDownload} disabled={!originalViewable}>Descargar</button></div></div>}
         {source && originalViewable && !visibleError && <div className={styles.page} aria-busy={rendering}>
           <canvas ref={canvasRef} role="img" aria-label={`Página ${page} de ${pageCount || '—'}`} />
-          {pageEvidence.map(({ id, label, region }) => <button
+          {!rendering && pageCount > 0 && pageEvidence.map(({ id, label, region }) => <button
             key={id}
             ref={(node) => { if (node) evidenceRefs.current.set(id, node); else evidenceRefs.current.delete(id); }}
             type="button"
@@ -228,7 +241,7 @@ export function DocumentViewer({
             aria-label={`Evidencia de ${label}`}
             onClick={() => onEvidenceSelect(id)}
           />)}
-          {rendering && <span className={styles.loading}>Cargando página…</span>}
+          {rendering && <span className={styles.loading} role="status">Cargando página…</span>}
         </div>}
       </div>
     </section>

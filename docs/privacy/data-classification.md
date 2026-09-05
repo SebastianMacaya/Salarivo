@@ -50,6 +50,10 @@ Originales, artefactos de texto reutilizables y temporales privados, cifrados y 
 
 Sólo IDs internos, stage, versión e idempotency key. Nunca PDF, OCR, salario ni credenciales.
 
+### Navegador y PWA
+
+La caché del service worker admite únicamente una allowlist generada desde código/estilos/fuentes públicos del build, iconos, manifest y una página offline sin información privada. API, HTML/RSC de la aplicación, originales, URLs firmadas, exportaciones, datos salariales/personales y credenciales quedan fuera. No se agrega almacenamiento privado para instalar la PWA. Al perder conexión, la interfaz y sus dialogs se ocultan e inhabilitan; los borradores siguen sólo en memoria de la página hasta continuar o cerrarla. Ver [ADR 0018](../adr/0018-private-pwa.md).
+
 ### Logs, traces, métricas y errores
 
 Allowlist:
