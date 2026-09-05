@@ -45,6 +45,20 @@ test('deep-link conserva sólo ids y página válidos', () => {
   assert.equal(writeDocumentLocation(`?document=${documentId}&page=2`, null), '');
 });
 
+test('la revisión de indemnización conserva sólo contexto e ids, y se retira al cambiar de documento', () => {
+  const search = `?section=history&tab=documents&document=${documentId}&review=termination&lineItem=${evidenceId}&reason=texto&amount=100`;
+  const location = readDocumentLocation(search);
+  assert.deepEqual(location, { documentId, review: 'termination', lineItemId: evidenceId });
+  assert.equal(writeDocumentLocation(search, { ...location!, page: 2 }),
+    `?section=history&tab=documents&document=${documentId}&page=2&review=termination&lineItem=${evidenceId}`);
+  assert.equal(writeOwnerLocation(search, { year: '2026' }),
+    `?section=history&tab=documents&year=2026&document=${documentId}&review=termination&lineItem=${evidenceId}`);
+  assert.equal(writeDocumentLocation(search, { documentId: employmentId }),
+    `?section=history&tab=documents&document=${employmentId}`);
+  assert.equal(writeDocumentLocation(search, null), '?section=history&tab=documents');
+  assert.deepEqual(readDocumentLocation(`?document=${documentId}&review=salario&lineItem=texto`), { documentId });
+});
+
 test('la ubicación owner lee sólo navegación y filtros válidos', () => {
   assert.deepEqual(readOwnerLocation(
     `?currencyCode=ARS&section=history&employmentContext=${employmentContext}&employmentId=${employmentId}&tab=purchasing-power&perspective=purchasing-power&range=24&year=2026&period=2026-08`

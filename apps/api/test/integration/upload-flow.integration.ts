@@ -2598,6 +2598,53 @@ test("upload privado crea un único documento y un único intent durable", async
       [item.itemOrdinal, item.amount, item.itemType]),
     [[1, "110.00", "DEDUCTION"], [2, "50.00", "DEDUCTION"], [3, "20.00", "DEDUCTION"]],
   );
+  assert.ok(reviewData.terminationReview.length > 0);
+  for (const path of ["settlement.remunerativeAmount", "settlement.nonRemunerativeAmount"]) {
+    const field = reviewFields.find(({ fieldPath }) => fieldPath === path);
+    assert.ok(field, "a missing total requested by the diagnostic must be editable");
+    assert.equal(field.id, null);
+    assert.equal(field.source, "MANUAL_OPTIONAL", "diagnosis does not create new review-completion requirements");
+  }
+  assert.deepEqual(reviewData.terminationReview.flatMap((issue: { lineItemIds: string[] }) => issue.lineItemIds), []);
+  const unclassifiedEarningId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO payroll_line_items (
+       id, user_id, settlement_id, item_ordinal, raw_description,
+       normalized_concept_code, amount, currency_code, item_type, confidence
+     ) VALUES ($1, $2, $3, 4, 'Haber sintético sin clasificar', NULL, 1000.00, 'ARS', 'EARNING', 0.8)`,
+    [unclassifiedEarningId, userId, settlementId],
+  );
+  const unclassifiedReview = (await app.inject({
+    remoteAddress: featureRemoteAddress, method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieA },
+  })).json().data.terminationReview as Array<{ lineItemIds: string[] }>;
+  assert.deepEqual([...new Set(unclassifiedReview.flatMap((issue) => issue.lineItemIds))], [unclassifiedEarningId]);
+  const { findReprocessingCandidates, countReprocessingCandidates } = await import("../../src/reprocessing.ts");
+  await pool.query("UPDATE extraction_runs SET parser_version = '8' WHERE id = $1", [runId]);
+  await pool.query(
+    `UPDATE payroll_settlements SET gross_amount = 1200.00, remunerative_amount = 1000.00,
+       non_remunerative_amount = 200.00 WHERE id = $1`, [settlementId],
+  );
+  assert.equal((await findReprocessingCandidates(pool, userId, { documentId })).length, 1);
+  assert.equal(await countReprocessingCandidates(pool, userId, [documentId]), 1);
+  assert.equal((await findReprocessingCandidates(pool, userIdB, { documentId })).length, 0);
+  const attemptedEarningRunId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO extraction_runs (id,user_id,document_id,processing_version,status,extractor_name,
+       extractor_version,parser_version,normalizer_version,base_extraction_run_id,pipeline_fingerprint,promotion_outcome,finished_at)
+     VALUES ($1,$2,$3,99,'REVIEW_REQUIRED','synthetic-test','7','9','6',$4,$5,'REVIEW_REQUIRED',now())`,
+    [attemptedEarningRunId, userId, documentId, runId, currentPipelineFingerprint],
+  );
+  assert.equal((await findReprocessingCandidates(pool, userId, { documentId })).length, 0);
+  assert.equal(await countReprocessingCandidates(pool, userId, [documentId]), 0);
+  await pool.query("DELETE FROM extraction_runs WHERE id = $1 AND user_id = $2", [attemptedEarningRunId, userId]);
+  await pool.query("UPDATE payroll_line_items SET amount = 1200.00 WHERE id = $1", [unclassifiedEarningId]);
+  assert.equal((await findReprocessingCandidates(pool, userId, { documentId })).length, 0);
+  await pool.query(
+    `UPDATE payroll_settlements SET gross_amount = NULL, remunerative_amount = NULL,
+       non_remunerative_amount = NULL WHERE id = $1`, [settlementId],
+  );
+  await pool.query("UPDATE extraction_runs SET parser_version = '3' WHERE id = $1", [runId]);
+  await pool.query("DELETE FROM payroll_line_items WHERE id = $1 AND user_id = $2", [unclassifiedEarningId, userId]);
   const documentIdor = await app.inject({
     method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieB },
   });
@@ -3906,6 +3953,7 @@ test("upload privado crea un único documento y un único intent durable", async
   await pool.query("UPDATE import_batches SET status = 'ACTIVE', completed_at = NULL WHERE id = $1", [batchData.id]);
 
   const periodReview = await app.inject({ method: "GET", url: `/api/v1/documents/${documentId}`, headers: { cookie: cookieA } });
+  assert.deepEqual(periodReview.json().data.terminationReview, []);
   const periodFields = periodReview.json().data.extractedFields as Array<{
     id: string | null; fieldPath: string; correctedValue: string | null; source: string;
   }>;

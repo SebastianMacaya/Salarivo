@@ -242,6 +242,25 @@ export const salaryCategories = [
 
 export type SalaryCategory = (typeof salaryCategories)[number];
 
+export const earningLabels: Record<string, string> = {
+  BASIC_SALARY: 'Sueldo básico', BASICO: 'Sueldo básico',
+  SENIORITY: 'Antigüedad', ANTIGUEDAD: 'Antigüedad',
+  ATTENDANCE: 'Presentismo',
+  ADDITIONAL: 'Adicional', ADICIONAL: 'Adicional',
+  SAC: 'Aguinaldo', AGUINALDO: 'Aguinaldo',
+  RETROACTIVE: 'Retroactivo', RETROACTIVO: 'Retroactivo',
+  VACATION: 'Vacaciones', VACACIONES: 'Vacaciones',
+  BONUS: 'Bono o premio', BONO: 'Bono',
+  MONTHLY_BONUS: 'Premio mensual', ANNUAL_BONUS: 'Bono anual',
+  COMMISSION: 'Comisión', COMISION: 'Comisión',
+  OVERTIME: 'Horas extra', HORAS_EXTRA: 'Horas extra',
+  REIMBURSEMENT: 'Reintegro', REINTEGRO: 'Reintegro',
+  NON_REMUNERATIVE: 'No remunerativo', NO_REMUNERATIVO: 'No remunerativo',
+  REMUNERATIVE_TOTAL: 'Total remunerativo',
+  MISSING_REMUNERATIVE: 'Remuneración pendiente de identificar',
+  UNKNOWN: 'Concepto sin clasificar',
+};
+
 const settlementTypeLabels: Record<string, string> = {
   NORMAL: 'Liquidación normal',
   SAC: 'Aguinaldo',

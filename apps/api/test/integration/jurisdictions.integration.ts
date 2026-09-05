@@ -26,8 +26,9 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
     await client.query(`INSERT INTO employments(id,user_id,employer_id,status,start_date,country_code,currency_code)
       VALUES($1,$2,$3,'ACTIVE','2019-07-01','AR','ARS')`, [legacy, owner, employer]);
     await client.query("BEGIN"); await client.query(migrations.find(({ version }: {version:number}) => version === 28)!.sql); await client.query("COMMIT");
-    await client.query(migrations.find(({ version }: {version:number}) => version === 29)!.sql);
-    await client.query(migrations.find(({ version }: {version:number}) => version === 30)!.sql);
+    for (const migration of migrations.filter(({ version }: {version:number}) => version > 28)) {
+      await client.query("BEGIN"); await client.query(migration.sql); await client.query("COMMIT");
+    }
     const preserved = (await client.query("SELECT * FROM employments WHERE id=$1", [legacy])).rows[0];
     assert.equal(preserved.country_code, "AR"); assert.equal(preserved.country_source, "LEGACY");
     assert.equal(preserved.country_confirmed_at, null); assert.equal(preserved.status_confirmed_at, null);
@@ -112,6 +113,10 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
     assert.equal(fromSalary.json().data.salaryBase.amount, "900000.00");
     assert.deepEqual(fromSalary.json().data.salaryBase.analyzedDocumentIds, [eligible.documentId]);
     assert.equal(JSON.stringify(fromSalary.json()).includes('"netAmount"'), false);
+    assert.equal(fromSalary.json().data.salaryBase.trace[0].sourceDescription, "Synthetic base");
+    assert.ok(fromSalary.json().data.salaryBase.trace[0].lineItemId);
+    assert.equal(JSON.stringify(fromSalary.json().data.inputs).includes("Synthetic base"), false);
+    assert.equal(JSON.stringify(fromSalary.json().data.inputs).includes("sourceDescription"), false);
     const incorrectCountry = await addSalary("US", "2024-10", "100.00");
     const conflict = await app.inject({ method: "PATCH", url: "/api/v1/documents/employment", headers,
       payload: { employmentId: legacy, documentIds: [incorrectCountry.documentId] } });

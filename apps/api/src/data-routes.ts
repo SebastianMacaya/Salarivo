@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { inheritDocumentCountries } from "./jurisdiction-routes.ts";
+import { reviewTerminationSalary } from "./termination-calculator.ts";
 import { Readable } from "node:stream";
 import {
   EmployerResolutionError,
@@ -2704,7 +2705,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         [request.authUser!.id, request.params.id, extractionRunId],
       ) : { rows: [] as Record<string, unknown>[] };
       const lineItems = extractionRunId ? await client.query(
-        `SELECT item.id, item.item_ordinal, item.raw_description, item.normalized_concept_code,
+        `SELECT item.id, item.settlement_id, item.item_ordinal, item.raw_description, item.normalized_concept_code,
                 item.amount, item.currency_code, item.item_type, item.is_recurring,
                 item.confidence, item.source_page, item.source_field
            FROM payroll_line_items item
@@ -2717,6 +2718,20 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       ) : { rows: [] as Record<string, unknown>[] };
       const manualValues = new Map(manual.rows.map((row) => [String(row.field_path), row]));
       const effectiveSettlement = settlement.rows[0] ?? {};
+      const terminationReview = settlement.rows.length ? reviewTerminationSalary({
+        settlementType: String(effectiveSettlement.settlement_type),
+        grossAmount: value(effectiveSettlement, "gross_amount"),
+        remunerativeAmount: value(effectiveSettlement, "remunerative_amount"),
+        nonRemunerativeAmount: value(effectiveSettlement, "non_remunerative_amount"),
+        earnings: lineItems.rows
+          .filter((item) => item.settlement_id === effectiveSettlement.id && item.item_type === "EARNING")
+          .map((item) => ({
+            code: value(item, "normalized_concept_code") ?? "UNKNOWN",
+            amount: String(item.amount),
+            isRecurring: item.is_recurring === true,
+            lineItemId: String(item.id),
+          })),
+      }) : [];
       const componentReviewRequired = (effectiveSettlement.remunerative_amount !== null
         && effectiveSettlement.remunerative_amount !== undefined)
         || (effectiveSettlement.non_remunerative_amount !== null
@@ -2771,7 +2786,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       });
       if (document.rows[0].document_type === "PAYROLL") {
         const existingPaths = new Set(extractedFields.map(({ fieldPath }) => fieldPath));
-        for (const fieldPath of effectiveReviewPaths) {
+        const displayReviewPaths = [...new Set([...effectiveReviewPaths, ...terminationReview.flatMap(issue => issue.fieldPaths)])];
+        for (const fieldPath of displayReviewPaths) {
           const existing = extractedFields.find((field) => field.fieldPath === fieldPath);
           if (existing && missingEffectivePaths.has(fieldPath)) existing.source = "MANUAL_REQUIRED";
           if (!existingPaths.has(fieldPath)) {
@@ -2785,7 +2801,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
               correctedValue,
               effectiveValue: correctedValue,
               confidence: "0",
-              source: "MANUAL_REQUIRED",
+              source: effectiveReviewPaths.includes(fieldPath) ? "MANUAL_REQUIRED" : "MANUAL_OPTIONAL",
               pageNumber: null,
               sourceRegion: null,
               extractorVersion: null,
@@ -2852,6 +2868,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         } : null,
         extractedFields,
         settlement: settlement.rows.length ? settlementView(settlement.rows[0]!) : null,
+        terminationReview,
         lineItems: lineItems.rows.map((item) => ({
           id: String(item.id),
           itemOrdinal: Number(item.item_ordinal),

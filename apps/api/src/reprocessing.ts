@@ -74,6 +74,26 @@ function layoutObservationSql(runAlias: string, issueAlias: string): string {
       'BASIC_AMOUNT_MISSING', 'CRITICAL_FIELD_MISSING'))`;
 }
 
+function earningsRecoverySql(runAlias: string): string {
+  return `(CASE WHEN ${runAlias}.parser_version ~ '^[0-9]{1,8}$'
+    THEN ${runAlias}.parser_version::integer < 9 ELSE false END
+    AND EXISTS (
+      SELECT 1 FROM payroll_settlements earning_settlement
+      JOIN payroll_line_items earning_item
+        ON earning_item.settlement_id = earning_settlement.id
+       AND earning_item.user_id = earning_settlement.user_id AND earning_item.item_type = 'EARNING'
+      WHERE earning_settlement.user_id = ${runAlias}.user_id
+        AND earning_settlement.document_id = ${runAlias}.document_id
+        AND earning_settlement.extraction_run_id = ${runAlias}.id
+        AND earning_settlement.gross_amount IS NOT NULL
+        AND earning_settlement.remunerative_amount IS NOT NULL
+        AND earning_settlement.non_remunerative_amount IS NOT NULL
+        AND earning_settlement.gross_amount = earning_settlement.remunerative_amount + earning_settlement.non_remunerative_amount
+      GROUP BY earning_settlement.id
+      HAVING sum(earning_item.amount) <> earning_settlement.gross_amount
+    ))`;
+}
+
 export function reprocessingCandidateExistsSql(
   documentAlias: string,
   fixesExpression: string,
@@ -89,7 +109,7 @@ export function reprocessingCandidateExistsSql(
     AND EXISTS (
       SELECT 1
         FROM extraction_runs candidate_run
-        JOIN extraction_run_issues candidate_issue
+        LEFT JOIN extraction_run_issues candidate_issue
           ON candidate_issue.user_id = candidate_run.user_id
          AND candidate_issue.document_id = candidate_run.document_id
          AND candidate_issue.extraction_run_id = candidate_run.id
@@ -118,7 +138,8 @@ export function reprocessingCandidateExistsSql(
              THEN candidate_run.parser_version::integer < candidate_fix."introducedInParserVersion"::integer
            ELSE candidate_run.parser_version IS DISTINCT FROM candidate_fix."introducedInParserVersion"
          END) OR ${ocrRecoverySql("candidate_run", "candidate_issue")} OR ${hasNewDocumentLayoutSql("candidate_run")}
-           OR ${layoutObservationSql("candidate_run", "candidate_issue")} OR ${countryRecoverySql("candidate_run")})
+           OR ${layoutObservationSql("candidate_run", "candidate_issue")} OR ${countryRecoverySql("candidate_run")}
+           OR ${earningsRecoverySql("candidate_run")})
          AND NOT EXISTS (
            SELECT 1 FROM extraction_runs attempted_run
             WHERE attempted_run.user_id = candidate_run.user_id
@@ -161,17 +182,17 @@ export async function findReprocessingCandidates(
             run.parser_version,
             run.pipeline_fingerprint,
             bool_or(job.id IS NOT NULL) AS in_progress,
-            jsonb_agg(DISTINCT jsonb_build_object(
+            COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
               'code', issue.code,
               'severity', issue.severity,
               'affectedFieldPath', issue.affected_field_path
-            )) AS issues
+            )) FILTER (WHERE issue.id IS NOT NULL), '[]'::jsonb) AS issues
        FROM documents document
        JOIN extraction_runs run
          ON run.id = document.active_extraction_run_id
         AND run.user_id = document.user_id
         AND run.document_id = document.id
-       JOIN extraction_run_issues issue
+       LEFT JOIN extraction_run_issues issue
          ON issue.user_id = run.user_id
         AND issue.document_id = run.document_id
         AND issue.extraction_run_id = run.id
@@ -202,7 +223,8 @@ export async function findReprocessingCandidates(
             THEN run.parser_version::integer < fix."introducedInParserVersion"::integer
           ELSE run.parser_version IS DISTINCT FROM fix."introducedInParserVersion"
         END) OR ${ocrRecoverySql("run", "issue")} OR ${hasNewDocumentLayoutSql("run")}
-          OR ${layoutObservationSql("run", "issue")} OR ${countryRecoverySql("run")})
+          OR ${layoutObservationSql("run", "issue")} OR ${countryRecoverySql("run")}
+          OR ${earningsRecoverySql("run")})
         AND NOT EXISTS (
           SELECT 1 FROM extraction_runs attempted_run
            WHERE attempted_run.user_id = run.user_id

@@ -22,7 +22,7 @@ const aliases: LayoutAliases = {
 const profile: ApprovedDocumentLayout = {
   id: 'synthetic-version', layoutId: 'synthetic-layout', version: 1,
   fingerprint: fingerprintLayout(receipt, 1)!, fingerprintVersion: '1', aliases,
-  countryCode: 'AR', documentType: 'PAYROLL', parserVersion: '8',
+  countryCode: 'AR', documentType: 'PAYROLL', parserVersion: '9',
 };
 const input = (text: string) => ({ text, source: 'PDF_TEXT' as const, evidence: [] });
 

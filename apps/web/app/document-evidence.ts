@@ -2,6 +2,8 @@ export type DocumentLocation = {
   documentId: string;
   evidenceId?: string;
   page?: number;
+  review?: 'termination';
+  lineItemId?: string;
 };
 
 export type OwnerLocation = {
@@ -210,6 +212,8 @@ function locationSearch(owner: OwnerLocation, documentLocation: DocumentLocation
     if (documentLocation.evidenceId && uuid.test(documentLocation.evidenceId)) {
       params.set('evidence', documentLocation.evidenceId);
     }
+    if (documentLocation.review === 'termination') params.set('review', documentLocation.review);
+    if (documentLocation.lineItemId && uuid.test(documentLocation.lineItemId)) params.set('lineItem', documentLocation.lineItemId);
   }
   const value = params.toString();
   return value ? `?${value}` : '';
@@ -232,10 +236,13 @@ export function readDocumentLocation(search: string): DocumentLocation | null {
   const rawPage = params.get('page');
   const parsedPage = rawPage === null ? undefined : Number(rawPage);
   const evidenceId = params.get('evidence');
+  const lineItemId = params.get('lineItem');
   return {
     documentId,
     ...(Number.isInteger(parsedPage) && parsedPage! >= 1 && parsedPage! <= 500 ? { page: parsedPage } : {}),
     ...(evidenceId && uuid.test(evidenceId) ? { evidenceId } : {}),
+    ...(params.get('review') === 'termination' ? { review: 'termination' as const } : {}),
+    ...(lineItemId && uuid.test(lineItemId) ? { lineItemId } : {}),
   };
 }
 

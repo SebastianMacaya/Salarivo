@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calculateTerminationEstimate, resolveTerminationRule, TERMINATION_LEGAL_RULES,
+import { calculateTerminationEstimate, reviewTerminationSalary, resolveTerminationRule, TERMINATION_LEGAL_RULES,
   type CollectiveAgreementVersion, type TerminationEstimate, type TerminationInput, type TerminationSalarySettlement } from "../src/termination-calculator.ts";
 import { formatAmount, parseAmount } from "../src/salary-analytics.ts";
 
@@ -306,6 +306,35 @@ test("unclassified aggregate remuneration is clearly conditional and duplicate m
   assert.equal(calculateTerminationEstimate(data).status, "UNAVAILABLE");
   data.settlements = [settlement("2026-05"), settlement("2026-05")];
   assert.equal(calculateTerminationEstimate(data).salaryBase.amount, "300000.00", "duplicate row IDs are idempotent");
+});
+
+test("receipt diagnostics distinguish missing data, unclassified concepts and exact reconciliation failures", () => {
+  const mixed = settlement("2026-05", "1200.00", { remunerativeAmount: "1000.00", nonRemunerativeAmount: "200.00",
+    earnings: [{ lineItemId: "base-item", code: "BASIC_SALARY", amount: "1000.00" },
+      { lineItemId: "unclassified-item", code: "UNKNOWN", amount: "4.50" }] });
+  const issues = reviewTerminationSalary(mixed);
+  assert.deepEqual(issues.map(issue => issue.code), ["UNASSIGNED_NON_REMUNERATIVE", "EARNINGS_TOTAL_MISMATCH", "UNCLASSIFIED_EARNING"]);
+  assert.deepEqual(issues[1]!.comparison, { totalField: "settlement.grossAmount", actual: "1004.50", expected: "1200.00", difference: "-195.50" });
+  assert.deepEqual(issues[1]!.lineItemIds, ["base-item", "unclassified-item"]);
+  assert.deepEqual(issues[2]!.lineItemIds, ["unclassified-item"]);
+  assert.ok(issues[2]!.explanation.includes("no significa que falte en el PDF"));
+  const data = input(); delete data.overrides;
+  data.settlements = [mixed, settlement("2026-04", "50.00", { settlementType: "SAC" })];
+  const result = calculateTerminationEstimate(data);
+  assert.equal(result.status, "UNAVAILABLE");
+  assert.deepEqual(result.salaryBase.unusablePeriods, ["2026-04", "2026-05"]);
+  assert.ok(!result.salaryBase.missingPeriods.includes("2026-04") && !result.salaryBase.missingPeriods.includes("2026-05"));
+  assert.ok(result.salaryBase.missingPeriods.includes("2026-03"));
+  const trace = result.salaryBase.trace.find(entry => entry.lineItemId === "unclassified-item")!;
+  assert.ok(issues.every(issue => trace.explanation.includes(issue.explanation)));
+  assert.equal(trace.treatment, "REVIEW_REQUIRED");
+  assert.deepEqual(reviewTerminationSalary(settlement("2026-05")), []);
+  assert.ok(reviewTerminationSalary({ ...mixed, remunerativeAmount: null }).some(issue => issue.code === "MISSING_REMUNERATIVE_TOTAL"));
+  const matchedMixed = { ...mixed, earnings: [{ code: "BASIC_SALARY", amount: "1000.00" }, { code: "NON_REMUNERATIVE", amount: "200.00" }] };
+  assert.deepEqual(reviewTerminationSalary(matchedMixed).map(issue => issue.code), ["UNASSIGNED_NON_REMUNERATIVE"]);
+  const duplicate = input(); delete duplicate.overrides;
+  duplicate.settlements = [settlement("2026-05"), settlement("2026-05", "300000.00", { id: "other-salary" })];
+  assert.ok(calculateTerminationEstimate(duplicate).salaryBase.trace.every(entry => entry.treatment === "REVIEW_REQUIRED" && entry.explanation.includes("duplicados")));
 });
 
 test("future scenario projects the last known salary and leaves future documents out", () => {

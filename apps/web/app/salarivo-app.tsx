@@ -8,7 +8,7 @@ import { ResponsiveDialog } from './responsive-dialog';
 import { countryName, getCountry } from '@salarivo/jurisdictions';
 import { CountrySettings, EmploymentJurisdictionFields } from './country-select';
 import { TerminationSimulator } from './termination-simulator';
-import { fetchDocumentPrefix, readDocumentLocation, readOwnerLocation, writeDocumentLocation, writeOwnerLocation, type CursorDocumentPage, type OwnerLocation, type OwnerLocationPatch } from './document-evidence';
+import { fetchDocumentPrefix, readDocumentLocation, readOwnerLocation, writeDocumentLocation, writeOwnerLocation, type CursorDocumentPage, type DocumentLocation, type OwnerLocation, type OwnerLocationPatch } from './document-evidence';
 import {
   batchIsActive,
   batchResolved,
@@ -23,6 +23,7 @@ import {
   amountFromCents,
   dateLabel,
   documentStatusLabel,
+  earningLabels,
   economicStatusMessage,
   economicTrendLabel,
   employmentOptionLabel,
@@ -455,18 +456,6 @@ const categoryLabels: Record<SalaryCategory, string> = {
   LIQUIDACION_FINAL: 'Liquidación final',
   INDEMNIZACION: 'Indemnizaciones',
   OTRO: 'Otros',
-};
-const earningLabels: Record<string, string> = {
-  BASIC_SALARY: 'Sueldo básico',
-  SENIORITY: 'Antigüedad',
-  ATTENDANCE: 'Presentismo',
-  SAC: 'Aguinaldo',
-  RETROACTIVE: 'Retroactivo',
-  VACATION: 'Vacaciones',
-  BONUS: 'Bono o premio',
-  COMMISSION: 'Comisión',
-  OVERTIME: 'Horas extra',
-  REIMBURSEMENT: 'Reintegro',
 };
 const comparisonConclusionLabels: Record<NonNullable<PeriodComparison['conclusionCode']>, string> = {
   NET_UNAVAILABLE: 'No hay neto suficiente para explicar la variación.',
@@ -2353,7 +2342,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
   const [openedFromList, setOpenedFromList] = useState(false);
   const [reviewBusy, setReviewBusy] = useState(false);
   const [reviewDirty, setReviewDirty] = useState(false);
-  const [locationSeed, setLocationSeed] = useState<{ evidenceId?: string; page?: number }>({});
+  const [locationSeed, setLocationSeed] = useState<Omit<DocumentLocation, 'documentId'>>({});
   const allowNextPop = useRef(false);
   const opener = useRef<HTMLButtonElement | null>(null);
   const reviewUrl = useRef('');
@@ -2438,7 +2427,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     if (linked && location) {
       reviewUrl.current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
       setTab('documents');
-      setLocationSeed({ evidenceId: location.evidenceId, page: location.page });
+      setLocationSeed(location);
       activeDocumentId.current = linked.id;
       setSelected(linked);
     } else {
@@ -2743,7 +2732,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
         setRunsError('');
       }
       setOpenedFromList(false);
-      setLocationSeed(location ? { evidenceId: location.evidenceId, page: location.page } : {});
+      setLocationSeed(location ?? {});
       const next = location ? resolveDocumentItem(documents, location.documentId) : null;
       activeDocumentId.current = next?.id;
       setSelected(next);
@@ -2839,9 +2828,10 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     await Promise.all([loadSalary(), reloadDocuments(true), refreshDetail()]);
   }
 
-  const updateDocumentLocation = useCallback((page: number, evidenceId?: string) => {
+  const updateDocumentLocation = useCallback((page: number, evidenceId?: string, lineItemId?: string) => {
     if (!selectedId) return;
-    reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: selectedId, page, evidenceId })}${window.location.hash}`;
+    const current = readDocumentLocation(window.location.search);
+    reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { ...(current?.documentId === selectedId ? current : {}), documentId: selectedId, page, evidenceId, lineItemId })}${window.location.hash}`;
     window.history.replaceState(window.history.state, '', reviewUrl.current);
   }, [selectedId]);
 
@@ -3288,6 +3278,8 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
         detail={detail}
         initialEvidenceId={locationSeed.evidenceId}
         initialPage={locationSeed.page}
+        initialReview={locationSeed.review}
+        initialLineItemId={locationSeed.lineItemId}
         position={{ canNext: selectedDocumentIndex >= 0 && (selectedDocumentIndex < documents.length - 1 || Boolean(documentCursor)), current: selectedDocumentIndex < 0 ? null : selectedDocumentIndex + 1, total: Math.max(1, documentTotal) }}
         settlement={detail.reviewSettlement ?? undefined}
         source={preview?.documentId === selected.id && (!privacyEnabled || privacyPreviewDocumentId === selected.id) ? preview : null}

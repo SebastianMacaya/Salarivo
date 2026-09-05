@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openBrowser } from './cdp.mjs';
 import { fixtureSource, id } from './fixtures.mjs';
-import { calculateTerminationEstimate } from '../../../api/src/termination-calculator.ts';
+import { calculateTerminationEstimate, reviewTerminationSalary } from '../../../api/src/termination-calculator.ts';
+import { periodLabel } from '../../app/format.ts';
 
 const base = process.env.SALARIVO_TEST_URL || 'http://127.0.0.1:3042';
 const output = process.env.SALARIVO_TEST_OUTPUT || join(tmpdir(), 'salarivo-jurisdiction-qa');
@@ -15,8 +16,20 @@ const future = `${current.getFullYear() + 1}-01-15`;
 const employment = { id: id(10), employerName: 'Empresa Sintética Internacional de Prueba', countryCode: 'AR', currencyCode: 'ARS', countryConfirmedAt: '2026-01-01', startDate: '2019-07-01', startDateSource: 'CONFIRMED', legalRegimeCode: 'AR_LCT_GENERAL', status: 'ACTIVE', statusConfirmedAt: '2026-01-01', employmentType: 'DEPENDENT' };
 const estimates = Object.fromEntries([today, '2024-12-15', future].map(terminationDate => [terminationDate, calculateTerminationEstimate({ employment, today, terminationDate, settlements: [], overrides: { monthlyRemuneration: '2000000.00' } })]));
 assert.ok(Object.values(estimates).every(result => result.status === 'AVAILABLE' && result.scenarios.length === 2));
+const reviewPeriod = new Date(Date.UTC(current.getFullYear(), current.getMonth() - 1, 1)).toISOString().slice(0, 7);
+const reviewSettlement = { id: id(219), documentId: id(319), employmentId: employment.id, currencyCode: 'ARS', payrollPeriod: reviewPeriod, settlementType: 'NORMAL', grossAmount: '1000000.00', remunerativeAmount: '1000000.00', nonRemunerativeAmount: '0.00', netAmount: '700000.00', deductionsAmount: '300000.00', basicAmount: '900000.00', earnings: [
+  { code: 'UNKNOWN', lineItemId: id(60), amount: '300000.00', isRecurring: false },
+  { code: 'BASIC_SALARY', lineItemId: id(61), amount: '900000.00', isRecurring: true },
+] };
+const reviewEstimate = calculateTerminationEstimate({ employment, today, terminationDate: today, settlements: [reviewSettlement] });
+const sourceDescription = 'Premio sintético sin clasificación <texto del recibo>';
+reviewEstimate.salaryBase.trace.forEach(line => { line.sourceDescription = line.lineItemId === id(60) ? sourceDescription : 'Básico sintético'; });
+const reviewData = { estimate: reviewEstimate, settlement: reviewSettlement, issues: reviewTerminationSalary(reviewSettlement) };
+assert.equal(reviewEstimate.status, 'UNAVAILABLE');
+assert.ok(!reviewEstimate.salaryBase.missingPeriods.includes(reviewPeriod));
+assert.deepEqual(reviewEstimate.salaryBase.unusablePeriods, [reviewPeriod]);
 
-function installJurisdictionFixture(employment, estimates, options) {
+function installJurisdictionFixture(employment, estimates, reviewData, options) {
   const priorFetch = window.fetch;
   const state = window.__jurisdictionFixture = { requests: [], employment: { ...employment, ...(options.unknown ? { status: 'UNKNOWN', statusConfirmedAt: null, employmentType: 'UNKNOWN', countryConfirmedAt: null, legalRegimeCode: null } : {}), ...(options.legacyActive ? { statusConfirmedAt: null } : {}) }, primaryCountryCode: options.unconfirmed ? null : 'AR', primaryCountryConfirmedAt: options.unconfirmed ? null : '2026-01-01' };
   const ok = data => Response.json({ data }, { headers: { 'Cache-Control': 'no-store' } });
@@ -41,7 +54,17 @@ function installJurisdictionFixture(employment, estimates, options) {
       state.requests.push({ method: init.method, url: url.href, body: JSON.parse(init.body), cache: init.cache, credentials: init.credentials });
       if (options.fail) return Response.json({ error: { code: 'SYNTHETIC_FAILURE', message: 'Fallo sintético. Reintentá.' } }, { status: 503 });
       await new Promise(resolve => setTimeout(resolve, 200));
-      return ok(estimates[JSON.parse(init.body).terminationDate]);
+      return ok(options.review ? reviewData.estimate : estimates[JSON.parse(init.body).terminationDate]);
+    }
+    if (options.review && path === `/api/v1/documents/${reviewData.settlement.documentId}`) {
+      const response = await priorFetch(input, init);
+      const body = await response.json();
+      const detail = body.data;
+      return ok({ ...detail, payrollPeriod: reviewData.settlement.payrollPeriod, settlement: reviewData.settlement, terminationReview: reviewData.issues,
+        extractedFields: [...detail.extractedFields.map(field => ({ ...field, effectiveValue: reviewData.settlement[field.fieldPath.replace('settlement.', '')] ?? field.effectiveValue })),
+          { ...detail.extractedFields[3], id: '00000000-0000-4000-8000-000000000070', fieldPath: 'settlement.remunerativeAmount', effectiveValue: reviewData.settlement.remunerativeAmount }],
+        lineItems: reviewData.settlement.earnings.map((earning, index) => ({ ...detail.lineItems[0], id: earning.lineItemId, amount: earning.amount, isRecurring: earning.isRecurring, normalizedConceptCode: earning.code, itemOrdinal: index + 1, rawDescription: reviewData.estimate.salaryBase.trace[index].sourceDescription })),
+      });
     }
     return priorFetch(input, init);
   };
@@ -52,7 +75,7 @@ browser.on('Runtime.exceptionThrown', ({ exceptionDetails }) => exceptions.push(
 let injection;
 async function visit(path, options = {}) {
   if (injection) await browser.command('Page.removeScriptToEvaluateOnNewDocument', { identifier: injection });
-  const source = `${fixtureSource({ ...options, private: options.private ?? false })}\n(${installJurisdictionFixture})(${JSON.stringify(employment)}, ${JSON.stringify(estimates)}, ${JSON.stringify(options)});`;
+  const source = `${fixtureSource({ ...options, private: options.private ?? false })}\n(${installJurisdictionFixture})(${JSON.stringify(employment)}, ${JSON.stringify(estimates)}, ${JSON.stringify(reviewData)}, ${JSON.stringify(options)});`;
   injection = (await browser.command('Page.addScriptToEvaluateOnNewDocument', { source })).identifier;
   await browser.navigate(new URL(path, base).href);
   await browser.waitFor('window.__jurisdictionFixture && document.querySelector("h1") && !document.querySelector("main .loader")');
@@ -147,6 +170,44 @@ try {
   await browser.waitFor('document.querySelector("select[name=currencyCode]")');
   assert.ok(await browser.evaluate('Boolean(document.querySelector("select[name=currencyCode] option[value=INR]") && document.querySelector("select[name=currencyCode] option[value=NZD]"))'));
   await click('Cancelar');
+  for (const width of [320, 1440]) {
+    await browser.viewport(width, 900);
+    await visit(`/?section=termination&employmentId=${employment.id}`, { review: true, private: true });
+    await click('Calcular estimación');
+    await browser.waitFor('document.querySelector(".termination-trace")');
+    await browser.evaluate('document.querySelector(".termination-trace").closest("details").open = true');
+    await click('Mostrar importes');
+    const trace = await browser.evaluate('document.querySelector(".termination-trace").innerText');
+    assert.ok(trace.includes('Concepto sin clasificar') && trace.includes('Sueldo básico'));
+    assert.ok(trace.includes(sourceDescription));
+    assert.ok(!trace.includes('UNKNOWN') && !trace.includes('BASIC_SALARY'));
+    const coverage = await browser.evaluate('[...document.querySelectorAll(".termination-result p")].map(el => el.innerText)');
+    assert.ok(coverage.some(text => text.startsWith('Períodos con recibos que no permiten calcular la base:') && text.includes(periodLabel(reviewPeriod))));
+    assert.ok(!coverage.find(text => text.startsWith('Períodos sin recibos analizados:')).includes(periodLabel(reviewPeriod)));
+    await browser.evaluate('document.querySelector(".termination-trace").scrollIntoView({block:"start"})');
+    await layout('termination-review-trace');
+    await click('Ocultar importes');
+    assert.ok(!await browser.evaluate(`document.querySelector('.termination-trace').textContent.includes(${JSON.stringify(sourceDescription)})`));
+    assert.ok(!await browser.evaluate('document.querySelector(".termination-trace").innerHTML.includes("Premio sintético")'));
+    const href = await browser.evaluate('document.querySelector(".termination-trace a").href');
+    assert.deepEqual(Object.fromEntries(new URL(href).searchParams), { currencyCode: 'ARS', section: 'history', employmentId: employment.id, tab: 'documents', document: id(319), review: 'termination', lineItem: id(60) });
+    await browser.evaluate('document.querySelector(".termination-trace a").click()');
+    await browser.waitFor('document.querySelector("#termination-review-title")');
+    assert.ok(await browser.evaluate('document.activeElement.getAttribute("aria-labelledby") === "termination-review-title"'));
+    assert.ok(!await browser.evaluate(`document.querySelector('dialog[aria-labelledby="review-title"]').textContent.includes(${JSON.stringify(sourceDescription)})`));
+    assert.ok(!await browser.evaluate('document.querySelector("dialog[aria-labelledby=review-title]").innerHTML.includes("Premio sintético")'));
+    assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/original"))'));
+    await layout('termination-source-review');
+    await click('Ver concepto');
+    await browser.waitFor(`document.activeElement.id === 'line-item-${id(60)}'`);
+    await visit(new URL(href).pathname + new URL(href).search, { review: true, private: false });
+    await browser.waitFor('document.querySelector("#termination-review-title")');
+    await browser.waitFor(`document.querySelector('dialog[aria-labelledby="review-title"]').textContent.includes(${JSON.stringify(sourceDescription)})`);
+    await click('Revisar Remunerativo');
+    await browser.waitFor(`document.activeElement.closest('article')?.id === 'field-${id(70)}'`);
+    assert.ok(await browser.evaluate(`document.querySelector('#field-${id(70)} input') !== null`));
+    assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/corrections") || call.path.endsWith("/original"))'));
+  }
   }
   for (const width of [320, 1440]) {
     await browser.viewport(width, 900);
@@ -175,5 +236,5 @@ try {
   assert.ok(await browser.evaluate('document.querySelector("dialog [role=alert]").innerText.includes("no coincide")'));
   assert.equal(await browser.evaluate('window.__salarivoFixture.documentCountry'), undefined);
   assert.deepEqual(exceptions, []);
-  process.stdout.write(`Jurisdiction browser smoke passed${process.argv.includes('--document-country-only') ? ': document confirmation/cancel/conflict at 320/1440' : ': 320/390/1440, historical/future, privacy, overrides, confirmation, empty/error, document country'}. Screenshots: ${output}\n`);
+  process.stdout.write(`Jurisdiction browser smoke passed${process.argv.includes('--document-country-only') ? ': document confirmation/cancel/conflict at 320/1440' : ': 320/390/1440, historical/future, privacy, overrides, confirmation, empty/error, document country, termination trace and source review'}. Screenshots: ${output}\n`);
 } finally { await browser.close(); }

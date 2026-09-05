@@ -719,7 +719,10 @@ function findPayrollTable(lines: string[]): PayrollTable | null {
 
 function mapTableAmounts(line: string, table: PayrollTable): Array<PositionedAmount | null> {
   const amounts = amountsInLine(line).filter(({ raw }) => !table.combinedEarnings || hasMoneyFormatting(raw));
-  if (!table.combinedEarnings) return mapAmountsToColumns(amounts, table.mappingColumns, table.columnTolerance);
+  if (!table.combinedEarnings) return mapAmountsToColumns(
+    amounts.filter(({ index, raw }) => index + raw.length > table.descriptionEnd),
+    table.mappingColumns, table.columnTolerance,
+  );
   const [, earningsStart, deductionsStart] = table.mappingColumns;
   const mapped: Array<PositionedAmount | null> = [null, null];
   for (const amount of amounts) {

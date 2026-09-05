@@ -5,7 +5,7 @@ import { countryName } from '@salarivo/jurisdictions';
 import { CountrySelect } from './country-select';
 import { evidenceIdForPage, extractionRunChanged, reviewValueChanged } from './document-evidence';
 import { DocumentViewer } from './document-viewer';
-import { documentStatusLabel, periodLabel, settlementTypeLabel, timestampLabel } from './format';
+import { documentStatusLabel, earningLabels, periodLabel, settlementTypeLabel, timestampLabel } from './format';
 import { MoneyValue, PercentageValue, PrivacyToggle, SensitiveValue, usePrivacyMode } from './privacy-mode';
 import { MONEY_MASK, PERCENTAGE_MASK, isMonetaryField, isSalaryPercentageField } from './privacy-mode-state';
 import {
@@ -84,6 +84,13 @@ export type DocumentDetail = {
   processedAt: string | null;
   processingStatus: string;
   reviewSettlement: ReviewSettlement | null;
+  terminationReview?: Array<{
+    code: string;
+    explanation: string;
+    fieldPaths: string[];
+    lineItemIds: string[];
+    comparison?: { totalField: string; actual: string; expected: string; difference: string };
+  }>;
   retentionPolicy: string;
   securityStatus: string;
   settlement: null | {
@@ -146,6 +153,7 @@ function provenance(field: ExtractedFieldDetail) {
   if (field.source === 'OCR') return 'Detectado por OCR';
   if (field.source === 'PDF_TEXT') return 'Detectado en el PDF';
   if (field.source === 'MANUAL_REQUIRED') return 'Requiere carga manual';
+  if (field.source === 'MANUAL_OPTIONAL') return 'Dato no detectado; podés completarlo';
   return field.source;
 }
 function comparisonValue(preview: ProcessingComparisonPreview, fieldPath: string, value: string | null, side: 'before' | 'after') {
@@ -187,6 +195,8 @@ export function DocumentReview({
   detail,
   initialEvidenceId,
   initialPage = 1,
+  initialReview,
+  initialLineItemId,
   position,
   settlement,
   source,
@@ -219,6 +229,8 @@ export function DocumentReview({
   detail: DocumentDetail;
   initialEvidenceId?: string;
   initialPage?: number;
+  initialReview?: 'termination';
+  initialLineItemId?: string;
   position: { canNext?: boolean; current: number | null; total: number };
   settlement?: ReviewSettlement;
   source: { expiresAt?: string; url: string } | null;
@@ -236,7 +248,7 @@ export function DocumentReview({
   onDownload: () => Promise<void>;
   onBusyChange: (busy: boolean) => void;
   onDirtyChange: (dirty: boolean) => void;
-  onLocationChange: (page: number, evidenceId?: string) => void;
+  onLocationChange: (page: number, evidenceId?: string, lineItemId?: string) => void;
   onNavigate: (direction: -1 | 1) => void;
   onReprocess: (retry?: boolean) => Promise<void>;
   onRunDecision: (run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE') => Promise<void>;
@@ -251,6 +263,7 @@ export function DocumentReview({
   const { enabled: privacyEnabled } = usePrivacyMode();
   const workspaceRef = useRef<HTMLElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const terminationReviewRef = useRef<HTMLElement>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
   const [editingRunId, setEditingRunId] = useState<string | null>(null);
@@ -258,7 +271,9 @@ export function DocumentReview({
   const [selectedEvidenceId, setSelectedEvidenceId] = useState(
     evidenceIdForPage(initialEvidenceId, initialPage, detail.extractedFields),
   );
-  const [mobileTab, setMobileTab] = useState<'data' | 'document'>(initialEvidenceId || initialPage > 1 ? 'document' : 'data');
+  const [mobileTab, setMobileTab] = useState<'data' | 'document'>(initialReview || initialLineItemId ? 'data' : initialEvidenceId || initialPage > 1 ? 'document' : 'data');
+  const [selectedLineItemId, setSelectedLineItemId] = useState(initialLineItemId);
+  const [selectedReviewFieldPath, setSelectedReviewFieldPath] = useState<string>();
   const [acceptedMismatchRunId, setAcceptedMismatchRunId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -290,6 +305,8 @@ export function DocumentReview({
   const analysisCopy = analysis ? analysisPresentation(analysis) : null;
   const runTimeline = processingRuns.length ? processingRuns : analysis?.currentRun ? [analysis.currentRun] : [];
   const currencyCode = detail.settlement?.currencyCode ?? 'ARS';
+  const terminationReview = detail.terminationReview ?? [];
+  const selectedLineItem = detail.lineItems.find((item) => item.id === selectedLineItemId);
 
   useEffect(() => {
     const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -298,6 +315,11 @@ export function DocumentReview({
     workspaceRef.current?.focus();
     return () => { dialog?.close(); if (returnFocus?.isConnected) returnFocus.focus(); };
   }, []);
+
+  useEffect(() => {
+    if (initialReview !== 'termination') return;
+    terminationReviewRef.current?.focus();
+  }, [initialReview]);
 
   useEffect(() => {
     if (!dirty) return;
@@ -309,7 +331,7 @@ export function DocumentReview({
   useEffect(() => { onDirtyChange(dirty); return () => onDirtyChange(false); }, [dirty, onDirtyChange]);
   useEffect(() => { onBusyChange(busy); return () => onBusyChange(false); }, [busy, onBusyChange]);
 
-  useEffect(() => { onLocationChange(page, selectedEvidenceId); }, [onLocationChange, page, selectedEvidenceId]);
+  useEffect(() => { onLocationChange(page, selectedEvidenceId, selectedLineItem?.id); }, [onLocationChange, page, selectedEvidenceId, selectedLineItem?.id]);
   useEffect(() => {
     if (mobileTab === 'data' && selectedEvidenceId) {
       document.getElementById(`field-${selectedEvidenceId}`)?.scrollIntoView({ block: 'nearest' });
@@ -368,6 +390,26 @@ export function DocumentReview({
     setPage(nextPage);
     setSelectedEvidenceId((current) => evidenceIdForPage(current, nextPage, detail.extractedFields));
   }
+  function focusReviewTarget(id: string) {
+    setMobileTab('data');
+    window.requestAnimationFrame(() => {
+      const target = document.getElementById(id);
+      target?.scrollIntoView({ block: 'nearest' });
+      target?.focus({ preventScroll: true });
+    });
+  }
+  function reviewField(field: ExtractedFieldDetail) {
+    setSelectedReviewFieldPath(field.fieldPath);
+    if (canEdit && editable.has(field.fieldPath) && !editing) {
+      setEditingRunId(currentRunId);
+      setEditing(true);
+    }
+    focusReviewTarget(field.id ? `field-${field.id}` : `field-path-${field.fieldPath}`);
+  }
+  function reviewConcept(id: string) {
+    setSelectedLineItemId(id);
+    focusReviewTarget(`line-item-${id}`);
+  }
 
   const reviewBlocked = missing.length > 0 || settlement?.totalsBalance === false
     || settlement?.componentsBalance === false
@@ -417,6 +459,27 @@ export function DocumentReview({
           <aside id="review-data-panel" tabIndex={-1} className={`${styles.dataPane}${mobileTab === 'document' ? ` ${styles.mobileHidden}` : ''}`} aria-label="Datos extraídos">
             {error && <p className={styles.error} role="alert">{error}</p>}
             <div className={styles.summary}><span>{documentStatusLabel(detail.processingStatus)}</span><p>{unsupported ? 'El documento quedó separado del historial salarial.' : detail.errorCode ? 'El procesamiento terminó con un error controlado.' : detail.lastReprocessError ? 'El último reprocesamiento no pudo completarse; conservamos la versión anterior.' : missing.length ? `Falta completar: ${missing.map((field) => labels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : settlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto.' : settlement?.componentsBalance === false ? 'Remunerativo más no remunerativo no coincide con el bruto.' : settlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total.' : 'Los cambios humanos quedan versionados y no se reemplazan en silencio.'}</p></div>
+
+            {(terminationReview.length > 0 || initialReview === 'termination') && <section ref={terminationReviewRef} tabIndex={-1} className={`${styles.callout} ${styles.terminationReview}`} aria-labelledby="termination-review-title">
+              <h3 id="termination-review-title">Para estimar la indemnización</h3>
+              <p>Estas observaciones se calculan con los datos actuales del recibo. Un documento procesado puede necesitar más detalle para esta estimación.</p>
+              {selectedLineItem && <p>Concepto que abriste: <SensitiveValue value={selectedLineItem.rawDescription} mask="Concepto salarial" />. <button type="button" onClick={() => reviewConcept(selectedLineItem.id)}>Ver concepto</button></p>}
+              {initialLineItemId && !selectedLineItem && <p>El concepto enlazado ya no está en el análisis actual. Revisá estas observaciones y volvé a calcular.</p>}
+              {terminationReview.length > 0 ? <ul>{terminationReview.map((issue, index) => <li key={`${issue.code}-${index}`}>
+                <p>{issue.explanation}</p>
+                {issue.comparison && <dl className={styles.settlementOverview}>
+                  <div><dt>Suma de conceptos</dt><dd><MoneyValue value={issue.comparison.actual} currency={currencyCode} /></dd></div>
+                  <div><dt>{labels[issue.comparison.totalField] ?? 'Total esperado'}</dt><dd><MoneyValue value={issue.comparison.expected} currency={currencyCode} /></dd></div>
+                  <div><dt>Diferencia</dt><dd><MoneyValue value={issue.comparison.difference} currency={currencyCode} /></dd></div>
+                </dl>}
+                <div>{issue.fieldPaths.flatMap((path) => {
+                  const field = detail.extractedFields.find((candidate) => candidate.fieldPath === path);
+                  return field ? <button key={path} type="button" disabled={busy} onClick={() => reviewField(field)}>Revisar {labels[path] ?? 'campo'}</button> : [];
+                })}{issue.lineItemIds.some((id) => detail.lineItems.some((item) => item.id === id)) && <button type="button" onClick={() => reviewConcept(issue.lineItemIds.find((id) => detail.lineItems.some((item) => item.id === id))!)}>Revisar conceptos afectados</button>}</div>
+              </li>)}</ul> : <p>No hay observaciones de conceptos en el análisis actual. Volvé al simulador y calculá nuevamente para revisar las condiciones del empleo y los demás recibos.</p>}
+              {terminationReview.some((issue) => issue.lineItemIds.length > 0) && <p>Los conceptos detectados se consultan aquí; todavía no se editan individualmente. Si la lectura del PDF es incorrecta, usá la opción de volver a analizar cuando esté disponible. También podés ingresar una remuneración bruta normal y habitual sólo para la simulación.</p>}
+              <p>Después de guardar una corrección o activar otro análisis, volvé a calcular la estimación.</p>
+            </section>}
 
             {analysis && analysisCopy && <section className={`${styles.analysis} ${styles[analysisCopy.tone]}`} aria-live="polite" aria-busy={analysis.reprocess.inProgress}>
               <div className={styles.analysisHead}><div><span aria-hidden="true">{analysisCopy.tone === 'ready' ? '✓' : analysisCopy.tone === 'danger' ? '!' : '↻'}</span><h3>{analysisCopy.title}</h3></div>{analysis.reprocess.inProgress && <span className={styles.pulse}>Procesando</span>}</div>
@@ -474,9 +537,9 @@ export function DocumentReview({
                   : field.fieldPath === 'settlement.type'
                   ? <select disabled={!editing || !isEditable} value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))}>{settlementTypes.map((type) => <option value={type} key={type}>{settlementTypeLabel(type)}</option>)}</select>
                   : <input disabled={!editing || !isEditable} type={field.fieldPath === 'settlement.payrollPeriod' ? 'month' : 'text'} inputMode={monetary ? 'decimal' : undefined} autoComplete="off" value={value} onChange={(event) => setDrafts((current) => ({ ...current, [field.fieldPath]: event.target.value }))} />;
-                return <article id={field.id ? `field-${field.id}` : undefined} tabIndex={-1} key={field.fieldPath} className={`${styles.field}${selectedEvidenceId === field.id ? ` ${styles.selectedField}` : ''}`} onMouseEnter={() => { if (field.id && field.pageNumber === page) setSelectedEvidenceId(field.id); }}>
+                return <article id={field.id ? `field-${field.id}` : `field-path-${field.fieldPath}`} tabIndex={-1} key={field.fieldPath} className={`${styles.field}${selectedEvidenceId === field.id || selectedReviewFieldPath === field.fieldPath ? ` ${styles.selectedField}` : ''}`} onMouseEnter={() => { if (field.id && field.pageNumber === page) setSelectedEvidenceId(field.id); }}>
                   <label><span>{labels[field.fieldPath] ?? field.fieldPath}</span>{editor}</label>
-                  <div className={styles.provenance}><span>{provenance(field)}</span>{field.source !== 'MANUAL_REQUIRED' && Number.isFinite(percent) && confidence < .9 && <strong className={confidence < .7 ? styles.low : ''}>{confidence < .7 ? 'Confianza baja' : 'Confianza media'} · {percent}%</strong>}{field.pageNumber && <button type="button" onClick={() => showSource(field)}>Ver fuente · pág. {field.pageNumber}</button>}</div>
+                  <div className={styles.provenance}><span>{provenance(field)}</span>{!field.source.startsWith('MANUAL_') && Number.isFinite(percent) && confidence < .9 && <strong className={confidence < .7 ? styles.low : ''}>{confidence < .7 ? 'Confianza baja' : 'Confianza media'} · {percent}%</strong>}{field.pageNumber && <button type="button" onClick={() => showSource(field)}>Ver fuente · pág. {field.pageNumber}</button>}</div>
                   {field.missingReason && <small>{missingReasons[field.missingReason]}</small>}
                   {(field.rawValue || field.correction) && (editing || field.correction) && <details><summary>Comparar con dato detectado</summary>{field.rawValue && <p>Texto fuente: <SensitiveValue value={field.rawValue} mask={monetary ? `${currencyCode} ${MONEY_MASK}` : salaryPercentage ? PERCENTAGE_MASK : 'Dato oculto'} /></p>}{field.correction && <><small>Interpretado: {monetary || salaryPercentage ? <SensitiveValue value={field.interpretedValue} missing="No disponible" mask={monetary ? `${currencyCode} ${MONEY_MASK}` : PERCENTAGE_MASK} /> : field.interpretedValue ?? 'No disponible'}</small><small>Corrección v{field.correction.version} · {timestampLabel(field.correction.correctedAt)}</small></>}</details>}
                 </article>;
@@ -486,7 +549,7 @@ export function DocumentReview({
               {editing && <div className={styles.editActions}><button type="button" disabled={busy || editingStale || !editingRunId || !correctionsDirty || privacyBlocksSave || changes.some(({ value }) => !value.trim())} onClick={() => { if (!editingRunId || editingStale || privacyBlocksSave) return; void run(async () => { await onSave(changes, editingRunId); setDrafts({}); setEditingRunId(null); setEditing(false); }); }}>{busy ? 'Guardando…' : `Guardar ${changes.length || ''} cambio${changes.length === 1 ? '' : 's'}`}</button><button type="button" disabled={busy} onClick={() => { setDrafts({}); setEditingRunId(null); setEditing(false); }}>Cancelar</button></div>}
             </section>
 
-            {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li key={item.id}><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /><strong><MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></strong>{item.sourcePage && <small>Pág. {item.sourcePage}</small>}</li>)}</ul></section>}
+            {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li id={`line-item-${item.id}`} tabIndex={-1} key={item.id} className={selectedLineItemId === item.id ? styles.selectedField : undefined}><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /><strong><MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></strong>{item.itemType === 'EARNING' && <small>Clasificación automática: {earningLabels[item.normalizedConceptCode ?? ''] ?? 'Concepto sin clasificar'}.</small>}{terminationReview.filter((issue) => issue.lineItemIds.includes(item.id)).map((issue, index) => <small key={`${issue.code}-${index}`}>{issue.explanation}</small>)}{item.sourcePage && <button type="button" onClick={() => { pendingMobileFocus.current = 'document'; setPage(item.sourcePage!); setSelectedEvidenceId(undefined); setMobileTab('document'); }}>Ver fuente · pág. {item.sourcePage}</button>}</li>)}</ul></section>}
 
             {analysis && <details className={styles.timeline} open={runTimeline.some(runNeedsDecision) || undefined}>
               <summary>Historial técnico del análisis ({runTimeline.length})</summary>

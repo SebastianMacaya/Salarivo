@@ -3,9 +3,9 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { countryName } from '@salarivo/jurisdictions';
 import { CountrySelect, type PrivateApi } from './country-select';
-import { dateLabel, employmentOptionLabel, periodLabel } from './format';
-import { normalizeReviewValue } from './document-evidence';
-import { MoneyValue, PrivacyToggle, usePrivacyMode } from './privacy-mode';
+import { dateLabel, earningLabels, employmentOptionLabel, periodLabel, settlementTypeLabel } from './format';
+import { normalizeReviewValue, writeDocumentLocation, writeOwnerLocation } from './document-evidence';
+import { MoneyValue, PrivacyToggle, SensitiveValue, usePrivacyMode } from './privacy-mode';
 
 type Employment = {
   id: string; employerName: string; countryCode: string | null; currencyCode: string;
@@ -19,8 +19,8 @@ type Estimate = {
   calculationVersion: string; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; warnings: string[]; assumptions: string[]; disclaimer: string;
   salaryBase: {
     amount: string | null; currentMonthlyRemuneration: string | null; selectedPeriod: string | null;
-    source: 'DOCUMENTS' | 'SIMULATION_OVERRIDE' | 'UNAVAILABLE'; analyzedDocumentIds: string[]; missingPeriods: string[];
-    trace: { documentId: string; settlementId: string; period: string; code: string; amount: string; treatment: 'INCLUDED' | 'EXCLUDED' | 'AVERAGED' | 'REVIEW_REQUIRED'; explanation: string }[];
+    source: 'DOCUMENTS' | 'SIMULATION_OVERRIDE' | 'UNAVAILABLE'; analyzedDocumentIds: string[]; missingPeriods: string[]; unusablePeriods?: string[];
+    trace: { documentId: string; settlementId: string; lineItemId?: string; sourceDescription?: string | null; period: string; code: string; amount: string; treatment: 'INCLUDED' | 'EXCLUDED' | 'AVERAGED' | 'REVIEW_REQUIRED'; explanation: string }[];
   };
   scenarios: { code: 'WITH_NOTICE' | 'WITHOUT_NOTICE'; total: string; notice: { unit: 'MONTHS' | 'DAYS'; value: number }; breakdown: { code: string; name: string; amount: string; explanation: string; ruleOrigin: string }[] }[];
   inputs: {
@@ -163,11 +163,17 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
         <div><dt>Recibos analizados</dt><dd>{result.salaryBase.analyzedDocumentIds.length}</dd></div><div><dt>Convenio</dt><dd>{result.inputs.collectiveAgreement ? `${result.inputs.collectiveAgreement.cctCode}${result.inputs.collectiveAgreement.category ? ` · ${result.inputs.collectiveAgreement.category}` : ''}` : 'Sin tope de convenio confirmado'}</dd></div>
         <div><dt>Versión normativa</dt><dd>{result.legalRuleVersion ? `${result.legalRuleVersion.code} / ${result.legalRuleVersion.version}` : 'Sin cobertura configurada'}</dd></div>
       </dl>
-      {result.salaryBase.missingPeriods.length > 0 && <p>Períodos sin recibos: {result.salaryBase.missingPeriods.map(periodLabel).join(', ')}.</p>}
+      {result.salaryBase.missingPeriods.length > 0 && <p>Períodos sin recibos analizados: {result.salaryBase.missingPeriods.map(periodLabel).join(', ')}.</p>}
+      {Boolean(result.salaryBase.unusablePeriods?.length) && <p>Períodos con recibos que no permiten calcular la base: {result.salaryBase.unusablePeriods!.map(periodLabel).join(', ')}. Revisá los motivos en el detalle de conceptos.</p>}
       {Object.keys(result.inputs.overrides).length > 0 && <p>Esta estimación incluye overrides explícitos. Los documentos originales y sus datos se conservan.</p>}
       {result.inputs.collectiveAgreement && <p>Tope: <MoneyValue value={result.inputs.collectiveAgreement.capAmount} currency={result.currencyCode} /> · versión {result.inputs.collectiveAgreement.version} · {dateLabel(result.inputs.collectiveAgreement.effectiveFrom)} a {dateLabel(result.inputs.collectiveAgreement.effectiveTo)}. <a className="inline-link" href={result.inputs.collectiveAgreement.sourceUrl} target="_blank" rel="noreferrer">Fuente del convenio</a></p>}
       </section>
-      {result.salaryBase.trace.length > 0 && <details className="panel"><summary>Por qué se incluyó o excluyó cada concepto</summary><ul className="termination-trace">{result.salaryBase.trace.map((line, index) => <li key={`${line.settlementId}-${index}`}><strong>{periodLabel(line.period)} · {line.code}</strong><span>{treatmentLabels[line.treatment]} · <MoneyValue value={line.amount} currency={result.currencyCode} /></span><p>{line.explanation}</p><a className="inline-link" href={`/?section=history&tab=documents&document=${encodeURIComponent(line.documentId)}`}>Revisar recibo fuente</a></li>)}</ul></details>}
+      {result.salaryBase.trace.length > 0 && <details className="panel"><summary>Por qué se incluyó o excluyó cada concepto</summary><ul className="termination-trace">{result.salaryBase.trace.map((line, index) => <li key={`${line.settlementId}-${index}`}>
+        <strong>{periodLabel(line.period)} · {earningLabels[line.code] ?? (settlementTypeLabel(line.code) !== '—' ? settlementTypeLabel(line.code) : 'Concepto sin clasificar')}</strong>
+        {line.sourceDescription && <span>Concepto en el recibo: <SensitiveValue value={line.sourceDescription} /></span>}
+        <span>{treatmentLabels[line.treatment]} · <MoneyValue value={line.amount} currency={result.currencyCode} /></span><p>{line.explanation}</p>
+        <a className="inline-link" href={`/${writeDocumentLocation(writeOwnerLocation('', { section: 'history', tab: 'documents', employmentId: result.inputs.employment.id, currencyCode: result.currencyCode }), { documentId: line.documentId, review: 'termination', lineItemId: line.lineItemId })}`}>Revisar motivo en el recibo</a>
+      </li>)}</ul></details>}
       {result.assumptions.length > 0 && <details className="panel"><summary>Supuestos de esta estimación</summary><ul>{result.assumptions.map((assumption, index) => <li key={index}>{assumption}</li>)}</ul></details>}
       {result.legalRuleVersion && <details className="panel"><summary>Normativa y fuentes</summary><p>Vigencia: {dateLabel(result.legalRuleVersion.effectiveFrom)} a {result.legalRuleVersion.effectiveTo ? dateLabel(result.legalRuleVersion.effectiveTo) : 'sin cierre configurado'}. Revisión: {dateLabel(result.legalRuleVersion.reviewedAt)}.</p><ul>{result.legalRuleVersion.references.map((source) => <li key={source.url}><a className="inline-link" href={source.url} target="_blank" rel="noreferrer">{source.name}</a></li>)}</ul><small>Cálculo: {result.calculationVersion}</small></details>}
       <p className="termination-disclaimer">{result.disclaimer}</p>

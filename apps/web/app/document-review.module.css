@@ -30,6 +30,10 @@
 .callout { background: #fff7ed; border: 1px solid #fed7aa; }
 .callout h3 { margin: 0; }
 .callout div { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
+.terminationReview ul { padding-left: 1.2rem; }
+.terminationReview li + li { margin-top: .8rem; }
+.terminationReview .settlementOverview { margin-top: .6rem; }
+.terminationReview .settlementOverview div { display: block; margin: 0; }
 .feedback { display: grid; gap: .5rem; margin-top: .8rem; }
 .feedback label { font-size: .8rem; font-weight: 700; }
 .feedback textarea { border: 1px solid #cbd5e1; border-radius: .45rem; font: inherit; font-size: 1rem; min-height: 5rem; padding: .55rem; resize: vertical; width: 100%; }

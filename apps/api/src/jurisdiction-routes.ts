@@ -158,6 +158,7 @@ export async function registerJurisdictionRoutes(app: FastifyInstance, { require
             ON run.id = document.active_extraction_run_id AND run.user_id = document.user_id AND run.document_id = document.id
           JOIN payroll_settlements settlement ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
           LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('code', COALESCE(item.normalized_concept_code, 'UNKNOWN'),
+              'lineItemId', item.id, 'sourceDescription', item.raw_description,
               'amount', item.amount::text, 'isRecurring', item.is_recurring) ORDER BY item.item_ordinal) AS items
             FROM payroll_line_items item WHERE item.user_id = settlement.user_id AND item.settlement_id = settlement.id
               AND item.item_type = 'EARNING') earnings ON true
@@ -178,7 +179,9 @@ export async function registerJurisdictionRoutes(app: FastifyInstance, { require
           currencyCode: salary.currency_code, payrollPeriod: salary.payroll_period, settlementType: salary.settlement_type,
           isRecurring: salary.is_recurring, basicAmount: salary.basic_amount, grossAmount: salary.gross_amount,
           remunerativeAmount: salary.remunerative_amount, nonRemunerativeAmount: salary.non_remunerative_amount,
-          knownOn: day(salary.known_on), earnings: salary.earnings,
+          knownOn: day(salary.known_on), earnings: salary.earnings.map((item: { lineItemId: string; code: string; amount: string; isRecurring: boolean | null }) => ({
+            lineItemId: item.lineItemId, code: item.code, amount: item.amount, isRecurring: item.isRecurring,
+          })),
         }));
         let estimate: TerminationEstimate;
         try { estimate = calculateTerminationEstimate({
@@ -194,6 +197,13 @@ export async function registerJurisdictionRoutes(app: FastifyInstance, { require
             throw new ApiError(400, "VALIDATION_ERROR", "Revisá fechas, importes y vigencia del convenio de la simulación.");
           }
           throw error;
+        }
+        // Original labels identify source rows in the owner UI only; never enter calculation inputs.
+        const sourceDescriptions = new Map<string, string>(result.rows.flatMap(salary => salary.earnings.map(
+          (item: { lineItemId: string; sourceDescription: string }) => [item.lineItemId, item.sourceDescription] as const)));
+        for (const entry of estimate.salaryBase.trace) {
+          const description = entry.lineItemId ? sourceDescriptions.get(entry.lineItemId) : undefined;
+          if (description) entry.sourceDescription = description;
         }
         if (row.employment_type !== "DEPENDENT") {
           estimate.status = "UNSUPPORTED"; estimate.scenarios = [];

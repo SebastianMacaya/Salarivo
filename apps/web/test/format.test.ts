@@ -7,6 +7,7 @@ import {
   documentStatusLabel,
   economicStatusMessage,
   economicTrendLabel,
+  earningLabels,
   employmentOptionLabel,
   extractionSourceLabel,
   money,
@@ -137,6 +138,9 @@ test('mantiene separados los contextos de distinta moneda dentro del mismo emple
 });
 
 test('muestra tipos y fuentes sin exponer códigos internos', () => {
+  assert.equal(earningLabels.UNKNOWN, 'Concepto sin clasificar');
+  assert.equal(earningLabels.BASIC_SALARY, 'Sueldo básico');
+  assert.equal(earningLabels.REMUNERATIVE_TOTAL, 'Total remunerativo');
   assert.equal(settlementTypeLabel('NORMAL'), 'Liquidación normal');
   assert.equal(settlementTypeLabel('SAC'), 'Aguinaldo');
   assert.equal(settlementTypeLabel('LIQUIDACION_FINAL'), 'Liquidación final');

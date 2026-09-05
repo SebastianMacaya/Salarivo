@@ -1,4 +1,4 @@
-import { formatAmount, parseAmount, roundDivide, type SalarySettlement } from "./salary-analytics.ts";
+import { formatAmount, parseAmount, roundDivide, type NormalizedEarning, type SalarySettlement } from "./salary-analytics.ts";
 
 export interface LegalRuleVersion {
   code: string;
@@ -56,6 +56,7 @@ export interface TerminationEmployment {
 export interface TerminationSalarySettlement extends SalarySettlement {
   /** Issue/payment date, when available; never the upload timestamp. */
   knownOn?: string | null;
+  earnings?: readonly (NormalizedEarning & { lineItemId?: string })[];
 }
 
 export interface TerminationInput {
@@ -75,6 +76,9 @@ export interface SalaryConceptTrace {
   amount: string;
   treatment: "INCLUDED" | "EXCLUDED" | "AVERAGED" | "REVIEW_REQUIRED";
   explanation: string;
+  lineItemId?: string;
+  /** Owner-only presentation supplied by the adapter, never used for calculation. */
+  sourceDescription?: string;
 }
 
 export interface TerminationSalaryBase {
@@ -87,6 +91,7 @@ export interface TerminationSalaryBase {
   analyzedSettlementIds: string[];
   analyzedPeriods: string[];
   missingPeriods: string[];
+  unusablePeriods: string[];
   variableAverage: { sixMonths: string | null; twelveMonths: string | null; selected: string };
   trace: SalaryConceptTrace[];
 }
@@ -280,6 +285,68 @@ const FIXED_CODES = new Set(["BASIC_SALARY", "BASICO", "SENIORITY", "ANTIGUEDAD"
 const VARIABLE_CODES = new Set(["OVERTIME", "HORAS_EXTRA", "COMMISSION", "COMISION", "MONTHLY_BONUS"]);
 const NON_MONTHLY_CODES = new Set(["SAC", "AGUINALDO", "VACATION", "VACACIONES", "ANNUAL_BONUS", "REIMBURSEMENT", "REINTEGRO", "NON_REMUNERATIVE", "NO_REMUNERATIVO", "RETROACTIVE", "RETROACTIVO"]);
 
+const salaryReviewReasons = {
+  MISSING_REMUNERATIVE_TOTAL: { explanation: "Falta el total remunerativo. Revisá Remunerativo; sólo se puede usar el bruto si el total no remunerativo está informado como cero.", fieldPaths: ["settlement.remunerativeAmount", "settlement.nonRemunerativeAmount", "settlement.grossAmount"] },
+  UNASSIGNED_NON_REMUNERATIVE: { explanation: "Hay haberes no remunerativos, pero los conceptos extraídos no conservan la separación entre haberes con y sin aportes. Los totales pueden estar correctos y aun así no alcanzar para formar la base. Compará esas columnas del PDF con los conceptos detectados.", fieldPaths: ["settlement.remunerativeAmount", "settlement.nonRemunerativeAmount"] },
+  EARNINGS_TOTAL_MISMATCH: { explanation: "La suma de los conceptos de haberes detectados no coincide con el total esperado. Compará cada importe con el PDF: puede faltar un renglón o haberse leído una unidad como importe. Corregí los totales sólo si difieren del original.", fieldPaths: ["settlement.grossAmount", "settlement.remunerativeAmount"] },
+  MISSING_EARNINGS: { explanation: "No se extrajo el detalle de haberes. Si hay un total remunerativo mensual, la estimación supone que es normal y habitual; revisá que no incluya pagos extraordinarios o variables.", fieldPaths: ["settlement.remunerativeAmount"] },
+  NEGATIVE_EARNING: { explanation: "Este concepto tiene un importe negativo. Revisá en el PDF si es un ajuste y a qué período corresponde antes de usarlo en una base mensual.", fieldPaths: [] },
+  AMBIGUOUS_BONUS: { explanation: "Este bono o premio no tiene periodicidad confirmada. Revisá si se paga mensualmente o es extraordinario; el nombre por sí solo no permite decidir si integra la base habitual.", fieldPaths: [] },
+  UNCLASSIFIED_EARNING: { explanation: "Se leyó el concepto y su importe, pero no se pudo clasificar como mensual, variable o extraordinario. Esto no significa que falte en el PDF. Revisá su descripción y periodicidad; la clasificación de conceptos todavía no se puede editar manualmente.", fieldPaths: [] },
+} as const;
+type SalaryReviewCode = keyof typeof salaryReviewReasons;
+export interface TerminationSalaryReviewIssue {
+  code: SalaryReviewCode;
+  explanation: string;
+  fieldPaths: string[];
+  lineItemIds: string[];
+  comparison?: { totalField: string; actual: string; expected: string; difference: string };
+}
+
+function earningReviewCode(earning: NormalizedEarning): SalaryReviewCode | null {
+  const code = earning.code.toUpperCase();
+  if ((money(earning.amount) ?? 0n) < 0n) return "NEGATIVE_EARNING";
+  if (code === "BONUS" && earning.isRecurring !== true) return "AMBIGUOUS_BONUS";
+  if (!NON_MONTHLY_CODES.has(code) && !VARIABLE_CODES.has(code) && !FIXED_CODES.has(code) && earning.isRecurring !== true) return "UNCLASSIFIED_EARNING";
+  return null;
+}
+
+/** Data completeness only: shared by the estimator and the current source-receipt review. */
+export function reviewTerminationSalary(settlement: Pick<TerminationSalarySettlement,
+  "settlementType" | "earnings" | "grossAmount" | "remunerativeAmount" | "nonRemunerativeAmount">): TerminationSalaryReviewIssue[] {
+  if (!["NORMAL", "HORAS_EXTRA", "OVERTIME", "COMISION", "COMMISSION"].includes(settlement.settlementType)) return [];
+  const issues: TerminationSalaryReviewIssue[] = [];
+  const add = (code: SalaryReviewCode, lineItemIds: string[] = []) => {
+    const issue: TerminationSalaryReviewIssue = { code, explanation: salaryReviewReasons[code].explanation,
+      fieldPaths: [...salaryReviewReasons[code].fieldPaths], lineItemIds };
+    issues.push(issue);
+    return issue;
+  };
+  const earnings = settlement.earnings ?? [];
+  const gross = money(settlement.grossAmount);
+  const nonRemunerative = money(settlement.nonRemunerativeAmount);
+  const remunerative = money(settlement.remunerativeAmount) ?? (nonRemunerative === 0n ? gross : null);
+  if (remunerative === null) add("MISSING_REMUNERATIVE_TOTAL");
+  if (earnings.length === 0) { add("MISSING_EARNINGS"); return issues; }
+  const lineItemIds = earnings.flatMap(item => item.lineItemId ? [item.lineItemId] : []);
+  if (nonRemunerative !== null && nonRemunerative !== 0n) add("UNASSIGNED_NON_REMUNERATIVE", lineItemIds);
+  const expected = nonRemunerative !== null && nonRemunerative !== 0n ? gross : remunerative;
+  const actual = earnings.reduce((sum, item) => sum + (money(item.amount) ?? 0n), 0n);
+  if (expected !== null && actual !== expected) {
+    add("EARNINGS_TOTAL_MISMATCH", lineItemIds).comparison = {
+      totalField: nonRemunerative !== null && nonRemunerative !== 0n ? "settlement.grossAmount" : "settlement.remunerativeAmount",
+      actual: formatAmount(actual), expected: formatAmount(expected), difference: formatAmount(actual - expected),
+    };
+  }
+  for (const earning of earnings) {
+    const code = earningReviewCode(earning);
+    if (!code) continue;
+    const issue = issues.find(issue => issue.code === code) ?? add(code);
+    if (earning.lineItemId) issue.lineItemIds.push(earning.lineItemId);
+  }
+  return issues;
+}
+
 function salaryMonths(input: TerminationInput, result: TerminationEstimate): SalaryMonth[] {
   const cutoff = input.terminationDate < input.today ? input.terminationDate : input.today;
   const start = result.inputs.startDate!;
@@ -303,8 +370,9 @@ function salaryMonths(input: TerminationInput, result: TerminationEstimate): Sal
     result.salaryBase.analyzedSettlementIds.push(settlement.id);
     const month = byPeriod.get(period) ?? { period, fixed: 0n, variables: new Map<string, bigint>(), remuneration: 0n, usable: true, projected: false };
     const extraType = !["NORMAL", "HORAS_EXTRA", "OVERTIME", "COMISION", "COMMISSION"].includes(settlement.settlementType);
-    const trace = (code: string, amount: bigint, treatment: SalaryConceptTrace["treatment"], explanation: string) =>
-      result.salaryBase.trace.push({ documentId: settlement.documentId, settlementId: settlement.id, period, code, amount: formatAmount(amount), treatment, explanation });
+    const trace = (code: string, amount: bigint, treatment: SalaryConceptTrace["treatment"], explanation: string, lineItemId?: string) =>
+      result.salaryBase.trace.push({ documentId: settlement.documentId, settlementId: settlement.id, period, code, amount: formatAmount(amount), treatment, explanation,
+        ...(lineItemId ? { lineItemId } : {}) });
     if (extraType) {
       trace(settlement.settlementType, money(settlement.remunerativeAmount ?? settlement.grossAmount) ?? 0n, "EXCLUDED", "Liquidación no mensual: no integra la base del artículo 245.");
       // SAC accrual includes remunerative extraordinary pay, except SAC itself and compensation/reimbursements.
@@ -319,17 +387,18 @@ function salaryMonths(input: TerminationInput, result: TerminationEstimate): Sal
     const nonRemunerative = money(settlement.nonRemunerativeAmount);
     const gross = money(settlement.grossAmount);
     const earnings = settlement.earnings ?? [];
+    const reviewIssues = reviewTerminationSalary(settlement);
     const earningsTotal = earnings.reduce((sum, item) => sum + (money(item.amount) ?? 0n), 0n);
     const knownRemunerative = remunerative ?? (nonRemunerative === 0n ? gross : null);
     if (knownRemunerative !== null) month.remuneration += knownRemunerative;
     if (earnings.length === 0) {
       if (knownRemunerative !== null && knownRemunerative > 0n && settlement.settlementType === "NORMAL") {
         month.fixed += knownRemunerative;
-        trace("REMUNERATIVE_TOTAL", knownRemunerative, "REVIEW_REQUIRED", "Total remunerativo mensual sin conceptos suficientes: revisar que no incluya pagos extraordinarios o variables.");
+        trace("REMUNERATIVE_TOTAL", knownRemunerative, "REVIEW_REQUIRED", salaryReviewReasons.MISSING_EARNINGS.explanation);
         result.warnings.push("Falta el detalle de conceptos de algunos recibos: se supone que su total remunerativo es mensual, normal y habitual.");
       } else {
         month.usable = false;
-        trace("MISSING_REMUNERATIVE", 0n, "REVIEW_REQUIRED", "No hay remuneración bruta clasificable. El neto nunca se utiliza.");
+        trace("MISSING_REMUNERATIVE", 0n, "REVIEW_REQUIRED", reviewIssues.map(issue => issue.explanation).join(" "));
       }
       byPeriod.set(period, month);
       continue;
@@ -343,25 +412,22 @@ function salaryMonths(input: TerminationInput, result: TerminationEstimate): Sal
     for (const earning of earnings) {
       const amount = money(earning.amount) ?? 0n;
       const code = earning.code.toUpperCase();
-      if (!completeRemunerative) { trace(code, amount, "REVIEW_REQUIRED", "El detalle no permite separar o conciliar los conceptos remunerativos."); continue; }
-      if (amount < 0n) { month.usable = false; trace(code, amount, "REVIEW_REQUIRED", "Ajuste negativo: requiere confirmar la base mensual."); continue; }
-      if (code === "BONUS" && earning.isRecurring !== true) {
-        // The parser's generic BONUS flag does not distinguish monthly awards from annual bonuses.
+      const issueCode = earningReviewCode(earning);
+      if (!completeRemunerative || issueCode) {
         month.usable = false;
-        trace(code, amount, "REVIEW_REQUIRED", "Bono o premio de un recibo mensual sin periodicidad inequívoca: requiere revisar si integra la remuneración habitual.");
-        result.warnings.push("Hay bonos o premios de recibos mensuales cuya periodicidad no está confirmada. Revisá su clasificación o ingresá una remuneración bruta para esta simulación.");
+        const explanations = reviewIssues.filter(issue => ["MISSING_REMUNERATIVE_TOTAL", "UNASSIGNED_NON_REMUNERATIVE", "EARNINGS_TOTAL_MISMATCH"].includes(issue.code)).map(issue => issue.explanation);
+        if (issueCode) explanations.push(salaryReviewReasons[issueCode].explanation);
+        trace(code, amount, "REVIEW_REQUIRED", explanations.join(" "), earning.lineItemId);
+        if (issueCode === "AMBIGUOUS_BONUS") result.warnings.push("Hay bonos o premios de recibos mensuales cuya periodicidad no está confirmada. Revisá su clasificación o ingresá una remuneración bruta para esta simulación.");
+        if (issueCode === "UNCLASSIFIED_EARNING") result.warnings.push("Hay conceptos cuya normalidad o habitualidad requiere confirmación.");
       } else if (NON_MONTHLY_CODES.has(code)) {
-        trace(code, amount, "EXCLUDED", "Concepto no mensual, no remunerativo o reintegro: excluido de la base por antigüedad.");
+        trace(code, amount, "EXCLUDED", "Concepto no mensual, no remunerativo o reintegro: excluido de la base por antigüedad.", earning.lineItemId);
       } else if (VARIABLE_CODES.has(code) || (code === "BONUS" && earning.isRecurring === true)) {
         month.variables.set(code, (month.variables.get(code) ?? 0n) + amount);
-        trace(code, amount, "INCLUDED", "Concepto variable remunerativo; su tratamiento se resuelve con la versión legal y la cobertura mensual.");
+        trace(code, amount, "INCLUDED", "Concepto variable remunerativo; su tratamiento se resuelve con la versión legal y la cobertura mensual.", earning.lineItemId);
       } else if (FIXED_CODES.has(code) || earning.isRecurring === true) {
         month.fixed += amount;
-        trace(code, amount, "INCLUDED", "Concepto remunerativo mensual recurrente incluido; la clasificación requiere revisión si no refleja el recibo.");
-      } else {
-        month.usable = false;
-        trace(code, amount, "REVIEW_REQUIRED", "Concepto sin clasificación mensual/habitual: no se fuerza una base legal.");
-        result.warnings.push("Hay conceptos cuya normalidad o habitualidad requiere confirmación.");
+        trace(code, amount, "INCLUDED", "Concepto remunerativo mensual recurrente incluido; la clasificación requiere revisión si no refleja el recibo.", earning.lineItemId);
       }
     }
     byPeriod.set(period, month);
@@ -370,11 +436,15 @@ function salaryMonths(input: TerminationInput, result: TerminationEstimate): Sal
     if (count > 1) {
       byPeriod.get(period)!.usable = false;
       result.warnings.push("Hay más de una liquidación normal en un período: resolvé la posible duplicación antes de usarla como base.");
+      for (const entry of result.salaryBase.trace.filter(entry => entry.period === period)) {
+        entry.treatment = "REVIEW_REQUIRED";
+        entry.explanation += " Hay más de una liquidación normal en este mes; revisá si son duplicados o si el tipo de liquidación es incorrecto.";
+      }
     }
   }
   result.inputs.salaryInputs = snapshot;
   result.salaryBase.analyzedDocumentIds = [...new Set(result.salaryBase.analyzedDocumentIds)];
-  result.salaryBase.analyzedPeriods = [...byPeriod.keys()].sort();
+  result.salaryBase.analyzedPeriods = [...new Set(snapshot.map(settlement => settlement.payrollPeriod.slice(0, 7)))].sort();
   return [...byPeriod.values()].sort((a, b) => a.period.localeCompare(b.period));
 }
 
@@ -386,8 +456,10 @@ function resolveSalary(input: TerminationInput, result: TerminationEstimate, mon
   const lastCompletedPeriod = monthEnd(cutoff.slice(0, 7)) === cutoff ? cutoff.slice(0, 7) : addMonths(`${cutoff.slice(0, 7)}-01`, -1).slice(0, 7);
   const expectedStart = addMonths(`${lastCompletedPeriod}-01`, -11);
   const expected = periods(expectedStart > result.inputs.startDate! ? expectedStart : result.inputs.startDate!, `${lastCompletedPeriod}-01`);
-  result.salaryBase.missingPeriods = expected.filter(period => !usable.some(month => month.period === period));
-  if (result.salaryBase.missingPeriods.length > 0) result.warnings.push("Faltan meses completos o clasificables del historial: completá recibos para revisar la mejor remuneración y los componentes variables.");
+  result.salaryBase.missingPeriods = expected.filter(period => !result.salaryBase.analyzedPeriods.includes(period));
+  result.salaryBase.unusablePeriods = expected.filter(period => result.salaryBase.analyzedPeriods.includes(period) && !usable.some(month => month.period === period));
+  if (result.salaryBase.missingPeriods.length > 0) result.warnings.push("Hay meses sin recibos aptos para analizar en esta simulación. Revisá su carga, estado, empleo y período.");
+  if (result.salaryBase.unusablePeriods.length > 0) result.warnings.push("Hay meses con recibos analizados que no permiten formar una base mensual. Revisá los motivos y conceptos indicados en cada recibo; no hace falta volver a cargar el mismo PDF.");
   if (usable.length < 6) result.warnings.push("No hay seis meses de recibos clasificables para acreditar la habitualidad de todos los conceptos.");
   if (latest && latest.period < lastCompletedPeriod) result.warnings.push("La última remuneración disponible es anterior al último mes completo: revisá si sigue vigente.");
   if (override !== undefined) {
@@ -474,7 +546,7 @@ export function calculateTerminationEstimate(input: TerminationInput,
     calculationVersion: "termination-estimate-v1", confidence: "LOW", warnings: [], assumptions: [],
     disclaimer: "Estimación informativa basada en los datos disponibles y la normativa configurada en Salarivo. El monto real puede variar según convenio, régimen, conceptos salariales, circunstancias de la desvinculación y cambios normativos.",
     salaryBase: { amount: null, currentMonthlyRemuneration: null, vacationMonthlyRemuneration: null, selectedPeriod: null,
-      source: "UNAVAILABLE", analyzedDocumentIds: [], analyzedSettlementIds: [], analyzedPeriods: [], missingPeriods: [],
+      source: "UNAVAILABLE", analyzedDocumentIds: [], analyzedSettlementIds: [], analyzedPeriods: [], missingPeriods: [], unusablePeriods: [],
       variableAverage: { sixMonths: null, twelveMonths: null, selected: "0.00" }, trace: [] }, scenarios: [],
     inputs: { employment: structuredClone(input.employment), startDate,
       startDateSource: overrides.startDate ? "SIMULATION_OVERRIDE" : input.employment.startDateSource ?? "UNKNOWN",
@@ -603,7 +675,7 @@ export function calculateTerminationEstimate(input: TerminationInput,
   });
   result.status = "AVAILABLE";
   result.warnings = [...new Set(result.warnings)];
-  const incomplete = result.salaryBase.missingPeriods.length > 0 || result.salaryBase.trace.some(entry => entry.treatment === "REVIEW_REQUIRED")
+  const incomplete = result.salaryBase.missingPeriods.length > 0 || result.salaryBase.unusablePeriods.length > 0 || result.salaryBase.trace.some(entry => entry.treatment === "REVIEW_REQUIRED")
     || inferredSac || !input.employment.countryConfirmedAt || !["CONFIRMED", "SIMULATION_OVERRIDE"].includes(result.inputs.startDateSource)
     || usableDocumentPeriods(result.salaryBase) < 6;
   result.confidence = incomplete ? "LOW" : !agreement || agreement.source === "SIMULATION_OVERRIDE" || result.inputs.isProjection || overrides.monthlyRemuneration ? "MEDIUM" : "HIGH";

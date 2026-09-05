@@ -24,7 +24,7 @@ test('layout lookup scopes country, document type and parser version before reus
   const client = { query: async (sql: string, values: unknown[]) => {
     queries++;
     assert.match(sql, /layout.country_code = \$4 AND layout.document_type = \$5 AND layout.parser_version = \$6/);
-    assert.deepEqual(values.slice(3), ['AR', 'PAYROLL', '8']);
+    assert.deepEqual(values.slice(3), ['AR', 'PAYROLL', '9']);
     return { rows: [{ id: 'version', layout_id: 'layout', version: 1, enabled: true,
       aliases: { 'settlement.basicAmount': ['Asignación fija'] } }] };
   } } as unknown as Parameters<typeof findApprovedDocumentLayout>[0];
@@ -35,6 +35,6 @@ test('layout lookup scopes country, document type and parser version before reus
   const profile = await findApprovedDocumentLayout(client, { ...input, countryCode: 'AR' });
   assert.equal(profile?.countryCode, 'AR');
   assert.equal(profile?.documentType, 'PAYROLL');
-  assert.equal(profile?.parserVersion, '8');
+  assert.equal(profile?.parserVersion, '9');
   assert.equal(queries, 1);
 });

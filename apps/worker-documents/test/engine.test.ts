@@ -561,6 +561,29 @@ test('separa descuentos del empleado de contribuciones y minimiza cada deducció
   );
 });
 
+test('no toma unidades como haberes en tablas con remunerativos separados', () => {
+  const row = (description: string, units = '', remunerative = '', nonRemunerative = '', deduction = '') =>
+    `${description.padEnd(30)}${units.padStart(8)}${remunerative.padStart(18)}${nonRemunerative.padStart(18)}${deduction.padStart(18)}`;
+  const receipt = [
+    'RECIBO DE HABERES', 'Empresa: Empresa Sintética SA', 'Período: 08/2026',
+    row('Concepto', 'Unidades', 'Remunerativos', 'No remunerativos', 'Descuentos'),
+    row('Sueldo básico', '30,00', '1.000,00'),
+    row('Asignación sintética', '4,50', '', '200,00'),
+    row('Deducción', '10,00', '', '', '100,00'),
+    row('Total', '', '1.000,00', '200,00', '100,00'),
+    'Neto a pagar $ 1.100,00',
+  ].join('\n');
+  const result = extractArgentinePayroll(receipt, 'PDF_TEXT');
+  assert.equal(result.basicAmount, '1000.00');
+  assert.deepEqual(result.lineItems.map(({ amount, itemType }) => [amount, itemType]),
+    [['1000.00', 'EARNING'], ['200.00', 'EARNING'], ['100.00', 'DEDUCTION']]);
+  const missingBasic = extractArgentinePayroll(receipt.replace(
+    row('Sueldo básico', '30,00', '1.000,00'), row('Sueldo básico', '30,00'),
+  ), 'PDF_TEXT');
+  assert.equal(missingBasic.basicAmount, null);
+  assert.equal(missingBasic.lineItems.some(({ amount }) => amount === '30.00'), false);
+});
+
 test('preserva haberes desconocidos y normaliza extraordinarios sin cambiar una liquidación normal', () => {
   const row = (description: string, remunerative = '', nonRemunerative = '', deduction = '') =>
     `${description.padEnd(38)}${remunerative.padEnd(20)}${nonRemunerative.padEnd(20)}${deduction}`;
