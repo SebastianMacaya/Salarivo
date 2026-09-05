@@ -65,7 +65,7 @@ test('reviewed layout aliases are versioned, admin-gated and reusable without an
       VALUES ($1,$2,'AR','VERIFIED','ADMIN',$3,now())`,[employerId,employerName,adminId]);
 
     const receipt = (period: string, basic: string, gross: string, deductions: string, net: string) =>
-      `RECIBO DE SUELDO\nEmpleador: ${employerName}\nCiclo liquidado: ${period}\nHaber garantizado $ ${basic}\n` +
+      `RECIBO DE SUELDO\nMoneda ARS\nEmpleador: ${employerName}\nCiclo liquidado: ${period}\nHaber garantizado $ ${basic}\n` +
       `Jubilacion $ ${deductions}\nTotal bruto $ ${gross}\nTotal descuentos $ ${deductions}\nNeto a cobrar $ ${net}`;
     const originalText = receipt('08/2026','1.000,00','1.000,00','100,00','900,00');
     const laterText = receipt('09/2026','1.500,00','1.500,00','150,00','1.350,00');
@@ -73,7 +73,7 @@ test('reviewed layout aliases are versioned, admin-gated and reusable without an
     assert.match(fingerprint, /^[a-f0-9]{64}$/);
     assert.equal(fingerprintLayout(laterText, 1), fingerprint, 'salary and date changes must not create another layout');
     const resolveLayout = (text: string, detectedEmployer: string) => database.findApprovedDocumentLayout(database.pool,
-      { employerName: detectedEmployer, fingerprint: fingerprintLayout(text, 1) });
+      { countryCode: 'AR', employerName: detectedEmployer, fingerprint: fingerprintLayout(text, 1) });
     let providerCalls = 0;
     const fallback = async () => {
       providerCalls++;
@@ -96,8 +96,9 @@ test('reviewed layout aliases are versioned, admin-gated and reusable without an
       VALUES ($1,$2,$3,$4,$5,$6,'synthetic-layout.pdf','application/pdf',2048,'CLEAN','SUPPORTED','PAYROLL','NEEDS_REVIEW','KEEP_ORIGINAL',$7)`,
     [documentId,ownerId,batchId,itemId,uploadId,`synthetic/${documentId}`,employerId]);
     await client.query(`INSERT INTO extraction_runs (id,user_id,document_id,processing_version,status,extractor_name,extractor_version,
-      parser_version,normalizer_version,detected_employer_id,layout_fingerprint,layout_fingerprint_version,pipeline_fingerprint,finished_at)
-      VALUES ($1,$2,$3,1,'REVIEW_REQUIRED','synthetic',$4,$5,'6',$6,$7,'1',$8,now())`,
+      parser_version,normalizer_version,detected_employer_id,layout_fingerprint,layout_fingerprint_version,pipeline_fingerprint,finished_at,
+      country_code,country_source,country_confidence)
+      VALUES ($1,$2,$3,1,'REVIEW_REQUIRED','synthetic',$4,$5,'6',$6,$7,'1',$8,now(),'AR','DOCUMENT_DETECTION','MEDIUM')`,
     [runId,ownerId,documentId,database.processingPipelineVersions.extractor,database.processingPipelineVersions.parser,employerId,fingerprint,database.currentPipelineFingerprint]);
     await client.query('UPDATE documents SET active_extraction_run_id=$1 WHERE id=$2',[runId,documentId]);
     await client.query(`INSERT INTO extraction_run_issues (id,user_id,document_id,extraction_run_id,code,severity,recoverable)
@@ -152,6 +153,11 @@ test('reviewed layout aliases are versioned, admin-gated and reusable without an
     assert.equal(await reprocessing.countReprocessingCandidates(database.pool,otherOwnerId),0);
     const profile = await resolveLayout(laterText,employerName);
     assert.ok(profile);
+    assert.equal(profile.countryCode,'AR');
+    assert.equal(profile.documentType,'PAYROLL');
+    assert.equal(profile.parserVersion,database.processingPipelineVersions.parser);
+    assert.equal(await database.findApprovedDocumentLayout(database.pool,
+      {countryCode:'US',employerName,fingerprint}),null);
     assert.deepEqual(profile.aliases,aliases);
     const namesakeId = randomUUID();
     await client.query(`INSERT INTO employers (id,name,country_code,status,created_source,created_by_user_id)
@@ -188,10 +194,14 @@ test('reviewed layout aliases are versioned, admin-gated and reusable without an
     // Another unsupported field can still require review after applying the approved aliases.
     assert.equal(await worker.persistExtraction(claimed.job,engine.classifyPayrollText(laterText),later.extraction,'PDF_TEXT',false,1,
       {layout:later.layout,issues:['UNKNOWN_LAYOUT']}),'NEEDS_REVIEW');
-    const attempted = (await client.query(`SELECT status,document_layout_version_id FROM extraction_runs
+    const attempted = (await client.query(`SELECT status,document_layout_version_id,country_code,country_source FROM extraction_runs
       WHERE document_id=$1 AND processing_version=$2`,[documentId,queued.job.processingVersion])).rows[0];
     assert.equal(attempted.status,'REVIEW_REQUIRED');
     assert.equal(attempted.document_layout_version_id,profile.id);
+    assert.equal(attempted.country_code,'AR');
+    assert.equal(attempted.country_source,'DOCUMENT_DETECTION');
+    assert.equal((await client.query('SELECT country_code FROM documents WHERE id=$1',[documentId])).rows[0].country_code,null,
+      'reprocessing cannot populate a historical document snapshot silently');
     assert.equal((await client.query('SELECT active_extraction_run_id FROM documents WHERE id=$1',[documentId])).rows[0].active_extraction_run_id,runId);
     assert.deepEqual((await client.query('SELECT corrected_value FROM user_corrections WHERE id=$1',[correctionId])).rows[0].corrected_value,correction.corrected_value);
     await client.query('UPDATE processing_jobs SET execution_owner=NULL WHERE id=$1',[queued.job.id]);
@@ -228,6 +238,92 @@ test('reviewed layout aliases are versioned, admin-gated and reusable without an
       WHERE run.document_id=$1 AND run.processing_version=$2 AND issue.code='LAYOUT_APPROVAL_CHANGED'`,
     [documentId,queuedAgain.job.processingVersion])).rows[0].count,1);
     assert.equal(providerCalls,callsBeforeKnownLayout,'all layout registry and recovery checks must remain offline');
+    await client.query('UPDATE processing_jobs SET execution_owner=NULL WHERE id=$1',[queuedAgain.job.id]);
+    // A selected run may never replace the preserved document jurisdiction, including admin rollback.
+    await client.query(`UPDATE documents SET country_code='AR',country_source='DOCUMENT_DETECTION',
+      country_confidence='MEDIUM',country_snapshot_at=now() WHERE id=$1`,[documentId]);
+    const foreignRunId = randomUUID();
+    await client.query(`INSERT INTO extraction_runs (id,user_id,document_id,processing_version,status,extractor_name,
+      extractor_version,parser_version,normalizer_version,pipeline_fingerprint,country_code,country_source,country_confidence,finished_at)
+      VALUES ($1,$2,$3,100,'COMPLETED','synthetic',$4,$5,'6',$6,'US','EMPLOYMENT_CONFIRMED','HIGH',now())`,
+    [foreignRunId,ownerId,documentId,database.processingPipelineVersions.extractor,database.processingPipelineVersions.parser,database.currentPipelineFingerprint]);
+    await assert.rejects(database.withTransaction((db) => reprocessing.promoteProcessingRun(db,
+      {userId:ownerId,documentId,runId:foreignRunId,expectedActiveRunId:runId,decision:'PROMOTE'},ApiError)),
+    /COUNTRY_REVIEW_REQUIRED/);
+    const preserved = (await client.query('SELECT country_code,active_extraction_run_id FROM documents WHERE id=$1',[documentId])).rows[0];
+    assert.equal(preserved.country_code,'AR');
+    assert.equal(preserved.active_extraction_run_id,runId);
+    const employmentId = randomUUID();
+    await client.query(`INSERT INTO employments (id,user_id,employer_id,status,start_date,country_code,currency_code,
+      country_source,country_confidence,country_confirmed_at)
+      VALUES ($1,$2,$3,'UNKNOWN','2026-01-01','AR','ARS','USER_CONFIRMED','HIGH',now())`,[employmentId,ownerId,employerId]);
+    const unresolvedRunId = randomUUID();
+    await client.query(`INSERT INTO extraction_runs (id,user_id,document_id,processing_version,status,extractor_name,
+      extractor_version,parser_version,normalizer_version,pipeline_fingerprint,finished_at)
+      VALUES ($1,$2,$3,101,'REVIEW_REQUIRED','synthetic',$4,$5,'6',$6,now())`,
+    [unresolvedRunId,ownerId,documentId,database.processingPipelineVersions.extractor,database.processingPipelineVersions.parser,database.currentPipelineFingerprint]);
+    await client.query(`INSERT INTO extraction_run_issues (id,user_id,document_id,extraction_run_id,code,severity,recoverable)
+      VALUES ($1,$2,$3,$4,'COUNTRY_UNCONFIRMED','ERROR',true)`,[randomUUID(),ownerId,documentId,unresolvedRunId]);
+    await client.query('UPDATE documents SET active_extraction_run_id=$1,employment_id=$2 WHERE id=$3',[unresolvedRunId,employmentId,documentId]);
+    assert.equal(await reprocessing.countReprocessingCandidates(database.pool,ownerId),1,'confirmed employment unlocks country recovery');
+    assert.equal((await reprocessing.findReprocessingCandidates(database.pool,ownerId)).length,1);
+    assert.equal(await reprocessing.countReprocessingCandidates(database.pool,otherOwnerId),0);
+    const recovery = await enqueue();
+    await client.query("UPDATE processing_jobs SET state='PUBLISHED' WHERE id=$1",[recovery.job.id]);
+    const recoveryClaim = await worker.claimJob(recovery.job.id,'synthetic-country-worker',worker.loadConfig());
+    assert.ok(recoveryClaim);
+    const recoverableText = laterText.replace('Moneda ARS\n','').replace('Ciclo liquidado','Período').replace('Haber garantizado','Sueldo básico');
+    const recovered = await orchestrator.orchestrateExtraction({text:recoverableText,evidence:[],source:'PDF_TEXT'},
+      {countryContext:{confirmedEmploymentCountryCode:'AR',snapshot:{countryCode:'AR',source:'DOCUMENT_DETECTION',confidence:'MEDIUM'}}});
+    assert.equal(await worker.persistExtraction(recoveryClaim.job,engine.classifyPayrollText(recoverableText),recovered.extraction,
+      'PDF_TEXT',false,1,{country:recovered.country,issues:recovered.issues,layout:recovered.layout}),'COMPLETED');
+    const recoveredRun = (await client.query('SELECT id,country_code,country_source,promotion_outcome FROM extraction_runs WHERE document_id=$1 AND processing_version=$2',
+      [documentId,recovery.job.processingVersion])).rows[0];
+    assert.equal(recoveredRun.country_code,'AR');
+    assert.equal(recoveredRun.country_source,'EMPLOYMENT_CONFIRMED');
+    await client.query('UPDATE processing_jobs SET execution_owner=NULL WHERE id=$1',[recovery.job.id]);
+    if (recoveredRun.promotion_outcome !== 'PROMOTED') {
+      await database.withTransaction((db) => reprocessing.promoteProcessingRun(db,
+        {userId:ownerId,documentId,runId:recoveredRun.id,expectedActiveRunId:unresolvedRunId,decision:'PROMOTE'},ApiError));
+    }
+    const recoveredDocument = (await client.query('SELECT country_code,country_source,employment_id FROM documents WHERE id=$1',[documentId])).rows[0];
+    assert.equal(recoveredDocument.country_code,'AR');
+    assert.equal(recoveredDocument.country_source,'DOCUMENT_DETECTION','reprocessing preserves the snapshot provenance');
+    assert.equal(recoveredDocument.employment_id,employmentId);
+    assert.equal((await client.query('SELECT active_extraction_run_id FROM documents WHERE id=$1',[documentId])).rows[0].active_extraction_run_id,recoveredRun.id);
+    assert.equal((await client.query("SELECT count(*)::integer AS count FROM extraction_run_issues WHERE extraction_run_id=$1 AND code='COUNTRY_UNCONFIRMED'",[unresolvedRunId])).rows[0].count,1,
+      'country recovery preserves the earlier issue for audit');
+    await client.query("UPDATE documents SET country_source='USER_CONFIRMED',country_confidence='HIGH',country_snapshot_at=now() WHERE id=$1",[documentId]);
+    for (const [index, confirmedCountry] of ['AR','US'].entries()) {
+      await client.query('UPDATE employments SET country_code=$2 WHERE id=$1',[employmentId,confirmedCountry]);
+      const correctionJobId = randomUUID();
+      await client.query(`INSERT INTO processing_jobs (id,user_id,document_id,stage,processing_version,idempotency_key,
+        state,attempt,lease_owner,execution_owner,lease_expires_at,trigger_kind,previous_document_status,base_extraction_run_id,pipeline_fingerprint)
+        VALUES ($1::uuid,$2,$3,'DOCUMENT_PIPELINE_V2',$4,$1::text,'RUNNING',1,'synthetic-country-worker','synthetic-country-worker',
+          now()+interval '5 minutes','USER_REPROCESS','COMPLETED',$5,$6)`,
+      [correctionJobId,ownerId,documentId,recovery.job.processingVersion+index+1,recoveredRun.id,database.currentPipelineFingerprint]);
+      const correctionJob = (await client.query('SELECT * FROM processing_jobs WHERE id=$1',[correctionJobId])).rows[0];
+      const contradictoryText = `${recoverableText}\nPaís: ES`;
+      const corrected = await orchestrator.orchestrateExtraction({text:contradictoryText,evidence:[],source:'PDF_TEXT'},
+        {countryContext:{confirmedEmploymentCountryCode:confirmedCountry,snapshot:{countryCode:'AR',source:'USER_CONFIRMED',confidence:'HIGH'}}});
+      assert.equal(await worker.persistExtraction(correctionJob,engine.classifyPayrollText(contradictoryText),corrected.extraction,
+        'PDF_TEXT',false,1,{country:corrected.country,issues:corrected.issues,layout:corrected.layout}),confirmedCountry==='AR'?'COMPLETED':'NEEDS_REVIEW');
+      const countryRun = (await client.query('SELECT id,country_code,country_source,promotion_outcome FROM extraction_runs WHERE document_id=$1 AND processing_version=$2',
+        [documentId,correctionJob.processing_version])).rows[0];
+      const countryIssues = (await client.query('SELECT code,severity,metadata_no_sensitive FROM extraction_run_issues WHERE extraction_run_id=$1 AND code LIKE \'COUNTRY_%\'',[countryRun.id])).rows;
+      if (confirmedCountry==='AR') {
+        assert.equal(countryRun.country_source,'USER_CONFIRMED');
+        assert.notEqual(countryRun.promotion_outcome,'REJECTED_REGRESSION','an informative country observation is not a regression');
+        assert.deepEqual(countryIssues,[{code:'COUNTRY_DETECTION_OVERRIDDEN',severity:'INFO',metadata_no_sensitive:{
+          detectedCountryCode:'ES',confirmedEmploymentCountryCode:'AR',snapshotCountryCode:'AR'}}]);
+      } else {
+        assert.ok(countryIssues.some(({code})=>code==='COUNTRY_EMPLOYMENT_CONFLICT'));
+        assert.equal((await client.query('SELECT count(*)::integer AS count FROM payroll_settlements WHERE extraction_run_id=$1',[countryRun.id])).rows[0].count,0);
+      }
+      assert.deepEqual((await client.query('SELECT country_code,country_source,employment_id FROM documents WHERE id=$1',[documentId])).rows[0],
+        {country_code:'AR',country_source:'USER_CONFIRMED',employment_id:employmentId});
+      await client.query('UPDATE processing_jobs SET execution_owner=NULL WHERE id=$1',[correctionJobId]);
+    }
   } finally {
     process.env.DATABASE_URL = databaseUrl;
     await app?.close();

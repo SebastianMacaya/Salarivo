@@ -33,6 +33,7 @@ export {
   compareProcessingSnapshots,
   criticalFieldsBySettlementType,
   currentPipelineFingerprint,
+  hasDocumentCountryRecoverySql,
   extractionRunStatuses,
   parserFixCatalog,
   processingPipelineVersions,

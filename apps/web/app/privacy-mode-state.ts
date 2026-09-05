@@ -29,11 +29,12 @@ export function privateMoney(
   enabled = false,
   kind: MoneyValueKind = 'default',
   creditAware = false,
+  locale = 'es-AR',
 ) {
   if (!value) return kind === 'salary' ? 'N/D' : '—';
   const credit = creditAware && value.startsWith('-');
   const amount = credit ? value.slice(1) : value;
-  const rendered = enabled ? `${currency} ${MONEY_MASK}` : money(amount, currency);
+  const rendered = enabled ? `${currency} ${MONEY_MASK}` : money(amount, currency, locale);
   return credit ? `Crédito ${rendered}` : rendered;
 }
 

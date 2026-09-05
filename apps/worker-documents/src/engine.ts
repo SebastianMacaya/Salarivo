@@ -1,10 +1,12 @@
 import { validateLayoutAliases, type LayoutAliases } from '@salarivo/database/document-layouts';
+import { detectDocumentCountry, type DocumentCountry } from './document-country.ts';
 
 export type FieldSource = 'PDF_TEXT' | 'OCR' | 'RULE';
 
 export type MissingFieldReason = 'VALUE_NOT_INTERPRETABLE' | 'LABEL_OR_LAYOUT_NOT_RECOGNIZED';
 
 export type Classification = {
+  country?: DocumentCountry;
   confidence: number;
   decision: 'SUPPORTED' | 'NEEDS_CONFIRMATION' | 'UNSUPPORTED';
   documentType: 'PAYROLL' | 'UNKNOWN';
@@ -503,7 +505,7 @@ export function classifyPayrollText(text: string, lowThreshold = 0.2, highThresh
     : confidence <= lowThreshold
       ? 'UNSUPPORTED'
       : 'NEEDS_CONFIRMATION';
-  return { confidence, decision, documentType: decision === 'SUPPORTED' ? 'PAYROLL' : 'UNKNOWN', signals };
+  return { confidence, country: detectDocumentCountry(text), decision, documentType: decision === 'SUPPORTED' ? 'PAYROLL' : 'UNKNOWN', signals };
 }
 
 function extractPeriod(text: string): { raw: string; value: string } | null {

@@ -85,6 +85,9 @@ export function analysisPresentation(analysis: DocumentAnalysis) {
   if (analysis.reprocess.inProgress || ['RUNNING', 'PROCESSING'].includes(analysis.status)) {
     return { tone: 'pending', title: 'Buscando una mejora', body: 'La versión activa sigue disponible mientras analizamos y comparamos el nuevo resultado.' };
   }
+  if (analysis.issues.some((issue) => issue.code.startsWith('COUNTRY_'))) {
+    return { tone: 'warning', title: 'Jurisdicción para revisar', body: 'Revisá el país del empleo y la asociación del documento antes de volver a analizarlo.' };
+  }
   if (analysis.status === 'FAILED' || analysis.reprocess.latestOutcome === 'FAILED') {
     return { tone: 'danger', title: 'La mejora no pudo completarse', body: analysis.activeRunId ? 'Conservamos intacta la versión que ya estaba activa.' : 'El intento falló sin reemplazar ningún resultado anterior.' };
   }
@@ -117,7 +120,14 @@ export function analysisPresentation(analysis: DocumentAnalysis) {
   return { tone: 'ready', title: 'Análisis completo', body: 'Este es el resultado activo del documento.' };
 }
 
-export function issueLabel(issue: Pick<ProcessingIssue, 'affectedFieldPath' | 'message'>) {
+export function issueLabel(issue: Pick<ProcessingIssue, 'affectedFieldPath' | 'message'> & { code?: string }) {
+  const countryMessage = ({
+    COUNTRY_UNCONFIRMED: 'Confirmá el país del empleo y asociá este documento.',
+    COUNTRY_EMPLOYMENT_CONFLICT: 'El país detectado difiere del empleo; revisá la asociación.',
+    COUNTRY_SNAPSHOT_CONFLICT: 'El país detectado difiere del país histórico del documento; revisá la asociación.',
+    COUNTRY_NOT_SUPPORTED: 'Todavía no hay un analizador salarial compatible con el país de este documento.',
+  } as Record<string, string>)[issue.code ?? ''];
+  if (countryMessage) return countryMessage;
   if (issue.message) return issue.message;
   if (issue.affectedFieldPath === 'settlement.basicAmount') return 'No pudimos identificar el sueldo básico de este recibo.';
   return 'Hay un dato del recibo que no pudimos identificar.';

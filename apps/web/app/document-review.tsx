@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { countryName } from '@salarivo/jurisdictions';
+import { CountrySelect } from './country-select';
 import { evidenceIdForPage, extractionRunChanged, reviewValueChanged } from './document-evidence';
 import { DocumentViewer } from './document-viewer';
 import { documentStatusLabel, periodLabel, settlementTypeLabel, timestampLabel } from './format';
@@ -38,6 +40,10 @@ export type DocumentDetail = {
   analysis?: DocumentAnalysis;
   classificationStatus: string | null;
   confidence: string | null;
+  countryCode?: string | null;
+  countrySource?: string | null;
+  countryConfidence?: string | null;
+  countrySnapshotAt?: string | null;
   createdAt: string;
   declaredMimeType: string;
   detectedMimeType: string | null;
@@ -192,6 +198,7 @@ export function DocumentReview({
   onClose,
   onCompleteReview,
   onConfirmType,
+  onConfirmCountry,
   onDeleteDocument,
   onDeleteOriginal,
   onDownload,
@@ -223,6 +230,7 @@ export function DocumentReview({
   onClose: () => void;
   onCompleteReview: (acceptDeductionsMismatch: boolean, extractionRunId: string) => Promise<void>;
   onConfirmType: (type: 'PAYROLL' | 'UNSUPPORTED') => Promise<void>;
+  onConfirmCountry: (countryCode: string, extractionRunId: string, expectedCountryCode: string | null) => Promise<void>;
   onDeleteDocument: () => Promise<void>;
   onDeleteOriginal: () => Promise<void>;
   onDownload: () => Promise<void>;
@@ -255,6 +263,9 @@ export function DocumentReview({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [feedbackDraft, setFeedbackDraft] = useState(detail.unsupportedFeedback ?? '');
+  const [countryDraft, setCountryDraft] = useState<{ code: string; runId: string | null; expected: string | null } | null>(null);
+  const [countryReset, setCountryReset] = useState(0);
+  const [countryNotice, setCountryNotice] = useState('');
   const pendingMobileFocus = useRef<'data' | 'document' | null>(null);
 
   const changes = useMemo(() => detail.extractedFields.flatMap((field) => {
@@ -268,10 +279,12 @@ export function DocumentReview({
     isMonetaryField(field.fieldPath) || isSalaryPercentageField(field.fieldPath)
   ));
   const feedbackDirty = feedbackDraft.trim() !== (detail.unsupportedFeedback ?? '');
-  const dirty = correctionsDirty || feedbackDirty;
+  const countryDirty = countryDraft !== null && countryDraft.code !== (detail.countryCode ?? '');
+  const dirty = correctionsDirty || feedbackDirty || countryDirty;
   const currentRunId = detail.extractionRun?.id ?? null;
   const acceptMismatch = acceptedMismatchRunId === currentRunId;
   const editingStale = editing && extractionRunChanged(editingRunId, currentRunId);
+  const countryStale = countryDraft !== null && (countryDraft.runId !== currentRunId || countryDraft.expected !== (detail.countryCode ?? null));
   const missing = detail.extractedFields.filter((field) => field.source === 'MANUAL_REQUIRED' && !savedValue(field));
   const analysis = detail.analysis;
   const analysisCopy = analysis ? analysisPresentation(analysis) : null;
@@ -412,6 +425,30 @@ export function DocumentReview({
               {(analysis.reprocess.available || analysis.reprocess.retryAvailable || analysis.reprocess.inProgress) && <p className={styles.preserved}>{analysis.activeRunId ? 'Tu análisis activo no se pierde durante el reprocesamiento.' : 'El reintento crea una versión nueva sin borrar el historial técnico.'}</p>}
               {(analysis.reprocess.available || analysis.reprocess.retryAvailable) && <button type="button" disabled={busy || dirty || analysis.reprocess.inProgress} onClick={() => void run(() => onReprocess(analysis.reprocess.retryAvailable === true))}>{busy ? 'Iniciando…' : analysis.reprocess.retryAvailable ? 'Reintentar análisis' : 'Buscar mejora'}</button>}
             </section>}
+
+            <details className={`${styles.section} ${styles.countrySection}`} open={Boolean(countryNotice) || !detail.countryCode || analysis?.issues.some((issue) => issue.code.startsWith('COUNTRY_'))}>
+              <summary>País del documento · {detail.countryCode ? countryName(detail.countryCode) : 'Sin confirmar'}</summary>
+              <p>{detail.countrySource === 'USER_CONFIRMED' ? 'Confirmado por vos' : detail.countrySource === 'EMPLOYMENT_CONFIRMED' ? 'Heredado del empleo confirmado' : 'País detectado o pendiente de revisión'}{detail.countrySnapshotAt ? ` · ${timestampLabel(detail.countrySnapshotAt)}` : ''}.</p>
+              {detail.countryConfidence && <p>Confianza de la clasificación: {({ HIGH: 'alta', MEDIUM: 'media', LOW: 'baja' } as Record<string, string>)[detail.countryConfidence] ?? 'sin evaluar'}.</p>}
+              <p>La confirmación cambia sólo el país de este documento y conserva su historial. No modifica el empleo, el PDF ni los datos de la extracción. Si está asociado a un empleo, el país debe coincidir con su jurisdicción confirmada.</p>
+              <form className="stack-form" onSubmit={(event) => {
+                event.preventDefault();
+                const code = String(new FormData(event.currentTarget).get('documentCountryCode') ?? '');
+                const runId = countryDraft?.runId ?? currentRunId;
+                if (!runId || !code || countryStale || busy || !canEdit || correctionsDirty || feedbackDirty || analysis?.reprocess.inProgress) return;
+                void run(async () => {
+                  await onConfirmCountry(code, runId, countryDraft ? countryDraft.expected : detail.countryCode ?? null);
+                  setCountryDraft(null); setCountryReset((value) => value + 1);
+                  setCountryNotice('País del documento confirmado. Podés volver a analizarlo cuando la acción esté disponible.');
+                });
+              }}>
+                <CountrySelect key={`${detail.countryCode}-${detail.countrySnapshotAt}-${countryReset}`} name="documentCountryCode" label="País del documento" initialValue={detail.countryCode ?? ''} required disabled={busy || !canEdit || analysis?.reprocess.inProgress} onChange={(code) => { setCountryNotice(''); setCountryDraft((previous) => ({ code, runId: previous?.runId ?? currentRunId, expected: previous ? previous.expected : detail.countryCode ?? null })); }} />
+                {countryStale && <p className={styles.error} role="alert">El documento cambió durante la edición. Cancelá y revisá la jurisdicción actual antes de confirmar.</p>}
+                {countryNotice && <p role="status">{countryNotice}</p>}
+                {!canEdit && <small>La confirmación estará disponible cuando termine el análisis y exista una extracción activa.</small>}
+                <div className={styles.editActions}><button type="submit" disabled={busy || !canEdit || countryStale || correctionsDirty || feedbackDirty || analysis?.reprocess.inProgress}>{busy ? 'Confirmando…' : 'Confirmar país'}</button>{countryDraft && <button type="button" disabled={busy} onClick={() => { setCountryDraft(null); setCountryReset((value) => value + 1); setCountryNotice(''); }}>Cancelar país</button>}</div>
+              </form>
+            </details>
 
             {detail.processingStatus === 'NEEDS_TYPE_CONFIRMATION' && <section className={styles.callout}><h3>¿Es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente.</p><div><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('PAYROLL'))}>Sí, continuar</button><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('UNSUPPORTED'))}>No corresponde</button></div></section>}
             {unsupported && <section className={styles.callout}><h3>Tipo de documento no soportado</h3><p>{unsupportedReason} El PDF original se elimina automáticamente; conservamos esta ficha mínima.</p><form className={styles.feedback} onSubmit={(event) => { event.preventDefault(); void run(async () => setFeedbackDraft(await onSaveUnsupportedFeedback(feedbackDraft) ?? '')); }}><label htmlFor="unsupported-feedback">¿Qué tipo de archivo es y por qué te serviría?</label><textarea id="unsupported-feedback" maxLength={500} value={feedbackDraft} onChange={(event) => setFeedbackDraft(event.target.value)} placeholder="Ej.: certificado laboral; me serviría para completar fechas del empleo." /><small>No incluyas salarios, DNI/CUIL ni otros datos personales.</small><button type="submit" disabled={busy || !feedbackDirty}>{busy ? 'Guardando…' : detail.unsupportedFeedback ? 'Actualizar feedback' : 'Enviar feedback'}</button></form></section>}

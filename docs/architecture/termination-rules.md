@@ -1,0 +1,60 @@
+# Jurisdicción y cálculo de desvinculación
+
+Estado: implementado en `apps/api/src/termination-calculator.ts`, verificado con fixtures sintéticos. No acredita despliegue ni dictamen profesional. Revisión de fuentes: 2026-09-05.
+
+## Contrato y alcance efectivo
+
+`calculateTerminationEstimate` recibe exclusivamente un empleo, fecha civil de egreso, fecha de referencia explícita, liquidaciones normalizadas y overrides. Devuelve dos escenarios completos, ocho conceptos con importes decimales, supuestos, cobertura, trazabilidad por concepto, versión legal y snapshot de entradas. Reutiliza los helpers exactos de analytics: centavos `BigInt`, redondeo half-up al centavo por línea y suma exacta de las líneas mostradas. No importa ORM, consulta PDFs ni utiliza IA, red, reloj implícito o storage.
+
+El resolver exige país, régimen explícito, moneda y fecha compatibles. Sólo `AR` / `ARS` / `AR_LCT_GENERAL`, mensualizado por tiempo indeterminado, despido sin causa, desde 2023-01-01. Una subdivisión argentina conserva su identidad como contexto; estas reglas nacionales no modelan divergencias judiciales provinciales. Otro país, régimen, moneda, causa o fecha anterior devuelve `UNSUPPORTED`, sin totales. La falta de ingreso, base o información necesaria devuelve `UNAVAILABLE`. Un recibo no confirma continuidad laboral ni convierte automáticamente un empleo en régimen LCT.
+
+El modelo mantiene requerimiento y cumplimiento de preaviso separados. Esta UI compara cumplimiento completo con omisión total, ambos para la misma fecha efectiva de egreso. El contrato permite agregar modalidades futuras sin introducir fórmulas nacionales en endpoints o React. La implementación actual no calcula preaviso parcialmente cumplido.
+
+## Fuentes y versiones
+
+| Versión de AR_LCT_GENERAL | Intervalo configurado | Diferencias verificadas |
+| --- | --- | --- |
+| `2023-01-01` | 2023-01-01 a 2024-07-08 | Prueba de tres meses; preaviso de 15 días durante prueba. Mejor mes normal/habitual, mínimo total equivalente a una base sin tope. |
+| `2024-07-09` | 2024-07-09 a 2026-03-05 | Prueba general de seis meses para nuevas contrataciones desde 09/07/2024; posibles extensiones CCT. Conserva los 15 días de preaviso en prueba y la base histórica. |
+| `2026-03-06` | Desde 2026-03-06, con intervalo cautelar indicado abajo | Sin preaviso legal en prueba; variables habituales con promedio 6/12 más favorable, exclusión de pagos no mensuales y piso legal del 67%. Mínimo de un mes de la base conforme al sistema nuevo. |
+
+La [Ley 25.877, arts. 2–5](https://www.argentina.gob.ar/normativa/nacional/ley-25877-93595/texto) conserva el texto histórico de prueba, preaviso, integración y art. 245; no se reconstruye diciembre de 2024 a partir del texto consolidado de 2026. La [Ley 27.742, arts. 91, 96 y 237](https://www.argentina.gob.ar/normativa/nacional/ley-27742-401266/texto) y el [Decreto 847/2024, anexo II, art. 4](https://www.argentina.gob.ar/normativa/nacional/decreto-847-2024-404509/texto) distinguen fecha de vigencia y fecha de contratación. Una contratación anterior mantiene el plazo previo.
+
+La [Ley 27.802, arts. 48, 51 y 217](https://www.argentina.gob.ar/normativa/nacional/ley-27802-423680/texto), publicada el 06/03/2026, modifica las bases y el preaviso. El [texto actualizado oficial de LCT](https://www.argentina.gob.ar/normativa/nacional/ley-20744-25552/actualizacion) permite revisar el régimen general vigente y las remisiones. La aplicación histórica del piso se basa en [CSJN, Vizzoti, Fallos 327:3677](https://sj.csjn.gov.ar/homeSJ/suplementos/suplemento/67/documento); desde marzo de 2026 existe además texto legal explícito.
+
+La cautelar del 30/03/2026 afectó, entre otros, los arts. 48 y 51 de la reforma: [BO 06/04/2026, sección segunda, páginas 81–89](https://otslist.boletinoficial.gob.ar/ots/download/02e1923e56b278dee85803d3e8dfc8e8c9030e1f321c21363f00455b314fb60c/0/). La [sentencia de CNAT Sala VIII del 23/04/2026](https://abogados.com.ar/archivos/2026-04-23-041426-rescamara.pdf), expediente CNT 10308/2026/1/CA1-RH1, otorgó efecto suspensivo al recurso contra aquella medida. Es una copia del fallo primario firmada por González, Pesino y Guardia, republicada por un sitio jurídico; no es un artículo de opinión. El motor devuelve `UNAVAILABLE` entre el 30/03 y el 22/04 inclusive, conservando motivo y fuentes. Fuera de ese intervalo usa el texto estatutario publicado; esto no declara resuelta la constitucionalidad ni determina efectos de medidas particulares sobre una persona.
+
+El Fondo de Asistencia Laboral no sustituye automáticamente la indemnización del trabajador. Su entrada en vigencia se prorrogó al 01/11/2026: [Decreto 408/2026, art. 27](https://www.argentina.gob.ar/normativa/nacional/decreto-408-2026-426272/texto). Un convenio que declara sustitución por fondo/sistema de cese devuelve `UNSUPPORTED` hasta implementar sus reglas. Casas particulares, construcción, agrarios, sector público, temporadas, pagos por hora y otros regímenes especiales tampoco utilizan esta fórmula.
+
+## Base salarial y datos históricos
+
+- El adaptador SQL aplica ownership, empleo, moneda, documento vigente y limpio, y corrida activa de documentos `COMPLETED`. El motor repite empleo/moneda y selecciona sólo períodos completos hasta `min(today, terminationDate)`, con fecha de conocimiento compatible. No usa el timestamp de upload ni lee netos o deducciones.
+- La base observa los últimos doce meses completos hasta el egreso. El salario del mes en curso se proyecta desde el último mes completo conocido. La fecha futura proyecta meses con la última remuneración; los recibos correspondientes al futuro permanecen excluidos aunque estén cargados. No predice inflación, aumentos ni leyes no publicadas.
+- Básico, antigüedad, presentismo y adicionales recurrentes entran como conceptos fijos. Horas extra, comisiones y premios mensuales son variables. SAC, vacaciones, bono anual, reintegros y retroactivos no se convierten en remuneración mensual habitual. Cada decisión conserva documento, liquidación, período, código, monto y motivo.
+- Los conceptos deben conciliar con el total remunerativo y permitir una atribución inequívoca. Mezclas remunerativas/no remunerativas sin atribución por línea, conceptos desconocidos, ajustes negativos o dos liquidaciones normales distintas del mismo mes requieren revisión; no se suman silenciosamente. Un `BONUS` genérico sin recurrencia confirmada dentro de un recibo mensual también invalida ese mes y requiere revisión: el parser no distingue con ese código un premio mensual de un bono anual. `ANNUAL_BONUS` explícito o una liquidación separada `BONO` conservan su exclusión de la base mensual. Si existe solamente total remunerativo de una liquidación normal, puede estimarse suponiendo naturaleza mensual/habitual, siempre con mensaje específico y calidad `LOW`.
+- Desde 2026, la recurrencia de los conceptos fijos es una hipótesis revisable sustentada en la clasificación normalizada. Los variables necesitan al menos seis meses observados/proyectados dentro de la ventana anual. Se usa el mayor promedio de seis o doce meses, incluyendo ceros de meses presentes donde el concepto no aparece. Un mes ausente no se inventa como cero: la cobertura incompleta baja calidad y se declara. La expresión legal «último año calendario» se interpreta aquí como ventana móvil anual hasta el egreso; otro criterio exige nueva versión de cálculo revisada.
+- Se separan mejor base para antigüedad, última remuneración para sueldo/preaviso/integración y base de vacaciones (fijo vigente más promedio variable favorable del año o seis meses). El tope nunca reduce los restantes conceptos.
+
+## Liquidación y supuestos explícitos
+
+Antigüedad cuenta aniversarios civiles y agrega un mes indemnizatorio sólo ante fracción estrictamente mayor de tres meses. El mínimo histórico total no usa el tope; el texto 2026 usa la base de su sistema. El tope aplicado es un importe ya calculado, no el promedio CCT: no se multiplica nuevamente por tres.
+
+Preaviso general: un mes hasta cinco años inclusive, dos después; la excepción de prueba depende de versión legal. No se integra el mes si hubo preaviso completo, si el egreso fue el último día o durante prueba válida. Un CCT validado puede mejorar duración o vacaciones y ampliar prueba cuando también existe un tamaño de empresa compatible.
+
+Salario e integración prorratean días calendario reales del mes; es una convención de esta estimación y se informa, sin presentar el divisor como texto literal de ley. SAC proporcional usa doceava parte de remuneraciones devengadas del semestre conforme art. 123 y descuenta el importe informado como ya pagado. Si faltan meses se declara la hipótesis de remuneración constante; los pagos remunerativos extraordinarios conocidos pueden integrar ese devengamiento aunque estén excluidos de antigüedad.
+
+Vacaciones usa derecho anual 14/21/28/35 según antigüedad civil al 31/12, proporción de días de servicio del año, divisor 25, menos días gozados y más saldo anterior indicado. Los promedios variables siguen art. 155. No hay datos de ausencias, calendario real de días trabajados, licencias o saldos previos: la respuesta explicita ese límite y permite override de días.
+
+Se muestra incidencia de SAC sobre preaviso e integración como criterio indemnizatorio de remuneración frustrada. Un ejemplo judicial primario que lo aplica es [CNAT, sentencia publicada por CIJ](https://www.cij.gov.ar/blog/d/sentencia-SGU-cd1502d6-2b4e-448f-a349-34c22a9a97b5.pdf). Su alcance no es universal para todas las jurisdicciones. No se suma SAC a vacaciones indemnizadas; la respuesta informa que su procedencia puede depender del criterio judicial. Los resultados son brutos, suponen pendiente el sueldo del mes y excluyen agravantes, tutela especial, multas, intereses y deudas anteriores. No sustituyen un balance final de pagos ya realizados.
+
+## Convenios, calidad y reproducción
+
+El catálogo `COLLECTIVE_AGREEMENT_VERSIONS` está vacío: no se publicaron topes ficticios ni se considera conocido un CCT por leer un nombre en OCR. Puede incorporarse un catálogo revisado con código, versión, categoría, importe, vigencia y fuente. La coincidencia debe ser única y vigente; cero o varias coincidencias mantienen la estimación sin tope confirmado.
+
+El usuario puede proporcionar ese mismo snapshot como override. Se valida el formato y la coherencia, no la autenticidad de su fuente, y así se informa. Las extensiones de prueba requieren además cantidad de trabajadores compatible. La URL es sólo procedencia: el motor nunca la visita.
+
+`HIGH` exige cobertura completa, conceptos utilizables, ingreso y país confirmados, y CCT de catálogo aplicable. Falta de CCT u override/proyección acotada puede dar `MEDIUM`; ausencias, inferencias o conceptos sin detalle dan `LOW`, sin porcentajes inventados. Estos niveles describen completitud documental, no probabilidad de éxito judicial.
+
+No se persisten simulaciones. Cada respuesta owner-only incluye datos y overrides utilizados, IDs documentales, versión de algoritmo, regla y CCT aplicado; conservar sólo `total` sería insuficiente. Agregar una fuente normativa nueva requiere otra versión con vigencia, fuentes y tests de ambos lados del cambio; nunca editar una versión histórica usada. La respuesta y sus montos son datos Restricted: sin logs, telemetría salarial, cache pública ni URLs de navegación con importes.
+
+La evolución normativa, un catálogo CCT realmente curado, criterios judiciales por subdivisión y regímenes nuevos quedan pendientes; las capacidades no verificadas responden explícitamente como no soportadas.

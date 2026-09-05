@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
+import { getCountry } from '@salarivo/jurisdictions';
 
 export const employerStatuses = ["PENDING", "VERIFIED", "MERGED", "REJECTED"] as const;
 export const employerSources = ["LEGACY", "MANUAL", "DOCUMENT", "ADMIN"] as const;
@@ -96,7 +97,7 @@ export async function lockEmployerMutation(client: PoolClient): Promise<void> {
 
 function validateInput(input: ResolveEmployerInput): void {
   const normalizedName = normalizeEmployerName(input.name);
-  if (!normalizedName || input.name.length > 200 || !/^[A-Z]{2}$/.test(input.countryCode)) {
+  if (!normalizedName || input.name.length > 200 || !getCountry(input.countryCode)) {
     throw new EmployerResolutionError("INVALID_NAME");
   }
   if (!employerSources.includes(input.createdSource)) throw new Error("Invalid employer source");

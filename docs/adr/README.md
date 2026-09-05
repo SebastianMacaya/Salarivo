@@ -45,3 +45,5 @@ Cada ADR contiene:
 - condiciones para aceptar o reemplazar.
 
 Para cambiar una decisión Accepted, crear un ADR que la superseda o actualizarla sólo si conserva su intención. El código y los tests del mismo cambio deben respaldarla.
+
+- [0020 — Jurisdicciones laborales y simulaciones reproducibles](0020-labor-jurisdictions-and-termination-estimates.md) — Accepted.

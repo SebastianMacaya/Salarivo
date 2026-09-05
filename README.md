@@ -36,6 +36,10 @@ Google se integra mediante OIDC Authorization Code con PKCE, `state` y `nonce`. 
 
 La gestión de sesiones muestra únicamente categoría de dispositivo, navegador y sistema operativo inferidos en forma gruesa al iniciar sesión, junto con creación, última actividad y vencimiento. No persiste user-agent crudo, versión, IP, ubicación, fingerprint ni nombre del dispositivo.
 
+## Jurisdicciones y desvinculación
+
+El código actual incorpora país principal confirmado, jurisdicción independiente por empleo, snapshots documentales y simulaciones versionadas de despido sin causa. Sólo está implementado `AR_LCT_GENERAL` con liquidación mensual en ARS; otros países y regímenes muestran disponibilidad explícita sin inventar resultados. Compara con/sin preaviso y explica base, conceptos, cobertura, convenio y overrides. No guarda simulaciones ni utiliza IA para calcularlas. Las migraciones 028–030 preservan datos previos sin confirmarlos automáticamente. Esta descripción acredita implementación local, no despliegue productivo. Ver [ADR 0020](docs/adr/0020-labor-jurisdictions-and-termination-estimates.md) y [versiones, fuentes y límites legales](docs/architecture/termination-rules.md).
+
 ## Estructura
 
 - `apps/web`: interfaz React/Vinext.
@@ -43,6 +47,7 @@ La gestión de sesiones muestra únicamente categoría de dispositivo, navegador
 - `apps/worker-documents`: dispatcher, reconciliadores y pipeline pesado.
 - `packages/database`: migración PostgreSQL y transacciones compartidas.
 - `packages/economic-data`: contratos, perfiles, resolución y aritmética económica exacta.
+- `packages/jurisdictions`: catálogo ISO compartido, formatos y sugerencias de país.
 - `docs`: alcance, arquitectura, seguridad, privacidad y ADR.
 
 ## Preparación local

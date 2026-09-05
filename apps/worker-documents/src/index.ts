@@ -9,6 +9,7 @@ import {
   compareProcessingSnapshots,
   criticalFieldsBySettlementType,
   currentPipelineFingerprint,
+  hasDocumentCountryRecoverySql,
   EmployerResolutionError,
   followMergedEmployer,
   findApprovedDocumentLayout,
@@ -61,6 +62,8 @@ import { DisabledOCRProvider, isOCRResult, MAX_OCR_RETRY_DELAY_MS, OCRProviderEr
 import { ZaiGlmOcrProvider } from './zai-ocr-provider.ts';
 import { ocrEvidence, orchestrateExtraction, type ExtractionLayout, type OCRTriggerReason } from './extraction-orchestrator.ts';
 import { fingerprintLayout } from './layout-fingerprint.ts';
+import { classifyDocumentCountry, resolveDocumentCountry, type ClassifiedDocumentCountry, type DocumentCountry,
+  type DocumentCountryContext } from './document-country.ts';
 import { recordOcrCacheHit, runBudgetedOcr } from './ocr-usage.ts';
 import {
   assertProductionStorageConfig,
@@ -1587,9 +1590,12 @@ export async function claimJob(jobId: string, workerId: string, config: WorkerCo
                  AND issue.extraction_run_id = prior_run.id AND issue.recoverable AND issue.code = ANY($5::text[])
             )
             AND NOT (${hasNewDocumentLayoutSql('prior_run')})
+            AND NOT EXISTS (SELECT 1 FROM extraction_runs country_baseline
+              WHERE country_baseline.id = $6 AND country_baseline.user_id = $1 AND country_baseline.document_id = $2
+                AND ${hasDocumentCountryRecoverySql('country_baseline')})
           LIMIT 1`,
         [job.user_id, job.document_id, job.pipeline_fingerprint, job.processing_version,
-          config.ocr.enabled && config.ocr.provider === 'zai' ? retryableOcrIssueCodes : []],
+          config.ocr.enabled && config.ocr.provider === 'zai' ? retryableOcrIssueCodes : [], job.base_extraction_run_id ?? null],
       );
       if (alreadyProcessed.rowCount) {
         await db.query(
@@ -2098,7 +2104,7 @@ function snapshotFromExtraction(
     deductionsAmount: extraction.deductionsAmount,
     employerId,
     grossAmount: extraction.grossAmount,
-    issueCodes: [...new Set(issues.map(({ code }) => code))].sort(),
+    issueCodes: [...new Set(issues.filter(({ code }) => code !== 'COUNTRY_DETECTION_OVERRIDDEN').map(({ code }) => code))].sort(),
     lineItemsFingerprint: lineItemsFingerprint(extraction),
     netAmount: extraction.netAmount,
     nonRemunerativeAmount: extraction.nonRemunerativeAmount,
@@ -2151,6 +2157,7 @@ async function loadProcessingSnapshot(
     db.query<{ code: string }>(
       `SELECT code FROM extraction_run_issues
         WHERE user_id = $1 AND document_id = $2 AND extraction_run_id = $3
+          AND code <> 'COUNTRY_DETECTION_OVERRIDDEN'
         ORDER BY code`,
       [userId, documentId, runId],
     ),
@@ -2201,7 +2208,7 @@ export async function persistExtraction(
   source: FieldSource,
   partialOcr: boolean,
   computeMs: number,
-  details: { ocr?: OCRResult | undefined; issues?: readonly string[]; layout?: ExtractionLayout } = {},
+  details: { ocr?: OCRResult | undefined; issues?: readonly string[]; layout?: ExtractionLayout; country?: ClassifiedDocumentCountry } = {},
 ): Promise<'COMPLETED' | 'NEEDS_REVIEW' | null> {
   return await withTransaction(async (db: PoolClient) => {
     await lockEmployerMutation(db);
@@ -2285,13 +2292,22 @@ export async function persistExtraction(
       currentCanonicalEmployerId = currentEmployer?.id ?? null;
     }
 
+    const countryContext = await loadDocumentCountryContext(db, job);
+    const detection: DocumentCountry = details.country?.detectedCountryCode
+      ? { countryCode: details.country.detectedCountryCode, source: 'DOCUMENT_DETECTION', confidence: details.country.confidence ?? 'MEDIUM' }
+      : classification.country ?? { countryCode: null, source: null, confidence: null };
+    const country = resolveDocumentCountry(detection, countryContext);
+    if (details.country && (country.countryCode !== details.country.countryCode || country.source !== details.country.source)) {
+      throw new WorkerError('EMPLOYMENT_ASSOCIATION_CHANGED', true);
+    }
+
     let resolvedEmployer: Awaited<ReturnType<typeof resolveEmployer>> | null = null;
     let employerResolutionError: EmployerResolutionError | null = null;
-    if (anticipatedExtraction.employerName) {
+    if (anticipatedExtraction.employerName && country.countryCode === 'AR' && !country.issues.length) {
       try {
         resolvedEmployer = await resolveEmployer(db, {
           name: anticipatedExtraction.employerName,
-          countryCode: 'AR',
+          countryCode: country.countryCode,
           createdByUserId: job.user_id,
           createdSource: 'DOCUMENT',
           ...(currentCanonicalEmployerId ? { preferredEmployerId: currentCanonicalEmployerId } : {}),
@@ -2312,6 +2328,7 @@ export async function persistExtraction(
           WHERE employment.user_id = $1
             AND employment.employer_id = $2
             AND employment.currency_code = $3
+            AND employment.country_code = $7 AND employment.country_confirmed_at IS NOT NULL
             AND date_trunc('month', employment.start_date)::date <= $4::date
             AND (employment.end_date IS NULL
               OR date_trunc('month', employment.end_date)::date >= $4::date)
@@ -2327,6 +2344,7 @@ export async function persistExtraction(
           `${anticipatedExtraction.payrollPeriod}-01`,
           anticipatedExtraction.employerName,
           resolvedEmployer.outcome === 'ALIAS' || resolvedEmployer.outcome === 'IDENTIFIER',
+          country.countryCode,
         ],
       );
       if (candidates.rowCount === 1) {
@@ -2341,15 +2359,19 @@ export async function persistExtraction(
 
     const activeDocument = await db.query<{
       active_extraction_run_id: string | null;
+      country_code: string | null;
       employment_id: string | null;
       security_status: string;
     }>(
-      `SELECT active_extraction_run_id, employment_id, security_status FROM documents
+      `SELECT active_extraction_run_id, employment_id, security_status, country_code FROM documents
         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE`,
       [job.document_id, job.user_id],
     );
     if (!activeDocument.rowCount) throw new WorkerError('DOCUMENT_NOT_AVAILABLE', false);
     if (String(activeDocument.rows[0]?.employment_id) !== String(observedEmploymentId)) {
+      throw new WorkerError('EMPLOYMENT_ASSOCIATION_CHANGED', true);
+    }
+    if ((activeDocument.rows[0]?.country_code ?? null) !== (countryContext.snapshot?.countryCode ?? null)) {
       throw new WorkerError('EMPLOYMENT_ASSOCIATION_CHANGED', true);
     }
 
@@ -2365,7 +2387,7 @@ export async function persistExtraction(
     let employerAssociationNeedsReview = false;
     if (persistCandidate) {
       await insertClassificationField(db, job, runId, classification);
-      for (const field of extraction.fields) {
+      for (const field of country.countryCode && country.countryCode !== 'AR' ? [] : extraction.fields) {
         await db.query(
           `INSERT INTO extracted_fields (
              id, user_id, document_id, extraction_run_id, field_path, entity_type,
@@ -2588,7 +2610,7 @@ export async function persistExtraction(
         );
       }
 
-      if (effectiveExtraction.payrollPeriod) {
+      if (effectiveExtraction.payrollPeriod && (!country.countryCode || country.countryCode === 'AR')) {
         const settlement = await db.query<{ id: string }>(
           `INSERT INTO payroll_settlements (
              id, user_id, document_id, extraction_run_id, employment_id, settlement_ordinal,
@@ -2647,8 +2669,12 @@ export async function persistExtraction(
     }
 
     const issues = extractionIssues(effectiveExtraction, partialOcr, employerAssociationNeedsReview);
+    if (country.source === 'USER_CONFIRMED' && country.detectedCountryCode && country.detectedCountryCode !== country.countryCode) {
+      issues.push({ affectedFieldPath: 'document.countryCode', code: 'COUNTRY_DETECTION_OVERRIDDEN', recoverable: false, severity: 'INFO' });
+    }
     if (details.layout?.profile && details.layout.fingerprint) {
       const approved = extraction.employerName ? await findApprovedDocumentLayout(db, {
+        countryCode: country.countryCode,
         employerName: extraction.employerName, fingerprint: details.layout.fingerprint,
         fingerprintVersion: details.layout.fingerprintVersion,
       }) : null;
@@ -2656,7 +2682,7 @@ export async function persistExtraction(
         issues.push({ affectedFieldPath: null, code: 'LAYOUT_APPROVAL_CHANGED', recoverable: true, severity: 'ERROR' });
       }
     }
-    for (const code of details.issues ?? []) {
+    for (const code of new Set([...country.issues, ...(details.issues ?? []).filter((code) => !code.startsWith('COUNTRY_'))])) {
       issues.push({ affectedFieldPath: null, code, recoverable: true, severity: 'ERROR' });
     }
     for (const issue of issues) {
@@ -2664,10 +2690,14 @@ export async function persistExtraction(
         `INSERT INTO extraction_run_issues (
            id, user_id, document_id, extraction_run_id, code, severity,
            recoverable, affected_field_path, metadata_no_sensitive
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '{}'::jsonb)
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
          ON CONFLICT (extraction_run_id, code, affected_field_path) DO NOTHING`,
         [randomUUID(), job.user_id, job.document_id, runId, issue.code,
-          issue.severity, issue.recoverable, issue.affectedFieldPath],
+          issue.severity, issue.recoverable, issue.affectedFieldPath, JSON.stringify(issue.code.startsWith('COUNTRY_') ? {
+            detectedCountryCode: country.detectedCountryCode,
+            confirmedEmploymentCountryCode: countryContext.confirmedEmploymentCountryCode ?? null,
+            snapshotCountryCode: countryContext.snapshot?.countryCode ?? null,
+          } : {})],
       );
     }
     const needsReview = partialOcr
@@ -2715,7 +2745,8 @@ export async function persistExtraction(
               promotion_outcome = $17, comparison_summary = $18::jsonb,
               promoted_at = CASE WHEN $17 = 'PROMOTED' THEN now() ELSE NULL END,
               error_code = NULL, layout_fingerprint = $19, layout_fingerprint_version = $20,
-              document_layout_version_id = $21
+              document_layout_version_id = $21,
+              country_code = $22, country_source = $23, country_confidence = $24
         WHERE id = $1 AND user_id = $2 AND document_id = $3`,
       [runId, job.user_id, job.document_id, runStatus, classification.confidence, computeMs,
         processingPipelineVersions.classifier, processingPipelineVersions.extractor,
@@ -2731,8 +2762,16 @@ export async function persistExtraction(
           previousRunPresent: previousRunId !== null,
         }), details.layout?.fingerprint ?? null,
         details.layout?.fingerprint ? details.layout.fingerprintVersion : null,
-        details.layout?.profile?.id ?? null],
+        details.layout?.profile?.id ?? null, country.countryCode, country.source, country.confidence],
     );
+    if (!isReprocessingJob(job) && country.countryCode && country.issues.every((code) => code === 'COUNTRY_NOT_SUPPORTED')) {
+      await db.query(`UPDATE documents SET country_code = $3, country_source = $4,
+          country_confidence = $5, country_snapshot_at = now()
+        WHERE id = $1 AND user_id = $2 AND country_code IS NULL`,
+      [job.document_id, job.user_id, country.countryCode,
+        automaticEmploymentId ? 'EMPLOYMENT_CONFIRMED' : country.source,
+        automaticEmploymentId ? 'HIGH' : country.confidence]);
+    }
     if (promotionOutcome === 'PROMOTED') {
       const promoted = await db.query(
         `UPDATE documents
@@ -2954,6 +2993,7 @@ export async function resolveDocumentLayout(
   text: string,
   employerName: string,
   pageCount: number,
+  countryCode?: string,
 ) {
   const fingerprint = fingerprintLayout(text, pageCount);
   if (!fingerprint) return null;
@@ -2969,8 +3009,20 @@ export async function resolveDocumentLayout(
       [job.id, job.user_id, job.document_id, job.lease_owner],
     );
     if (!authorized.rowCount) return null;
-    return findApprovedDocumentLayout(db, { employerName, fingerprint, fingerprintVersion: '1' });
+    const country = classifyDocumentCountry(text, await loadDocumentCountryContext(db, job));
+    if (country.issues.length || (countryCode && countryCode !== country.countryCode)) return null;
+    return findApprovedDocumentLayout(db, { countryCode: country.countryCode, employerName, fingerprint, fingerprintVersion: '1' });
   });
+}
+
+async function loadDocumentCountryContext(db: Pick<PoolClient, 'query'>, job: Pick<JobRow, 'user_id' | 'document_id'>): Promise<DocumentCountryContext> {
+  const rows = await db.query(`SELECT document.country_code, document.country_source, document.country_confidence,
+      CASE WHEN employment.country_confirmed_at IS NOT NULL THEN employment.country_code END AS confirmed_country_code
+    FROM documents document LEFT JOIN employments employment ON employment.id = document.employment_id AND employment.user_id = document.user_id
+    WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL`, [job.document_id, job.user_id]);
+  const row = rows.rows[0];
+  return { confirmedEmploymentCountryCode: row?.confirmed_country_code ?? null,
+    snapshot: row?.country_code ? { countryCode: row.country_code, source: row.country_source, confidence: row.country_confidence } : null };
 }
 
 async function processJob(
@@ -2987,12 +3039,13 @@ async function processJob(
   let checksum: string | null = null;
   let duplicateChecksum: string | null = null;
   try {
+    const countryContext = await loadDocumentCountryContext(pool, job);
     if (isReprocessingJob(job) || jobTrigger(job) === 'USER_TYPE_CONFIRMATION' || job.attempt > 1) {
       const artifact = await loadCompatibleTextArtifact(s3, config, job);
       const cachedPageCount = artifact?.pageCount ?? Math.max(artifact?.evidence.length ?? 0, 1);
-      const resolveCachedLayout = (text: string, employerName: string) => resolveDocumentLayout(job, text, employerName, cachedPageCount);
+      const resolveCachedLayout = (text: string, employerName: string, countryCode: string) => resolveDocumentLayout(job, text, employerName, cachedPageCount, countryCode);
       const deterministic = artifact ? await orchestrateExtraction(artifact, {
-        pageCount: cachedPageCount, resolveLayout: resolveCachedLayout,
+        countryContext, pageCount: cachedPageCount, resolveLayout: resolveCachedLayout,
       }) : null;
       const needsExternalRecovery = artifact && !artifact.ocr && config.ocr.enabled && config.ocr.provider === 'zai'
         && deterministic?.triggerReason;
@@ -3010,7 +3063,7 @@ async function processJob(
         };
         await setDocumentStage(job, 'PARSING');
         const outcome = await orchestrateExtraction(artifact, {
-          pageCount: cachedPageCount, resolveLayout: resolveCachedLayout,
+          countryContext, pageCount: cachedPageCount, resolveLayout: resolveCachedLayout,
           cachedOcr: artifact.ocr,
           fallback: !config.ocr.enabled
             ? async () => new DisabledOCRProvider().extract({ bytes: new Uint8Array(), mimeType: 'application/pdf', pageCount: 1 })
@@ -3031,7 +3084,7 @@ async function processJob(
           artifact.source,
           false,
           Date.now() - started,
-          { ocr: outcome.ocrResult, issues: outcome.issues, layout: outcome.layout },
+          { ocr: outcome.ocrResult, issues: outcome.issues, layout: outcome.layout, country: outcome.country },
         );
         log('job_completed', { jobId: job.id, result: result ?? 'STALE' });
         return;
@@ -3078,7 +3131,8 @@ async function processJob(
       config.classificationHighThreshold,
     );
     let classificationOcr: OCRResult | undefined;
-    if (nativeTextPoor && automaticClassification.decision !== 'SUPPORTED'
+    if (!classifyDocumentCountry(sample.text, countryContext).issues.some((code) => code !== 'COUNTRY_UNCONFIRMED')
+      && nativeTextPoor && automaticClassification.decision !== 'SUPPORTED'
       && !automaticClassification.signals.some((signal) => ['documento_comercial', 'certificado_laboral', 'documento_fiscal'].includes(signal))
       && config.ocr.enabled && config.ocr.provider === 'zai') {
       try {
@@ -3106,6 +3160,13 @@ async function processJob(
           signals: [...automaticClassification.signals, 'user_type_confirmation'],
         }
       : automaticClassification;
+    const sampleCountry = classifyDocumentCountry(sample.text, countryContext);
+    if (sampleCountry.issues.some((code) => code !== 'COUNTRY_UNCONFIRMED') && classification.decision === 'SUPPORTED') {
+      const outcome = await orchestrateExtraction({ ...sample, source: source === 'OCR' ? 'OCR' : 'PDF_TEXT' }, { countryContext, pageCount: pages });
+      await persistExtraction(job, classification, outcome.extraction, outcome.source, false, Date.now() - started,
+        { issues: outcome.issues, country: outcome.country, layout: outcome.layout });
+      return;
+    }
     if (classification.decision !== 'SUPPORTED') {
       if (classificationOcr && classification.decision === 'NEEDS_CONFIRMATION') {
         await persistTextArtifact(s3, config, job, await processingRunId(job), sample, 'OCR', false, pages, classificationOcr);
@@ -3158,7 +3219,7 @@ async function processJob(
         ? requestExternalOcr
         : undefined;
     const outcome = await orchestrateExtraction({ ...extracted, source: source === 'OCR' ? 'OCR' : 'PDF_TEXT' }, {
-      pageCount: pages, resolveLayout: (text, employerName) => resolveDocumentLayout(job, text, employerName, pages),
+      countryContext, pageCount: pages, resolveLayout: (text, employerName, countryCode) => resolveDocumentLayout(job, text, employerName, pages, countryCode),
       fallback, classificationLowThreshold: config.classificationLowThreshold,
       classificationHighThreshold: config.classificationHighThreshold,
       cachedOcr: classificationOcr,
@@ -3169,7 +3230,7 @@ async function processJob(
     await persistTextArtifact(s3, config, job, runId, outcome,
       outcome.source, partialOcr, pages, outcome.ocrResult, outcome.issues.includes('OCR_RESULT_CONFLICT'));
     const result = await persistExtraction(job, classification, outcome.extraction, outcome.source,
-      partialOcr, Date.now() - started, { ocr: outcome.ocrResult, issues: outcome.issues, layout: outcome.layout });
+      partialOcr, Date.now() - started, { ocr: outcome.ocrResult, issues: outcome.issues, layout: outcome.layout, country: outcome.country });
     log('job_completed', { jobId: job.id, result: result ?? 'STALE' });
   } catch (error) {
     const normalized = normalizeError(error);

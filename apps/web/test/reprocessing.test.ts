@@ -85,6 +85,8 @@ test('pagina juntas las versiones e issues de health hasta cubrir la lista más 
 
 test('traduce issues y outcomes sin mostrar códigos internos al owner', () => {
   assert.equal(issueLabel({ affectedFieldPath: 'settlement.basicAmount' }), 'No pudimos identificar el sueldo básico de este recibo.');
+  assert.equal(issueLabel({ code: 'COUNTRY_UNCONFIRMED', affectedFieldPath: null }), 'Confirmá el país del empleo y asociá este documento.');
+  assert.equal(analysisPresentation(analysis({ issues: [{ code: 'COUNTRY_EMPLOYMENT_CONFLICT', affectedFieldPath: null, severity: 'ERROR' }] })).title, 'Jurisdicción para revisar');
   assert.equal(runOutcomeLabel('REJECTED_REGRESSION'), 'Se conservó la versión anterior');
   assert.equal(runNeedsDecision({ decisionRequired: true }), true);
   assert.equal(runNeedsDecision({ decisionRequired: false }), false);

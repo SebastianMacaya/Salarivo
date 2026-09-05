@@ -113,3 +113,9 @@ La UI puede afirmar sólo lo que la implementación demuestra. Debe explicar de 
 - que Google autentica, pero el UUID y la sesión siguen siendo internos y el email no auto-vincula cuentas;
 - cómo eliminar/exportar;
 - qué queda temporalmente en backups.
+
+## Jurisdicciones y simulaciones
+
+País principal/candidato, confirmaciones, jurisdicción del empleo y snapshot/corrección de país documental son datos privados del titular. Google sólo aporta un código regional candidato cuando existe locale; no se guardan scopes adicionales, IP, timezone ni locale del navegador. La exportación incluye preferencias de país, metadata jurisdiccional y sus correcciones; la eliminación de cuenta conserva sus cascadas habituales.
+
+La simulación de desvinculación contiene datos salariales altamente sensibles. La primera versión es una proyección en memoria con respuesta no-store; no hay tabla de simulaciones, caché ni envío externo. Auditoría y logs no incluyen base, desglose, overrides o totales. Las fuentes normativas y el catálogo CCT son configuración pública sin documentos ni usuarios.

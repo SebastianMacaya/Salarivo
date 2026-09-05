@@ -54,6 +54,7 @@
 .pulse { border-radius: 999px; background: #fff4d8; color: #825d14; font-size: .7rem; font-weight: 800; padding: .3rem .5rem; }
 .section { background: #fff; border: 1px solid #dce1e8; border-radius: .65rem; margin-bottom: 1rem; padding: .9rem; }
 .section h3 { font-size: 1rem; margin: .15rem 0 .75rem; }
+.countrySection > p { color: #475569; font-size: .85rem; font-weight: 400; letter-spacing: normal; line-height: 1.5; margin: .5rem 0; text-transform: none; }
 .sectionHead { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; justify-content: space-between; }
 .sectionHead span { color: #2563eb; font-size: .8rem; font-weight: 700; }
 .settlementOverview { display: grid; gap: .6rem; grid-template-columns: minmax(0, 1fr); margin: 0; }

@@ -19,6 +19,7 @@
     "@salarivo/database": "0.1.0",
     "@salarivo/economic-data": "0.1.0",
     "pg": "8.23.0",
-    "redis": "6.2.1"
+    "redis": "6.2.1",
+    "@salarivo/jurisdictions": "0.1.0"
   }
 }

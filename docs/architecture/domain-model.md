@@ -1,6 +1,6 @@
 # Modelo de dominio
 
-> Estado: el modelo vigente existe en las migraciones 001–023. PositionPeriod y documentos laborales secundarios siguen Proposed.
+> Estado: el modelo vigente existe en las migraciones 001–030. PositionPeriod y documentos laborales secundarios siguen Proposed.
 
 ## Separaciones centrales
 
@@ -137,11 +137,14 @@ Metadata mínima:
 - sizeBytes, pageCount y checksum;
 - securityStatus, classificationStatus, documentType y confidence;
 - processingStatus, activeExtractionRunId y retentionPolicy;
+- countryCode, countrySource, countryConfidence y countrySnapshotAt, nulos hasta contar con evidencia o confirmación;
 - createdAt, processedAt y deletedAt.
 
 El nombre visible del recibo se deriva exclusivamente de la corrida activa (`payrollPeriod` y empresa efectiva); no reemplaza `originalFilename` ni la key opaca del objeto. Una corrida candidata usa su propio estado/job y no cambia `processingStatus` hasta ser promovida.
 
 La asociación con Employment puede definirse al importar, resolverse de manera inequívoca durante el procesamiento o confirmarse después. El cambio actualiza en una sola transacción el ImportBatchItem, el Document y sus PayrollSettlement. Un nombre aislado nunca basta cuando hay más de un candidato.
+
+El país documental es un snapshot separado del perfil y del empleo. Prefiere el empleo confirmado; sin él, la detección sólo conserva señales explícitas. Un reproceso nunca modifica el snapshot ni la jurisdicción laboral y cada ExtractionRun registra el país usado, procedencia y confianza. Corregir el país del documento exige una acción owner-only, validación del país confirmado del empleo y ausencia de jobs activos: registra el valor anterior y el nuevo como `UserCorrection` en `document.countryCode` y cambia la procedencia a `USER_CONFIRMED`. Las corridas y correcciones anteriores permanecen trazables. La detección posterior no sobrescribe esa decisión; una discrepancia con el empleo confirmado sigue requiriendo revisión. Cambiar el país principal del perfil no modifica ninguno de estos registros.
 
 No hay deduplicación física global. El checksum se compara sólo dentro del mismo `userId`: un segundo binario exacto se tombstonea y elimina junto con item, sesión, jobs y metadata; sólo queda un conteo agregado en el lote y auditoría sanitaria. Las similitudes estructurales no borran datos y continúan como advertencia.
 

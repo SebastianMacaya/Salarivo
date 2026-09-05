@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { inheritDocumentCountries } from "./jurisdiction-routes.ts";
 import { Readable } from "node:stream";
 import {
   EmployerResolutionError,
@@ -228,6 +229,10 @@ const exportSections = [
       employer.country_code AS "employerCountryCode", employment.status,
       employment.start_date AS "startDate", employment.end_date AS "endDate", employment.role,
       employment.category, employment.modality, employment.country_code AS "countryCode",
+      employment.subdivision_code AS "subdivisionCode", employment.legal_regime_code AS "legalRegimeCode",
+      employment.country_source AS "countrySource", employment.country_confidence AS "countryConfidence",
+      employment.country_confirmed_at AS "countryConfirmedAt", employment.status_confirmed_at AS "statusConfirmedAt",
+      employment.start_date_confirmed_at AS "startDateConfirmedAt", employment.employment_type AS "employmentType",
       employment.currency_code AS "currencyCode", employment.created_at AS "createdAt"
       FROM employments employment
       JOIN employers employer ON employer.id = employment.employer_id
@@ -245,6 +250,8 @@ const exportSections = [
       LEFT JOIN employers employer ON employer.id = employment.employer_id
       WHERE item.user_id = $1 ORDER BY batch.created_at, item.ordinal, item.id`],
   ["documents", `SELECT document.original_filename AS "filename",
+      document.country_code AS "countryCode", document.country_source AS "countrySource",
+      document.country_confidence AS "countryConfidence", document.country_snapshot_at AS "countrySnapshotAt",
       COALESCE(document.detected_mime_type, document.declared_mime_type) AS "mediaType",
       document.size_bytes AS "sizeBytes", document.page_count AS "pageCount",
       document.document_type AS "documentType", document.processing_status AS "processingStatus",
@@ -842,7 +849,7 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
               to_char(employment.start_date, 'YYYY-MM-DD') AS employment_start_date,
               to_char(employment.end_date, 'YYYY-MM-DD') AS employment_end_date,
               COALESCE(employer.name, detected_employer.name) AS employer_name,
-              COALESCE(employment.country_code, detected_employer.country_code) AS country_code,
+              COALESCE(document.country_code, employment.country_code, detected_employer.country_code) AS country_code,
               COALESCE(earnings.items, '[]'::jsonb) AS earnings,
               COALESCE(earnings.earning_count, 0)::integer AS earning_count,
               COALESCE(earnings.unknown_count, 0)::integer AS unknown_earning_count,
@@ -1104,6 +1111,7 @@ function privacyExportStream(
       const account = await client.query(
         `SELECT app_user.email, app_user.display_name, app_user.default_retention_policy,
                 app_user.email_verified_at, app_user.onboarding_completed_at,
+                app_user.primary_country_code, app_user.primary_country_confirmed_at, app_user.suggested_country_code,
                 app_user.last_login_at, app_user.created_at,
                 factor.enabled_at AS mfa_enabled_at,
                 COALESCE(recovery.codes_remaining, 0)::integer AS recovery_codes_remaining
@@ -1131,6 +1139,8 @@ function privacyExportStream(
           defaultRetentionPolicy: row.default_retention_policy,
           emailVerifiedAt: row.email_verified_at,
           onboardingCompletedAt: row.onboarding_completed_at,
+          primaryCountryCode: row.primary_country_code, primaryCountryConfirmedAt: row.primary_country_confirmed_at,
+          suggestedCountryCode: row.suggested_country_code,
           lastLoginAt: row.last_login_at,
           createdAt: row.created_at,
           secondFactor: {
@@ -1750,6 +1760,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
            ) VALUES ($1, $2, $3, $1, $4, $5, $6, $7, $8, $9, 'UPLOADED', $10)`,
           [documentId, request.authUser!.id, row.batch_id, request.params.id, row.employment_id, canonicalKey, row.original_filename, row.declared_mime_type, row.expected_size_bytes, row.default_retention_policy],
         );
+        if (row.employment_id) await inheritDocumentCountries(client, request.authUser!.id, String(row.employment_id), [documentId], ApiError);
         await client.query(
           `INSERT INTO processing_jobs (
              id, user_id, document_id, stage, processing_version, idempotency_key,
@@ -2510,6 +2521,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                 floor(extract(epoch FROM document.created_at) * 1000000)::bigint::text AS created_at_micros,
                 document.processing_status, document.document_type,
                 document.classification_confidence, document.original_deleted_at,
+                document.country_code, document.country_source, document.country_confidence, document.country_snapshot_at,
                 document.deleted_at, item.error_code, projection.payroll_period, projection.settlement_type,
                 COALESCE(employer.name, projection.corrected_employer_name,
                          projection.extracted_employer_name) AS employer_name,
@@ -2550,6 +2562,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         `SELECT document.id, document.employment_id, document.original_filename, document.created_at,
                 document.processing_status, document.document_type,
                 document.classification_confidence, document.original_deleted_at,
+                document.country_code, document.country_source, document.country_confidence, document.country_snapshot_at,
                 document.deleted_at, document.declared_mime_type, document.detected_mime_type,
                 document.size_bytes, document.page_count, document.security_status,
                 document.classification_status, document.retention_policy, document.processed_at,
@@ -2804,6 +2817,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       const row = document.rows[0];
       return { data: {
         ...documentView(row),
+        countryCode: value(row, "country_code"), countrySource: value(row, "country_source"),
+        countryConfidence: value(row, "country_confidence"), countrySnapshotAt: row.country_snapshot_at ? timestamp(row.country_snapshot_at) : null,
         declaredMimeType: String(row.declared_mime_type),
         detectedMimeType: value(row, "detected_mime_type"),
         sizeBytes: Number(row.size_bytes),
@@ -2898,6 +2913,7 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         if (documents.rows.some((row) => !associationReadyStatuses.has(String(row.processing_status)))) {
           throw new ApiError(409, "DOCUMENT_STILL_PROCESSING", "Esperá a que terminen todos los documentos seleccionados.");
         }
+        if (employmentId) await inheritDocumentCountries(client, userId, employmentId, documentIds, ApiError);
         await client.query(
           "UPDATE documents SET employment_id = $1 WHERE user_id = $2 AND id = ANY($3::uuid[])",
           [employmentId, userId, documentIds],
@@ -3244,8 +3260,12 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
       const result = await withTransaction(async (client) => {
         if (employerNameTarget) await lockEmployerMutation(client);
         const observedDocument = await client.query(
-          `SELECT processing_status, import_batch_item_id, employment_id FROM documents
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          `SELECT processing_status, import_batch_item_id, employment_id,
+                  COALESCE(country_code,
+                    (SELECT country_code FROM extraction_runs WHERE id = documents.active_extraction_run_id AND user_id = $2),
+                    (SELECT country_code FROM employments WHERE id = documents.employment_id AND user_id = $2 AND country_confirmed_at IS NOT NULL),
+                    (SELECT country_code FROM employers WHERE id = documents.detected_employer_id)) AS country_code
+             FROM documents WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
           [request.params.id, request.authUser!.id],
         );
         if (!observedDocument.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
@@ -3281,9 +3301,9 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             currentCanonicalEmployerId = currentEmployer?.id ?? null;
           }
           try {
-            resolvedEmployer = await resolveEmployer(client, {
+            if (observedDocument.rows[0].country_code) resolvedEmployer = await resolveEmployer(client, {
               name: corrected,
-              countryCode: "AR",
+              countryCode: String(observedDocument.rows[0].country_code),
               createdByUserId: request.authUser!.id,
               createdSource: "DOCUMENT",
               ...(currentCanonicalEmployerId ? { preferredEmployerId: currentCanonicalEmployerId } : {}),
@@ -3546,6 +3566,15 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         );
         if (!activeRun.rowCount || String(activeRun.rows[0].id) !== request.body.extractionRunId) {
           throw new ApiError(409, "STALE_EXTRACTION_RUN", "La extracción cambió; recargá el documento antes de finalizar la revisión.");
+        }
+        const countryReview = await client.query(`SELECT document.country_code, document.country_source,
+          EXISTS(SELECT 1 FROM extraction_run_issues WHERE document_id=document.id AND user_id=document.user_id
+            AND extraction_run_id=document.active_extraction_run_id AND code IN
+            ('COUNTRY_UNCONFIRMED','COUNTRY_EMPLOYMENT_CONFLICT','COUNTRY_SNAPSHOT_CONFLICT','COUNTRY_NOT_SUPPORTED')) AS required
+          FROM documents document WHERE id=$1 AND user_id=$2`, [request.params.id, request.authUser!.id]);
+        if (countryReview.rows[0]?.required && (countryReview.rows[0].country_code !== "AR"
+            || countryReview.rows[0].country_source !== "USER_CONFIRMED")) {
+          throw new ApiError(409, "COUNTRY_REVIEW_REQUIRED", "Confirmá el país del documento antes de finalizar. El parser actual sólo admite recibos argentinos.");
         }
         const settlement = await client.query(
           `SELECT settlement.id, settlement.extraction_run_id, settlement.payroll_period,

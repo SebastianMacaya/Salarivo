@@ -1696,6 +1696,8 @@ test("upload privado crea un único documento y un único intent durable", async
         startDate: "2026-01-01",
         countryCode: "AR",
         currencyCode: "ARS",
+        status: "ACTIVE",
+        employmentType: "DEPENDENT",
       },
     });
     assert.equal(employment.statusCode, 201, employment.body);
@@ -2425,14 +2427,16 @@ test("upload privado crea un único documento y un único intent durable", async
   await pool.query(
     `UPDATE documents SET processing_status = 'COMPLETED', classification_status = 'SUPPORTED',
             document_type = 'PAYROLL', detected_mime_type = 'application/pdf', page_count = 1,
+            country_code = 'AR', country_source = 'DOCUMENT_DETECTION', country_confidence = 'HIGH', country_snapshot_at = now(),
             security_status = 'CLEAN', processed_at = now() WHERE id = $1`,
     [documentId],
   );
   await pool.query(
     `INSERT INTO extraction_runs (
        id, user_id, document_id, processing_version, status, extractor_name,
-       extractor_version, parser_version, normalizer_version, finished_at, confidence
-     ) VALUES ($1, $2, $3, 2, 'COMPLETED', 'synthetic-test', '3', '3', '3', now(), 0.9)`,
+       extractor_version, parser_version, normalizer_version, finished_at, confidence,
+       country_code,country_source,country_confidence
+     ) VALUES ($1, $2, $3, 2, 'COMPLETED', 'synthetic-test', '3', '3', '3', now(), 0.9,'AR','DOCUMENT_DETECTION','HIGH')`,
     [runId, userId, documentId],
   );
   await pool.query(
@@ -2799,10 +2803,10 @@ test("upload privado crea un único documento y un único intent durable", async
          id, user_id, import_batch_id, import_batch_item_id, upload_session_id, employment_id,
          object_key, original_filename, declared_mime_type, detected_mime_type, size_bytes,
          security_status, classification_status, document_type, classification_confidence,
-         processing_status, retention_policy, created_at
+         processing_status, retention_policy, created_at, country_code,country_source,country_confidence,country_snapshot_at
        ) SELECT $13, $2, $3, inserted_upload.item_id, inserted_upload.id, $4,
                 $14, $7, 'application/pdf', 'application/pdf', $8,
-                'CLEAN', $15, $16, 0.9, $17, 'KEEP_ORIGINAL', $10
+                'CLEAN', $15, $16, 0.9, $17, 'KEEP_ORIGINAL', $10,'AR','DOCUMENT_DETECTION','HIGH', $10
            FROM inserted_upload`,
       [
         itemId, userId, batchData.id, fixture.employmentId, `list-${fixture.id}`, 100 + index,
@@ -3706,7 +3710,7 @@ test("upload privado crea un único documento y un único intent durable", async
     method: "POST",
     url: "/api/v1/employment-detections/confirm",
     headers: { origin, cookie: cookieB },
-    payload: { employerId: detectedEmployerContextId, employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
+    payload: { employerId: detectedEmployerContextId, employerName: "Empresa Sintética SA", countryCode: "AR", currencyCode: "ARS", startDate: "2026-08-01", endDate: null, status: "ACTIVE", employmentType: "DEPENDENT" },
   });
   assert.equal(foreignDetectionConfirmation.statusCode, 404, foreignDetectionConfirmation.body);
   await Promise.all([
@@ -3721,7 +3725,7 @@ test("upload privado crea un único documento y un único intent durable", async
     method: "POST",
     url: "/api/v1/employment-detections/confirm",
     headers: { origin, cookie: cookieA },
-    payload: { employerId: detectedEmployerContextId, employerName: "Empresa Sintética SA", currencyCode: "ARS", startDate: "2026-08-01", endDate: null },
+    payload: { employerId: detectedEmployerContextId, employerName: "Empresa Sintética SA", countryCode: "AR", currencyCode: "ARS", startDate: "2026-08-01", endDate: null, status: "ACTIVE", employmentType: "DEPENDENT" },
   });
   assert.equal(confirmedDetection.statusCode, 201, confirmedDetection.body);
   assert.equal(confirmedDetection.json().data.associatedDocuments, 1);
@@ -5823,8 +5827,9 @@ test("upload privado crea un único documento y un único intent durable", async
   );
   await pool.query(
     `INSERT INTO employments (
-       id, user_id, employer_id, status, start_date, country_code, currency_code
-     ) VALUES ($1, $2, $3, 'ACTIVE', '2026-01-01', 'AR', 'ARS')`,
+       id, user_id, employer_id, status, start_date, country_code, currency_code,
+       country_source,country_confidence,country_confirmed_at,status_confirmed_at,employment_type
+     ) VALUES ($1, $2, $3, 'ACTIVE', '2026-01-01', 'AR', 'ARS','USER_CONFIRMED','HIGH',now(),now(),'DEPENDENT')`,
     [preferredBatchEmploymentId, userId, preferredBatchEmployerId],
   );
   const preferredBatchExtraction = {

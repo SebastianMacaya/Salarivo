@@ -285,7 +285,7 @@ function requireText(value: string, field: string): string {
   return normalized;
 }
 
-function parseAmount(value: MoneyAmount | null | undefined, field: string): bigint | null {
+export function parseAmount(value: MoneyAmount | null | undefined, field: string): bigint | null {
   if (value === null || value === undefined) return null;
   const match = /^([+-]?)(\d+)(?:\.(\d{1,2}))?$/.exec(value.trim());
   if (!match) throw new TypeError(`${field} must be a decimal with at most two fraction digits`);
@@ -296,13 +296,13 @@ function parseAmount(value: MoneyAmount | null | undefined, field: string): bigi
   return match[1] === "-" ? -cents : cents;
 }
 
-function formatAmount(cents: bigint): MoneyAmount {
+export function formatAmount(cents: bigint): MoneyAmount {
   const negative = cents < 0n;
   const absolute = negative ? -cents : cents;
   return `${negative ? "-" : ""}${absolute / 100n}.${(absolute % 100n).toString().padStart(2, "0")}`;
 }
 
-function roundDivide(numerator: bigint, denominator: bigint): bigint {
+export function roundDivide(numerator: bigint, denominator: bigint): bigint {
   if (denominator <= 0n) throw new RangeError("denominator must be positive");
   const negative = numerator < 0n;
   const absolute = negative ? -numerator : numerator;

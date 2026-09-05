@@ -18,6 +18,10 @@ import { createStepUpGate } from '../app/sensitive-action.ts';
 const documentId = '11111111-1111-4111-8111-111111111111';
 const evidenceId = '22222222-2222-4222-8222-222222222222';
 const employmentId = '33333333-3333-4333-8333-333333333333';
+test('el simulador conserva sólo navegación y descarta overrides salariales de la URL', () => {
+  assert.equal(writeOwnerLocation(`?monthlyRemuneration=1000000&terminationDate=2026-09-05`, { section: 'termination', employmentId }), `?section=termination&employmentId=${employmentId}`);
+  assert.deepEqual(readOwnerLocation(`?section=termination&employmentId=${employmentId}`), { section: 'termination', employmentId });
+});
 const employmentContext = 'detected:44444444-4444-4444-8444-444444444444';
 const region = parseNormalizedRegion({
   version: 1,

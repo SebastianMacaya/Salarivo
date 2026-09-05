@@ -28,6 +28,14 @@ test('formatea dinero sin perder precisión decimal', () => {
   assert.equal(money('-0.5', 'USD'), 'USD -0,50');
   assert.equal(percentage('12.34'), '12,34%');
   assert.equal(percentage(null), '—');
+  assert.equal(money('123456789012345678.90', 'USD', 'en-US'), 'USD 123,456,789,012,345,678.90');
+  assert.equal(money('-0.05', 'BRL', 'pt-BR'), 'BRL -0,05');
+});
+
+test('no presenta un empleo sin estado confirmado como actualmente vigente', () => {
+  const label = employmentOptionLabel({ employerName: 'Empresa sintética', startDate: '2025-01-01', status: 'UNKNOWN' });
+  assert.match(label, /Continuidad sin confirmar/);
+  assert.doesNotMatch(label, /actualidad/);
 });
 
 test('convierte centavos y puntos básicos sin pasar por punto flotante', () => {

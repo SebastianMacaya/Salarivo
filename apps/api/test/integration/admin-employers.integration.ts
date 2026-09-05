@@ -540,18 +540,54 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
       .sort((left, right) => left.localeCompare(right))
       .map((id) => ({ id, matchReason: "EXACT_NORMALIZED_NAME" })),
   );
+  const jurisdictionEmployments = [
+    { id: randomUUID(), subdivisionCode: "AR-B", regimeCode: "AR_LCT_GENERAL", employmentType: "DEPENDENT" },
+    { id: randomUUID(), subdivisionCode: "AR-C", regimeCode: "AR_LCT_GENERAL", employmentType: "DEPENDENT" },
+    { id: randomUUID(), subdivisionCode: "AR-B", regimeCode: "AR_TEST_SPECIAL", employmentType: "DEPENDENT" },
+    { id: randomUUID(), subdivisionCode: "AR-B", regimeCode: "AR_LCT_GENERAL", employmentType: "INDEPENDENT" },
+  ];
+  for (const [index, employment] of jurisdictionEmployments.entries()) {
+    await pool.query(
+      `INSERT INTO employments (
+         id, user_id, employer_id, status, start_date, country_code, currency_code,
+         subdivision_code, legal_regime_code, employment_type,
+         country_source, country_confidence, country_confirmed_at
+       ) VALUES ($1, $2, $3, 'UNKNOWN', '2026-01-01', 'AR', 'ARS', $4, $5, $6,
+                 'USER_CONFIRMED', 'HIGH', '2026-01-02T12:00:00Z')`,
+      [employment.id, userId, index === 0 ? duplicateAEmployerId : duplicateBEmployerId,
+        employment.subdivisionCode, employment.regimeCode, employment.employmentType],
+    );
+  }
   const mergedAIntoB = await app.inject({
     method: "POST", url: `/api/v1/admin/employers/${duplicateAEmployerId}/merge`,
     headers: { origin, cookie }, payload: { ...reason, targetEmployerId: duplicateBEmployerId },
   });
   assert.equal(mergedAIntoB.statusCode, 200, mergedAIntoB.body);
   assert.equal(mergedAIntoB.json().data.mergedIntoEmployerId, duplicateBEmployerId);
+  assert.equal(mergedAIntoB.json().data.movedEmploymentCount, 1);
+  assert.equal(mergedAIntoB.json().data.consolidatedEmploymentCount, 0);
   const mergedBIntoC = await app.inject({
     method: "POST", url: `/api/v1/admin/employers/${duplicateBEmployerId}/merge`,
     headers: { origin, cookie }, payload: { ...reason, targetEmployerId: duplicateCEmployerId },
   });
   assert.equal(mergedBIntoC.statusCode, 200, mergedBIntoC.body);
   assert.equal(mergedBIntoC.json().data.mergedIntoEmployerId, duplicateCEmployerId);
+  assert.equal(mergedBIntoC.json().data.movedEmploymentCount, 4);
+  assert.equal(mergedBIntoC.json().data.consolidatedEmploymentCount, 0);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT id, employer_id, subdivision_code, legal_regime_code, employment_type,
+              country_source, country_confidence, country_confirmed_at
+         FROM employments WHERE id = ANY($1::uuid[]) ORDER BY id`,
+      [jurisdictionEmployments.map((employment) => employment.id)],
+    )).rows,
+    jurisdictionEmployments.map((employment) => ({
+      id: employment.id, employer_id: duplicateCEmployerId,
+      subdivision_code: employment.subdivisionCode, legal_regime_code: employment.regimeCode,
+      employment_type: employment.employmentType, country_source: "USER_CONFIRMED",
+      country_confidence: "HIGH", country_confirmed_at: new Date("2026-01-02T12:00:00Z"),
+    })).sort((left, right) => left.id.localeCompare(right.id)),
+  );
   const resolvedDuplicate = await withTransaction((client) => followMergedEmployer(client, duplicateAEmployerId));
   assert.equal(resolvedDuplicate?.id, duplicateCEmployerId);
   assert.deepEqual(
@@ -588,6 +624,35 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
      VALUES ($1, $3), ($1, $4), ($2, $3)`,
     [userId, sourceOnlyUserId, sourceEmployerId, targetEmployerId],
   );
+  await pool.query(
+    "UPDATE employments SET status = 'UNKNOWN', status_confirmed_at = '2026-01-01T12:00:00Z' WHERE id = $1",
+    [targetEmploymentId],
+  );
+  await pool.query(
+    `UPDATE employments SET status = 'ACTIVE', country_source = 'USER_CONFIRMED', country_confidence = 'HIGH',
+            country_confirmed_at = '2026-01-02T12:00:00Z', status_confirmed_at = '2026-01-03T12:00:00Z',
+            start_date_confirmed_at = '2026-01-04T12:00:00Z'
+      WHERE id = $1`,
+    [sourceEmploymentId],
+  );
+  const statusConflict = await app.inject({
+    method: "POST", url: `/api/v1/admin/employers/${sourceEmployerId}/merge`,
+    headers: { origin, cookie }, payload: { ...reason, targetEmployerId },
+  });
+  assert.equal(statusConflict.statusCode, 409, statusConflict.body);
+  assert.equal(statusConflict.json().error.code, "EMPLOYMENT_STATUS_CONFLICT");
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT employer_id, status, status_confirmed_at FROM employments WHERE id = $1`,
+      [sourceEmploymentId],
+    )).rows,
+    [{ employer_id: sourceEmployerId, status: "ACTIVE", status_confirmed_at: new Date("2026-01-03T12:00:00Z") }],
+  );
+  assert.equal(
+    (await pool.query("SELECT employment_id FROM documents WHERE id = $1", [documentId])).rows[0].employment_id,
+    sourceEmploymentId,
+  );
+  await pool.query("UPDATE employments SET status_confirmed_at = NULL WHERE id = $1", [targetEmploymentId]);
 
   const [concurrentResolution, merged] = await Promise.all([
     withTransaction(async (client) => {
@@ -636,6 +701,17 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
     },
   );
   assert.equal((await pool.query("SELECT count(*)::integer AS count FROM employments WHERE id = $1", [sourceEmploymentId])).rows[0].count, 0);
+  assert.deepEqual(
+    (await pool.query(
+      `SELECT status, country_source, country_confidence, country_confirmed_at,
+              status_confirmed_at, start_date_confirmed_at FROM employments WHERE id = $1`,
+      [targetEmploymentId],
+    )).rows[0],
+    { status: "ACTIVE", country_source: "USER_CONFIRMED", country_confidence: "HIGH",
+      country_confirmed_at: new Date("2026-01-02T12:00:00Z"),
+      status_confirmed_at: new Date("2026-01-03T12:00:00Z"),
+      start_date_confirmed_at: new Date("2026-01-04T12:00:00Z") },
+  );
   assert.equal(
     (await pool.query("SELECT employer_id FROM employments WHERE id = $1", [movedEmploymentId])).rows[0].employer_id,
     targetEmployerId,
@@ -656,15 +732,23 @@ test("admin employers conserva evidencia y fusiona referencias sin exponer ident
     ].sort((left, right) => left.user_id.localeCompare(right.user_id)),
   );
   const mergeAudit = await pool.query(
-    `SELECT result, reason_code, reference, metadata_no_sensitive
+      `SELECT result, reason_code, reference, metadata_no_sensitive
        FROM admin_audit_events
-      WHERE actor_user_id = $1 AND resource_id = $2 AND action = 'EMPLOYER_MERGED'`,
+      WHERE actor_user_id = $1 AND resource_id = $2 AND action = 'EMPLOYER_MERGED' AND result = 'SUCCESS'`,
     [userId, sourceEmployerId],
   );
   assert.equal(mergeAudit.rowCount, 1);
   assert.equal(mergeAudit.rows[0].result, "SUCCESS");
   assert.equal(mergeAudit.rows[0].reason_code, reason.reasonCode);
   assert.equal(mergeAudit.rows[0].reference, reason.reference);
+  assert.equal(
+    (await pool.query(
+      `SELECT count(*)::integer AS count FROM admin_audit_events
+        WHERE actor_user_id = $1 AND resource_id = $2 AND action = 'EMPLOYER_MERGED' AND result = 'DENIED'`,
+      [userId, sourceEmployerId],
+    )).rows[0].count,
+    1,
+  );
   const auditMetadata = JSON.stringify(mergeAudit.rows[0].metadata_no_sensitive);
   for (const forbidden of [identifierFingerprint, "synthetic-encrypted-identifier", "salary", "ocr"]) {
     assert.equal(auditMetadata.toLowerCase().includes(forbidden.toLowerCase()), false);

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { countryFromLocale } from "@salarivo/jurisdictions";
 import { pool, withTransaction, type PoolClient } from "@salarivo/database";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiConfig } from "./config.ts";
@@ -389,9 +390,10 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
           await client.query(
             `UPDATE users
                 SET last_login_at = GREATEST(created_at, clock_timestamp()),
-                    updated_at = GREATEST(updated_at, clock_timestamp())
+                    updated_at = GREATEST(updated_at, clock_timestamp()),
+                    suggested_country_code = COALESCE(suggested_country_code, $2)
               WHERE id = $1`,
-            [user.id],
+            [user.id, countryFromLocale(identity.locale)],
           );
           await client.query(
             `UPDATE auth_accounts
@@ -413,9 +415,9 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
         const pending = await client.query(
           `UPDATE oauth_attempts
               SET status = 'IDENTITY_VERIFIED', pending_subject = $2,
-                  pending_email = $3, pending_display_name = $4, updated_at = now()
+                  pending_email = $3, pending_display_name = $4, pending_country_code = $5, updated_at = now()
             WHERE id = $1 AND status = 'EXCHANGING'`,
-          [attempt.id, identity.subject, identity.email, identity.displayName],
+          [attempt.id, identity.subject, identity.email, identity.displayName, countryFromLocale(identity.locale)],
         );
         return { status: pending.rowCount === 1 ? "REGISTER" : "INVALID" } as const;
       });
@@ -460,7 +462,7 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
       const token = opaqueToken();
       const outcome = await withTransaction(async (client) => {
         const attempt = await client.query(
-          `SELECT id, pending_subject, pending_email, pending_display_name
+          `SELECT id, pending_subject, pending_email, pending_display_name, pending_country_code
              FROM oauth_attempts
             WHERE provider = 'GOOGLE' AND purpose = 'LOGIN' AND browser_token_hash = $1
               AND status = 'IDENTITY_VERIFIED' AND expires_at > now()
@@ -519,11 +521,11 @@ export async function registerGoogleAuthRoutes(app: FastifyInstance, options: Op
           const inserted = await client.query(
             `INSERT INTO users (
                id, email, password_hash, display_name, status, default_retention_policy,
-               email_verified_at, last_login_at
-             ) VALUES ($1, $2, NULL, $3, 'ACTIVE', 'KEEP_ORIGINAL', now(), now())
+               email_verified_at, last_login_at, suggested_country_code
+             ) VALUES ($1, $2, NULL, $3, 'ACTIVE', 'KEEP_ORIGINAL', now(), now(), $4)
              RETURNING id, email, display_name, role, created_at, onboarding_completed_at,
                        true AS google_enabled, false AS mfa_enabled`,
-            [userId, pending.pending_email, pending.pending_display_name],
+            [userId, pending.pending_email, pending.pending_display_name, pending.pending_country_code],
           );
           row = inserted.rows[0];
           await client.query(

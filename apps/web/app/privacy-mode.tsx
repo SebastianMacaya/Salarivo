@@ -21,6 +21,7 @@ import styles from './privacy-mode.module.css';
 
 export type PrivacyModeValue = {
   enabled: boolean;
+  locale: string;
   setEnabled: (enabled: boolean) => void;
   toggle: () => void;
 };
@@ -55,7 +56,7 @@ export function subscribePrivacyMode(onChange: () => void) {
   };
 }
 
-export function PrivacyModeProvider({ children }: { children: ReactNode }) {
+export function PrivacyModeProvider({ children, locale = 'es-AR' }: { children: ReactNode; locale?: string }) {
   // The server snapshot stays hidden so hydration cannot flash a salary.
   const enabled = useSyncExternalStore(subscribePrivacyMode, privacySnapshot, () => true);
 
@@ -66,7 +67,7 @@ export function PrivacyModeProvider({ children }: { children: ReactNode }) {
     window.dispatchEvent(new Event(PRIVACY_MODE_EVENT));
   }, []);
   const toggle = useCallback(() => setEnabled(!enabled), [enabled, setEnabled]);
-  const value = useMemo(() => ({ enabled, setEnabled, toggle }), [enabled, setEnabled, toggle]);
+  const value = useMemo(() => ({ enabled, setEnabled, toggle, locale }), [enabled, setEnabled, toggle, locale]);
 
   return <PrivacyModeContext.Provider value={value}>{children}</PrivacyModeContext.Provider>;
 }
@@ -117,8 +118,8 @@ export function MoneyValue({
   kind = 'default',
   value,
 }: MoneyValueProps) {
-  const { enabled } = usePrivacyMode();
-  const rendered = privateMoney(value, currency, enabled, kind, creditAware);
+  const { enabled, locale } = usePrivacyMode();
+  const rendered = privateMoney(value, currency, enabled, kind, creditAware, locale);
   if (!enabled || !value) return <span className={className}>{rendered}</span>;
   return <span className={className}>
     <span aria-hidden="true">{rendered}</span>

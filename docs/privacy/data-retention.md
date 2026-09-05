@@ -125,3 +125,5 @@ Un error deja la cuenta en `DELETION_PENDING`, no un falso borrado. Las keys se 
 - verificación operativa en producción de la retención de evidencia de aceptación y del mapping de identidad externa; la versión legal inicial 1.0 no cubre la operación multiusuario actual.
 
 Estas decisiones requieren producto, seguridad y asesoramiento legal aplicable; no deben inventarse en código.
+
+La primera versión del simulador de desvinculación no persiste estimaciones. Los snapshots de respuesta y overrides se descartan al cerrar o recargar la página. Confirmaciones y correcciones de país pertenecen al perfil/empleo/documento y siguen sus políticas existentes de exportación y borrado, con la historia de UserCorrection para revisión documental.

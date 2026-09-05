@@ -23,6 +23,7 @@ export type ApiConfig = Readonly<{
   maxBatchBytes: number;
   maxActiveImportsPerUser: number;
   maxUserDocuments: number;
+  maxTerminationSettlements: number;
   maxUserStorageBytes: number;
   uploadTtlSeconds: number;
   storageProvider: ObjectStorageProvider;
@@ -312,6 +313,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     maxFilesPerBatch: integer(env.MAX_FILES_PER_BATCH, "MAX_FILES_PER_BATCH", production ? undefined : 200, 1, 1_000),
     maxBatchBytes: integer(env.MAX_BATCH_BYTES, "MAX_BATCH_BYTES", production ? undefined : 512 * 1024 * 1024, 1_024, 10 * 1024 * 1024 * 1024),
     maxActiveImportsPerUser: integer(env.MAX_ACTIVE_IMPORTS_PER_USER, "MAX_ACTIVE_IMPORTS_PER_USER", production ? undefined : 1, 1, 10),
+    maxTerminationSettlements: integer(env.MAX_TERMINATION_SETTLEMENTS, "MAX_TERMINATION_SETTLEMENTS", 500, 1, 5000),
     maxUserDocuments: integer(env.MAX_USER_DOCUMENTS, "MAX_USER_DOCUMENTS", production ? undefined : 5_000, 1, 100_000),
     maxUserStorageBytes: integer(env.MAX_USER_STORAGE_BYTES, "MAX_USER_STORAGE_BYTES", production ? undefined : 5 * 1024 * 1024 * 1024, 1_024, 1024 * 1024 * 1024 * 1024),
     uploadTtlSeconds: integer(env.UPLOAD_TTL_SECONDS, "UPLOAD_TTL_SECONDS", 300, 60, 900),

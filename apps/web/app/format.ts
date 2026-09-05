@@ -1,9 +1,10 @@
-export function money(value?: string | null, currency = 'ARS') {
+export function money(value?: string | null, currency = 'ARS', locale = 'es-AR') {
   if (!value) return '—';
   const match = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(value);
   if (!match?.[2]) return `${currency} ${value}`;
-  const grouped = match[2].replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-  return `${currency} ${match[1]}${grouped},${(match[3] ?? '00').padEnd(2, '0')}`;
+  const grouped = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(BigInt(match[2]));
+  const separator = new Intl.NumberFormat(locale).formatToParts(1.1).find((part) => part.type === 'decimal')?.value ?? ',';
+  return `${currency} ${match[1]}${grouped}${separator}${(match[3] ?? '00').padEnd(2, '0')}`;
 }
 
 export function percentage(value?: string | null) {
@@ -91,8 +92,8 @@ export function employmentOptionLabel(employment: {
 }) {
   const status = employment.status === 'ACTIVE'
     ? 'Activo'
-    : employment.status === 'ENDED' ? 'Finalizado' : employment.status;
-  const range = `${dateLabel(employment.startDate)} a ${employment.endDate ? dateLabel(employment.endDate) : 'actualidad'}`;
+    : employment.status === 'ENDED' ? 'Finalizado' : 'Continuidad sin confirmar';
+  const range = `${dateLabel(employment.startDate)} a ${employment.endDate ? dateLabel(employment.endDate) : employment.status === 'ACTIVE' ? 'actualidad' : 'fecha final sin confirmar'}`;
   return [
     employment.employerName,
     employment.isFavorite ? 'Favorita' : null,
@@ -119,9 +120,9 @@ export function salaryContextOptionLabel(context: {
     : context.state === 'DETECTED' ? 'Recibos sin asociar' : 'Sin confirmar';
   const employmentStatus = context.employmentStatus === 'ACTIVE'
     ? 'Activo'
-    : context.employmentStatus === 'ENDED' ? 'Finalizado' : context.employmentStatus;
+    : context.employmentStatus === 'ENDED' ? 'Finalizado' : context.employmentStatus === 'UNKNOWN' ? 'Continuidad sin confirmar' : context.employmentStatus;
   const employmentRange = context.startDate
-    ? `${dateLabel(context.startDate)} a ${context.endDate ? dateLabel(context.endDate) : 'actualidad'}`
+    ? `${dateLabel(context.startDate)} a ${context.endDate ? dateLabel(context.endDate) : context.employmentStatus === 'ACTIVE' ? 'actualidad' : 'fecha final sin confirmar'}`
     : null;
   const observedRange = context.firstPeriod && context.lastPeriod
     ? context.firstPeriod === context.lastPeriod

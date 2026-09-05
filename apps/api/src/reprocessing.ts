@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   currentPipelineFingerprint,
+  hasDocumentCountryRecoverySql as countryRecoverySql,
   followMergedEmployer,
   hasNewDocumentLayoutSql,
   lockEmployerMutation,
@@ -110,21 +111,21 @@ export function reprocessingCandidateExistsSql(
          AND candidate_run.user_id = ${documentAlias}.user_id
          AND candidate_run.document_id = ${documentAlias}.id
          AND (candidate_run.pipeline_fingerprint IS DISTINCT FROM ${fingerprintExpression}
-              OR ${ocrRetrySql("candidate_run")} OR ${hasNewDocumentLayoutSql("candidate_run")})
+              OR ${ocrRetrySql("candidate_run")} OR ${hasNewDocumentLayoutSql("candidate_run")} OR ${countryRecoverySql("candidate_run")})
          AND ((candidate_fix."issueCode" IS NOT NULL AND CASE
            WHEN candidate_run.parser_version ~ '^[0-9]+$'
              AND candidate_fix."introducedInParserVersion" ~ '^[0-9]+$'
              THEN candidate_run.parser_version::integer < candidate_fix."introducedInParserVersion"::integer
            ELSE candidate_run.parser_version IS DISTINCT FROM candidate_fix."introducedInParserVersion"
          END) OR ${ocrRecoverySql("candidate_run", "candidate_issue")} OR ${hasNewDocumentLayoutSql("candidate_run")}
-           OR ${layoutObservationSql("candidate_run", "candidate_issue")})
+           OR ${layoutObservationSql("candidate_run", "candidate_issue")} OR ${countryRecoverySql("candidate_run")})
          AND NOT EXISTS (
            SELECT 1 FROM extraction_runs attempted_run
             WHERE attempted_run.user_id = candidate_run.user_id
               AND attempted_run.document_id = candidate_run.document_id
               AND attempted_run.base_extraction_run_id = candidate_run.id
               AND attempted_run.pipeline_fingerprint = ${fingerprintExpression}
-              AND NOT (${ocrRetrySql("attempted_run")} OR ${hasNewDocumentLayoutSql("attempted_run")})
+              AND NOT (${ocrRetrySql("attempted_run")} OR ${hasNewDocumentLayoutSql("attempted_run")} OR ${countryRecoverySql("attempted_run")})
               AND (
                 attempted_run.status = 'REVIEW_REQUIRED'
                 OR attempted_run.promotion_outcome IN ('PROMOTED', 'UNCHANGED', 'REVIEW_REQUIRED', 'REJECTED_REGRESSION')
@@ -195,20 +196,20 @@ export async function findReprocessingCandidates(
         AND document.document_type = 'PAYROLL'
         AND ($2::uuid IS NULL OR document.id = $2)
         AND ($6::uuid[] IS NULL OR document.id = ANY($6::uuid[]))
-        AND (run.pipeline_fingerprint IS DISTINCT FROM $5 OR ${ocrRetrySql("run")} OR ${hasNewDocumentLayoutSql("run")})
+        AND (run.pipeline_fingerprint IS DISTINCT FROM $5 OR ${ocrRetrySql("run")} OR ${hasNewDocumentLayoutSql("run")} OR ${countryRecoverySql("run")})
         AND ((fix."issueCode" IS NOT NULL AND CASE
           WHEN run.parser_version ~ '^[0-9]+$' AND fix."introducedInParserVersion" ~ '^[0-9]+$'
             THEN run.parser_version::integer < fix."introducedInParserVersion"::integer
           ELSE run.parser_version IS DISTINCT FROM fix."introducedInParserVersion"
         END) OR ${ocrRecoverySql("run", "issue")} OR ${hasNewDocumentLayoutSql("run")}
-          OR ${layoutObservationSql("run", "issue")})
+          OR ${layoutObservationSql("run", "issue")} OR ${countryRecoverySql("run")})
         AND NOT EXISTS (
           SELECT 1 FROM extraction_runs attempted_run
            WHERE attempted_run.user_id = run.user_id
              AND attempted_run.document_id = run.document_id
              AND attempted_run.base_extraction_run_id = run.id
              AND attempted_run.pipeline_fingerprint = $5
-             AND NOT (${ocrRetrySql("attempted_run")} OR ${hasNewDocumentLayoutSql("attempted_run")})
+             AND NOT (${ocrRetrySql("attempted_run")} OR ${hasNewDocumentLayoutSql("attempted_run")} OR ${countryRecoverySql("attempted_run")})
              AND (
                attempted_run.status = 'REVIEW_REQUIRED'
                OR attempted_run.promotion_outcome IN ('PROMOTED', 'UNCHANGED', 'REVIEW_REQUIRED', 'REJECTED_REGRESSION')
@@ -683,7 +684,7 @@ export async function promoteProcessingRun(
 ) {
   await lockEmployerMutation(client);
   const document = await client.query(
-    `SELECT active_extraction_run_id, security_status, employment_id FROM documents
+    `SELECT active_extraction_run_id, security_status, employment_id, country_code FROM documents
       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE`,
     [input.documentId, input.userId],
   );
@@ -707,7 +708,7 @@ export async function promoteProcessingRun(
   }
   const run = await client.query(
     `SELECT run.id, run.status, run.promotion_outcome, run.base_extraction_run_id,
-            run.pipeline_fingerprint, run.detected_employer_id, run.confidence,
+            run.pipeline_fingerprint, run.detected_employer_id, run.confidence, run.country_code,
             run.comparison_summary ->> 'comparison' AS comparison,
             settlement.id IS NOT NULL AS has_settlement,
             settlement.payroll_period, settlement.currency_code
@@ -752,6 +753,20 @@ export async function promoteProcessingRun(
   }
   if (document.rows[0].security_status !== "CLEAN") {
     throw new ApiError(409, "REPROCESS_NOT_ALLOWED", "El documento no está habilitado para activar resultados.");
+  }
+  const countryIssues = await client.query(`SELECT 1 FROM extraction_run_issues
+    WHERE extraction_run_id = $1 AND document_id = $2 AND user_id = $3
+      AND code IN ('COUNTRY_UNCONFIRMED', 'COUNTRY_EMPLOYMENT_CONFLICT', 'COUNTRY_SNAPSHOT_CONFLICT', 'COUNTRY_NOT_SUPPORTED') LIMIT 1`,
+  [input.runId, input.documentId, input.userId]);
+  const confirmedEmployment = document.rows[0].employment_id ? await client.query(
+    `SELECT country_code FROM employments WHERE id = $1 AND user_id = $2 AND country_confirmed_at IS NOT NULL FOR SHARE`,
+    [document.rows[0].employment_id, input.userId]) : null;
+  const runCountry = run.rows[0].country_code;
+  if (countryIssues.rowCount || (runCountry && (
+    (document.rows[0].country_code && document.rows[0].country_code !== runCountry)
+    || (confirmedEmployment?.rows[0]?.country_code && confirmedEmployment.rows[0].country_code !== runCountry)
+  ))) {
+    throw new ApiError(409, 'COUNTRY_REVIEW_REQUIRED', 'Revisá el país y la asociación del empleo; después reprocesá el documento antes de activar este análisis.');
   }
   const activeCorrectionsChanged = await client.query(
     `WITH active_corrections AS (

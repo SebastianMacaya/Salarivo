@@ -27,7 +27,7 @@ const completeSnapshot: ProcessingSnapshot = {
 
 test("parser 8 supports approved aliases and preserves the parser 7 basic-layout fix catalog", () => {
   assert.deepEqual(processingPipelineVersions, {
-    classifier: "6",
+    classifier: "7",
     extractor: "7",
     parser: "8",
     normalizer: "6",

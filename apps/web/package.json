@@ -16,6 +16,7 @@
     "test": "node --test test/*.test.ts",
     "test:browser": "node test/browser/smoke.mjs",
     "test:browser:navigation": "node test/browser/navigation-smoke.mjs",
+    "test:browser:jurisdictions": "node test/browser/jurisdiction-smoke.mjs",
     "test:browser:admin": "node test/browser/admin-smoke.mjs",
     "test:browser:webkit": "node test/browser/webkit-smoke.mjs",
     "test:browser:loading": "node test/browser/loading-smoke.mjs",
@@ -28,7 +29,8 @@
     "pdfjs-dist": "6.3.289",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "uqr": "0.1.3"
+    "uqr": "0.1.3",
+    "@salarivo/jurisdictions": "0.1.0"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.54.1",

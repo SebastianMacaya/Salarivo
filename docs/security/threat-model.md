@@ -150,3 +150,9 @@ Ninguno puede marcarse como mitigado hasta existir configuración, test y eviden
 ## Cuándo actualizar
 
 Actualizar este archivo al agregar un tipo documental, proveedor, flujo de descarga/export/share, privilegio, superficie de red, parser, feature de IA o cambio de retención. Una amenaza nueva material puede requerir ADR.
+
+## Simulador y revisión de jurisdicción
+
+El simulador exige sesión válida, ownership de empleo/documentos y lecturas consistentes de corridas activas. Fecha, ISO, subdivisión, régimen, importes exactos y fuente/vigencia de overrides se validan en servidor. No se consulta ninguna URL entregada como fuente de convenio. Cambiar el país principal no modifica la jurisdicción del empleo; cambiar el empleo no reescribe snapshots históricos. La corrección explícita de país documental exige corrida/país esperados, ausencia de trabajo activo y compatibilidad con el empleo confirmado; deja historia append-only y auditoría sin valores salariales.
+
+El país detectado no autoriza parsers ni legislación. Conflictos quedan revisables; reglas desconocidas y períodos normativos no cubiertos no producen totales. El límite configurable de liquidaciones y rate limit restringen costo de cálculo. Tests de integración cubren IDOR, CSRF existente, respuestas no-store, datos incompletos y exclusión de países/períodos incompatibles; el smoke de navegador cubre privacidad de resultados y overrides.

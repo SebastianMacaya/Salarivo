@@ -20,7 +20,8 @@
     "@salarivo/database": "0.1.0",
     "@salarivo/economic-data": "0.1.0",
     "fastify": "5.12.1",
-    "openid-client": "6.8.7"
+    "openid-client": "6.8.7",
+    "@salarivo/jurisdictions": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

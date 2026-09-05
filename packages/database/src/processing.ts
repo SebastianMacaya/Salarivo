@@ -35,7 +35,7 @@ export const promotionOutcomes = [
 export type PromotionOutcome = (typeof promotionOutcomes)[number];
 
 export const processingPipelineVersions = {
-  classifier: "6",
+  classifier: "7",
   extractor: "7",
   parser: "8",
   normalizer: "6",
@@ -45,6 +45,23 @@ export const processingPipelineVersions = {
 export const currentPipelineFingerprint = createHash("sha256")
   .update(JSON.stringify(processingPipelineVersions))
   .digest("hex");
+
+export function hasDocumentCountryRecoverySql(runAlias: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/.test(runAlias)) throw new Error('INVALID_SQL_ALIAS');
+  return `EXISTS (SELECT 1 FROM documents country_document
+    LEFT JOIN employments country_employment ON country_employment.id = country_document.employment_id
+      AND country_employment.user_id = country_document.user_id
+    WHERE country_document.id = ${runAlias}.document_id AND country_document.user_id = ${runAlias}.user_id
+      AND COALESCE(CASE WHEN country_employment.country_confirmed_at IS NOT NULL THEN country_employment.country_code END,
+        CASE WHEN country_document.country_source = 'USER_CONFIRMED' THEN country_document.country_code END) = 'AR'
+      AND (country_document.country_code IS NULL OR country_document.country_code = 'AR')
+      AND (${runAlias}.country_code IS DISTINCT FROM 'AR'
+        OR country_employment.country_confirmed_at > ${runAlias}.started_at
+        OR (country_document.country_source = 'USER_CONFIRMED' AND country_document.country_snapshot_at > ${runAlias}.started_at))
+      AND EXISTS (SELECT 1 FROM extraction_run_issues country_issue WHERE country_issue.extraction_run_id = ${runAlias}.id
+        AND country_issue.user_id = ${runAlias}.user_id AND country_issue.document_id = ${runAlias}.document_id
+        AND country_issue.code IN ('COUNTRY_UNCONFIRMED', 'COUNTRY_EMPLOYMENT_CONFLICT', 'COUNTRY_SNAPSHOT_CONFLICT', 'COUNTRY_NOT_SUPPORTED'))) `;
+}
 
 export const retryableOcrIssueCodes = [
   "OCR_DISABLED", "OCR_TIMEOUT", "OCR_RATE_LIMITED", "OCR_PROVIDER_UNAVAILABLE",

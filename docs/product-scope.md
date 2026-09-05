@@ -56,6 +56,12 @@ La evolución de poder adquisitivo reúne por período el neto nominal, su equiv
 
 Las deducciones individuales siguen minimizadas a etiqueta genérica e importe: no se conserva ni expone obra social, sindicato, descripción original, código normalizado, recurrencia ni campo fuente. Un total de descuentos negativo se presenta como crédito/reintegro, conservando el signo para el cálculo. Un duplicado binario exacto del mismo titular se descarta sin conservar documento, item ni metadata del archivo; una firma estructural parecida sólo advierte y requiere revisión humana. Un tipo no soportado elimina siempre el PDF original y puede conservar un comentario owner-only opcional para evaluar demanda futura, sin habilitar OCR genérico.
 
+### Jurisdicciones y simulación de desvinculación
+
+La implementación local admite país principal confirmado desde onboarding/configuración y empleos de distintos países ISO, con subdivisión, régimen, tipo de relación y estado confirmables. Cambiar el perfil no cambia empleos ni documentos. El país de cada documento conserva trazabilidad y admite revisión humana explícita; la ingestión sigue limitada a PDF salarial argentino.
+
+El simulador usa por defecto el último empleo activo de tipo dependiente y permite elegir otro o confirmar un estado desconocido. Compara despido sin causa con/sin preaviso, con desglose, base bruta trazable, datos utilizados, calidad, fecha histórica/futura y overrides visibles. El régimen general argentino tiene versiones desde 2023; el intervalo cautelar 30/03–22/04/2026 no produce importes. Sólo procesa reglas verificadas/configuradas; otro régimen o país devuelve no disponible. No se guarda historial de simulaciones ni se envían datos a IA. El catálogo CCT está preparado pero sin topes cargados; un tope manual es un override con fuente y vigencia. Ver [reglas y límites](architecture/termination-rules.md) y [ADR 0020](adr/0020-labor-jurisdictions-and-termination-estimates.md). Este texto no afirma despliegue de la funcionalidad.
+
 ### No incluye
 
 - documentos arbitrarios o un OCR genérico;
@@ -63,7 +69,7 @@ Las deducciones individuales siguen minimizadas a etiqueta genérica e importe: 
 - comparación salarial con el mercado;
 - billing, suscripciones o capacidades pagas;
 - Income Passport o enlaces públicos;
-- múltiples países habilitados;
+- parsers y motores legales para países distintos de Argentina;
 - entrenamiento con datos de usuarios;
 - microservicios independientes;
 - LLM como extractor primario.

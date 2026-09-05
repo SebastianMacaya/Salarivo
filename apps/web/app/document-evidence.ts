@@ -12,7 +12,7 @@ export type OwnerLocation = {
   period?: string;
   perspective?: 'nominal' | 'historical-usd' | 'purchasing-power';
   range?: '6' | '12' | '24' | '60' | 'all';
-  section?: 'summary' | 'jobs' | 'import' | 'history' | 'settings';
+  section?: 'summary' | 'jobs' | 'import' | 'history' | 'settings' | 'termination';
   settlementType?: string;
   status?: 'ALL' | 'READY' | 'REVIEW' | 'PROCESSING' | 'ERROR';
   tab?: 'summary' | 'evolution' | 'purchasing-power' | 'annual' | 'concepts' | 'documents';
@@ -42,7 +42,7 @@ export type NormalizedRegion = {
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const amountField = /^settlement\..+Amount$/;
-const ownerSections = ['summary', 'jobs', 'import', 'history', 'settings'] as const;
+const ownerSections = ['summary', 'jobs', 'import', 'history', 'settings', 'termination'] as const;
 const ownerTabs = ['summary', 'evolution', 'purchasing-power', 'annual', 'concepts', 'documents'] as const;
 const ownerPerspectives = ['nominal', 'historical-usd', 'purchasing-power'] as const;
 const ownerRanges = ['6', '12', '24', '60', 'all'] as const;

@@ -11,6 +11,7 @@ export type GoogleIdentity = Readonly<{
   email: string;
   emailVerified: boolean;
   displayName: string | null;
+  locale?: string | null;
 }>;
 
 export type GoogleOidcClient = Readonly<{
@@ -79,6 +80,7 @@ export function createGoogleOidc(config: ApiConfig["googleOAuth"]): GoogleOidcCl
         email: typeof claims?.email === "string" ? claims.email : "",
         emailVerified: claims?.email_verified === true,
         displayName: typeof claims?.name === "string" ? claims.name : null,
+        locale: typeof claims?.locale === "string" && claims.locale.length <= 100 ? claims.locale : null,
       };
     },
   };

@@ -5,6 +5,7 @@ import { orchestrateExtraction } from '../src/extraction-orchestrator.ts';
 import { DisabledOCRProvider, OCRProviderError, type OCRResult } from '../src/ocr-provider.ts';
 
 const syntheticReceipt = `RECIBO DE SUELDO
+Moneda: ARS
 Empleador: Empresa-Sintética S.A.
 Período de liquidación: 08/2026
 Sueldo básico $ 1.000,00
@@ -49,7 +50,7 @@ test('layout desconocido y proveedor desactivado dejan issues de revisión sin H
   const outcome = await orchestrateExtraction(input(''), {
     fallback: () => disabled.extract({ bytes: new Uint8Array(), mimeType: 'application/pdf', pageCount: 1 }),
   });
-  assert.deepEqual(outcome.issues, ['OCR_DISABLED']);
+  assert.deepEqual(outcome.issues, ['COUNTRY_UNCONFIRMED', 'OCR_DISABLED']);
   assert.equal(outcome.extraction.payrollPeriod, null);
 });
 

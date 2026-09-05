@@ -7,6 +7,7 @@ import { fingerprintLayout } from '../src/layout-fingerprint.ts';
 import { OCRProviderError, type OCRResult } from '../src/ocr-provider.ts';
 
 const receipt = `RECIBO DE SUELDO
+Moneda: ARS
 Empleador: Empresa Sintética S.A.
 Ciclo liquidado: 08/2026
 Asignación contractual $ 1.000,00
@@ -21,6 +22,7 @@ const aliases: LayoutAliases = {
 const profile: ApprovedDocumentLayout = {
   id: 'synthetic-version', layoutId: 'synthetic-layout', version: 1,
   fingerprint: fingerprintLayout(receipt, 1)!, fingerprintVersion: '1', aliases,
+  countryCode: 'AR', documentType: 'PAYROLL', parserVersion: '8',
 };
 const input = (text: string) => ({ text, source: 'PDF_TEXT' as const, evidence: [] });
 

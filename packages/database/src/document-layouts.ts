@@ -1,5 +1,8 @@
 import type { PoolClient } from "pg";
 import { normalizeEmployerNameConservative } from "./employers.ts";
+import { processingPipelineVersions } from "./processing.ts";
+
+export const documentLayoutParserVersion = processingPipelineVersions.parser;
 
 export const layoutAliasFields = [
   "settlement.basicAmount", "settlement.grossAmount", "settlement.netAmount",
@@ -10,6 +13,7 @@ export type LayoutAliasField = typeof layoutAliasFields[number];
 export type LayoutAliases = Partial<Record<LayoutAliasField, string[]>>;
 export type ApprovedDocumentLayout = {
   id: string; layoutId: string; version: number; fingerprint: string; fingerprintVersion: "1"; aliases: LayoutAliases;
+  countryCode: string; documentType: 'PAYROLL'; parserVersion: string;
 };
 
 export function hasNewDocumentLayoutSql(runAlias: string): string {
@@ -19,7 +23,9 @@ export function hasNewDocumentLayoutSql(runAlias: string): string {
       JOIN employers employer ON employer.id = layout.employer_id
       JOIN LATERAL (SELECT id, enabled, approved_at FROM document_layout_versions
         WHERE layout_id = layout.id ORDER BY version DESC LIMIT 1) latest_layout ON true
-     WHERE employer.status = 'VERIFIED' AND employer.country_code = 'AR'
+     WHERE employer.status = 'VERIFIED' AND employer.country_code = layout.country_code
+       AND layout.country_code = ${runAlias}.country_code AND layout.document_type = 'PAYROLL'
+       AND layout.parser_version = '${processingPipelineVersions.parser}'
        AND layout.employer_id = ${runAlias}.detected_employer_id
        AND layout.fingerprint_version = ${runAlias}.layout_fingerprint_version
        AND layout.structural_fingerprint = ${runAlias}.layout_fingerprint
@@ -53,14 +59,15 @@ export function validateLayoutAliases(value: unknown, enabled = true): LayoutAli
 
 export async function findApprovedDocumentLayout(
   client: Pick<PoolClient, "query">,
-  input: { employerName: string; fingerprint: string; fingerprintVersion?: "1" },
+  input: { countryCode: string | null; employerName: string; fingerprint: string; fingerprintVersion?: "1";
+    documentType?: 'PAYROLL'; parserVersion?: string },
 ): Promise<ApprovedDocumentLayout | null> {
-  if (!/^[0-9a-f]{64}$/.test(input.fingerprint) || !input.employerName || input.employerName.length > 200) return null;
+  if (input.countryCode !== 'AR' || !/^[0-9a-f]{64}$/.test(input.fingerprint) || !input.employerName || input.employerName.length > 200) return null;
   // Match all live identities first: a pending namesake must make reuse ambiguous, too.
   const versions = await client.query(
     `WITH identities AS (SELECT DISTINCT employer.id, employer.status FROM employers employer
        LEFT JOIN employer_aliases alias ON alias.employer_id = employer.id
-      WHERE employer.country_code = 'AR' AND employer.status IN ('PENDING', 'VERIFIED')
+      WHERE employer.country_code = $4 AND employer.status IN ('PENDING', 'VERIFIED')
         AND (lower(btrim(regexp_replace(replace(normalize(employer.name, NFKC), '.', ''), '\\s+', ' ', 'g'))) = $1
           OR lower(btrim(regexp_replace(replace(normalize(alias.alias, NFKC), '.', ''), '\\s+', ' ', 'g'))) = $1)
       ORDER BY employer.id LIMIT 2)
@@ -69,12 +76,15 @@ export async function findApprovedDocumentLayout(
        JOIN identities employer ON employer.id = layout.employer_id
       WHERE employer.status = 'VERIFIED' AND (SELECT count(*) FROM identities) = 1
         AND layout.fingerprint_version = $2 AND layout.structural_fingerprint = $3
+        AND layout.country_code = $4 AND layout.document_type = $5 AND layout.parser_version = $6
       ORDER BY version.version DESC LIMIT 1`,
-    [normalizeEmployerNameConservative(input.employerName), input.fingerprintVersion ?? "1", input.fingerprint],
+    [normalizeEmployerNameConservative(input.employerName), input.fingerprintVersion ?? "1", input.fingerprint,
+      input.countryCode, input.documentType ?? 'PAYROLL', input.parserVersion ?? processingPipelineVersions.parser],
   );
   const row = versions.rows[0];
   if (!row?.enabled) return null;
   const aliases = validateLayoutAliases(row.aliases);
   return aliases ? { id: String(row.id), layoutId: String(row.layout_id), version: Number(row.version),
-    fingerprint: input.fingerprint, fingerprintVersion: "1", aliases } : null;
+    fingerprint: input.fingerprint, fingerprintVersion: "1", aliases, countryCode: input.countryCode,
+    documentType: input.documentType ?? 'PAYROLL', parserVersion: input.parserVersion ?? processingPipelineVersions.parser } : null;
 }

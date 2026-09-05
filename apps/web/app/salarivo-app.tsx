@@ -5,6 +5,9 @@ import Link from 'next/link';
 import type { DocumentDetail, ExtractedFieldDetail } from './document-review';
 import { AppNavigation } from './app-navigation';
 import { ResponsiveDialog } from './responsive-dialog';
+import { countryName, getCountry } from '@salarivo/jurisdictions';
+import { CountrySettings, EmploymentJurisdictionFields } from './country-select';
+import { TerminationSimulator } from './termination-simulator';
 import { fetchDocumentPrefix, readDocumentLocation, readOwnerLocation, writeDocumentLocation, writeOwnerLocation, type CursorDocumentPage, type OwnerLocation, type OwnerLocationPatch } from './document-evidence';
 import {
   batchIsActive,
@@ -59,6 +62,8 @@ type User = {
   authState: 'AUTHENTICATED' | 'MFA_REQUIRED' | 'MFA_SETUP_REQUIRED';
   mfaEnabled: boolean;
   onboardingCompleted: boolean;
+  primaryCountryCode?: string | null;
+  primaryCountryConfirmedAt?: string | null;
   legalAcceptanceRequired: boolean;
   authMethods: 'GOOGLE'[];
 };
@@ -80,8 +85,15 @@ type Employment = {
   role?: string | null;
   startDate: string;
   endDate?: string | null;
-  status: 'ACTIVE' | 'ENDED';
-  countryCode: string;
+  status: 'ACTIVE' | 'ENDED' | 'UNKNOWN';
+  countryCode: string | null;
+  subdivisionCode?: string | null;
+  legalRegimeCode?: string | null;
+  countrySource?: string | null;
+  countryConfidence?: string | null;
+  countryConfirmedAt?: string | null;
+  statusConfirmedAt?: string | null;
+  employmentType?: 'DEPENDENT' | 'INDEPENDENT' | 'UNKNOWN';
   currencyCode: string;
   isFavorite: boolean;
   employerStatus?: 'PENDING' | 'VERIFIED' | 'MERGED' | 'REJECTED' | null;
@@ -693,7 +705,7 @@ export function SalarivoApp() {
   if (!user.onboardingCompleted) {
     return <OnboardingScreen user={user} onComplete={setUser} onLogout={() => setUser(null)} />;
   }
-  return <PrivacyModeProvider><PrivateApp
+  return <PrivacyModeProvider locale={getCountry(user.primaryCountryCode ?? '')?.locale ?? 'es-AR'}><PrivateApp
       user={user}
       authNotice={authNotice}
       onAuthNoticeDismiss={() => setAuthNotice('')}
@@ -1150,7 +1162,7 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
   );
 }
 
-type Section = 'summary' | 'jobs' | 'import' | 'history' | 'settings';
+type Section = 'summary' | 'jobs' | 'import' | 'history' | 'settings' | 'termination';
 type AppNavigationOptions = { currencyCode?: string | null; employmentContext?: string | null; employmentId?: string | null; tab?: HistoryTab; period?: string | null; perspective?: EconomicPerspective | null; range?: (typeof evolutionRanges)[number][0] };
 type NavigateApp = (section: Section, options?: AppNavigationOptions) => void;
 const sections: Array<{ id: Section; label: string; icon: string }> = [
@@ -1158,6 +1170,7 @@ const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'jobs', label: 'Empleos', icon: '▣' },
   { id: 'import', label: 'Importar', icon: '↑' },
   { id: 'history', label: 'Historial', icon: '≋' },
+  { id: 'termination', label: 'Indemnización estimada', icon: '≈' },
   { id: 'settings', label: 'Configuración', icon: '⚙' },
 ];
 
@@ -1203,6 +1216,7 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
     return readDocumentLocation(window.location.search) ? { ...next, section: 'history', tab: 'documents' } : next;
   });
   const [section, setSection] = useState<Section>(() => readDocumentLocation(window.location.search) ? 'history' : readOwnerLocation(window.location.search).section ?? 'summary');
+  const [countryDismissed, setCountryDismissed] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -1311,10 +1325,12 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
       <main id="private-content" className="content" tabIndex={-1} inert={sensitiveActions.open ? true : undefined} aria-hidden={sensitiveActions.open || undefined}>
         <header className="mobile-header"><button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menú" aria-expanded={menuOpen} aria-controls="private-navigation">☰</button><Brand /><PrivacyToggle /></header>
         {authNotice && <p className="message success" aria-live="polite">{authNotice} <button type="button" className="text-button" onClick={onAuthNoticeDismiss}>Cerrar</button></p>}
+        {section === 'summary' && !user.primaryCountryConfirmedAt && !countryDismissed && <div className="page country-onboarding"><CountrySettings api={api} dismissible onDismiss={() => setCountryDismissed(true)} onConfirmed={(profile) => onUserChanged({ ...user, primaryCountryCode: profile.primaryCountryCode, primaryCountryConfirmedAt: profile.primaryCountryConfirmedAt })} /></div>}
         {section === 'summary' && <Summary key={refreshKey} user={user} onNavigate={navigate} />}
-        {section === 'jobs' && <Employments key={refreshKey} selectedLocation={ownerLocation} onNavigate={navigate} runSensitive={sensitiveActions.runSensitive} />}
+        {section === 'jobs' && <Employments key={refreshKey} primaryCountryCode={user.primaryCountryCode} selectedLocation={ownerLocation} onNavigate={navigate} runSensitive={sensitiveActions.runSensitive} />}
         {section === 'import' && <Importer onBusyChange={setImportBusy} onDone={() => setRefreshKey((n) => n + 1)} />}
         {section === 'history' && <History key={refreshKey} initialLocation={ownerLocation} onLocationChange={updateHistoryLocation} onNavigate={navigate} runSensitive={sensitiveActions.runSensitive} />}
+        {section === 'termination' && <TerminationSimulator key={ownerLocation.employmentId ?? 'default'} api={api} selectedEmploymentId={ownerLocation.employmentId} onEmploymentChange={(employmentId) => navigate('termination', { employmentId })} onManageEmployment={() => navigate('jobs')} />}
         {section === 'settings' && <Settings user={user} onUserChanged={onUserChanged} runSensitive={sensitiveActions.runSensitive} onDeletionRequested={onDeletionRequested} />}
       </main>
       <nav className="mobile-navigation" aria-label="Accesos principales" inert={sensitiveActions.open || undefined}>
@@ -1809,6 +1825,7 @@ function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) 
       {history && context && scope ? <>
         <SalaryScopeControl history={history} selectedKey={selectedScopeKey} onChange={setSelectedScopeKey} id="summary-salary-scope" />
         <SalaryContextNotice context={context} />
+        {context.employmentId && <div className="inline-actions"><button type="button" className="button secondary" onClick={() => onNavigate('termination', { employmentId: context.employmentId })}>Indemnización estimada</button></div>}
         <SalaryMetricGrid scope={scope} context={context} />
       </> : history && !historyLoading && <EmptyState title="Todavía no hay datos salariales" body="Importá un recibo soportado y completá su revisión para construir el historial." action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />}
       <div className="dashboard-grid summary-documents-grid">
@@ -1841,7 +1858,7 @@ function DocumentStatusBadges({ document }: { document: DocumentItem }) {
   return <span className="document-badges"><Status value={document.processingStatus} />{document.decisionRequired && <span className="status pending">Para revisar</span>}{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
 }
 
-function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedLocation: OwnerLocation; onNavigate: NavigateApp; runSensitive: RunSensitive }) {
+function Employments({ selectedLocation, onNavigate, runSensitive, primaryCountryCode }: { selectedLocation: OwnerLocation; onNavigate: NavigateApp; runSensitive: RunSensitive; primaryCountryCode?: string | null }) {
   const [items, setItems] = useState<Employment[]>([]);
   const [detections, setDetections] = useState<EmploymentDetection[]>([]);
   const [salaryHistory, setSalaryHistory] = useState<SalaryHistory | null>(null);
@@ -1851,13 +1868,13 @@ function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedL
   const [confirmation, setConfirmation] = useState<EmploymentDetection | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmationError, setConfirmationError] = useState('');
+  const [confirmationEmploymentChoice, setConfirmationEmploymentChoice] = useState('');
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const employmentForm = useRef<HTMLFormElement>(null);
-  const employmentFormDirty = useCallback(() => Array.from(employmentForm.current?.elements ?? []).some((control) => (
-    control instanceof HTMLInputElement ? control.value !== control.defaultValue
-      : control instanceof HTMLSelectElement && Array.from(control.options).some((option) => option.selected !== option.defaultSelected)
-  )), []);
+  const initialEmploymentForm = useRef('');
+  useEffect(() => { initialEmploymentForm.current = JSON.stringify([...new FormData(employmentForm.current ?? undefined).entries()]); }, [editing, confirmation]);
+  const employmentFormDirty = useCallback(() => Boolean(employmentForm.current) && JSON.stringify([...new FormData(employmentForm.current!).entries()]) !== initialEmploymentForm.current, []);
   const confirmEmploymentDiscard = useCallback(() => !employmentFormDirty() || window.confirm('Hay cambios sin guardar. ¿Querés descartarlos?'), [employmentFormDirty]);
   const closeEmployment = useCallback(() => {
     if (!savingRef.current && confirmEmploymentDiscard()) setEditing(null);
@@ -1915,7 +1932,9 @@ function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedL
       const payload = {
         employerName, role: form.get('role') || null,
         startDate: form.get('startDate'), endDate: form.get('endDate') || null,
-        countryCode: 'AR', currencyCode: form.get('currencyCode') || 'ARS',
+        countryCode: form.get('countryCode'), currencyCode: form.get('currencyCode'),
+        subdivisionCode: form.get('subdivisionCode') || null, legalRegimeCode: form.get('legalRegimeCode') || null,
+        status: form.get('status'), employmentType: form.get('employmentType'),
       };
       const path = currentEmployment === 'new' ? '/employments' : `/employments/${currentEmployment.id}`;
       await api(path, { method: currentEmployment === 'new' ? 'POST' : 'PATCH', body: JSON.stringify(payload) });
@@ -1964,7 +1983,7 @@ function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedL
           currencyCode: detection.currencyCode,
           ...(employmentId && employmentId !== 'new'
             ? { employmentId }
-            : { startDate: form.get('startDate'), endDate: form.get('endDate') || null }),
+            : { startDate: form.get('startDate'), endDate: form.get('endDate') || null, countryCode: form.get('countryCode'), subdivisionCode: form.get('subdivisionCode') || null, legalRegimeCode: form.get('legalRegimeCode') || null, status: form.get('status'), employmentType: form.get('employmentType') }),
         }),
       });
       setConfirmation(null);
@@ -1976,7 +1995,7 @@ function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedL
 
   function closeConfirmation() {
     if (confirming || !confirmEmploymentDiscard()) return;
-    setConfirmation(null); setConfirmationError('');
+    setConfirmation(null); setConfirmationError(''); setConfirmationEmploymentChoice('');
   }
 
   const matchingEmployments = confirmation
@@ -2009,8 +2028,9 @@ function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedL
       {!loading && !selectedEmployment && !error && <EmptyState title="No encontramos ese empleo" body="Puede haber sido eliminado o no pertenecer a tu cuenta." action={<button className="button secondary" onClick={() => onNavigate('jobs', { employmentId: null })}>Volver a empleos</button>} />}
       {selectedEmployment && <>
         <PageHeader eyebrow="Trayectoria" title={selectedEmployment.employerName} action={<button type="button" className="button secondary" disabled={saving} onClick={() => void toggleFavorite(selectedEmployment)}>{saving ? 'Guardando…' : selectedEmployment.isFavorite ? 'Quitar de favoritas' : 'Marcar favorita'}</button>} />
-        <section className="panel employment-detail"><div className="employment-detail-heading"><div className="employer-avatar">{selectedEmployment.employerName.slice(0, 2).toUpperCase()}</div><div><h2>{selectedEmployment.role || 'Puesto sin especificar'}</h2><p>{selectedEmployment.employerStatus === 'VERIFIED' ? 'Empresa verificada' : selectedEmployment.employerStatus === 'PENDING' ? 'Empresa por verificar' : 'Empresa registrada'}</p></div></div><dl><div><dt>Desde</dt><dd>{dateLabel(selectedEmployment.startDate)}</dd></div><div><dt>Hasta</dt><dd>{selectedEmployment.endDate ? dateLabel(selectedEmployment.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{selectedEmployment.currencyCode}</dd></div><div><dt>Estado</dt><dd>{selectedEmployment.status === 'ACTIVE' ? 'Empleo actual' : 'Empleo anterior'}</dd></div></dl></section>
+        <section className="panel employment-detail"><div className="employment-detail-heading"><div className="employer-avatar">{selectedEmployment.employerName.slice(0, 2).toUpperCase()}</div><div><h2>{selectedEmployment.role || 'Puesto sin especificar'}</h2><p>{selectedEmployment.employerStatus === 'VERIFIED' ? 'Empresa verificada' : selectedEmployment.employerStatus === 'PENDING' ? 'Empresa por verificar' : 'Empresa registrada'}</p></div></div><dl><div><dt>Desde</dt><dd>{dateLabel(selectedEmployment.startDate)}</dd></div><div><dt>Hasta</dt><dd>{selectedEmployment.endDate ? dateLabel(selectedEmployment.endDate) : selectedEmployment.status === 'ACTIVE' ? 'Actualidad' : 'Sin confirmar'}</dd></div><div><dt>País laboral</dt><dd>{selectedEmployment.countryCode ? countryName(selectedEmployment.countryCode) : 'Sin confirmar'}{selectedEmployment.countryCode && !selectedEmployment.countryConfirmedAt ? ' · pendiente de confirmar' : ''}</dd></div><div><dt>Moneda</dt><dd>{selectedEmployment.currencyCode}</dd></div><div><dt>Estado</dt><dd>{selectedEmployment.status === 'ACTIVE' ? 'Empleo actual' : selectedEmployment.status === 'ENDED' ? 'Empleo anterior' : 'Continuidad sin confirmar'}</dd></div></dl></section>
         {selectedScope && selectedContext ? <><SalaryMetricGrid scope={selectedScope} context={selectedContext} /><section className="panel employment-coverage"><div className="panel-heading"><div><p className="eyebrow">Fuentes vinculadas</p><h2>Cobertura del historial</h2></div></div><dl className="employment-summary"><div><dt>Liquidaciones</dt><dd>{selectedScope.annual.reduce((total, annual) => total + annual.settlementCount, 0)}</dd></div><div><dt>Documentos</dt><dd>{selectedScope.annual.reduce((total, annual) => total + annual.documentCount, 0)}</dd></div><div><dt>Períodos</dt><dd>{selectedScope.evolution.length}</dd></div><div><dt>Posibles faltantes</dt><dd>{selectedScope.coverage.possibleMissingPeriods.length}</dd></div></dl>{selectedScope.coverage.possibleMissingPeriods.length > 0 && <p className="coverage-note">Revisá: {selectedScope.coverage.possibleMissingPeriods.map(periodLabel).join(', ')}.</p>}</section></> : salaryHistory && !error ? <EmptyState title="Sin historial salarial asociado" body="Los datos aparecerán cuando asocies y revises recibos de este empleo." /> : null}
+        <div className="inline-actions"><button type="button" className="button primary" onClick={() => onNavigate('termination', { employmentId: selectedEmployment.id })}>Indemnización estimada</button></div>
         <section className="employment-detail-actions" aria-label="Explorar datos del empleo">{([['summary', 'Revisar y comparar períodos'], ['evolution', 'Explorar evolución'], ['documents', 'Ver documentos fuente']] as Array<[HistoryTab, string]>).map(([tab, label]) => <a className="panel detail-action" href={historyHref(tab)} key={tab} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('history', { tab, ...selectedSalaryLocation }); } }}><strong>{label}</strong><span aria-hidden="true">→</span></a>)}</section>
       </>}
     </div>;
@@ -2041,11 +2061,11 @@ function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedL
             const settlementCount = itemScope?.annual.reduce((total, annual) => total + annual.settlementCount, 0) ?? 0;
             const documentCount = itemScope?.annual.reduce((total, annual) => total + annual.documentCount, 0) ?? 0;
             const itemLocation = { currencyCode: itemContext?.currencyCode ?? item.currencyCode, employmentContext: itemContext?.employmentContext, employmentId: item.id };
-            return <article className="employment-card interactive" key={item.id}><a className="employment-card-link" href={`/${writeOwnerLocation('', { section: 'jobs', ...itemLocation })}`} aria-label={`Abrir detalle de ${item.employerName}, ${item.role || 'puesto sin especificar'}`} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('jobs', itemLocation); } }} /><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p>{item.isFavorite && <span className="status ready">Favorita</span>}{item.employerStatus === 'PENDING' && <span className="status pending">Empresa por verificar</span>}</div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : 'Finalizado'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : 'Actualidad'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl>{itemScope?.current && <div className="employment-card-summary"><span>Último neto · {periodLabel(itemScope.current.period)}</span><strong><MoneyValue value={itemScope.current.amounts.netAmount} currency={itemContext?.currencyCode ?? item.currencyCode} kind="salary" /></strong><small>{settlementCount} {settlementCount === 1 ? 'liquidación' : 'liquidaciones'} · {documentCount} documento{documentCount === 1 ? '' : 's'}{itemScope.coverage.possibleMissingPeriods.length ? ` · ${itemScope.coverage.possibleMissingPeriods.length} posible${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : ''}</small></div>}</div><details className="employment-menu"><summary aria-label={`Acciones para ${item.employerName}`}>•••</summary><div><button type="button" className="text-button" disabled={saving} onClick={() => void toggleFavorite(item)}>{item.isFavorite ? 'Quitar de favoritas' : 'Marcar favorita'}</button><button className="text-button" disabled={saving} onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" disabled={saving} onClick={() => void remove(item)}>Eliminar</button></div></details><span className="employment-arrow" aria-hidden="true">→</span></article>;
+            return <article className="employment-card interactive" key={item.id}><a className="employment-card-link" href={`/${writeOwnerLocation('', { section: 'jobs', ...itemLocation })}`} aria-label={`Abrir detalle de ${item.employerName}, ${item.role || 'puesto sin especificar'}`} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); onNavigate('jobs', itemLocation); } }} /><div className="employer-avatar">{item.employerName.slice(0, 2).toUpperCase()}</div><div className="employment-main"><div><h2>{item.employerName}</h2><p>{item.role || 'Puesto sin especificar'}</p>{item.isFavorite && <span className="status ready">Favorita</span>}{item.employerStatus === 'PENDING' && <span className="status pending">Empresa por verificar</span>}</div><span className={`status ${item.status === 'ACTIVE' ? 'ready' : ''}`}>{item.status === 'ACTIVE' ? 'Activo' : item.status === 'ENDED' ? 'Finalizado' : 'Continuidad sin confirmar'}</span><dl><div><dt>Desde</dt><dd>{dateLabel(item.startDate)}</dd></div><div><dt>Hasta</dt><dd>{item.endDate ? dateLabel(item.endDate) : item.status === 'ACTIVE' ? 'Actualidad' : 'Sin confirmar'}</dd></div><div><dt>Moneda</dt><dd>{item.currencyCode}</dd></div></dl>{itemScope?.current && <div className="employment-card-summary"><span>Último neto · {periodLabel(itemScope.current.period)}</span><strong><MoneyValue value={itemScope.current.amounts.netAmount} currency={itemContext?.currencyCode ?? item.currencyCode} kind="salary" /></strong><small>{settlementCount} {settlementCount === 1 ? 'liquidación' : 'liquidaciones'} · {documentCount} documento{documentCount === 1 ? '' : 's'}{itemScope.coverage.possibleMissingPeriods.length ? ` · ${itemScope.coverage.possibleMissingPeriods.length} posible${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'} faltante${itemScope.coverage.possibleMissingPeriods.length === 1 ? '' : 's'}` : ''}</small></div>}</div><details className="employment-menu"><summary aria-label={`Acciones para ${item.employerName}`}>•••</summary><div><button type="button" className="text-button" disabled={saving} onClick={() => void toggleFavorite(item)}>{item.isFavorite ? 'Quitar de favoritas' : 'Marcar favorita'}</button><button className="text-button" disabled={saving} onClick={() => setEditing(item)}>Editar</button><button className="text-button danger-text" disabled={saving} onClick={() => void remove(item)}>Eliminar</button></div></details><span className="employment-arrow" aria-hidden="true">→</span></article>;
           })}</div> : !loading && !error && <EmptyState title={detections.length ? 'Todavía no confirmaste empleos' : 'Sumá tu primer empleo'} body={detections.length ? 'Confirmá una detección o agregá un empleo manualmente.' : 'Podés empezar por tu trabajo actual y completar el resto después.'} action={<button className="button primary" disabled={saving} onClick={() => setEditing('new')}>Agregar empleo</button>} />}
         </section>
       </div>
-      {editing && <ResponsiveDialog labelId="employment-title" busy={saving} onClose={closeEmployment}><section className="modal"><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" disabled={saving} onClick={closeEmployment} aria-label="Cerrar">×</button></div><form ref={employmentForm} className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" autoComplete="organization" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" autoComplete="organization-title" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><label>Moneda<select name="currencyCode" defaultValue={editing === 'new' ? 'ARS' : editing.currencyCode}><option value="ARS">ARS — Peso argentino</option><option value="USD">USD — Dólar</option><option value="EUR">EUR — Euro</option></select></label>{error && <p className="message error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="button secondary" disabled={saving} onClick={closeEmployment}>Cancelar</button><button className="button primary" disabled={saving}>{saving ? 'Guardando…' : 'Guardar'}</button></div></form></section></ResponsiveDialog>}
+      {editing && <ResponsiveDialog labelId="employment-title" busy={saving} onClose={closeEmployment}><section className="modal"><div className="modal-head"><h2 id="employment-title">{editing === 'new' ? 'Nuevo empleo' : 'Editar empleo'}</h2><button className="icon-button" disabled={saving} onClick={closeEmployment} aria-label="Cerrar">×</button></div><form ref={employmentForm} className="stack-form" onSubmit={save}><label>Empresa<input name="employerName" autoComplete="organization" defaultValue={editing === 'new' ? '' : editing.employerName} minLength={2} maxLength={160} required /></label><label>Puesto<input name="role" autoComplete="organization-title" defaultValue={editing === 'new' ? '' : editing.role ?? ''} maxLength={120} /></label><div className="field-row"><label>Inicio<input name="startDate" type="date" defaultValue={editing === 'new' ? '' : editing.startDate.slice(0, 10)} required /></label><label>Fin<input name="endDate" type="date" defaultValue={editing === 'new' ? '' : editing.endDate?.slice(0, 10) ?? ''} /></label></div><EmploymentJurisdictionFields initial={editing === 'new' ? undefined : editing} primaryCountryCode={primaryCountryCode} />{error && <p className="message error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="button secondary" disabled={saving} onClick={closeEmployment}>Cancelar</button><button className="button primary" disabled={saving}>{saving ? 'Guardando…' : 'Guardar'}</button></div></form></section></ResponsiveDialog>}
       {confirmation && <ResponsiveDialog labelId="employment-confirmation-title" busy={confirming} onClose={closeConfirmation}>
         <section className="modal" aria-describedby="employment-confirmation-description">
           <div className="modal-head"><div><p className="eyebrow">Empleo detectado</p><h2 id="employment-confirmation-title">Confirmar empleo</h2></div><button type="button" className="icon-button" disabled={confirming} onClick={closeConfirmation} aria-label="Cerrar">×</button></div>
@@ -2053,8 +2073,9 @@ function Employments({ selectedLocation, onNavigate, runSensitive }: { selectedL
             <label>Empresa<input value={confirmation.employerName} readOnly /></label>
             <div className="field-row"><label>Moneda<input value={confirmation.currencyCode} readOnly /></label><label>Documentos detectados<input value={confirmation.documentCount} readOnly /></label></div>
             <p id="employment-confirmation-description">Detectamos recibos entre {periodLabel(confirmation.firstPeriod)} y {periodLabel(confirmation.lastPeriod)}. El último recibo no implica que el empleo haya finalizado.</p>
-            {matchingEmployments.length > 0 && <label>Asociar a<select name="employmentId" defaultValue={matchingEmployments.length === 1 ? matchingEmployments[0]!.id : ''} required autoFocus><option value="" disabled>Elegí un empleo</option>{matchingEmployments.map((item) => <option key={item.id} value={item.id}>{employmentOptionLabel(item)}</option>)}<option value="new">Crear otro empleo</option></select><small>Al elegir uno existente se conservan sus fechas y datos.</small></label>}
-            <div className="field-row"><label>{matchingEmployments.length ? 'Inicio (si creás otro)' : 'Inicio'}<input name="startDate" type="date" defaultValue={`${confirmation.firstPeriod}-01`} required autoFocus={!matchingEmployments.length} /></label><label>Fin (opcional)<input name="endDate" type="date" /></label></div>
+            {matchingEmployments.length > 0 && <label>Asociar a<select name="employmentId" value={confirmationEmploymentChoice || (matchingEmployments.length === 1 ? matchingEmployments[0]!.id : '')} onChange={(event) => setConfirmationEmploymentChoice(event.target.value)} required autoFocus><option value="" disabled>Elegí un empleo</option>{matchingEmployments.map((item) => <option key={item.id} value={item.id}>{employmentOptionLabel(item)}</option>)}<option value="new">Crear otro empleo</option></select><small>Al elegir uno existente se conservan sus fechas y datos.</small></label>}
+            {(!matchingEmployments.length || confirmationEmploymentChoice === 'new') && <><div className="field-row"><label>{matchingEmployments.length ? 'Inicio (si creás otro)' : 'Inicio'}<input name="startDate" type="date" defaultValue={`${confirmation.firstPeriod}-01`} required autoFocus={!matchingEmployments.length} /></label><label>Fin (opcional)<input name="endDate" type="date" /></label></div>
+            <EmploymentJurisdictionFields primaryCountryCode={primaryCountryCode} detectedCurrencyCode={confirmation.currencyCode} /></>}
             {confirmationError && <p className="message error" role="alert">{confirmationError}</p>}
             <div className="modal-actions"><button type="button" className="button secondary" disabled={confirming} onClick={closeConfirmation}>Cancelar</button><button className="button primary" disabled={confirming}>{confirming ? 'Confirmando…' : matchingEmployments.length ? 'Asociar recibos' : 'Confirmar empleo'}</button></div>
           </form>
@@ -2796,6 +2817,14 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     await api(`/documents/${selected.id}/type-confirmation`, { method: 'POST', body: JSON.stringify({ documentType }) });
     await Promise.all([loadSalary(), reloadDocuments(true), refreshDetail()]);
   }
+  async function confirmDocumentCountry(countryCode: string, extractionRunId: string, expectedCountryCode: string | null) {
+    if (!selected) return;
+    try {
+      await api(`/documents/${selected.id}/country`, { method: 'PATCH', body: JSON.stringify({ countryCode, extractionRunId, expectedCountryCode }) });
+    } finally {
+      await refreshDetail();
+    }
+  }
   async function saveUnsupportedFeedback(comment: string) {
     if (!selected) return null;
     const saved = await api<{ comment: string | null }>(`/documents/${selected.id}/unsupported-feedback`, {
@@ -3217,6 +3246,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
       {history && context && scope && <>
         <SalaryScopeControl history={history} employments={employments} selectedKey={selectedScopeKey} onChange={selectScope} id="history-salary-scope" />
         <SalaryContextNotice context={context} />
+        {context.employmentId && <div className="inline-actions"><button type="button" className="button secondary" onClick={() => onNavigate('termination', { employmentId: context.employmentId })}>Indemnización estimada</button></div>}
         {(evolutionTab || tab === 'annual' || tab === 'concepts') && <div className="history-filters">{evolutionTab ? <><label>Rango<select value={selectedEvolutionRange} onChange={(event) => { const range = event.target.value as (typeof evolutionRanges)[number][0]; setEvolutionRange(range); onLocationChange({ range }, true); }}>{evolutionRanges.filter(([value]) => (availableRangeValues as readonly (string | number)[]).includes(value === 'all' ? 'all' : Number(value))).map(([value, label]) => <option value={value} key={value}>{value === 'all' ? 'Todo el empleo' : label}</option>)}</select></label><label>Ver evolución como<select value={selectedPerspective} onChange={(event) => selectPerspective(event.target.value as EconomicPerspective)}>{economicPerspectives.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label></> : <><label>Año<select value={selectedYear} onChange={(event) => { setYearFilter(event.target.value); onLocationChange({ year: event.target.value }, true); }}><option value="all">Todos</option>{years.map((year) => <option value={year} key={year}>{year}</option>)}</select></label><label>Categoría<select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value as 'all' | SalaryCategory)}><option value="all">Todas</option>{salaryCategories.map((item) => <option value={item} key={item}>{categoryLabels[item]}</option>)}</select></label></>}</div>}
       </>}
 
@@ -3269,6 +3299,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
         onClose={closeDocument}
         onCompleteReview={completeReview}
         onConfirmType={confirmType}
+        onConfirmCountry={confirmDocumentCountry}
         onDeleteDocument={deleteDocument}
         onDeleteOriginal={deleteOriginal}
         onBusyChange={setReviewBusy}
@@ -3577,6 +3608,6 @@ function Settings({ user, onUserChanged, runSensitive, onDeletionRequested }: {
   return <div className="page narrow-page settings-page"><PageHeader eyebrow="Tu cuenta" title="Configuración" /><div className="tabs settings-tabs" role="tablist" aria-label="Secciones de configuración">{settingsTabs.map(([value, label], index) => <button type="button" id={`settings-tab-${value}`} role="tab" aria-controls={`settings-panel-${value}`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className={tab === value ? 'active' : ''} onKeyDown={(event) => moveTab(event, index)} onClick={() => setTab(value)} key={value}>{label}</button>)}</div>
     <section id="settings-panel-security" role="tabpanel" aria-labelledby="settings-tab-security" tabIndex={0} hidden={tab !== 'security'}><MfaSettings key={String(user.mfaEnabled)} mfaEnabled={user.mfaEnabled} onSessionsChanged={() => setSessionsRefreshKey((value) => value + 1)} onUserChanged={onUserChanged} runSensitive={runSensitive} /><SessionsSettings refreshKey={sessionsRefreshKey} runSensitive={runSensitive} /></section>
     <section id="settings-panel-privacy" role="tabpanel" aria-labelledby="settings-tab-privacy" tabIndex={0} hidden={tab !== 'privacy'}><PrivacySettings runSensitive={runSensitive} /></section>
-    <section id="settings-panel-account" role="tabpanel" aria-labelledby="settings-tab-account" tabIndex={0} hidden={tab !== 'account'}><AccountSettings user={user} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} /></section>
+    <section id="settings-panel-account" role="tabpanel" aria-labelledby="settings-tab-account" tabIndex={0} hidden={tab !== 'account'}><CountrySettings api={api} onConfirmed={(profile) => onUserChanged({ ...user, primaryCountryCode: profile.primaryCountryCode, primaryCountryConfirmedAt: profile.primaryCountryConfirmedAt })} /><AccountSettings user={user} runSensitive={runSensitive} onDeletionRequested={onDeletionRequested} /></section>
   </div>;
 }

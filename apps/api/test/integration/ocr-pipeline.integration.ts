@@ -99,7 +99,7 @@ test("OCR versionado conserva activo, descubre recuperación y reutiliza artefac
     [randomUUID(),userId,documentId,processingPipelineVersions.extractor,processingPipelineVersions.parser,currentPipelineFingerprint,baselineRunId]);
   await worker.setDocumentStage(job,"PARSING");
   const runId = (await pool.query("SELECT id FROM extraction_runs WHERE document_id=$1 AND processing_version=2", [documentId])).rows[0]!.id;
-  const text = `RECIBO DE SUELDO\nEmpleador: Empresa Sintética OCR ${documentId}\nPeríodo: 08/2026\nSueldo básico $ 1.000,00\nJubilación $ 100,00\nTotal bruto $ 1.000,00\nTotal descuentos $ 100,00\nNeto a cobrar $ 900,00`;
+  const text = `RECIBO DE SUELDO\nMoneda ARS\nEmpleador: Empresa Sintética OCR ${documentId}\nPeríodo: 08/2026\nSueldo básico $ 1.000,00\nJubilación $ 100,00\nTotal bruto $ 1.000,00\nTotal descuentos $ 100,00\nNeto a cobrar $ 900,00`;
   let calls = 0;
   const outcome = await orchestrator.orchestrateExtraction({ text:"",evidence:[],source:"PDF_TEXT" }, {
     fallback: async () => { calls++; return { provider:"zai",model:"glm-ocr",providerVersion:"1",text,

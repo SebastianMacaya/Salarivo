@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { getCountry } from "@salarivo/jurisdictions";
+import { inheritDocumentCountries, registerJurisdictionRoutes } from "./jurisdiction-routes.ts";
 import { isIP } from "node:net";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
@@ -56,6 +58,8 @@ type AuthUser = {
   authState: "AUTHENTICATED" | "MFA_REQUIRED" | "MFA_SETUP_REQUIRED";
   mfaEnabled: boolean;
   onboardingCompleted: boolean;
+  primaryCountryCode: string | null;
+  primaryCountryConfirmedAt: string | null;
   legalAcceptanceRequired: boolean;
   authMethods: "GOOGLE"[];
 };
@@ -200,6 +204,8 @@ const userSchema = {
     authState: { type: "string", enum: ["AUTHENTICATED", "MFA_REQUIRED", "MFA_SETUP_REQUIRED"] },
     mfaEnabled: { type: "boolean" },
     onboardingCompleted: { type: "boolean" },
+    primaryCountryCode: nullableText(2),
+    primaryCountryConfirmedAt: nullableText(40),
     legalAcceptanceRequired: { type: "boolean" },
     authMethods: {
       type: "array",
@@ -289,7 +295,7 @@ const employmentSchema = {
     employerId: { type: "string", pattern: UUID_PATTERN },
     employerName: { type: "string" },
     employerStatus: { type: "string", enum: ["PENDING", "VERIFIED"] },
-    status: { type: "string", enum: ["ACTIVE", "ENDED"] },
+    status: { type: "string", enum: ["ACTIVE", "ENDED", "UNKNOWN"] },
     startDate: { type: "string", pattern: DATE_PATTERN },
     endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
     role: nullableText(120),
@@ -297,6 +303,14 @@ const employmentSchema = {
     modality: nullableText(80),
     countryCode: { type: "string", pattern: "^[A-Z]{2}$" },
     currencyCode: { type: "string", pattern: "^[A-Z]{3}$" },
+    subdivisionCode: nullableText(6),
+    legalRegimeCode: nullableText(80),
+    countrySource: { type: "string", enum: ["LEGACY", "DOCUMENT", "USER_CONFIRMED"] },
+    countryConfidence: nullableText(6),
+    countryConfirmedAt: nullableText(40),
+    statusConfirmedAt: nullableText(40),
+    startDateConfirmedAt: nullableText(40),
+    employmentType: { type: "string", enum: ["DEPENDENT", "INDEPENDENT", "UNKNOWN"] },
     isFavorite: { type: "boolean" },
     createdAt: { type: "string" },
     updatedAt: { type: "string" },
@@ -377,6 +391,8 @@ function userFrom(row: Record<string, unknown>): AuthUser {
     onboardingCompleted: row.onboarding_completed_at !== null && row.onboarding_completed_at !== undefined,
     legalAcceptanceRequired: row.legal_documents_acknowledged !== true,
     authMethods,
+    primaryCountryCode: row.primary_country_code ? String(row.primary_country_code) : null,
+    primaryCountryConfirmedAt: row.primary_country_confirmed_at ? timestamp(row.primary_country_confirmed_at as Date | string) : null,
   };
 }
 
@@ -434,6 +450,14 @@ function employmentFrom(row: Record<string, unknown>) {
     modality: row.modality === null ? null : String(row.modality),
     countryCode: String(row.country_code),
     currencyCode: String(row.currency_code),
+    subdivisionCode: row.subdivision_code ? String(row.subdivision_code) : null,
+    legalRegimeCode: row.legal_regime_code ? String(row.legal_regime_code) : null,
+    countrySource: String(row.country_source ?? "LEGACY"),
+    countryConfidence: row.country_confidence ? String(row.country_confidence) : null,
+    countryConfirmedAt: row.country_confirmed_at ? timestamp(row.country_confirmed_at as Date | string) : null,
+    statusConfirmedAt: row.status_confirmed_at ? timestamp(row.status_confirmed_at as Date | string) : null,
+    startDateConfirmedAt: row.start_date_confirmed_at ? timestamp(row.start_date_confirmed_at as Date | string) : null,
+    employmentType: String(row.employment_type ?? "UNKNOWN"),
     isFavorite: row.is_favorite === true,
     createdAt: timestamp(row.created_at as Date | string),
     updatedAt: timestamp(row.updated_at as Date | string),
@@ -455,10 +479,29 @@ function optionalText(value: string | null | undefined, maximum: number): string
 
 function countryCode(value: string): string {
   const normalized = value.trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(normalized)) {
+  if (!getCountry(normalized)) {
     throw new ApiError(400, "VALIDATION_ERROR", "Los datos enviados no son válidos.");
   }
   return normalized;
+}
+
+function validateEmploymentStatus(status: string, endDate: string | null): string {
+  if (!["ACTIVE", "ENDED", "UNKNOWN"].includes(status) || (status === "ENDED") !== (endDate !== null)) {
+    throw new ApiError(400, "VALIDATION_ERROR", "El estado y la fecha de egreso no coinciden.");
+  }
+  return status;
+}
+function validateSubdivision(value: string | null, country: string): string | null {
+  if (value !== null && (!/^[A-Z]{2}-[A-Z0-9]{1,3}$/.test(value) || !value.startsWith(`${country}-`))) {
+    throw new ApiError(400, "VALIDATION_ERROR", "La subdivisión debe corresponder al país del empleo.");
+  }
+  return value;
+}
+function validateRegime(value: string | null, country: string): string | null {
+  if (value !== null && (!/^[A-Z][A-Z0-9_]{1,79}$/.test(value) || !value.startsWith(`${country}_`))) {
+    throw new ApiError(400, "VALIDATION_ERROR", "El régimen debe corresponder al país del empleo.");
+  }
+  return value;
 }
 
 function currencyCode(value: string): string {
@@ -504,6 +547,10 @@ type EmployerBody = { name: string; countryCode: string };
 type EmployerPatch = { name?: string; countryCode?: string };
 type EmployerFavoriteBody = { isFavorite: boolean };
 type EmploymentBody = {
+  status?: "ACTIVE" | "ENDED" | "UNKNOWN";
+  employmentType?: "DEPENDENT" | "INDEPENDENT" | "UNKNOWN";
+  subdivisionCode?: string | null;
+  legalRegimeCode?: string | null;
   employerId?: string;
   employerName?: string;
   startDate: string;
@@ -516,6 +563,11 @@ type EmploymentBody = {
 };
 type EmploymentPatch = Partial<EmploymentBody>;
 type EmploymentDetectionBody = {
+  countryCode?: string;
+  subdivisionCode?: string | null;
+  legalRegimeCode?: string | null;
+  status?: "ACTIVE" | "ENDED" | "UNKNOWN";
+  employmentType?: "DEPENDENT" | "INDEPENDENT" | "UNKNOWN";
   employerId?: string | null;
   employerName: string;
   employmentId?: string;
@@ -675,7 +727,7 @@ export async function buildApp(
     const digest = tokenHash(rawToken);
     const result = await pool.query(
       `SELECT u.id, u.email, u.display_name, u.role, u.admin_role, u.created_at,
-              u.onboarding_completed_at,
+              u.onboarding_completed_at, u.primary_country_code, u.primary_country_confirmed_at,
               EXISTS (
                 SELECT 1 FROM auth_accounts account
                  WHERE account.user_id = u.id AND account.provider = 'GOOGLE'
@@ -1279,7 +1331,9 @@ export async function buildApp(
     SELECT e.id, e.employer_id, employer.name AS employer_name,
            employer.status AS employer_status, e.status,
            e.start_date, e.end_date, e.role, e.category, e.modality,
-           e.country_code, e.currency_code,
+           e.country_code, e.currency_code, e.subdivision_code, e.legal_regime_code,
+           e.country_source, e.country_confidence, e.country_confirmed_at, e.status_confirmed_at,
+           e.start_date_confirmed_at, e.employment_type,
            EXISTS (
              SELECT 1 FROM user_favorite_employers favorite
               WHERE favorite.user_id = e.user_id AND favorite.employer_id = e.employer_id
@@ -1371,6 +1425,10 @@ export async function buildApp(
             startDate: { type: "string", pattern: DATE_PATTERN },
             endDate: { anyOf: [{ type: "string", pattern: DATE_PATTERN }, { type: "null" }] },
             currencyCode: { type: "string", minLength: 3, maxLength: 3 },
+            countryCode: { type: "string", minLength: 2, maxLength: 2 },
+            subdivisionCode: nullableText(6), legalRegimeCode: nullableText(80),
+            status: { type: "string", enum: ["ACTIVE", "ENDED", "UNKNOWN"] },
+            employmentType: { type: "string", enum: ["DEPENDENT", "INDEPENDENT", "UNKNOWN"] },
           },
         },
         response: responses(201, {
@@ -1389,6 +1447,10 @@ export async function buildApp(
       const selectedCurrency = currencyCode(request.body.currencyCode);
       const requestedDetectedEmployerId = request.body.employerId ?? null;
       const requestedEmploymentId = request.body.employmentId ?? null;
+      let selectedCountry = request.body.countryCode ? countryCode(request.body.countryCode) : null;
+      if (!requestedEmploymentId && !selectedCountry) {
+        throw new ApiError(400, "COUNTRY_CONFIRMATION_REQUIRED", "Confirmá el país del nuevo empleo.");
+      }
       if (!requestedEmploymentId && !request.body.startDate) {
         throw new ApiError(400, "VALIDATION_ERROR", "Elegí un empleo existente o indicá su fecha de inicio.");
       }
@@ -1439,6 +1501,7 @@ export async function buildApp(
             || ![observedEmployerId, existingEmployer.id].includes(String(existingEmployment.rows[0].employer_id))) {
             throw new ApiError(409, "EMPLOYMENT_CHANGED", "El empleo cambió; recargá e intentá nuevamente.");
           }
+          selectedCountry = String(existingEmployment.rows[0].country_code);
           startDate = existingEmployment.rows[0].start_date;
           endDate = existingEmployment.rows[0].end_date;
         } else if (requestedDetectedEmployerId) {
@@ -1451,7 +1514,7 @@ export async function buildApp(
         } else {
           employerId = (await resolveEmployerForApi(client, {
             name: employerName,
-            countryCode: "AR",
+            countryCode: selectedCountry!,
             createdByUserId: request.authUser!.id,
             createdSource: "DOCUMENT",
           }, request)).id;
@@ -1492,26 +1555,44 @@ export async function buildApp(
           throw new ApiError(404, "DETECTION_NOT_FOUND", "No encontramos recibos sin asociar para esa empresa y período.");
         }
         if (!employmentId) {
-          const existing = await client.query<{ id: string }>(
-            `SELECT id FROM employments
-              WHERE user_id = $1 AND employer_id = $2 AND country_code = 'AR'
+          const existing = await client.query<{ id: string; status: string; country_confirmed_at: unknown; status_confirmed_at: unknown; start_date_confirmed_at: unknown }>(
+            `SELECT id, status, country_confirmed_at, status_confirmed_at, start_date_confirmed_at FROM employments
+              WHERE user_id = $1 AND employer_id = $2 AND country_code = $6
                 AND currency_code = $3 AND start_date = $4
                 AND end_date IS NOT DISTINCT FROM $5::date
                 AND role IS NULL AND category IS NULL AND modality IS NULL
+                AND subdivision_code IS NOT DISTINCT FROM $7::text
+                AND legal_regime_code IS NOT DISTINCT FROM $8::text AND employment_type = $9
               ORDER BY id LIMIT 1 FOR UPDATE`,
-            [request.authUser!.id, employerId, selectedCurrency, startDate, endDate],
+            [request.authUser!.id, employerId, selectedCurrency, startDate, endDate, selectedCountry,
+              validateSubdivision(request.body.subdivisionCode ?? null, selectedCountry!),
+              validateRegime(request.body.legalRegimeCode ?? null, selectedCountry!), request.body.employmentType ?? "UNKNOWN"],
           );
+          if (existing.rowCount && (!existing.rows[0]!.country_confirmed_at || !existing.rows[0]!.start_date_confirmed_at
+              || existing.rows[0]!.status !== (request.body.status ?? (endDate ? "ENDED" : "UNKNOWN"))
+              || (request.body.status !== undefined && !existing.rows[0]!.status_confirmed_at))) {
+            throw new ApiError(409, "EMPLOYMENT_DUPLICATE", "Ese empleo ya existe; revisá y confirmá sus datos antes de asociar los documentos.");
+          }
           employmentId = existing.rows[0]?.id ?? randomUUID();
           if (!existing.rowCount) {
             await client.query(
               `INSERT INTO employments (
-                 id, user_id, employer_id, status, start_date, end_date, country_code, currency_code
-               ) VALUES ($1, $2, $3, $4, $5, $6, 'AR', $7)`,
-              [employmentId, request.authUser!.id, employerId, endDate === null ? "ACTIVE" : "ENDED", startDate, endDate, selectedCurrency],
+                 id, user_id, employer_id, status, start_date, end_date, country_code, currency_code,
+                 subdivision_code, legal_regime_code, employment_type,
+                 country_source, country_confidence, country_confirmed_at, status_confirmed_at, start_date_confirmed_at
+               ) VALUES ($1, $2, $3, $4, $5, $6, $8, $7, $9, $10, $11,
+                         'USER_CONFIRMED', 'HIGH', now(), CASE WHEN $12 THEN now() END, now())`,
+              [employmentId, request.authUser!.id, employerId,
+                validateEmploymentStatus(request.body.status ?? (endDate ? "ENDED" : "UNKNOWN"), endDate as string | null),
+                startDate, endDate, selectedCurrency, selectedCountry,
+                validateSubdivision(request.body.subdivisionCode ?? null, selectedCountry!),
+                validateRegime(request.body.legalRegimeCode ?? null, selectedCountry!), request.body.employmentType ?? "UNKNOWN",
+                request.body.status !== undefined || endDate !== null],
             );
           }
         }
         const documentIds = lockedDocuments.rows.map((row) => String(row.id));
+        await inheritDocumentCountries(client, request.authUser!.id, employmentId, documentIds, ApiError);
         await client.query(
           `UPDATE documents SET employment_id = $1, detected_employer_id = $2
             WHERE user_id = $3 AND employment_id IS NULL AND id = ANY($4::uuid[])`,
@@ -1583,6 +1664,10 @@ export async function buildApp(
             role: nullableText(120),
             category: nullableText(120),
             modality: nullableText(80),
+            status: { type: "string", enum: ["ACTIVE", "ENDED", "UNKNOWN"] },
+            employmentType: { type: "string", enum: ["DEPENDENT", "INDEPENDENT", "UNKNOWN"] },
+            subdivisionCode: nullableText(6),
+            legalRegimeCode: nullableText(80),
             countryCode: { type: "string", minLength: 2, maxLength: 2 },
             currencyCode: { type: "string", minLength: 3, maxLength: 3 },
           },
@@ -1597,6 +1682,9 @@ export async function buildApp(
       const { startDate, endDate } = validateEmploymentDates(request.body.startDate, request.body.endDate ?? null);
       const selectedCountry = countryCode(request.body.countryCode);
       const selectedCurrency = currencyCode(request.body.currencyCode);
+      const status = validateEmploymentStatus(request.body.status ?? (endDate ? "ENDED" : "UNKNOWN"), endDate);
+      const subdivision = validateSubdivision(request.body.subdivisionCode ?? null, selectedCountry);
+      const regime = validateRegime(request.body.legalRegimeCode ?? null, selectedCountry);
       const role = optionalText(request.body.role, 120) ?? null;
       const category = optionalText(request.body.category, 120) ?? null;
       const modality = optionalText(request.body.modality, 80) ?? null;
@@ -1617,7 +1705,7 @@ export async function buildApp(
           }, request)).id;
         } else {
           const canonical = await followMergedEmployer(client, request.body.employerId!);
-          if (!canonical || canonical.countryCode !== selectedCountry) {
+          if (!canonical) {
             throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
           }
           const allowed = await client.query(
@@ -1644,10 +1732,12 @@ export async function buildApp(
               AND category IS NOT DISTINCT FROM $6::text
               AND modality IS NOT DISTINCT FROM $7::text
               AND country_code = $8 AND currency_code = $9
+              AND subdivision_code IS NOT DISTINCT FROM $10::text
+              AND legal_regime_code IS NOT DISTINCT FROM $11::text AND employment_type = $12
             ORDER BY id LIMIT 1 FOR UPDATE`,
           [
             request.authUser!.id, employerId, startDate, endDate, role, category,
-            modality, selectedCountry, selectedCurrency,
+            modality, selectedCountry, selectedCurrency, subdivision, regime, request.body.employmentType ?? "UNKNOWN",
           ],
         );
         const employmentId = existing.rows[0]?.id ?? randomUUID();
@@ -1655,12 +1745,16 @@ export async function buildApp(
           await client.query(
             `INSERT INTO employments (
                id, user_id, employer_id, status, start_date, end_date, role, category,
-               modality, country_code, currency_code
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+               modality, country_code, currency_code, subdivision_code, legal_regime_code,
+               country_source, country_confidence, country_confirmed_at, status_confirmed_at,
+               start_date_confirmed_at, employment_type
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                       'USER_CONFIRMED', 'HIGH', now(), CASE WHEN $14 THEN now() END, now(), $15)`,
             [
               employmentId, request.authUser!.id, employerId,
-              endDate === null ? "ACTIVE" : "ENDED", startDate, endDate,
-              role, category, modality, selectedCountry, selectedCurrency,
+              status, startDate, endDate,
+              role, category, modality, selectedCountry, selectedCurrency, subdivision, regime,
+              request.body.status !== undefined || endDate !== null, request.body.employmentType ?? "UNKNOWN",
             ],
           );
         }
@@ -1668,6 +1762,10 @@ export async function buildApp(
           `${employmentSelect} WHERE e.id = $1 AND e.user_id = $2`,
           [employmentId, request.authUser!.id],
         );
+        if (existing.rowCount && (selected.rows[0].status !== status || !selected.rows[0].country_confirmed_at || !selected.rows[0].start_date_confirmed_at
+            || (request.body.status !== undefined && !selected.rows[0].status_confirmed_at))) {
+          throw new ApiError(409, "EMPLOYMENT_DUPLICATE", "Ese empleo ya existe con datos pendientes o distintos; editá el empleo existente para confirmarlos.");
+        }
         return selected.rows[0];
       });
       return reply.code(201).send({ data: employmentFrom(created) });
@@ -1708,6 +1806,10 @@ export async function buildApp(
             role: nullableText(120),
             category: nullableText(120),
             modality: nullableText(80),
+            status: { type: "string", enum: ["ACTIVE", "ENDED", "UNKNOWN"] },
+            employmentType: { type: "string", enum: ["DEPENDENT", "INDEPENDENT", "UNKNOWN"] },
+            subdivisionCode: nullableText(6),
+            legalRegimeCode: nullableText(80),
             countryCode: { type: "string", minLength: 2, maxLength: 2 },
             currencyCode: { type: "string", minLength: 3, maxLength: 3 },
           },
@@ -1726,7 +1828,8 @@ export async function buildApp(
         await client.query("SELECT id FROM users WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE", [userId]);
         const observed = await client.query(
           `SELECT e.employer_id, e.start_date::text, e.end_date::text, e.role, e.category,
-                  e.modality, e.country_code, e.currency_code, e.updated_at::text
+                  e.modality, e.country_code, e.currency_code, e.updated_at::text,
+                  e.status, e.subdivision_code, e.legal_regime_code, e.employment_type
              FROM employments AS e
             WHERE e.id = $1 AND e.user_id = $2`,
           [request.params.id, userId],
@@ -1749,7 +1852,7 @@ export async function buildApp(
           }, request)).id;
         } else if (request.body.employerId !== undefined) {
           const canonical = await followMergedEmployer(client, request.body.employerId);
-          if (!canonical || canonical.countryCode !== nextCountry) {
+          if (!canonical) {
             throw new ApiError(404, "NOT_FOUND", "Empleador no encontrado.");
           }
           const allowed = await client.query(
@@ -1770,7 +1873,8 @@ export async function buildApp(
         }
         const current = await client.query(
           `SELECT e.employer_id, e.start_date::text, e.end_date::text, e.role, e.category,
-                  e.modality, e.country_code, e.currency_code, e.updated_at::text
+                  e.modality, e.country_code, e.currency_code, e.updated_at::text,
+                  e.status, e.subdivision_code, e.legal_regime_code, e.employment_type
              FROM employments AS e
             WHERE e.id = $1 AND e.user_id = $2
             FOR UPDATE`,
@@ -1802,6 +1906,14 @@ export async function buildApp(
         const nextCurrency = request.body.currencyCode === undefined
           ? String(previous.currency_code)
           : currencyCode(request.body.currencyCode);
+        const nextStatus = validateEmploymentStatus(request.body.status
+          ?? (request.body.endDate !== undefined ? (nextEnd ? "ENDED" : "UNKNOWN") : String(previous.status)), nextEnd);
+        const nextSubdivision = validateSubdivision(request.body.subdivisionCode === undefined
+          ? (nextCountry === String(previous.country_code) ? previous.subdivision_code as string | null : null)
+          : request.body.subdivisionCode, nextCountry);
+        const nextRegime = validateRegime(request.body.legalRegimeCode === undefined
+          ? (nextCountry === String(previous.country_code) ? previous.legal_regime_code as string | null : null)
+          : request.body.legalRegimeCode, nextCountry);
         const duplicate = await client.query(
           `SELECT 1 FROM employments
             WHERE user_id = $1 AND id <> $2 AND employer_id = $3 AND start_date = $4
@@ -1810,10 +1922,13 @@ export async function buildApp(
               AND category IS NOT DISTINCT FROM $7::text
               AND modality IS NOT DISTINCT FROM $8::text
               AND country_code = $9 AND currency_code = $10
+              AND subdivision_code IS NOT DISTINCT FROM $11::text
+              AND legal_regime_code IS NOT DISTINCT FROM $12::text AND employment_type = $13
             LIMIT 1`,
           [
             userId, request.params.id, employerId, nextStart, nextEnd, nextRole,
             nextCategory, nextModality, nextCountry, nextCurrency,
+            nextSubdivision, nextRegime, request.body.employmentType ?? previous.employment_type,
           ],
         );
         if (duplicate.rowCount) {
@@ -1823,12 +1938,21 @@ export async function buildApp(
           `UPDATE employments
               SET employer_id = $3, status = $4, start_date = $5, end_date = $6,
                   role = $7, category = $8, modality = $9, country_code = $10,
-                  currency_code = $11, updated_at = now()
+                  currency_code = $11, updated_at = now(), subdivision_code = $12, legal_regime_code = $13,
+                  employment_type = $14,
+                  country_source = CASE WHEN $15 THEN 'USER_CONFIRMED' ELSE country_source END,
+                  country_confidence = CASE WHEN $15 THEN 'HIGH' ELSE country_confidence END,
+                  country_confirmed_at = CASE WHEN $15 THEN now() ELSE country_confirmed_at END,
+                  status_confirmed_at = CASE WHEN $16 THEN now() ELSE status_confirmed_at END,
+                  start_date_confirmed_at = CASE WHEN $17 THEN now() ELSE start_date_confirmed_at END
             WHERE id = $1 AND user_id = $2
             RETURNING id, start_date::text, end_date::text`,
           [
-            request.params.id, userId, employerId, nextEnd === null ? "ACTIVE" : "ENDED",
+            request.params.id, userId, employerId, nextStatus,
             nextStart, nextEnd, nextRole, nextCategory, nextModality, nextCountry, nextCurrency,
+            nextSubdivision, nextRegime, request.body.employmentType ?? previous.employment_type,
+            request.body.countryCode !== undefined, request.body.status !== undefined || request.body.endDate !== undefined,
+            request.body.startDate !== undefined,
           ],
         );
         if (updated.rowCount !== 1) {
@@ -1890,6 +2014,8 @@ export async function buildApp(
       return { data: null };
     },
   );
+
+  await registerJurisdictionRoutes(app, { config, requireAuth, ApiError });
 
   await registerDataRoutes(app, {
     config,

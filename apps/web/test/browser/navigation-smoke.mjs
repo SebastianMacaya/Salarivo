@@ -203,6 +203,8 @@ try {
     await textClick('Empleos', '#private-navigation nav button');
     await textClick('Asociar recibos');
     await browser.waitFor('document.querySelector("#employment-confirmation-title")');
+    await browser.evaluate('(() => { const select=document.querySelector("select[name=employmentId]"); select.value="new"; select.dispatchEvent(new Event("change",{bubbles:true})); })()');
+    await browser.waitFor('document.querySelector("input[name=startDate]")');
     await fill('input[name=startDate]', '2025-02-01');
     dialogAccept = false; await back();
     await browser.evaluate('new Promise(resolve=>setTimeout(resolve,250))');

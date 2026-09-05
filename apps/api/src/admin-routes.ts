@@ -2974,7 +2974,7 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
         `WITH ranked AS (
            SELECT id, employer_id,
                   first_value(id) OVER (
-                    PARTITION BY user_id, start_date, end_date, role, category, modality, country_code, currency_code
+                    PARTITION BY user_id, start_date, end_date, role, category, modality, country_code, currency_code, subdivision_code, legal_regime_code, employment_type
                     ORDER BY (employer_id = $2)::integer DESC, created_at, id
                   ) AS survivor_id
              FROM employments
@@ -2992,6 +2992,19 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
       let relinkedDocumentCount = 0;
       let relinkedSettlementCount = 0;
       if (sourceEmploymentIds.length > 0) {
+        const confirmedStatusConflict = await client.query(
+          `SELECT 1
+             FROM unnest($1::uuid[], $2::uuid[]) AS mapping(source_id, survivor_id)
+             JOIN employments source ON source.id = mapping.source_id
+             JOIN employments survivor ON survivor.id = mapping.survivor_id
+            WHERE source.status_confirmed_at IS NOT NULL AND survivor.status_confirmed_at IS NOT NULL
+              AND source.status <> survivor.status
+            LIMIT 1`,
+          [sourceEmploymentIds, survivorEmploymentIds],
+        );
+        if (confirmedStatusConflict.rowCount) {
+          throw new ApiError(409, "EMPLOYMENT_STATUS_CONFLICT", "Los empleos tienen estados confirmados distintos; deben revisarse antes de fusionar.");
+        }
         relinkedImportItemCount = (await client.query(
           `UPDATE import_batch_items item
               SET employment_id = mapping.survivor_id, updated_at = now()
@@ -3013,6 +3026,16 @@ export async function registerAdminRoutes(app: FastifyInstance, dependencies: Ad
             WHERE settlement.employment_id = mapping.source_id`,
           [sourceEmploymentIds, survivorEmploymentIds],
         )).rowCount ?? 0;
+        await client.query(`UPDATE employments survivor SET
+          country_source = CASE WHEN survivor.country_confirmed_at IS NULL AND source.country_confirmed_at IS NOT NULL THEN source.country_source ELSE survivor.country_source END,
+          country_confidence = CASE WHEN survivor.country_confirmed_at IS NULL AND source.country_confirmed_at IS NOT NULL THEN source.country_confidence ELSE survivor.country_confidence END,
+          country_confirmed_at = COALESCE(survivor.country_confirmed_at, source.country_confirmed_at),
+          status = CASE WHEN survivor.status_confirmed_at IS NULL AND source.status_confirmed_at IS NOT NULL THEN source.status ELSE survivor.status END,
+          status_confirmed_at = COALESCE(survivor.status_confirmed_at, source.status_confirmed_at),
+          start_date_confirmed_at = COALESCE(survivor.start_date_confirmed_at, source.start_date_confirmed_at)
+          FROM unnest($1::uuid[], $2::uuid[]) AS mapping(source_id, survivor_id), employments source
+          WHERE source.id = mapping.source_id AND survivor.id = mapping.survivor_id AND source.user_id = survivor.user_id`,
+          [sourceEmploymentIds, survivorEmploymentIds]);
         await client.query(`DELETE FROM employments WHERE id = ANY($1::uuid[])`, [sourceEmploymentIds]);
       }
       const movedEmployments = await client.query(
