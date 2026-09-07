@@ -13,7 +13,7 @@ await mkdir(output, { recursive: true });
 const current = new Date();
 const today = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}-${String(current.getDate()).padStart(2, '0')}`;
 const future = `${current.getFullYear() + 1}-01-15`;
-const employment = { id: id(10), employerName: 'Empresa Sintética Internacional de Prueba', countryCode: 'AR', currencyCode: 'ARS', countryConfirmedAt: '2026-01-01', startDate: '2019-07-01', startDateSource: 'CONFIRMED', legalRegimeCode: 'AR_LCT_GENERAL', status: 'ACTIVE', statusConfirmedAt: '2026-01-01', employmentType: 'DEPENDENT' };
+const employment = { id: id(10), employerName: 'Empresa Sintética Internacional de Prueba', countryCode: 'AR', currencyCode: 'ARS', countryConfirmedAt: '2026-01-01', startDate: '2019-07-01', startDateConfirmedAt: '2026-01-01', startDateSource: 'CONFIRMED', legalRegimeCode: 'AR_LCT_GENERAL', status: 'ACTIVE', statusConfirmedAt: '2026-01-01', employmentType: 'DEPENDENT' };
 const estimates = Object.fromEntries([today, '2024-12-15', future].map(terminationDate => [terminationDate, calculateTerminationEstimate({ employment, today, terminationDate, settlements: [], overrides: { monthlyRemuneration: '2000000.00' } })]));
 assert.ok(Object.values(estimates).every(result => result.status === 'AVAILABLE' && result.scenarios.length === 2));
 const reviewPeriod = new Date(Date.UTC(current.getFullYear(), current.getMonth() - 1, 1)).toISOString().slice(0, 7);
@@ -31,7 +31,7 @@ assert.deepEqual(reviewEstimate.salaryBase.unusablePeriods, [reviewPeriod]);
 
 function installJurisdictionFixture(employment, estimates, reviewData, options) {
   const priorFetch = window.fetch;
-  const state = window.__jurisdictionFixture = { requests: [], employment: { ...employment, ...(options.unknown ? { status: 'UNKNOWN', statusConfirmedAt: null, employmentType: 'UNKNOWN', countryConfirmedAt: null, legalRegimeCode: null } : {}), ...(options.legacyActive ? { statusConfirmedAt: null } : {}) }, primaryCountryCode: options.unconfirmed ? null : 'AR', primaryCountryConfirmedAt: options.unconfirmed ? null : '2026-01-01' };
+  const state = window.__jurisdictionFixture = { requests: [], employmentPatch: null, employment: { ...employment, ...(options.unknown ? { status: 'UNKNOWN', statusConfirmedAt: null, employmentType: 'UNKNOWN', countryConfirmedAt: null, startDateConfirmedAt: null, legalRegimeCode: null } : {}), ...(options.legacyActive ? { statusConfirmedAt: null } : {}) }, primaryCountryCode: options.unconfirmed ? null : 'AR', primaryCountryConfirmedAt: options.unconfirmed ? null : '2026-01-01' };
   const ok = data => Response.json({ data }, { headers: { 'Cache-Control': 'no-store' } });
   window.fetch = async (input, init = {}) => {
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
@@ -47,7 +47,8 @@ function installJurisdictionFixture(employment, estimates, reviewData, options) 
     }
     if (path === '/api/v1/employments') return ok(options.empty ? [] : [state.employment]);
     if (path === `/api/v1/employments/${employment.id}` && init.method === 'PATCH') {
-      Object.assign(state.employment, JSON.parse(init.body), { countryConfirmedAt: '2026-09-05', statusConfirmedAt: '2026-09-05' });
+      state.employmentPatch = JSON.parse(init.body);
+      Object.assign(state.employment, state.employmentPatch, { countryConfirmedAt: '2026-09-05', statusConfirmedAt: '2026-09-05', ...(state.employmentPatch.startDate ? { startDateConfirmedAt: '2026-09-05' } : {}) });
       return ok(state.employment);
     }
     if (path === `/api/v1/employments/${employment.id}/termination-estimate`) {
@@ -148,12 +149,14 @@ try {
   assert.equal(await browser.evaluate('window.__jurisdictionFixture.primaryCountryCode'), 'US');
   await visit(`/?section=termination&employmentId=${employment.id}`, { unknown: true });
   await browser.waitFor('document.querySelector("select[name=status]")');
+  assert.equal(await browser.evaluate('document.querySelector("input[name=startDate]").value'), employment.startDate);
   await input('select[name=status]', 'ACTIVE');
   await input('select[name=employmentType]', 'DEPENDENT');
   await input('select[name=legalRegimeCode]', 'AR_LCT_GENERAL');
   await click('Confirmar datos del empleo');
   await browser.waitFor('!document.querySelector("select[name=status]")');
   assert.equal(await browser.evaluate('window.__jurisdictionFixture.employment.status'), 'ACTIVE');
+  assert.equal(await browser.evaluate('window.__jurisdictionFixture.employmentPatch.startDate'), employment.startDate);
   await visit('/?section=termination', { empty: true });
   assert.ok(await browser.evaluate('document.body.innerText.includes("Primero, registrá tu empleo")'));
   await visit('/?section=termination', { fail: true });
@@ -175,6 +178,9 @@ try {
     await visit(`/?section=termination&employmentId=${employment.id}`, { review: true, private: true });
     await click('Calcular estimación');
     await browser.waitFor('document.querySelector(".termination-trace")');
+    await click('Ingresar remuneración para esta simulación');
+    assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").closest("details").open'), true);
+    assert.equal(await browser.evaluate('document.activeElement?.getAttribute("name")'), 'monthlyRemuneration');
     await browser.evaluate('document.querySelector(".termination-trace").closest("details").open = true');
     await click('Mostrar importes');
     const trace = await browser.evaluate('document.querySelector(".termination-trace").innerText');
@@ -209,6 +215,18 @@ try {
     assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/corrections") || call.path.endsWith("/original"))'));
   }
   }
+  await visit(`/?section=history&tab=documents&document=${id(319)}`, { documentIssues: [
+    { code: 'COUNTRY_DETECTION_OVERRIDDEN', affectedFieldPath: 'document.countryCode', severity: 'INFO', recoverable: false },
+  ] });
+  await browser.waitFor('document.querySelector("dialog[aria-labelledby=review-title]")');
+  assert.ok(await browser.evaluate('document.body.innerText.includes("Heredado del empleo confirmado")'));
+  assert.equal(await browser.evaluate('document.querySelector("select[name=documentCountryCode]")'), null);
+  assert.equal(await browser.evaluate('[...document.querySelectorAll("details")].find(el => el.querySelector("summary")?.textContent.includes("País del documento"))?.open'), false);
+  await visit(`/?section=history&tab=documents&document=${id(319)}`, { documentIssues: [
+    { code: 'COUNTRY_EMPLOYMENT_CONFLICT', affectedFieldPath: 'document.countryCode', severity: 'ERROR', recoverable: false },
+  ] });
+  await browser.waitFor('document.querySelector("select[name=documentCountryCode]")');
+  assert.equal(await browser.evaluate('document.querySelector("select[name=documentCountryCode]").closest("details").open'), true);
   for (const width of [320, 1440]) {
     await browser.viewport(width, 900);
     await visit(`/?section=history&tab=documents&document=${id(319)}`, { private: true, documentCountry: { countryCode: 'US', countrySource: 'DOCUMENT_DETECTION', countryConfidence: 'LOW', countrySnapshotAt: null } });
@@ -227,14 +245,14 @@ try {
     await click('Cancelar país');
     assert.equal(await browser.evaluate('document.querySelector("select[name=documentCountryCode]").value'), 'AR');
   }
-  await visit(`/?section=history&tab=documents&document=${id(319)}`, { failCountry: true });
+  await visit(`/?section=history&tab=documents&document=${id(319)}`, { failCountry: true, documentCountry: { countryCode: 'AR', countrySource: 'DOCUMENT_DETECTION', countryConfidence: 'LOW', countrySnapshotAt: null } });
   await browser.waitFor('document.querySelector("select[name=documentCountryCode]")');
   await browser.evaluate('document.querySelector("select[name=documentCountryCode]").closest("details").open = true');
   await input('select[name=documentCountryCode]', 'US');
   await click('Confirmar país');
   await browser.waitFor('document.querySelector("dialog [role=alert]")');
   assert.ok(await browser.evaluate('document.querySelector("dialog [role=alert]").innerText.includes("no coincide")'));
-  assert.equal(await browser.evaluate('window.__salarivoFixture.documentCountry'), undefined);
+  assert.equal(await browser.evaluate('window.__salarivoFixture.documentCountry.countryCode'), 'AR');
   assert.deepEqual(exceptions, []);
   process.stdout.write(`Jurisdiction browser smoke passed${process.argv.includes('--document-country-only') ? ': document confirmation/cancel/conflict at 320/1440' : ': 320/390/1440, historical/future, privacy, overrides, confirmation, empty/error, document country, termination trace and source review'}. Screenshots: ${output}\n`);
 } finally { await browser.close(); }

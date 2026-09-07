@@ -516,6 +516,16 @@ export async function loadProcessingAnalysis(client: PoolClient, userId: string,
             ORDER BY latest.processing_version DESC, latest.id DESC LIMIT 1)
         )
       WHERE document.id = $1 AND document.user_id = $2 AND document.deleted_at IS NULL
+        AND NOT (
+          issue.code = 'COUNTRY_UNCONFIRMED'
+          AND document.country_code = 'AR'
+          AND document.country_source = 'EMPLOYMENT_CONFIRMED'
+          AND EXISTS (SELECT 1 FROM employments employment
+            WHERE employment.id = document.employment_id
+              AND employment.user_id = document.user_id
+              AND employment.country_confirmed_at IS NOT NULL
+              AND employment.country_code = document.country_code)
+        )
       ORDER BY issue.severity DESC, issue.code, issue.affected_field_path`,
     [documentId, userId],
   );

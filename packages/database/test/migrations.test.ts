@@ -23,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 31);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 31 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 32);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 32 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 31, name: "payroll_quantity_columns" },
+    { version: 32, name: "inherit_confirmed_employment_country" },
   );
   const migration = migrations[0];
   assert.ok(migration);
@@ -39,6 +39,17 @@ test("migration history detects edits and only returns unapplied files", async (
     () => pendingMigrations(migrations, [{ ...migration, checksum: "0".repeat(64) }]),
     /was modified/,
   );
+});
+
+test("confirmed employment country fills only missing active document snapshots", async () => {
+  const migration = (await loadMigrations()).find(({ version }) => version === 32);
+  assert.ok(migration);
+  assert.match(migration.sql, /employment\.id = document\.employment_id/);
+  assert.match(migration.sql, /employment\.user_id = document\.user_id/);
+  assert.match(migration.sql, /employment\.country_confirmed_at IS NOT NULL/);
+  assert.match(migration.sql, /document\.deleted_at IS NULL/);
+  assert.match(migration.sql, /document\.country_code IS NULL/);
+  assert.doesNotMatch(migration.sql, /UPDATE (?:employments|extraction_runs)/);
 });
 
 test("Google identity migration keeps provider identity separate and transient OAuth data minimal", async () => {

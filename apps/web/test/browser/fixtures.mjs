@@ -104,7 +104,10 @@ function installFixture(data, options) {
       state.documentCountry = { countryCode: body.countryCode, countrySource: 'USER_CONFIRMED', countryConfidence: 'HIGH', countrySnapshotAt: data.now };
       return ok(state.documentCountry);
     }
-    if (/^\/documents\/[^/]+$/.test(path)) return ok({ ...data.detail, ...state.documentCountry, id: path.split('/')[2] });
+    if (/^\/documents\/[^/]+$/.test(path)) {
+      const current = { ...data.detail, ...state.documentCountry, id: path.split('/')[2] };
+      return ok(state.documentIssues ? { ...current, analysis: { ...current.analysis, issues: state.documentIssues } } : current);
+    }
     if (path === '/reprocessing/candidates') return ok({ items: [], total: 0, batchLimit: 100 });
     if (path === '/reprocessing-batches/latest') return ok(null);
     if (path === '/imports/active') return ok(batch && ['ACTIVE', 'PAUSED'].includes(batch.status) ? batch : null);

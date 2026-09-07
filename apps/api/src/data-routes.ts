@@ -3641,14 +3641,25 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           throw new ApiError(409, "STALE_EXTRACTION_RUN", "La extracción cambió; recargá el documento antes de finalizar la revisión.");
         }
         const countryReview = await client.query(`SELECT document.country_code, document.country_source,
-          EXISTS(SELECT 1 FROM extraction_run_issues WHERE document_id=document.id AND user_id=document.user_id
-            AND extraction_run_id=document.active_extraction_run_id AND code IN
-            ('COUNTRY_UNCONFIRMED','COUNTRY_EMPLOYMENT_CONFLICT','COUNTRY_SNAPSHOT_CONFLICT','COUNTRY_NOT_SUPPORTED')) AS required
+          EXISTS(SELECT 1 FROM extraction_run_issues issue
+            WHERE issue.document_id=document.id AND issue.user_id=document.user_id
+              AND issue.extraction_run_id=document.active_extraction_run_id AND issue.code IN
+                ('COUNTRY_UNCONFIRMED','COUNTRY_EMPLOYMENT_CONFLICT','COUNTRY_SNAPSHOT_CONFLICT','COUNTRY_NOT_SUPPORTED')
+              AND (issue.code <> 'COUNTRY_UNCONFIRMED' OR NOT (
+                document.country_code = 'AR' AND document.country_source = 'EMPLOYMENT_CONFIRMED'
+                AND EXISTS (SELECT 1 FROM employments employment
+                  WHERE employment.id = document.employment_id AND employment.user_id = document.user_id
+                    AND employment.country_confirmed_at IS NOT NULL
+                    AND employment.country_code = document.country_code)
+              ))) AS required
           FROM documents document WHERE id=$1 AND user_id=$2`, [request.params.id, request.authUser!.id]);
         if (countryReview.rows[0]?.required && (countryReview.rows[0].country_code !== "AR"
             || countryReview.rows[0].country_source !== "USER_CONFIRMED")) {
           throw new ApiError(409, "COUNTRY_REVIEW_REQUIRED", "Confirmá el país del documento antes de finalizar. El parser actual sólo admite recibos argentinos.");
         }
+        const inheritedCountryResolved = countryReview.rows[0]?.required === false
+          && countryReview.rows[0].country_code === "AR"
+          && countryReview.rows[0].country_source === "EMPLOYMENT_CONFIRMED";
         const settlement = await client.query(
           `SELECT settlement.id, settlement.extraction_run_id, settlement.payroll_period,
                   settlement.gross_amount, settlement.net_amount, settlement.deductions_amount,
@@ -3715,10 +3726,11 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
                      WHERE issue.user_id = run.user_id
                        AND issue.document_id = run.document_id
                        AND issue.extraction_run_id = run.id
+                       AND NOT ($4::boolean AND issue.code = 'COUNTRY_UNCONFIRMED')
                   ) THEN 'COMPLETED_WITH_WARNINGS' ELSE 'COMPLETED' END
             WHERE run.id = $1 AND run.user_id = $2 AND run.document_id = $3
               AND run.status = 'REVIEW_REQUIRED'`,
-          [request.body.extractionRunId, request.authUser!.id, request.params.id],
+          [request.body.extractionRunId, request.authUser!.id, request.params.id, inheritedCountryResolved],
         );
         await client.query(
           "UPDATE import_batch_items SET status = 'COMPLETED', error_code = NULL, updated_at = now() WHERE id = $1 AND user_id = $2",

@@ -318,6 +318,9 @@ export function DocumentReview({
   const countryStale = countryDraft !== null && (countryDraft.runId !== currentRunId || countryDraft.expected !== (detail.countryCode ?? null));
   const missing = detail.extractedFields.filter((field) => field.source === 'MANUAL_REQUIRED' && !savedValue(field));
   const analysis = detail.analysis;
+  const countryIssue = analysis?.issues.some((issue) => issue.code.startsWith('COUNTRY_') && issue.severity !== 'INFO') ?? false;
+  const countryInherited = detail.countrySource === 'EMPLOYMENT_CONFIRMED' && Boolean(detail.countryCode);
+  const countryActionRequired = !countryInherited || countryIssue;
   const analysisCopy = analysis ? analysisPresentation(analysis) : null;
   const runTimeline = processingRuns.length ? processingRuns : analysis?.currentRun ? [analysis.currentRun] : [];
   const decisionRun = runTimeline.find(runNeedsDecision);
@@ -550,12 +553,13 @@ export function DocumentReview({
               {(analysis.reprocess.available || analysis.reprocess.retryAvailable) && <button type="button" disabled={busy || dirty || analysis.reprocess.inProgress} onClick={() => void run(() => onReprocess(analysis.reprocess.retryAvailable === true))}>{busy ? 'Iniciando…' : analysis.reprocess.retryAvailable ? 'Reintentar análisis' : 'Buscar mejora'}</button>}
             </section>}
 
-            <details className={`${styles.section} ${styles.countrySection}`} open={Boolean(countryNotice) || !detail.countryCode || analysis?.issues.some((issue) => issue.code.startsWith('COUNTRY_'))}>
-              <summary>País del documento · {detail.countryCode ? countryName(detail.countryCode) : 'Sin confirmar'}</summary>
-              <p>{detail.countrySource === 'USER_CONFIRMED' ? 'Confirmado por vos' : detail.countrySource === 'EMPLOYMENT_CONFIRMED' ? 'Heredado del empleo confirmado' : 'País detectado o pendiente de revisión'}{detail.countrySnapshotAt ? ` · ${timestampLabel(detail.countrySnapshotAt)}` : ''}.</p>
-              {detail.countryConfidence && <p>Confianza de la clasificación: {({ HIGH: 'alta', MEDIUM: 'media', LOW: 'baja' } as Record<string, string>)[detail.countryConfidence] ?? 'sin evaluar'}.</p>}
-              <p>La confirmación cambia sólo el país de este documento y conserva su historial. No modifica el empleo, el PDF ni los datos de la extracción. Si está asociado a un empleo, el país debe coincidir con su jurisdicción confirmada.</p>
-              <form className="stack-form" onSubmit={(event) => {
+            <details className={`${styles.section} ${styles.countrySection}`} open={countryActionRequired && (Boolean(countryNotice) || !detail.countryCode || countryIssue)}>
+              <summary>País del documento · {detail.countryCode ? countryName(detail.countryCode) : 'Sin confirmar'}{!countryActionRequired ? ' · Heredado del empleo confirmado' : ''}</summary>
+              {!countryActionRequired ? <p>Se usa automáticamente en este recibo.</p> : <>
+                <p>{detail.countrySource === 'USER_CONFIRMED' ? 'Confirmado por vos' : detail.countrySource === 'EMPLOYMENT_CONFIRMED' ? 'Heredado del empleo confirmado' : 'País detectado o pendiente de revisión'}{detail.countrySnapshotAt ? ` · ${timestampLabel(detail.countrySnapshotAt)}` : ''}.</p>
+                {detail.countryConfidence && <p>Confianza de la clasificación: {({ HIGH: 'alta', MEDIUM: 'media', LOW: 'baja' } as Record<string, string>)[detail.countryConfidence] ?? 'sin evaluar'}.</p>}
+                <p>La confirmación cambia sólo el país de este documento y conserva su historial. No modifica el empleo, el PDF ni los datos de la extracción. Si está asociado a un empleo, el país debe coincidir con su jurisdicción confirmada.</p>
+                <form className="stack-form" onSubmit={(event) => {
                 event.preventDefault();
                 const code = String(new FormData(event.currentTarget).get('documentCountryCode') ?? '');
                 const runId = countryDraft?.runId ?? currentRunId;
@@ -565,13 +569,14 @@ export function DocumentReview({
                   setCountryDraft(null); setCountryReset((value) => value + 1);
                   setCountryNotice('País del documento confirmado. Podés volver a analizarlo cuando la acción esté disponible.');
                 });
-              }}>
-                <CountrySelect key={`${detail.countryCode}-${detail.countrySnapshotAt}-${countryReset}`} name="documentCountryCode" label="País del documento" initialValue={detail.countryCode ?? ''} required disabled={busy || !canEdit || analysis?.reprocess.inProgress} onChange={(code) => { setCountryNotice(''); setCountryDraft((previous) => ({ code, runId: previous?.runId ?? currentRunId, expected: previous ? previous.expected : detail.countryCode ?? null })); }} />
-                {countryStale && <p className={styles.error} role="alert">El documento cambió durante la edición. Cancelá y revisá la jurisdicción actual antes de confirmar.</p>}
-                {countryNotice && <p role="status">{countryNotice}</p>}
-                {!canEdit && <small>La confirmación estará disponible cuando termine el análisis y exista una extracción activa.</small>}
-                <div className={styles.editActions}><button type="submit" disabled={busy || !canEdit || countryStale || correctionsDirty || feedbackDirty || analysis?.reprocess.inProgress}>{busy ? 'Confirmando…' : 'Confirmar país'}</button>{countryDraft && <button type="button" disabled={busy} onClick={() => { setCountryDraft(null); setCountryReset((value) => value + 1); setCountryNotice(''); }}>Cancelar país</button>}</div>
-              </form>
+                }}>
+                  <CountrySelect key={`${detail.countryCode}-${detail.countrySnapshotAt}-${countryReset}`} name="documentCountryCode" label="País del documento" initialValue={detail.countryCode ?? ''} required disabled={busy || !canEdit || analysis?.reprocess.inProgress} onChange={(code) => { setCountryNotice(''); setCountryDraft((previous) => ({ code, runId: previous?.runId ?? currentRunId, expected: previous ? previous.expected : detail.countryCode ?? null })); }} />
+                  {countryStale && <p className={styles.error} role="alert">El documento cambió durante la edición. Cancelá y revisá la jurisdicción actual antes de confirmar.</p>}
+                  {countryNotice && <p role="status">{countryNotice}</p>}
+                  {!canEdit && <small>La confirmación estará disponible cuando termine el análisis y exista una extracción activa.</small>}
+                  <div className={styles.editActions}><button type="submit" disabled={busy || !canEdit || countryStale || correctionsDirty || feedbackDirty || analysis?.reprocess.inProgress}>{busy ? 'Confirmando…' : 'Confirmar país'}</button>{countryDraft && <button type="button" disabled={busy} onClick={() => { setCountryDraft(null); setCountryReset((value) => value + 1); setCountryNotice(''); }}>Cancelar país</button>}</div>
+                </form>
+              </>}
             </details>
 
             {detail.processingStatus === 'NEEDS_TYPE_CONFIRMATION' && <section className={styles.callout}><h3>¿Es un recibo de sueldo?</h3><p>La clasificación automática no fue concluyente.</p><div><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('PAYROLL'))}>Sí, continuar</button><button type="button" disabled={busy} onClick={() => void run(() => onConfirmType('UNSUPPORTED'))}>No corresponde</button></div></section>}

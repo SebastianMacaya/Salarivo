@@ -78,7 +78,7 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
     assert.equal(first.json().data.scenarios.length, 2);
     assert.equal(first.headers["cache-control"], "no-store");
     assert.deepEqual((await app.inject({ method: "POST", url: estimateUrl, headers, payload: base })).json(), first.json());
-    async function addSalary(country: string, period: string, amount: string, status = "COMPLETED") {
+    async function addSalary(country: string | null, period: string, amount: string, status = "COMPLETED", reviewReady = false) {
       const documentId = randomUUID(), runId = randomUUID(), settlementId = randomUUID();
       const batchId = randomUUID(), uploadId = randomUUID();
       await client.query(`INSERT INTO import_batches(id,user_id,idempotency_key,request_fingerprint)
@@ -91,17 +91,35 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
         object_key,original_filename,declared_mime_type,size_bytes,security_status,classification_status,document_type,processing_status,
         retention_policy,country_code,country_source,country_confidence,country_snapshot_at)
         VALUES($1,$2,$3,$1,$4,$5,$6,'salary-synthetic.pdf','application/pdf',128,'CLEAN','SUPPORTED','PAYROLL',$7,
-        'KEEP_ORIGINAL',$8,'DOCUMENT_DETECTION','HIGH',now())`, [documentId, owner, batchId, uploadId, legacy, `synthetic/${documentId}`, status, country]);
+        'KEEP_ORIGINAL',$8,CASE WHEN $8::text IS NULL THEN NULL ELSE 'DOCUMENT_DETECTION' END,
+        CASE WHEN $8::text IS NULL THEN NULL ELSE 'HIGH' END,CASE WHEN $8::text IS NULL THEN NULL ELSE now() END)`,
+        [documentId, owner, batchId, uploadId, legacy, `synthetic/${documentId}`, status, country]);
       await client.query(`INSERT INTO extraction_runs(id,user_id,document_id,processing_version,status,extractor_name,extractor_version,
         parser_version,normalizer_version,pipeline_fingerprint,finished_at)
-        VALUES($1,$2,$3,1,'COMPLETED','synthetic','7','8','6',$4,now())`, [runId, owner, documentId, database!.currentPipelineFingerprint]);
+        VALUES($1,$2,$3,1,$4,'synthetic','7','8','6',$5,now())`,
+        [runId, owner, documentId, reviewReady ? "REVIEW_REQUIRED" : "COMPLETED", database!.currentPipelineFingerprint]);
       await client.query("UPDATE documents SET active_extraction_run_id=$1 WHERE id=$2", [runId, documentId]);
       await client.query(`INSERT INTO payroll_settlements(id,user_id,document_id,extraction_run_id,employment_id,settlement_ordinal,
-        payroll_period,issue_date,payment_date,settlement_type,is_recurring,currency_code,basic_amount,remunerative_amount,gross_amount,net_amount)
-        VALUES($1,$2,$3,$4,$5,1,$6,'2024-12-05','2024-12-20','NORMAL',true,'ARS',$7,$7,$7,42)`,
-        [settlementId, owner, documentId, runId, legacy, `${period}-01`, amount]);
+        payroll_period,issue_date,payment_date,settlement_type,is_recurring,currency_code,basic_amount,remunerative_amount,
+        non_remunerative_amount,gross_amount,net_amount,deductions_amount)
+        VALUES($1,$2,$3,$4,$5,1,$6,'2024-12-05','2024-12-20','NORMAL',true,'ARS',$7,$7,
+          CASE WHEN $8::boolean THEN 0 ELSE NULL END,$7::numeric,CASE WHEN $8::boolean THEN $7::numeric ELSE 42::numeric END,
+          CASE WHEN $8::boolean THEN 0 ELSE NULL END)`,
+        [settlementId, owner, documentId, runId, legacy, `${period}-01`, amount, reviewReady]);
       await client.query(`INSERT INTO payroll_line_items(id,user_id,settlement_id,item_ordinal,raw_description,normalized_concept_code,amount,currency_code,item_type,is_recurring)
         VALUES($1,$2,$3,1,'Synthetic base','BASIC_SALARY',$4,'ARS','EARNING',true)`, [randomUUID(), owner, settlementId, amount]);
+      if (reviewReady) {
+        const money = JSON.stringify({ amount, currencyCode: "ARS" });
+        await client.query(`INSERT INTO extracted_fields(id,user_id,document_id,extraction_run_id,field_path,entity_type,
+          raw_value,interpreted_value,confidence,source,extractor_version) VALUES
+          ($1,$2,$3,$4,'settlement.payrollPeriod','PAYROLL_SETTLEMENT',$5,$6::jsonb,1,'RULE','7'),
+          ($7,$2,$3,$4,'settlement.grossAmount','PAYROLL_SETTLEMENT',$8,$9::jsonb,1,'RULE','7'),
+          ($10,$2,$3,$4,'settlement.netAmount','PAYROLL_SETTLEMENT',$8,$9::jsonb,1,'RULE','7'),
+          ($11,$2,$3,$4,'settlement.deductionsAmount','PAYROLL_SETTLEMENT','0.00',$12::jsonb,1,'RULE','7')`, [
+          randomUUID(), owner, documentId, runId, period, JSON.stringify(period),
+          randomUUID(), amount, money, randomUUID(), randomUUID(), JSON.stringify({ amount: "0.00", currencyCode: "ARS" }),
+        ]);
+      }
       return { documentId, runId };
     }
     const eligible = await addSalary("AR", "2024-11", "900000.00");
@@ -132,6 +150,46 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
     const countryHistory = (await client.query("SELECT extracted_value,corrected_value FROM user_corrections WHERE document_id=$1 AND field_path='document.countryCode'", [incorrectCountry.documentId])).rows;
     assert.deepEqual(countryHistory, [{ extracted_value: "US", corrected_value: "AR" }]);
     assert.equal((await app.inject({ method: "PATCH", url: countryUrl, headers, payload: countryBody })).statusCode, 409);
+    await client.query("UPDATE employments SET country_source='LEGACY',country_confidence=NULL,country_confirmed_at=NULL WHERE id=$1", [legacy]);
+    const inheritedReview = await addSalary(null, "2024-08", "800000.00", "NEEDS_REVIEW", true);
+    const conflictingReview = await addSalary(null, "2024-07", "700000.00", "NEEDS_REVIEW", true);
+    await client.query(`INSERT INTO extraction_run_issues(id,user_id,document_id,extraction_run_id,code,severity,recoverable) VALUES
+      ($1,$2,$3,$4,'COUNTRY_UNCONFIRMED','ERROR',true),
+      ($5,$2,$6,$7,'COUNTRY_UNCONFIRMED','ERROR',true),
+      ($8,$2,$6,$7,'COUNTRY_EMPLOYMENT_CONFLICT','ERROR',false)`, [
+      randomUUID(), owner, inheritedReview.documentId, inheritedReview.runId,
+      randomUUID(), conflictingReview.documentId, conflictingReview.runId, randomUUID(),
+    ]);
+    const confirmedWithDocuments = await app.inject({
+      method: "PATCH", url: `/api/v1/employments/${legacy}`, headers, payload: { countryCode: "AR" },
+    });
+    assert.equal(confirmedWithDocuments.statusCode, 200, confirmedWithDocuments.body);
+    assert.deepEqual((await client.query(
+      "SELECT country_code,country_source,country_confidence FROM documents WHERE id=$1",
+      [inheritedReview.documentId],
+    )).rows[0], { country_code: "AR", country_source: "EMPLOYMENT_CONFIRMED", country_confidence: "HIGH" });
+    const inheritedDetail = await app.inject({ method: "GET", url: `/api/v1/documents/${inheritedReview.documentId}`, headers });
+    assert.equal(inheritedDetail.statusCode, 200, inheritedDetail.body);
+    assert.equal(inheritedDetail.json().data.analysis.issues.some(({ code }: { code: string }) => code === "COUNTRY_UNCONFIRMED"), false);
+    assert.equal((await client.query(
+      "SELECT count(*)::integer AS count FROM extraction_run_issues WHERE extraction_run_id=$1 AND code='COUNTRY_UNCONFIRMED'",
+      [inheritedReview.runId],
+    )).rows[0].count, 1, "the resolved issue remains as audit evidence");
+    const completedInheritedReview = await app.inject({
+      method: "POST", url: `/api/v1/documents/${inheritedReview.documentId}/review-complete`, headers,
+      payload: { extractionRunId: inheritedReview.runId },
+    });
+    assert.equal(completedInheritedReview.statusCode, 200, completedInheritedReview.body);
+    assert.equal((await client.query("SELECT status FROM extraction_runs WHERE id=$1", [inheritedReview.runId])).rows[0].status, "COMPLETED");
+    const completedInheritedDetail = await app.inject({ method: "GET", url: `/api/v1/documents/${inheritedReview.documentId}`, headers });
+    assert.equal(completedInheritedDetail.json().data.analysis.status, "COMPLETED");
+    assert.deepEqual(completedInheritedDetail.json().data.analysis.issues, []);
+    const blockedConflictReview = await app.inject({
+      method: "POST", url: `/api/v1/documents/${conflictingReview.documentId}/review-complete`, headers,
+      payload: { extractionRunId: conflictingReview.runId },
+    });
+    assert.equal(blockedConflictReview.statusCode, 409, blockedConflictReview.body);
+    assert.equal(blockedConflictReview.json().error.code, "COUNTRY_REVIEW_REQUIRED");
     assert.equal((await app.inject({ method: "POST", url: estimateUrl, headers, payload: { terminationDate: "2026-02-30" } })).statusCode, 400);
     assert.equal((await app.inject({ method: "POST", url: estimateUrl, headers, payload: { overrides: { monthlyRemuneration: "-1" } } })).statusCode, 400);
     assert.equal((await app.inject({ method: "POST", url: estimateUrl, headers, payload: { overrides: { vacationDaysTaken: "367" } } })).statusCode, 400);

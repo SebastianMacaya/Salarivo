@@ -105,7 +105,7 @@ export function analysisPresentation(analysis: DocumentAnalysis) {
   if (analysis.reprocess.inProgress || ['RUNNING', 'PROCESSING'].includes(analysis.status)) {
     return { tone: 'pending', title: 'Buscando una mejora', body: 'La versión activa sigue disponible mientras analizamos y comparamos el nuevo resultado.' };
   }
-  if (analysis.issues.some((issue) => issue.code.startsWith('COUNTRY_'))) {
+  if (analysis.issues.some((issue) => issue.code.startsWith('COUNTRY_') && issue.severity !== 'INFO')) {
     return { tone: 'warning', title: 'Jurisdicción para revisar', body: 'Revisá el país del empleo y la asociación del documento antes de volver a analizarlo.' };
   }
   if (analysis.status === 'FAILED' || analysis.reprocess.latestOutcome === 'FAILED') {

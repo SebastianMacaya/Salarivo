@@ -9,7 +9,7 @@ import { MoneyValue, PrivacyToggle, SensitiveValue, usePrivacyMode } from './pri
 
 type Employment = {
   id: string; employerName: string; countryCode: string | null; currencyCode: string;
-  startDate: string; endDate?: string | null; statusConfirmedAt?: string | null; status: 'ACTIVE' | 'ENDED' | 'UNKNOWN';
+  startDate: string; startDateConfirmedAt?: string | null; endDate?: string | null; statusConfirmedAt?: string | null; status: 'ACTIVE' | 'ENDED' | 'UNKNOWN';
   employmentType?: 'DEPENDENT' | 'INDEPENDENT' | 'UNKNOWN'; countryConfirmedAt?: string | null;
   legalRegimeCode?: string | null; subdivisionCode?: string | null;
 };
@@ -51,6 +51,8 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
   const [date, setDate] = useState(today);
   const [result, setResult] = useState<Estimate | null>(null);
   const resultTitle = useRef<HTMLHeadingElement>(null);
+  const overridesDetails = useRef<HTMLDetailsElement>(null);
+  const monthlyRemuneration = useRef<HTMLInputElement>(null);
   const [capOverride, setCapOverride] = useState(false);
   const [confirmCountry, setConfirmCountry] = useState('');
   useEffect(() => {
@@ -67,13 +69,13 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
   }, [api, retry]);
   const employment = selectedEmploymentId ? employments.find(({ id }) => id === selectedEmploymentId)
     : [...employments].filter((item) => item.status === 'ACTIVE' && Boolean(item.statusConfirmedAt) && item.employmentType === 'DEPENDENT').sort((a, b) => b.startDate.localeCompare(a.startDate) || a.id.localeCompare(b.id))[0];
-  const needsConfirmation = employment && (!employment.statusConfirmedAt || !employment.countryConfirmedAt || !employment.legalRegimeCode || employment.employmentType === 'UNKNOWN' || !employment.employmentType);
+  const needsConfirmation = employment && (!employment.startDateConfirmedAt || !employment.statusConfirmedAt || !employment.countryConfirmedAt || !employment.legalRegimeCode || employment.employmentType === 'UNKNOWN' || !employment.employmentType);
   async function confirmEmployment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!employment || busy) return;
     const form = new FormData(event.currentTarget);
     const patch = {
-      countryCode: form.get('countryCode'), legalRegimeCode: form.get('legalRegimeCode') || null,
+      startDate: form.get('startDate'), countryCode: form.get('countryCode'), legalRegimeCode: form.get('legalRegimeCode') || null,
       employmentType: form.get('employmentType'),
       ...(form.get('status') ? { status: form.get('status') } : {}),
       ...(form.get('endDate') ? { endDate: form.get('endDate') } : {}),
@@ -120,6 +122,7 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
       <p>Esta confirmación se guarda en el empleo. Los cambios de remuneración y fecha de ingreso que hagas más abajo se usan sólo en la simulación.</p>
       <form className="stack-form" onSubmit={confirmEmployment}>
         <CountrySelect label="País laboral" initialValue={employment.countryCode ?? ''} required disabled={busy} onChange={setConfirmCountry} />
+        <label>Fecha de ingreso<input name="startDate" type="date" defaultValue={employment.startDate} required disabled={busy} /></label>
         <label>Régimen laboral<select name="legalRegimeCode" defaultValue={employment.legalRegimeCode ?? ''} disabled={busy}><option value="">Sin confirmar / otro régimen</option>{(confirmCountry || employment.countryCode) === 'AR' && <option value="AR_LCT_GENERAL">Ley de Contrato de Trabajo · régimen general</option>}</select></label>
         <label>Tipo de relación<select name="employmentType" defaultValue={employment.employmentType ?? 'UNKNOWN'} disabled={busy}><option value="UNKNOWN">Sin confirmar</option><option value="DEPENDENT">Relación de dependencia</option><option value="INDEPENDENT">Independiente</option></select></label>
         {(employment.status === 'UNKNOWN' || !employment.statusConfirmedAt) && <label>¿Actualmente seguís trabajando en {employment.employerName}?<select name="status" defaultValue={employment.status === 'ENDED' ? 'ENDED' : 'UNKNOWN'} disabled={busy}><option value="UNKNOWN">Prefiero dejarlo pendiente</option><option value="ACTIVE">Sí, sigo trabajando aquí</option><option value="ENDED">No, finalizó</option></select></label>}
@@ -132,9 +135,9 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
       <div className="field-row"><label>Fecha efectiva de finalización<input name="terminationDate" type="date" value={date} onChange={(event) => setDate(event.target.value)} required disabled={busy} /></label><div className="termination-today"><button type="button" className="button secondary" disabled={busy} onClick={() => { setDate(today()); setResult(null); }}>Hoy</button></div></div>
       {date > today() && <p>Esta simulación supone que tu remuneración se mantiene igual a la última conocida, salvo que ingreses otra. Es una proyección.</p>}
       {date < today() && <p>El cálculo histórico utiliza la normativa y la información salarial correspondientes hasta esa fecha.</p>}
-      <details><summary>Corregir datos sólo para esta simulación</summary><div className="stack-form termination-overrides">
+      <details ref={overridesDetails}><summary>Corregir datos sólo para esta simulación</summary><div className="stack-form termination-overrides">
         <p>Los campos vacíos usan el dato disponible. Estos overrides no cambian el empleo ni los datos extraídos de los PDFs.</p>
-        <div className="field-row"><label>Usar otra fecha de ingreso<input name="startDate" type="date" disabled={busy} /><small>Registrada: {dateLabel(employment.startDate)}</small></label><label>Remuneración mensual bruta normal y habitual ({employment.currencyCode})<input name="monthlyRemuneration" type={inputType} inputMode="decimal" autoComplete="off" placeholder="Importe para esta simulación" maxLength={24} disabled={busy} /><small>No uses el salario neto.</small></label></div>
+        <div className="field-row"><label>Usar otra fecha de ingreso<input name="startDate" type="date" disabled={busy} /><small>Registrada: {dateLabel(employment.startDate)}</small></label><label>Remuneración mensual bruta normal y habitual ({employment.currencyCode})<input ref={monthlyRemuneration} name="monthlyRemuneration" type={inputType} inputMode="decimal" autoComplete="off" placeholder="Importe para esta simulación" maxLength={24} disabled={busy} /><small>No uses el salario neto.</small></label></div>
         <div className="field-row"><label>Convenio colectivo (CCT)<input name="cctCode" placeholder="Código del convenio, si lo conocés" maxLength={80} required={capOverride} disabled={busy} /></label><label>Categoría del convenio<input name="cctCategory" maxLength={120} disabled={busy} /></label></div>
         <label className="termination-check"><input type="checkbox" checked={capOverride} disabled={busy} onChange={(event) => setCapOverride(event.target.checked)} />Tengo un tope de convenio con fuente y vigencia para revisar</label>
         {capOverride && <div className="stack-form"><label>Tope aplicable ({employment.currencyCode})<input name="capAmount" type={inputType} inputMode="decimal" autoComplete="off" maxLength={24} required disabled={busy} /></label><div className="field-row"><label>Vigente desde<input type="date" name="capEffectiveFrom" required disabled={busy} /></label><label>Vigente hasta<input type="date" name="capEffectiveTo" required disabled={busy} /></label></div><label>Fuente del tope<input name="capSourceUrl" type="url" placeholder="https://…" required disabled={busy} maxLength={500} /></label><small>Se mostrará como tope aportado para esta simulación, con su fuente y vigencia.</small></div>}
@@ -147,7 +150,7 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
     {result && <section className="termination-result stack-form" aria-label="Resultado de la estimación" aria-live="polite">
       <div className="panel-heading"><div><p className="eyebrow">{result.inputs.isProjection ? 'Proyección' : 'Estimación'} · {dateLabel(result.inputs.terminationDate)}</p><h2 ref={resultTitle} tabIndex={-1}>{result.status === 'AVAILABLE' ? 'Comparación de escenarios' : result.status === 'UNSUPPORTED' ? 'Régimen o fecha sin cobertura' : 'Faltan datos para calcular'}</h2></div><span className={`status ${result.confidence === 'HIGH' ? 'ready' : 'pending'}`}>Completitud {qualityLabels[result.confidence].toLowerCase()}</span></div>
       {result.scenarios.length > 0 && <dl className="panel termination-mobile-totals" aria-label="Totales estimados de ambos escenarios">{result.scenarios.map((scenario) => <div key={scenario.code}><dt>{scenario.code === 'WITH_NOTICE' ? 'Con preaviso' : 'Sin preaviso'}</dt><dd><MoneyValue value={scenario.total} currency={result.currencyCode} /></dd></div>)}</dl>}
-      {result.warnings.length > 0 && <section className="panel"><h3>Datos para revisar</h3><ul>{result.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul><p>Podés revisar el empleo, asociar recibos o completar los overrides antes de volver a calcular.</p></section>}
+      {result.warnings.length > 0 && <section className="panel"><h3>Datos para revisar</h3><ul>{result.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul><p>Podés revisar el empleo, asociar recibos o completar los overrides antes de volver a calcular.</p>{result.status === 'UNAVAILABLE' && <button type="button" className="button secondary" onClick={() => { if (overridesDetails.current) overridesDetails.current.open = true; monthlyRemuneration.current?.focus(); monthlyRemuneration.current?.scrollIntoView({ block: 'center' }); }}>Ingresar remuneración para esta simulación</button>}</section>}
       <div className="termination-scenarios">{result.scenarios.map((scenario) => <article className="panel termination-scenario" key={scenario.code}>
         <h3>{scenario.code === 'WITH_NOTICE' ? 'Con preaviso' : 'Sin preaviso'}</h3><p>{scenario.code === 'WITH_NOTICE' ? 'Período de preaviso cumplido completamente.' : 'Incluye los conceptos que corresponden por falta de preaviso.'}</p>
         <small>Total estimado</small><strong className="termination-total"><MoneyValue value={scenario.total} currency={result.currencyCode} /></strong>

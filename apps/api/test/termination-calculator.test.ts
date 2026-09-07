@@ -279,6 +279,7 @@ test("generic parser bonuses in monthly payroll require review instead of silent
     assert.deepEqual(result.scenarios, []);
     assert.equal(result.salaryBase.trace.filter(row => row.code === "BONUS" && row.treatment === "REVIEW_REQUIRED").length, 12);
     assert.ok(result.warnings.some(warning => warning.includes("bonos o premios") && warning.includes("simulación")));
+    assert.equal(result.warnings.length, new Set(result.warnings).size);
   }
   data.overrides.monthlyRemuneration = "310000.00";
   const manual = calculateTerminationEstimate(data, [cap()]);

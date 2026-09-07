@@ -596,7 +596,10 @@ export function calculateTerminationEstimate(input: TerminationInput,
   resolveSalary(input, result, months);
   const base = money(result.salaryBase.amount);
   const current = money(result.salaryBase.currentMonthlyRemuneration);
-  if (current === null || (base === null && !inProbation)) return result;
+  if (current === null || (base === null && !inProbation)) {
+    result.warnings = [...new Set(result.warnings)];
+    return result;
+  }
   if (result.inputs.isProjection) {
     result.assumptions.push(overrides.monthlyRemuneration ? "Esta proyección mantiene la remuneración ingresada para la simulación."
       : "Esta simulación supone que tu remuneración se mantiene igual a la última conocida.");

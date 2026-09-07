@@ -1958,6 +1958,24 @@ export async function buildApp(
         if (updated.rowCount !== 1) {
           throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
         }
+        if (request.body.countryCode !== undefined) {
+          const documentsWithoutCountry = await client.query<{ id: string }>(
+            `SELECT id FROM documents
+              WHERE user_id = $1 AND employment_id = $2 AND deleted_at IS NULL
+                AND country_code IS NULL
+              ORDER BY id FOR UPDATE`,
+            [userId, request.params.id],
+          );
+          if (documentsWithoutCountry.rowCount) {
+            await inheritDocumentCountries(
+              client,
+              userId,
+              request.params.id,
+              documentsWithoutCountry.rows.map(({ id }) => id),
+              ApiError,
+            );
+          }
+        }
         if (String(previous.employer_id) !== employerId) {
           await client.query(
             `DELETE FROM user_favorite_employers favorite
