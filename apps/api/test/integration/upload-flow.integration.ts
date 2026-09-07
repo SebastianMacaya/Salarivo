@@ -2638,7 +2638,24 @@ test("upload privado crea un único documento y un único intent durable", async
   assert.equal(await countReprocessingCandidates(pool, userId, [documentId]), 0);
   await pool.query("DELETE FROM extraction_runs WHERE id = $1 AND user_id = $2", [attemptedEarningRunId, userId]);
   await pool.query("UPDATE payroll_line_items SET amount = 1200.00 WHERE id = $1", [unclassifiedEarningId]);
+  await pool.query("UPDATE extraction_runs SET parser_version = '9' WHERE id = $1", [runId]);
+  assert.equal((await findReprocessingCandidates(pool, userId, { documentId })).length, 1,
+    "balanced totals still need the explicit non-remunerative column preserved by parser 10");
+  assert.equal(await countReprocessingCandidates(pool, userId, [documentId]), 1);
+  await pool.query("UPDATE payroll_line_items SET amount = 1000.00, normalized_concept_code = 'BASIC_SALARY' WHERE id = $1", [unclassifiedEarningId]);
+  const nonRemunerativeEarningId = crypto.randomUUID();
+  await pool.query(`INSERT INTO payroll_line_items(id,user_id,settlement_id,item_ordinal,raw_description,
+    normalized_concept_code,amount,currency_code,item_type,confidence,source_field)
+    VALUES($1,$2,$3,5,'Haber sintético sin aportes','UNKNOWN',200.00,'ARS','EARNING',0.8,'settlement.nonRemunerativeAmount')`,
+  [nonRemunerativeEarningId, userId, settlementId]);
   assert.equal((await findReprocessingCandidates(pool, userId, { documentId })).length, 0);
+  await pool.query("UPDATE payroll_line_items SET normalized_concept_code = NULL WHERE id = $1", [unclassifiedEarningId]);
+  assert.equal((await findReprocessingCandidates(pool, userId, { documentId })).length, 1,
+    "a prior parser may recover an unclassified earning even when both component totals reconcile");
+  await pool.query("UPDATE extraction_runs SET parser_version = '10' WHERE id = $1", [runId]);
+  assert.equal((await findReprocessingCandidates(pool, userId, { documentId })).length, 0);
+  assert.equal(await countReprocessingCandidates(pool, userId, [documentId]), 0);
+  await pool.query("DELETE FROM payroll_line_items WHERE id = $1 AND user_id = $2", [nonRemunerativeEarningId, userId]);
   await pool.query(
     `UPDATE payroll_settlements SET gross_amount = NULL, remunerative_amount = NULL,
        non_remunerative_amount = NULL WHERE id = $1`, [settlementId],
@@ -5809,6 +5826,19 @@ test("upload privado crea un único documento y un único intent durable", async
     [retryRecovery.json().data.job.id, secondRetryRecoveryOwner],
   );
   assert.equal(runningRetryRecovery.rows[0]!.attempt, 2);
+  const splitRecoveryRow = (description: string, remunerative = '', nonRemunerative = '', deduction = '') =>
+    `${description.padEnd(48)}${remunerative.padStart(20)}${nonRemunerative.padStart(20)}${deduction.padStart(20)}`;
+  const splitRecoveryExtraction = extractArgentinePayroll([
+    'RECIBO DE SUELDO', 'Empleador: Empresa Sintetica SA', 'Periodo de liquidacion: 08/2026',
+    splitRecoveryRow('Concepto', 'Remunerativo', 'No remunerativo', 'Descuentos'),
+    splitRecoveryRow('Sueldo basico', '800,00'),
+    splitRecoveryRow('Premio sintético', '', '200,00'),
+    splitRecoveryRow('Jubilacion', '', '', '110,00'),
+    splitRecoveryRow('Obra social', '', '', '50,00'),
+    splitRecoveryRow('Sindicato', '', '', '20,00'),
+    splitRecoveryRow('Totales', '800,00', '200,00', '180,00'),
+    'Neto a cobrar $ 820,00',
+  ].join('\n'), 'PDF_TEXT');
   assert.equal(await persistExtraction(
     runningRetryRecovery.rows[0]!,
     {
@@ -5817,11 +5847,18 @@ test("upload privado crea un único documento y un único intent durable", async
       documentType: "PAYROLL",
       signals: ["synthetic_retry_recovery"],
     },
-    balancedReviewExtraction,
+    splitRecoveryExtraction,
     "PDF_TEXT",
     false,
     1,
   ), "COMPLETED");
+  const splitRecoveryDetail = await app.inject({ method: "GET", url: `/api/v1/documents/${retryRecoveryDocumentId}`,
+    remoteAddress: featureRemoteAddress, headers: { cookie: cookieA } });
+  assert.equal(splitRecoveryDetail.statusCode, 200, splitRecoveryDetail.body);
+  assert.deepEqual(splitRecoveryDetail.json().data.lineItems.filter((item: {itemType:string}) => item.itemType === 'EARNING')
+    .map((item: {normalizedConceptCode:string;sourceField:string}) => [item.normalizedConceptCode, item.sourceField]),
+  [['BASIC_SALARY', 'settlement.remunerativeAmount'], ['BONUS', 'settlement.nonRemunerativeAmount']]);
+  assert.deepEqual(splitRecoveryDetail.json().data.terminationReview, []);
   assert.deepEqual(
     (await pool.query(
       `SELECT run.id, run.status, run.error_code,
@@ -5836,7 +5873,7 @@ test("upload privado crea un único documento y un único intent durable", async
     )).rows[0],
     {
       id: transientRetryRun.id,
-      status: "COMPLETED_WITH_WARNINGS",
+      status: "COMPLETED",
       error_code: null,
       stale_issues: 0,
     },

@@ -47,6 +47,9 @@ function installFixture(data, options) {
   if (!['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)) throw new Error('Synthetic fixtures require localhost.');
   const nativeFetch = window.fetch.bind(window);
   const state = window.__salarivoFixture = { mode: 'owner', empty: false, failPaths: [], delay: 0, calls: [], unhandled: [], sessions: [1, 2], ...options };
+  const readingIds = data.documents.slice(0, 2).map((document) => document.id);
+  const readingPending = (documentId) => state.readingImprovement && readingIds.includes(documentId) && !(state.confirmedReadings || []).includes(documentId);
+  const readingRun = { ...data.run, id: '00000000-0000-4000-8000-000000000041', processingVersion: 2, active: false, decisionRequired: true, promotionOutcome: 'REVIEW_REQUIRED' };
   localStorage.setItem('salarivo.privacy-mode', state.private ? 'enabled' : 'disabled');
   let batch = null;
   const ok = (result) => Response.json({ data: result }, { headers: { 'Cache-Control': 'no-store' } });
@@ -93,9 +96,22 @@ function installFixture(data, options) {
     if (path === '/salary-history') return ok(state.empty ? { ...data.history, contexts: [], analytics: { ...data.history.analytics, scopes: [] } } : data.history);
     if (path === '/salary-history/concepts') return ok({ items: state.empty ? [] : [{ period: '2026-08', settlementId: 'synthetic-settlement', settlementType: 'NORMAL', earningIndex: 0, category: 'NORMAL', code: 'BASIC_SALARY', isRecurring: true, amount: data.detail.settlement.basicAmount }], nextCursor: null });
     if (path === '/salary-history/comparison') return ok(data.comparisons.latest);
-    if (path === '/documents') return ok({ items: state.empty ? [] : data.documents.slice(0, Number(url.searchParams.get('limit')) || 20), nextCursor: null, pendingReview: 0, total: state.empty ? 0 : 20 });
+    if (path === '/documents') {
+      const items = state.empty ? [] : data.documents.map((document) => ({ ...document, needsReview: Boolean(readingPending(document.id)), decisionRequired: Boolean(readingPending(document.id)) })).filter((document) => !state.readingImprovement || url.searchParams.get('statusGroup') !== 'REVIEW' || document.needsReview);
+      return ok({ items: items.slice(0, Number(url.searchParams.get('limit')) || 20), nextCursor: null, pendingReview: state.empty ? 0 : readingIds.filter(readingPending).length, total: items.length });
+    }
     if (/^\/documents\/[^/]+\/original$/.test(path)) return ok({ url: `${location.origin}/__qa__/salary.pdf`, expiresAt: '2026-10-01T12:00:00.000Z' });
-    if (/^\/documents\/[^/]+\/processing-runs$/.test(path)) return ok({ items: [data.run] });
+    if (/^\/documents\/[^/]+\/processing-runs$/.test(path)) return ok({ items: readingPending(path.split('/')[2]) ? [readingRun, data.run] : [data.run] });
+    if (/^\/documents\/[^/]+\/processing-runs\/[^/]+$/.test(path)) return ok({ ...readingRun, issues: [], compatiblePromotionCount: state.readingCompatibleCount ?? 2, comparisonPreview: { baseRunId: data.run.id, candidateRunId: readingRun.id, fields: [], lineItems: { beforeCount: 1, afterCount: 1, changed: true, changes: [{ itemOrdinal: 1, before: { ...data.detail.lineItems[0], sourceField: null }, after: { ...data.detail.lineItems[0], sourceField: 'settlement.remunerativeAmount' } }] } } });
+    if (/^\/documents\/[^/]+\/processing-runs\/[^/]+\/decision$/.test(path) && method === 'POST') {
+      const body = JSON.parse(init.body);
+      state.readingDecisions = [...(state.readingDecisions || []), body];
+      if (state.changeCompatibleCount) { state.readingCompatibleCount = 1; state.changeCompatibleCount = false; return Response.json({ error: { code: 'COMPATIBLE_PROMOTION_COUNT_CHANGED', message: 'Cambió la cantidad de recibos compatibles.' } }, { status: 409 }); }
+      if (body.expectedActiveRunId !== data.run.id) return Response.json({ error: { code: 'ACTIVE_RUN_CHANGED' } }, { status: 409 });
+      state.confirmedReadings = [...(state.confirmedReadings || []), ...(body.scope === 'COMPATIBLE' ? readingIds : [path.split('/')[2]])];
+      if (state.failAfterReadingDecision) state.failPaths.push(`/documents/${path.split('/')[2]}`);
+      return ok({ compatiblePromotionCount: body.scope === 'COMPATIBLE' ? 2 : 1 });
+    }
     if (/^\/documents\/[^/]+\/country$/.test(path) && method === 'PATCH') {
       const body = JSON.parse(init.body);
       state.countryRequests = [...(state.countryRequests || []), body];
@@ -105,7 +121,7 @@ function installFixture(data, options) {
       return ok(state.documentCountry);
     }
     if (/^\/documents\/[^/]+$/.test(path)) {
-      const current = { ...data.detail, ...state.documentCountry, id: path.split('/')[2] };
+      const current = { ...data.detail, ...state.documentCountry, id: path.split('/')[2], decisionRequired: Boolean(readingPending(path.split('/')[2])) };
       return ok(state.documentIssues ? { ...current, analysis: { ...current.analysis, issues: state.documentIssues } } : current);
     }
     if (path === '/reprocessing/candidates') return ok({ items: [], total: 0, batchLimit: 100 });

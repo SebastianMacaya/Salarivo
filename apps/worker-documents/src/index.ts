@@ -2090,6 +2090,7 @@ function lineItemsFingerprint(extraction: Pick<PayrollExtraction, 'lineItems'>):
     itemType: item.itemType,
     normalizedConceptCode: item.normalizedConceptCode,
     rawDescription: item.rawDescription,
+    ...(item.sourceField ? { sourceField: item.sourceField } : {}),
   })))).digest('hex');
 }
 
@@ -2168,8 +2169,9 @@ async function loadProcessingSnapshot(
           item_type: PayrollExtraction['lineItems'][number]['itemType'];
           normalized_concept_code: string | null;
           raw_description: string;
+          source_field: string | null;
         }>(
-          `SELECT amount::text, is_recurring, item_type, normalized_concept_code, raw_description
+          `SELECT amount::text, is_recurring, item_type, normalized_concept_code, raw_description, source_field
              FROM payroll_line_items
             WHERE user_id = $1 AND settlement_id = $2
             ORDER BY item_ordinal`,
@@ -2191,6 +2193,8 @@ async function loadProcessingSnapshot(
           itemType: item.item_type,
           normalizedConceptCode: item.normalized_concept_code,
           rawDescription: item.raw_description,
+          ...(['settlement.remunerativeAmount', 'settlement.nonRemunerativeAmount'].includes(item.source_field ?? '')
+            ? { sourceField: item.source_field } : {}),
         })))).digest('hex')
       : null,
     netAmount: row.net_amount,
@@ -2661,7 +2665,7 @@ export async function persistExtraction(
               item.itemType,
               item.isRecurring,
               item.confidence,
-              item.itemType === 'DEDUCTION' ? null : item.normalizedConceptCode,
+              item.itemType === 'DEDUCTION' ? null : item.sourceField ?? item.normalizedConceptCode,
             ],
           );
         }

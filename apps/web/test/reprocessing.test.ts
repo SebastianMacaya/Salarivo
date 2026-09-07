@@ -7,6 +7,7 @@ import {
   batchWasDismissed,
   compatiblePromotionLabel,
   processingRunDecisionPayload,
+  remunerationColumnLabel,
   issueLabel,
   processingHealthPage,
   processingHealthPagination,
@@ -67,13 +68,20 @@ test('recupera el lote activo sólo ante el conflicto esperado', () => {
 
 test('ofrece alcance compatible sólo cuando hay más de un recibo', () => {
   assert.equal(compatiblePromotionLabel(1), null);
-  assert.equal(compatiblePromotionLabel(4), 'Aplicar el mismo cambio en 4 recibos');
+  assert.equal(compatiblePromotionLabel(4), 'Confirmar el cambio en 4 recibos');
   assert.deepEqual(processingRunDecisionPayload('PROMOTE', 'COMPATIBLE', 'active-run', 4), {
     decision: 'PROMOTE', scope: 'COMPATIBLE', expectedActiveRunId: 'active-run', expectedCompatiblePromotionCount: 4,
   });
   assert.deepEqual(processingRunDecisionPayload('PROMOTE', 'DOCUMENT', 'active-run', 4), {
     decision: 'PROMOTE', expectedActiveRunId: 'active-run',
   });
+});
+
+test('distingue la columna del concepto y no inventa una para lecturas anteriores', () => {
+  assert.equal(remunerationColumnLabel('settlement.remunerativeAmount'), 'Columna remunerativa');
+  assert.equal(remunerationColumnLabel('settlement.nonRemunerativeAmount'), 'Columna no remunerativa');
+  assert.equal(remunerationColumnLabel(null), 'Columna sin determinar');
+  assert.equal(remunerationColumnLabel('untrusted-field'), 'Columna sin determinar');
 });
 
 test('pagina juntas las versiones e issues de health hasta cubrir la lista más larga', () => {

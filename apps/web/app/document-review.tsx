@@ -12,6 +12,7 @@ import {
   analysisPresentation,
   compatiblePromotionLabel,
   issueLabel,
+  remunerationColumnLabel,
   runNeedsDecision,
   runOutcomeLabel,
   triggerLabel,
@@ -77,6 +78,7 @@ export type DocumentDetail = {
     normalizedConceptCode: string | null;
     rawDescription: string;
     sourcePage: number | null;
+    sourceField?: string | null;
   }>;
   needsReview: boolean;
   lastReprocessError: null | { code: string; failedAt: string; processingVersion: number };
@@ -176,7 +178,7 @@ function comparisonLineItem(item: ProcessingComparisonLineItem | null) {
     ? earningLabels[item.normalizedConceptCode ?? 'UNKNOWN'] ?? 'Otro concepto'
     : item.itemType === 'DEDUCTION' ? 'Descuento' : 'Otro concepto';
   const recurrence = item.isRecurring === true ? 'Recurrente' : item.isRecurring === false ? 'No recurrente' : 'Periodicidad sin determinar';
-  return <><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /> · {classification} · {recurrence} · <MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></>;
+  return <><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /> · {classification} · {recurrence}{item.itemType === 'EARNING' && <> · {remunerationColumnLabel(item.sourceField)}</>} · <MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></>;
 }
 
 function handleReviewKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
@@ -229,6 +231,8 @@ export function DocumentReview({
   onNavigate,
   onReprocess,
   onRunDecision,
+  onReviewPending,
+  pendingReviewCount = 0,
   onSave,
   onSaveUnsupportedFeedback,
   processingRuns = [],
@@ -263,7 +267,9 @@ export function DocumentReview({
   onLocationChange: (page: number, evidenceId?: string, lineItemId?: string) => void;
   onNavigate: (direction: -1 | 1) => void;
   onReprocess: (retry?: boolean) => Promise<void>;
-  onRunDecision: (run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE', scope: 'DOCUMENT' | 'COMPATIBLE') => Promise<void>;
+  onRunDecision: (run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE', scope: 'DOCUMENT' | 'COMPATIBLE') => Promise<string | void>;
+  onReviewPending: (trigger: HTMLButtonElement) => void;
+  pendingReviewCount?: number;
   onSave: (changes: Array<{ field: ExtractedFieldDetail; value: string }>, extractionRunId: string) => Promise<void>;
   onSaveUnsupportedFeedback: (comment: string) => Promise<string | null>;
   processingRuns?: ProcessingRun[];
@@ -398,10 +404,10 @@ export function DocumentReview({
   }
   async function decideReviewCandidate(decision: 'PROMOTE' | 'KEEP_ACTIVE', scope: 'DOCUMENT' | 'COMPATIBLE') {
     if (!decisionRun) return;
-    await onRunDecision(decisionRun, decision, scope);
-    setDecisionNotice(decision === 'PROMOTE'
+    const refreshNotice = await onRunDecision(decisionRun, decision, scope);
+    setDecisionNotice(refreshNotice || (decision === 'PROMOTE'
       ? scope === 'COMPATIBLE' ? `Mejora aplicada en ${decisionCompatibleCount} recibos.` : 'Mejora aplicada en este recibo.'
-      : 'Conservamos los datos actuales de este recibo.');
+      : 'Conservamos los datos actuales de este recibo.'));
   }
   function selectEvidence(id: string) {
     pendingMobileFocus.current = 'data';
@@ -501,12 +507,12 @@ export function DocumentReview({
             {error && <p className={styles.error} role="alert">{error}</p>}
             <div className={styles.summary}><span>{documentStatusLabel(detail.processingStatus)}</span><p>{unsupported ? 'El documento quedó separado del historial salarial.' : detail.errorCode ? 'El procesamiento terminó con un error controlado.' : detail.lastReprocessError ? 'El último reprocesamiento no pudo completarse; conservamos la versión anterior.' : missing.length ? `Falta completar: ${missing.map((field) => labels[field.fieldPath] ?? field.fieldPath).join(', ')}.` : settlement?.totalsBalance === false ? 'Bruto menos descuentos no coincide con neto.' : settlement?.componentsBalance === false ? 'Remunerativo más no remunerativo no coincide con el bruto.' : settlement?.deductionsMatchTotal === false ? 'El desglose no coincide con el total.' : 'Los cambios humanos quedan versionados y no se reemplazan en silencio.'}</p></div>
 
-            {decisionNotice && <p className={styles.success} role="status">{decisionNotice}</p>}
+            {decisionNotice && <div className={styles.success} role="status"><p>{decisionNotice}</p><div className={styles.runActions}>{pendingReviewCount > 0 ? <button type="button" disabled={busy} onClick={(event) => { if (confirmDiscard()) onReviewPending(event.currentTarget); }}>Revisar siguiente pendiente</button> : <button type="button" disabled={busy} onClick={close}>Volver a documentos</button>}</div></div>}
             {decisionRun && <section ref={decisionReviewRef} tabIndex={-1} className={`${styles.analysis} ${styles.decision}`} aria-labelledby="reading-improvement-title" aria-live="polite" aria-busy={runsLoading}>
               <div className={styles.analysisHead}><div><span aria-hidden="true">↻</span><h3 id="reading-improvement-title">Nueva lectura para confirmar</h3></div></div>
               <p>{decisionChangedLineItems.length > 0
                 ? `Encontramos una lectura distinta de ${decisionChangedLineItems.length} concepto${decisionChangedLineItems.length === 1 ? '' : 's'}.`
-                : 'Encontramos una lectura nueva de los datos del recibo.'} El recibo actual sigue activo hasta que elijas.</p>
+                : 'Encontramos una lectura nueva de los datos del recibo.'} Compará el resultado actual con la propuesta. Confirmar aplica los cambios a tu historial; conservar mantiene la lectura actual. No hace falta volver a subir el PDF.</p>
               {runsError || runPreviewErrors[decisionRun.id] ? <p className={styles.error} role="alert">{runsError || runPreviewErrors[decisionRun.id]} Podés conservar los datos actuales y revisar otra vez más tarde.</p> : decisionPreview === undefined ? <p role="status">Cargando la comparación…</p> : decisionPreview === null ? <p>No hay una base comparable; esta versión no se puede activar desde acá.</p> : <>
                 <div className={styles.comparison}>
                   <h4>Qué va a cambiar</h4>
@@ -514,13 +520,14 @@ export function DocumentReview({
                   {decisionPreview.lineItems.changed && <p>Conceptos detectados: {decisionPreview.lineItems.beforeCount} actuales → {decisionPreview.lineItems.afterCount} con la lectura nueva.</p>}
                   {decisionChangedLineItems.length > 0 && <ul className={styles.lineItems}>{decisionChangedLineItems.map((change) => <li key={change.itemOrdinal}><small>Actual: {comparisonLineItem(change.before)}</small><small>Lectura nueva: {comparisonLineItem(change.after)}</small></li>)}</ul>}
                 </div>
-                {decisionCompatibleCount > 1 && <p>Verificamos que {decisionCompatibleCount - 1} recibo{decisionCompatibleCount === 2 ? '' : 's'} más tiene{decisionCompatibleCount === 2 ? '' : 'n'} el mismo formato y la misma corrección.</p>}
+                {decisionCompatibleCount > 1 ? <p><strong>Podés confirmar juntos {decisionCompatibleCount} recibos, incluido este.</strong> Tienen el mismo formato y la misma corrección. Los recibos con cambios distintos se revisan por separado.</p> : <p>Esta propuesta se confirma sólo en este recibo. Las lecturas con cambios distintos requieren una revisión propia.</p>}
                 {!decisionMatchesActive && <p>El análisis activo cambió. Estamos actualizando la comparación antes de habilitar la decisión.</p>}
               </>}
+              {dirty && <p>Guardá o descartá tus cambios antes de elegir una lectura.</p>}
               <div className={styles.runActions}>
-                {decisionMatchesActive && decisionCompatibleCount > 1 && <button type="button" className={styles.primaryDecision} disabled={busy || analysis?.reprocess.inProgress} onClick={() => void run(() => decideReviewCandidate('PROMOTE', 'COMPATIBLE'))}>{compatiblePromotionLabel(decisionCompatibleCount)}</button>}
-                {decisionMatchesActive && <button type="button" className={decisionCompatibleCount > 1 ? styles.secondaryDecision : styles.primaryDecision} disabled={busy || analysis?.reprocess.inProgress} onClick={() => void run(() => decideReviewCandidate('PROMOTE', 'DOCUMENT'))}>{decisionCompatibleCount > 1 ? 'Aplicar sólo en este recibo' : 'Aplicar esta mejora'}</button>}
-                <button type="button" className={styles.secondaryDecision} disabled={busy || analysis?.reprocess.inProgress} onClick={() => void run(() => decideReviewCandidate('KEEP_ACTIVE', 'DOCUMENT'))}>Conservar datos actuales</button>
+                {decisionMatchesActive && decisionCompatibleCount > 1 && <button type="button" className={styles.primaryDecision} disabled={busy || dirty || analysis?.reprocess.inProgress} onClick={() => void run(() => decideReviewCandidate('PROMOTE', 'COMPATIBLE'))}>{compatiblePromotionLabel(decisionCompatibleCount)}</button>}
+                {decisionMatchesActive && <button type="button" className={decisionCompatibleCount > 1 ? styles.secondaryDecision : styles.primaryDecision} disabled={busy || dirty || analysis?.reprocess.inProgress} onClick={() => void run(() => decideReviewCandidate('PROMOTE', 'DOCUMENT'))}>{decisionCompatibleCount > 1 ? 'Confirmar sólo este recibo' : 'Confirmar esta lectura'}</button>}
+                <button type="button" className={styles.secondaryDecision} disabled={busy || dirty || analysis?.reprocess.inProgress} onClick={() => void run(() => decideReviewCandidate('KEEP_ACTIVE', 'DOCUMENT'))}>Conservar datos actuales</button>
               </div>
             </section>}
 
@@ -615,7 +622,7 @@ export function DocumentReview({
               {editing && <div className={styles.editActions}><button type="button" disabled={busy || editingStale || !editingRunId || !correctionsDirty || privacyBlocksSave || changes.some(({ value }) => !value.trim())} onClick={() => { if (!editingRunId || editingStale || privacyBlocksSave) return; void run(async () => { await onSave(changes, editingRunId); setDrafts({}); setEditingRunId(null); setEditing(false); }); }}>{busy ? 'Guardando…' : `Guardar ${changes.length || ''} cambio${changes.length === 1 ? '' : 's'}`}</button><button type="button" disabled={busy} onClick={() => { setDrafts({}); setEditingRunId(null); setEditing(false); }}>Cancelar</button></div>}
             </section>
 
-            {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li id={`line-item-${item.id}`} tabIndex={-1} key={item.id} className={selectedLineItemId === item.id ? styles.selectedField : undefined}><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /><strong><MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></strong>{item.itemType === 'EARNING' && <small>Clasificación automática: {earningLabels[item.normalizedConceptCode ?? ''] ?? 'Concepto sin clasificar'}.</small>}{terminationReview.filter((issue) => issue.lineItemIds.includes(item.id)).map((issue, index) => <small key={`${issue.code}-${index}`}>{issue.explanation}</small>)}{item.sourcePage && <button type="button" onClick={() => { pendingMobileFocus.current = 'document'; setPage(item.sourcePage!); setSelectedEvidenceId(undefined); setMobileTab('document'); }}>Ver fuente · pág. {item.sourcePage}</button>}</li>)}</ul></section>}
+            {detail.lineItems.length > 0 && <section className={styles.section}><p>Detalle</p><h3>Conceptos detectados</h3><ul className={styles.lineItems}>{detail.lineItems.map((item) => <li id={`line-item-${item.id}`} tabIndex={-1} key={item.id} className={selectedLineItemId === item.id ? styles.selectedField : undefined}><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /><strong><MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></strong>{item.itemType === 'EARNING' && <small>Clasificación automática: {earningLabels[item.normalizedConceptCode ?? ''] ?? 'Concepto sin clasificar'} · {remunerationColumnLabel(item.sourceField)}.</small>}{terminationReview.filter((issue) => issue.lineItemIds.includes(item.id)).map((issue, index) => <small key={`${issue.code}-${index}`}>{issue.explanation}</small>)}{item.sourcePage && <button type="button" onClick={() => { pendingMobileFocus.current = 'document'; setPage(item.sourcePage!); setSelectedEvidenceId(undefined); setMobileTab('document'); }}>Ver fuente · pág. {item.sourcePage}</button>}</li>)}</ul></section>}
 
             {analysis && <details className={styles.timeline}>
               <summary>Historial técnico del análisis ({runTimeline.length})</summary>

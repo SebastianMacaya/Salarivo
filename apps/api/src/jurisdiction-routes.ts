@@ -159,6 +159,8 @@ export async function registerJurisdictionRoutes(app: FastifyInstance, { require
           JOIN payroll_settlements settlement ON settlement.extraction_run_id = run.id AND settlement.user_id = run.user_id
           LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('code', COALESCE(item.normalized_concept_code, 'UNKNOWN'),
               'lineItemId', item.id, 'sourceDescription', item.raw_description,
+              'sourceField', CASE WHEN item.source_field IN ('settlement.remunerativeAmount', 'settlement.nonRemunerativeAmount')
+                THEN item.source_field ELSE NULL END,
               'amount', item.amount::text, 'isRecurring', item.is_recurring) ORDER BY item.item_ordinal) AS items
             FROM payroll_line_items item WHERE item.user_id = settlement.user_id AND item.settlement_id = settlement.id
               AND item.item_type = 'EARNING') earnings ON true
@@ -179,8 +181,8 @@ export async function registerJurisdictionRoutes(app: FastifyInstance, { require
           currencyCode: salary.currency_code, payrollPeriod: salary.payroll_period, settlementType: salary.settlement_type,
           isRecurring: salary.is_recurring, basicAmount: salary.basic_amount, grossAmount: salary.gross_amount,
           remunerativeAmount: salary.remunerative_amount, nonRemunerativeAmount: salary.non_remunerative_amount,
-          knownOn: day(salary.known_on), earnings: salary.earnings.map((item: { lineItemId: string; code: string; amount: string; isRecurring: boolean | null }) => ({
-            lineItemId: item.lineItemId, code: item.code, amount: item.amount, isRecurring: item.isRecurring,
+          knownOn: day(salary.known_on), earnings: salary.earnings.map((item: { lineItemId: string; code: string; amount: string; isRecurring: boolean | null; sourceField: string | null }) => ({
+            lineItemId: item.lineItemId, code: item.code, amount: item.amount, isRecurring: item.isRecurring, sourceField: item.sourceField,
           })),
         }));
         let estimate: TerminationEstimate;

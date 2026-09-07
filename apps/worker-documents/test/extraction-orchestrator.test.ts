@@ -31,6 +31,24 @@ test('el recibo conocido conserva todos los valores y no llama al proveedor', as
   assert.equal(outcome.triggerReason, null);
 });
 
+test('OCR que cambia la columna remunerativa conserva el conflicto aunque concilien importes y conceptos', async () => {
+  const row = (label: string, remunerative = '', nonRemunerative = '', deductions = '') =>
+    `${label.padEnd(48)}${remunerative.padStart(20)}${nonRemunerative.padStart(20)}${deductions.padStart(20)}`;
+  const receipt = (swapped: boolean) => [
+    'RECIBO DE SUELDO', 'Moneda: ARS', 'Empleador: Empresa Sintética S.A.', 'Período: 08/2026',
+    row('Concepto', 'Remunerativo', 'No remunerativo', 'Descuentos'),
+    row('Sueldo básico', swapped ? '' : '100,00', swapped ? '100,00' : ''),
+    row('Adicional empresa', swapped ? '100,00' : '', swapped ? '' : '100,00'),
+    row('Deducción', '', '', '20,00'), row('Totales', '100,00', '100,00', '20,00'),
+    'Neto a cobrar $ 180,00',
+  ].join('\n');
+  const outcome = await orchestrateExtraction(input(receipt(false)), {
+    requiredReason: 'FIELD_RECOVERY', fallback: async () => result(receipt(true)),
+  });
+  assert.equal(outcome.extraction.needsReview, false);
+  assert.ok(outcome.issues.includes('OCR_RESULT_CONFLICT'));
+});
+
 test('scan sintético recupera por OCR, reintenta el parser y conserva evidencia real', async () => {
   let calls = 0;
   const outcome = await orchestrateExtraction(input(''), {

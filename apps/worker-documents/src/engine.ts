@@ -59,6 +59,7 @@ export type PayrollLineItem = {
   itemType: 'EARNING' | 'DEDUCTION';
   normalizedConceptCode: string | null;
   rawDescription: string;
+  sourceField?: 'settlement.remunerativeAmount' | 'settlement.nonRemunerativeAmount';
 };
 
 export type PayrollExtraction = {
@@ -855,7 +856,8 @@ const concepts: Array<{
   { code: 'REIMBURSEMENT', pattern: /\b(?:reintegros?|devoluciones?|creditos?|ajustes?\s+a\s+favor)\b/, recurring: false, type: 'EARNING' },
   { code: 'SENIORITY', pattern: /antiguedad/, recurring: true, type: 'EARNING' },
   { code: 'ATTENDANCE', pattern: /presentismo/, recurring: true, type: 'EARNING' },
-  { code: 'BASIC_SALARY', pattern: /(?:sueldo\s+basico|salario\s+base|basico\s+convenio)/, recurring: true, type: 'EARNING' },
+  { code: 'BASIC_SALARY', pattern: /\b(?:(?:sueldo|salario|haber|remuneracion)\s+basic[oa]|salario\s+base|basico\s+convenio|sueldo\s+minimo\s+conformado)\b/, recurring: true, type: 'EARNING' },
+  { code: 'ADDITIONAL', pattern: /\b(?:adicional\s+(?:de\s+)?empresa|adic(?:ional)?\.?\s+voluntario)\b/, recurring: true, type: 'EARNING' },
 ];
 
 function lineDescription(line: string, end: number): string | null {
@@ -887,16 +889,20 @@ function extractLineItems(lines: string[], table: PayrollTable | null): PayrollL
         continue;
       }
       if (concept?.type === 'DEDUCTION') continue;
-      const earning = table.combinedEarnings ? mapped[0] : mapped[0] ?? mapped[1];
-      if (!earning) continue;
-      items.push({
-        amount: earning.value,
-        confidence: 0.86,
-        isRecurring: concept?.recurring ?? null,
-        itemType: 'EARNING',
-        normalizedConceptCode: concept?.code ?? null,
-        rawDescription,
-      });
+      for (const [column, earning] of mapped.slice(0, table.combinedEarnings ? 1 : 2).entries()) {
+        if (!earning) continue;
+        items.push({
+          amount: earning.value,
+          confidence: 0.86,
+          isRecurring: concept?.recurring ?? null,
+          itemType: 'EARNING',
+          normalizedConceptCode: concept?.code ?? null,
+          rawDescription,
+          ...(!table.combinedEarnings ? {
+            sourceField: column === 1 ? 'settlement.nonRemunerativeAmount' as const : 'settlement.remunerativeAmount' as const,
+          } : {}),
+        });
+      }
     }
     return items;
   }

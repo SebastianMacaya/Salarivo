@@ -332,10 +332,41 @@ test("receipt diagnostics distinguish missing data, unclassified concepts and ex
   assert.deepEqual(reviewTerminationSalary(settlement("2026-05")), []);
   assert.ok(reviewTerminationSalary({ ...mixed, remunerativeAmount: null }).some(issue => issue.code === "MISSING_REMUNERATIVE_TOTAL"));
   const matchedMixed = { ...mixed, earnings: [{ code: "BASIC_SALARY", amount: "1000.00" }, { code: "NON_REMUNERATIVE", amount: "200.00" }] };
-  assert.deepEqual(reviewTerminationSalary(matchedMixed).map(issue => issue.code), ["UNASSIGNED_NON_REMUNERATIVE"]);
+  assert.deepEqual(reviewTerminationSalary(matchedMixed), []);
+  assert.ok(result.warnings.some(warning => warning.includes("Los recibos ya se analizaron")));
   const duplicate = input(); delete duplicate.overrides;
   duplicate.settlements = [settlement("2026-05"), settlement("2026-05", "300000.00", { id: "other-salary" })];
   assert.ok(calculateTerminationEstimate(duplicate).salaryBase.trace.every(entry => entry.treatment === "REVIEW_REQUIRED" && entry.explanation.includes("duplicados")));
+});
+
+test("explicit non-remunerative columns can form a base only when both component totals reconcile exactly", () => {
+  const data = input(); delete data.overrides;
+  const mixed = settlement("2026-05", "1200.00", { remunerativeAmount: "1000.00", nonRemunerativeAmount: "200.00",
+    earnings: [{ lineItemId: "monthly-base", code: "BASIC_SALARY", amount: "1000.00", isRecurring: true, sourceField: "settlement.remunerativeAmount" },
+      { lineItemId: "without-contributions", code: "UNKNOWN", amount: "200.00", isRecurring: null, sourceField: "settlement.nonRemunerativeAmount" }] });
+  data.settlements = [mixed];
+  const result = calculateTerminationEstimate(data);
+  assert.equal(result.status, "AVAILABLE");
+  assert.equal(result.calculationVersion, "termination-estimate-v2");
+  assert.equal(result.salaryBase.amount, "1000.00");
+  assert.equal(result.salaryBase.currentMonthlyRemuneration, "1000.00");
+  assert.deepEqual(result.salaryBase.unusablePeriods, []);
+  assert.equal(result.salaryBase.trace.find(entry => entry.lineItemId === "without-contributions")?.treatment, "EXCLUDED");
+  assert.equal(result.inputs.salaryInputs[0]!.earnings![1]!.sourceField, "settlement.nonRemunerativeAmount");
+  amounts(result); amounts(result, "WITH_NOTICE");
+  for (const invalid of [
+    { ...mixed, nonRemunerativeAmount: null },
+    { ...mixed, nonRemunerativeAmount: "199.99" },
+    { ...mixed, remunerativeAmount: "1000.01" },
+    { ...mixed, grossAmount: "1199.99" },
+    { ...mixed, earnings: [mixed.earnings![0]!, { code: "UNKNOWN", amount: "200.00" }] },
+    { ...mixed, grossAmount: "1100.00", nonRemunerativeAmount: "100.00",
+      earnings: [...mixed.earnings!, { code: "NON_REMUNERATIVE", amount: "-100.00" }] },
+  ]) {
+    data.settlements = [invalid];
+    assert.equal(calculateTerminationEstimate(data).status, "UNAVAILABLE");
+    assert.ok(reviewTerminationSalary(invalid).length > 0);
+  }
 });
 
 test("future scenario projects the last known salary and leaves future documents out", () => {

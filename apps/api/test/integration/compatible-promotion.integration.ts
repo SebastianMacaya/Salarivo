@@ -108,6 +108,7 @@ test("a reviewed parser improvement promotes only compatible receipts", { timeou
       { primaryFieldChanged: false, candidateConceptCode: "BASIC_SALARY", description: "Synthetic bonus", candidateAmount: "1000.00", extraSettlement: false },
       { primaryFieldChanged: false, candidateConceptCode: "BASIC_SALARY", description: "Synthetic base", candidateAmount: "1000.00", extraSettlement: true },
       { primaryFieldChanged: false, candidateConceptCode: "BASIC_SALARY", description: "Synthetic base", candidateAmount: "950.00", extraSettlement: false },
+      { primaryFieldChanged: false, candidateConceptCode: "BASIC_SALARY", description: "Synthetic base", candidateAmount: "1000.00", extraSettlement: false, candidateSourceField: "settlement.remunerativeAmount" },
     ];
     for (const [index, scenario] of scenarios.entries()) {
       const itemId = randomUUID();
@@ -117,7 +118,7 @@ test("a reviewed parser improvement promotes only compatible receipts", { timeou
       const candidateRunId = randomUUID();
       const baseSettlementId = randomUUID();
       const candidateSettlementId = randomUUID();
-      const period = ["2026-05-01", "2026-06-01", "2026-07-01", "2026-08-01", "2026-09-01", "2026-10-01"][index]!;
+      const period = ["2026-05-01", "2026-06-01", "2026-07-01", "2026-08-01", "2026-09-01", "2026-10-01", "2026-11-01"][index]!;
       await client.query(
         `INSERT INTO import_batch_items (
            id,user_id,batch_id,employment_id,client_item_key,ordinal,original_filename,
@@ -162,11 +163,11 @@ test("a reviewed parser improvement promotes only compatible receipts", { timeou
            trigger_kind,base_extraction_run_id,detected_employer_id,layout_fingerprint,
            layout_fingerprint_version,country_code,country_source,country_confidence,
            promotion_outcome,comparison_summary,finished_at
-         ) VALUES ($1,$2,$3,2,'COMPLETED','synthetic','7','9','6','1',$4,'PARSER_UPGRADE',
+         ) VALUES ($1,$2,$3,2,'COMPLETED','synthetic','7',$8,'6','1',$4,'PARSER_UPGRADE',
            $5,$6,$7,'1','AR','DOCUMENT_DETECTION','HIGH','REVIEW_REQUIRED',
            '{"comparison":"REVIEW_REQUIRED"}'::jsonb,now())`,
         [candidateRunId, ownerId, documentId, database.currentPipelineFingerprint,
-          baseRunId, employerId, layoutFingerprint],
+          baseRunId, employerId, layoutFingerprint, database.processingPipelineVersions.parser],
       );
       const baseBasic = "1000.00";
       const candidateBasic = scenario.primaryFieldChanged ? "1100.00" : baseBasic;
@@ -198,12 +199,13 @@ test("a reviewed parser improvement promotes only compatible receipts", { timeou
       await client.query(
         `INSERT INTO payroll_line_items (
            id,user_id,settlement_id,item_ordinal,raw_description,normalized_concept_code,
-           amount,currency_code,item_type,is_recurring
+           amount,currency_code,item_type,is_recurring,source_field
          ) VALUES
-           ($1,$2,$3,1,$7,'UNKNOWN','900.00','ARS','EARNING',true),
-           ($4,$2,$5,1,$7,$6,$8,'ARS','EARNING',true)`,
+           ($1,$2,$3,1,$7,'UNKNOWN','900.00','ARS','EARNING',true,NULL),
+           ($4,$2,$5,1,$7,$6,$8,'ARS','EARNING',true,$9)`,
         [randomUUID(), ownerId, baseSettlementId, randomUUID(), candidateSettlementId,
-          scenario.candidateConceptCode, scenario.description, scenario.candidateAmount],
+          scenario.candidateConceptCode, scenario.description, scenario.candidateAmount,
+          'candidateSourceField' in scenario ? scenario.candidateSourceField : null],
       );
       await client.query(
         `INSERT INTO processing_jobs (
@@ -217,8 +219,8 @@ test("a reviewed parser improvement promotes only compatible receipts", { timeou
       receipts.push({ baseRunId, candidateRunId, documentId });
     }
 
-    const [source, peer, changed, structural, multipleSettlements, unreconciled] = receipts;
-    assert.ok(source && peer && changed && structural && multipleSettlements && unreconciled);
+    const [source, peer, changed, structural, multipleSettlements, unreconciled, differentColumn] = receipts;
+    assert.ok(source && peer && changed && structural && multipleSettlements && unreconciled && differentColumn);
     const detail = await app.inject({
       method: "GET",
       url: `/api/v1/documents/${source.documentId}/processing-runs/${source.candidateRunId}`,
@@ -230,11 +232,11 @@ test("a reviewed parser improvement promotes only compatible receipts", { timeou
       itemOrdinal: 1,
       before: {
         itemOrdinal: 1, rawDescription: "Synthetic base", normalizedConceptCode: "UNKNOWN",
-        amount: "900.00", currencyCode: "ARS", itemType: "EARNING", isRecurring: true,
+        amount: "900.00", currencyCode: "ARS", itemType: "EARNING", isRecurring: true, sourceField: null,
       },
       after: {
         itemOrdinal: 1, rawDescription: "Synthetic base", normalizedConceptCode: "BASIC_SALARY",
-        amount: "1000.00", currencyCode: "ARS", itemType: "EARNING", isRecurring: true,
+        amount: "1000.00", currencyCode: "ARS", itemType: "EARNING", isRecurring: true, sourceField: null,
       },
     }]);
 
@@ -323,6 +325,9 @@ test("a reviewed parser improvement promotes only compatible receipts", { timeou
     assert.equal(String(unreconciledState.active_extraction_run_id), unreconciled.baseRunId);
     assert.equal(unreconciledState.processing_status, "COMPLETED");
     assert.equal(unreconciledState.promotion_outcome, "REVIEW_REQUIRED");
+    const differentColumnState = stateByDocument.get(differentColumn.documentId)!;
+    assert.equal(String(differentColumnState.active_extraction_run_id), differentColumn.baseRunId);
+    assert.equal(differentColumnState.promotion_outcome, "REVIEW_REQUIRED");
   } finally {
     process.env.DATABASE_URL = databaseUrl;
     await app?.close();

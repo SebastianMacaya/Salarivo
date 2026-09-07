@@ -2786,6 +2786,8 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
             amount: String(item.amount),
             isRecurring: item.is_recurring === true,
             lineItemId: String(item.id),
+            sourceField: ["settlement.remunerativeAmount", "settlement.nonRemunerativeAmount"].includes(item.source_field)
+              ? item.source_field : null,
           })),
       }) : [];
       const componentReviewRequired = (effectiveSettlement.remunerative_amount !== null

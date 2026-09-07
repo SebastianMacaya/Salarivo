@@ -87,3 +87,20 @@ test("processing comparison preserves unknown and non-recurring line items", asy
   assert.equal(preview?.lineItems.changes[0]?.before?.isRecurring, null);
   assert.equal(preview?.lineItems.changes[0]?.after?.isRecurring, false);
 });
+
+test("processing comparison shows recovered contribution columns when concept and amount stay the same", async () => {
+  process.env.DATABASE_URL = "postgresql://test:test@localhost:5432/test";
+  const { loadProcessingComparisonPreview } = await import("../src/reprocessing.ts");
+  const item = { itemOrdinal: 1, rawDescription: "Concepto sintético", normalizedConceptCode: "REIMBURSEMENT",
+    amount: "100.00", currencyCode: "ARS", itemType: "EARNING", isRecurring: false };
+  const query = async () => ({ rows: [
+    { id: "candidate", base_extraction_run_id: "base", settlement_id: "candidate-settlement", item_count: 1,
+      line_items_fingerprint: "candidate", line_items: [{ ...item, sourceField: "settlement.nonRemunerativeAmount" }] },
+    { id: "base", base_extraction_run_id: null, settlement_id: "base-settlement", item_count: 1,
+      line_items_fingerprint: "base", line_items: [item] },
+  ] });
+  const preview = await loadProcessingComparisonPreview({ query } as never, "owner", "document", "candidate", true);
+  assert.equal(preview?.lineItems.changes.length, 1);
+  assert.equal(preview?.lineItems.changes[0]?.before?.sourceField, null);
+  assert.equal(preview?.lineItems.changes[0]?.after?.sourceField, "settlement.nonRemunerativeAmount");
+});

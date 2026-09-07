@@ -26,12 +26,14 @@ type Estimate = {
   inputs: {
     employment: Employment; startDate: string | null; startDateSource: 'CONFIRMED' | 'EXTRACTED' | 'UNKNOWN' | 'SIMULATION_OVERRIDE';
     terminationDate: string; isProjection: boolean; seniority: { years: number; months: number; days: number; indemnityYears: number } | null;
+    probation: { months: number; applies: boolean } | null;
+    salaryInputs: { documentId: string; payrollPeriod: string; settlementType: string; remunerativeAmount: string | null }[];
     cappedSalaryBase: string | null;
     collectiveAgreement: { cctCode: string; category?: string | null; capAmount: string; version: string; effectiveFrom: string; effectiveTo: string; sourceUrl: string } | null;
     overrides: Record<string, unknown>;
   };
 };
-const sourceLabels = { CONFIRMED: 'Dato confirmado', EXTRACTED: 'Dato extraído', UNKNOWN: 'Sin confirmar', SIMULATION_OVERRIDE: 'Override de esta simulación', DOCUMENTS: 'Recibos procesados', UNAVAILABLE: 'No disponible' };
+const sourceLabels = { CONFIRMED: 'Dato confirmado', EXTRACTED: 'Dato extraído', UNKNOWN: 'Sin confirmar', SIMULATION_OVERRIDE: 'Dato ingresado para esta simulación', DOCUMENTS: 'Recibos procesados', UNAVAILABLE: 'No disponible' };
 const treatmentLabels = { INCLUDED: 'Incluido', EXCLUDED: 'Excluido', AVERAGED: 'Promedio aplicado', REVIEW_REQUIRED: 'Revisar' };
 const qualityLabels = { HIGH: 'Alta', MEDIUM: 'Media', LOW: 'Baja' };
 const today = () => {
@@ -108,6 +110,18 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
     finally { setBusy(false); }
   }
   const inputType = privateMode ? 'password' : 'text';
+  const documentsHref = employment ? `/${writeOwnerLocation('', { section: 'history', tab: 'documents', employmentId: employment.id, currencyCode: employment.currencyCode })}` : '/?section=history&tab=documents';
+  const reviewDocuments = [...new Map(result?.salaryBase.trace.filter((line) => line.treatment === 'REVIEW_REQUIRED').map((line) => [line.documentId, line])).values()].sort((a, b) => b.period.localeCompare(a.period));
+  const missingSalary = result?.status === 'UNAVAILABLE' && result.inputs.probation !== null && result.salaryBase.amount === null;
+  const monthlyReceipts = result?.inputs.salaryInputs.filter((item) => item.settlementType === 'NORMAL') ?? [];
+  const latestMonthlyReceipt = [...monthlyReceipts].sort((a, b) => b.payrollPeriod.localeCompare(a.payrollPeriod))[0];
+  const salaryReference = latestMonthlyReceipt?.remunerativeAmount && /^[0-9]+\.[0-9]{2}$/.test(latestMonthlyReceipt.remunerativeAmount)
+    && !/^0+\.00$/.test(latestMonthlyReceipt.remunerativeAmount)
+    && monthlyReceipts.filter((item) => item.payrollPeriod === latestMonthlyReceipt.payrollPeriod).length === 1 ? latestMonthlyReceipt : null;
+  const enterSalary = () => {
+    if (overridesDetails.current) overridesDetails.current.open = true;
+    monthlyRemuneration.current?.focus(); monthlyRemuneration.current?.scrollIntoView({ block: 'center' });
+  };
   return <div className="page termination-page" aria-busy={loading || busy}>
     <div className="page-header"><div><p className="eyebrow">Tu relación laboral</p><h1>Indemnización estimada</h1></div><PrivacyToggle /></div>
     <p className="page-intro">Compará un despido sin causa con el preaviso cumplido y sin preaviso, usando los datos de un empleo.</p>
@@ -131,12 +145,13 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
       </form>
     </section>}
     {employment && <form className="panel stack-form" onSubmit={calculate} onChange={() => setResult(null)}>
-      <div className="panel-heading"><div><p className="eyebrow">Despido sin causa</p><h2>Preparar simulación</h2></div></div>
+      <div className="panel-heading"><div><p className="eyebrow">Despido sin causa</p><h2>Preparar simulación</h2></div><a className="inline-link" href={documentsHref}>Ver recibos de este empleo</a></div>
+      <p>Elegí la fecha y calculá con los recibos ya analizados. Si falta información, te indicaremos qué recibo revisar. También podés ingresar una remuneración para probar una estimación.</p>
       <div className="field-row"><label>Fecha efectiva de finalización<input name="terminationDate" type="date" value={date} onChange={(event) => setDate(event.target.value)} required disabled={busy} /></label><div className="termination-today"><button type="button" className="button secondary" disabled={busy} onClick={() => { setDate(today()); setResult(null); }}>Hoy</button></div></div>
       {date > today() && <p>Esta simulación supone que tu remuneración se mantiene igual a la última conocida, salvo que ingreses otra. Es una proyección.</p>}
       {date < today() && <p>El cálculo histórico utiliza la normativa y la información salarial correspondientes hasta esa fecha.</p>}
       <details ref={overridesDetails}><summary>Corregir datos sólo para esta simulación</summary><div className="stack-form termination-overrides">
-        <p>Los campos vacíos usan el dato disponible. Estos overrides no cambian el empleo ni los datos extraídos de los PDFs.</p>
+        <p>Completá sólo lo que quieras ajustar; el resto usa el dato disponible. Estos cambios no modifican el empleo ni los datos de los PDFs.</p>
         <div className="field-row"><label>Usar otra fecha de ingreso<input name="startDate" type="date" disabled={busy} /><small>Registrada: {dateLabel(employment.startDate)}</small></label><label>Remuneración mensual bruta normal y habitual ({employment.currencyCode})<input ref={monthlyRemuneration} name="monthlyRemuneration" type={inputType} inputMode="decimal" autoComplete="off" placeholder="Importe para esta simulación" maxLength={24} disabled={busy} /><small>No uses el salario neto.</small></label></div>
         <div className="field-row"><label>Convenio colectivo (CCT)<input name="cctCode" placeholder="Código del convenio, si lo conocés" maxLength={80} required={capOverride} disabled={busy} /></label><label>Categoría del convenio<input name="cctCategory" maxLength={120} disabled={busy} /></label></div>
         <label className="termination-check"><input type="checkbox" checked={capOverride} disabled={busy} onChange={(event) => setCapOverride(event.target.checked)} />Tengo un tope de convenio con fuente y vigencia para revisar</label>
@@ -148,9 +163,18 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
     </form>}
     {busy && <section className="panel" role="status"><div className="loader" aria-hidden="true" /><p>Preparando datos y comparación…</p></section>}
     {result && <section className="termination-result stack-form" aria-label="Resultado de la estimación" aria-live="polite">
-      <div className="panel-heading"><div><p className="eyebrow">{result.inputs.isProjection ? 'Proyección' : 'Estimación'} · {dateLabel(result.inputs.terminationDate)}</p><h2 ref={resultTitle} tabIndex={-1}>{result.status === 'AVAILABLE' ? 'Comparación de escenarios' : result.status === 'UNSUPPORTED' ? 'Régimen o fecha sin cobertura' : 'Faltan datos para calcular'}</h2></div><span className={`status ${result.confidence === 'HIGH' ? 'ready' : 'pending'}`}>Completitud {qualityLabels[result.confidence].toLowerCase()}</span></div>
+      <div className="panel-heading"><div><p className="eyebrow">{result.inputs.isProjection ? 'Proyección' : 'Estimación'} · {dateLabel(result.inputs.terminationDate)}</p><h2 ref={resultTitle} tabIndex={-1}>{result.status === 'AVAILABLE' ? 'Comparación de escenarios' : result.status === 'UNSUPPORTED' ? 'Régimen o fecha sin cobertura' : missingSalary ? 'Falta resolver la remuneración mensual' : 'Faltan datos para calcular'}</h2></div>{result.status === 'AVAILABLE' && <span className={`status ${result.confidence === 'HIGH' ? 'ready' : 'pending'}`}>Completitud {qualityLabels[result.confidence].toLowerCase()}</span>}</div>
+      {missingSalary && <section className="panel stack-form termination-next-step" aria-labelledby="termination-next-step-title">
+        <h3 id="termination-next-step-title">Cómo continuar</h3>
+        <p>{result.salaryBase.analyzedDocumentIds.length > 0 ? `Analizamos ${result.salaryBase.analyzedDocumentIds.length} recibo${result.salaryBase.analyzedDocumentIds.length === 1 ? '' : 's'} de este empleo, pero no pudimos separar con certeza la remuneración mensual normal y habitual. Los PDFs ya están cargados; no hace falta subirlos otra vez.` : 'Todavía no hay recibos utilizables para este empleo y esta fecha. Revisá si están asociados al empleo, terminaron de analizarse o tienen una nueva lectura pendiente de tu confirmación.'}</p>
+        <div className="inline-actions"><a className="button primary" href={reviewDocuments.length ? `/${writeDocumentLocation(documentsHref.slice(1), { documentId: reviewDocuments[0].documentId, review: 'termination', lineItemId: reviewDocuments[0].lineItemId })}` : documentsHref}>{reviewDocuments.length ? 'Revisar el recibo más reciente' : 'Revisar recibos del empleo'}</a><button type="button" className="button secondary" onClick={enterSalary}>Ingresar remuneración para esta simulación</button></div>
+        <p>Si conocés tu remuneración bruta normal y habitual, podés ingresarla y volver a calcular. El importe queda sólo en esta simulación; no uses el neto cobrado.</p>
+        {salaryReference && <div className="termination-salary-reference stack-form"><strong>Un importe de referencia ya está en tu recibo</strong><p>Total remunerativo de {periodLabel(salaryReference.payrollPeriod)}: <MoneyValue value={salaryReference.remunerativeAmount} currency={result.currencyCode} />.</p><p>Puede incluir vacaciones, premios, retroactivos o ajustes. Revisá que represente tu remuneración mensual normal y habitual antes de calcular.</p><div className="inline-actions"><button type="button" className="button secondary" onClick={() => { enterSalary(); if (monthlyRemuneration.current) monthlyRemuneration.current.value = salaryReference.remunerativeAmount!; }}>Completar con este importe y revisarlo</button><a className="inline-link" href={`/${writeDocumentLocation(documentsHref.slice(1), { documentId: salaryReference.documentId, review: 'termination' })}`}>Ver recibo de referencia</a></div></div>}
+        {reviewDocuments.length > 0 && <details><summary>Recibos con datos para revisar ({reviewDocuments.length})</summary><ul className="termination-review-documents">{reviewDocuments.map((line) => <li key={line.documentId}><div><strong>{periodLabel(line.period)}</strong><p>{line.explanation}</p></div><a className="inline-link" href={`/${writeDocumentLocation(documentsHref.slice(1), { documentId: line.documentId, review: 'termination', lineItemId: line.lineItemId })}`}>Revisar recibo de {periodLabel(line.period)}</a></li>)}</ul></details>}
+      </section>}
+      {result.status === 'UNAVAILABLE' && !result.inputs.startDate && <section className="panel stack-form"><h3>Completá la fecha de ingreso</h3><p>Es necesaria para calcular la antigüedad. Podés confirmarla en tu empleo.</p><button type="button" className="button secondary" onClick={onManageEmployment}>Revisar datos del empleo</button></section>}
       {result.scenarios.length > 0 && <dl className="panel termination-mobile-totals" aria-label="Totales estimados de ambos escenarios">{result.scenarios.map((scenario) => <div key={scenario.code}><dt>{scenario.code === 'WITH_NOTICE' ? 'Con preaviso' : 'Sin preaviso'}</dt><dd><MoneyValue value={scenario.total} currency={result.currencyCode} /></dd></div>)}</dl>}
-      {result.warnings.length > 0 && <section className="panel"><h3>Datos para revisar</h3><ul>{result.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul><p>Podés revisar el empleo, asociar recibos o completar los overrides antes de volver a calcular.</p>{result.status === 'UNAVAILABLE' && <button type="button" className="button secondary" onClick={() => { if (overridesDetails.current) overridesDetails.current.open = true; monthlyRemuneration.current?.focus(); monthlyRemuneration.current?.scrollIntoView({ block: 'center' }); }}>Ingresar remuneración para esta simulación</button>}</section>}
+      {result.warnings.length > 0 && <details className="panel" open={result.status !== 'AVAILABLE' && !missingSalary}><summary>{result.status === 'AVAILABLE' ? 'Alcance y datos por confirmar' : 'Detalle de los datos pendientes'} ({result.warnings.length})</summary>{result.status === 'AVAILABLE' && <p>Ya podés ver la estimación. Estos puntos explican sus límites y qué datos permitirían afinarla.</p>}<ul>{result.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul><div className="inline-actions"><a className="inline-link" href={documentsHref}>Ver recibos de este empleo</a><button type="button" className="text-button" onClick={onManageEmployment}>Revisar empleo</button></div></details>}
       <div className="termination-scenarios">{result.scenarios.map((scenario) => <article className="panel termination-scenario" key={scenario.code}>
         <h3>{scenario.code === 'WITH_NOTICE' ? 'Con preaviso' : 'Sin preaviso'}</h3><p>{scenario.code === 'WITH_NOTICE' ? 'Período de preaviso cumplido completamente.' : 'Incluye los conceptos que corresponden por falta de preaviso.'}</p>
         <small>Total estimado</small><strong className="termination-total"><MoneyValue value={scenario.total} currency={result.currencyCode} /></strong>
@@ -168,7 +192,7 @@ export function TerminationSimulator({ api, selectedEmploymentId, onEmploymentCh
       </dl>
       {result.salaryBase.missingPeriods.length > 0 && <p>Períodos sin recibos analizados: {result.salaryBase.missingPeriods.map(periodLabel).join(', ')}.</p>}
       {Boolean(result.salaryBase.unusablePeriods?.length) && <p>Períodos con recibos que no permiten calcular la base: {result.salaryBase.unusablePeriods!.map(periodLabel).join(', ')}. Revisá los motivos en el detalle de conceptos.</p>}
-      {Object.keys(result.inputs.overrides).length > 0 && <p>Esta estimación incluye overrides explícitos. Los documentos originales y sus datos se conservan.</p>}
+      {Object.keys(result.inputs.overrides).length > 0 && <p>Esta estimación incluye datos ingresados sólo para simular. Los documentos originales y sus datos se conservan.</p>}
       {result.inputs.collectiveAgreement && <p>Tope: <MoneyValue value={result.inputs.collectiveAgreement.capAmount} currency={result.currencyCode} /> · versión {result.inputs.collectiveAgreement.version} · {dateLabel(result.inputs.collectiveAgreement.effectiveFrom)} a {dateLabel(result.inputs.collectiveAgreement.effectiveTo)}. <a className="inline-link" href={result.inputs.collectiveAgreement.sourceUrl} target="_blank" rel="noreferrer">Fuente del convenio</a></p>}
       </section>
       {result.salaryBase.trace.length > 0 && <details className="panel"><summary>Por qué se incluyó o excluyó cada concepto</summary><ul className="termination-trace">{result.salaryBase.trace.map((line, index) => <li key={`${line.settlementId}-${index}`}>

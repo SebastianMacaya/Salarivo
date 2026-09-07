@@ -87,6 +87,59 @@ async function check(name, action) {
 
 try {
   await browser.viewport(390, 844);
+  await check('recent-document-opens-review-and-back-restores-summary', async () => {
+    await visit('/?section=summary');
+    await browser.screenshot(join(output, 'recent-documents-actions.png'));
+    await click('.recent-document'); await review();
+    assert.equal(await browser.evaluate('new URLSearchParams(location.search).get("document")'), id(319));
+    assert.equal(await browser.evaluate('new URLSearchParams(location.search).get("employmentId")'), id(10));
+    assert.ok(await browser.evaluate('!window.__salarivoFixture.calls.some(c=>c.method === "POST" || c.path.endsWith("/original"))'));
+    await back();
+    await browser.waitFor('document.querySelector(".recent-document") && !document.querySelector("#review-title")');
+  });
+  await check('reading-badge-opens-comparison-and-confirms-compatible-group', async () => {
+    await visit('/?section=summary', { readingImprovement: true });
+    await click('.recent-document .status.pending'); await review();
+    await browser.waitFor('document.querySelector("#reading-improvement-title")');
+    await browser.waitFor('document.querySelector("#review-data-panel")?.innerText.includes("Lectura nueva:")');
+    assert.ok(await browser.evaluate('document.querySelector("#review-data-panel").innerText.includes("Columna sin determinar") && document.querySelector("#review-data-panel").innerText.includes("Columna remunerativa")'));
+    await browser.screenshot(join(output, 'reading-compatible-confirmation.png'));
+    assert.ok(await browser.evaluate('!window.__salarivoFixture.readingDecisions?.length'));
+    await textClick('Confirmar el cambio en 2 recibos');
+    await browser.waitFor('document.querySelector("#review-data-panel")?.innerText.includes("Mejora aplicada en 2 recibos.")');
+    assert.deepEqual(await browser.evaluate('window.__salarivoFixture.readingDecisions'), [{ decision: 'PROMOTE', scope: 'COMPATIBLE', expectedActiveRunId: id(40), expectedCompatiblePromotionCount: 2 }]);
+    assert.equal(await browser.evaluate('window.__salarivoFixture.confirmedReadings.length'), 2);
+    await textClick('Volver a documentos');
+    await browser.waitFor('!document.querySelector("#review-title")');
+  });
+  await check('reading-decision-protects-drafts-and-refreshes-stale-group', async () => {
+    await visit('/?section=summary', { readingImprovement: true, changeCompatibleCount: true });
+    await textClick('Revisar pendientes');
+    await browser.waitFor('new URLSearchParams(location.search).get("status") === "REVIEW" && document.querySelector(".document-row")');
+    await click('.document-row'); await review();
+    await textClick('Editar'); await fill('#review-data-panel input[inputmode=decimal]', '1234567.89');
+    assert.equal(await browser.evaluate('[...document.querySelectorAll("button")].find(el=>el.innerText === "Confirmar el cambio en 2 recibos")?.disabled'), true);
+    assert.ok(await browser.evaluate('!window.__salarivoFixture.readingDecisions?.length'));
+    await textClick('Cancelar', '#review-data-panel button');
+    await textClick('Confirmar el cambio en 2 recibos');
+    await browser.waitFor('document.querySelector("#review-data-panel")?.innerText.includes("Cambió el grupo de recibos compatibles")');
+    assert.ok(await browser.evaluate('!window.__salarivoFixture.confirmedReadings?.length'));
+    assert.equal(await browser.evaluate('[...document.querySelectorAll("button")].some(el=>el.innerText === "Confirmar el cambio en 2 recibos")'), false);
+    await textClick('Confirmar esta lectura');
+    await browser.waitFor('document.querySelector("#review-data-panel")?.innerText.includes("Mejora aplicada en este recibo.")');
+    await textClick('Revisar siguiente pendiente');
+    await browser.waitFor(`new URLSearchParams(location.search).get('document') === ${JSON.stringify(id(318))} && document.querySelector('#reading-improvement-title')`);
+    assert.equal(await browser.evaluate('window.__salarivoFixture.confirmedReadings.length'), 1);
+  });
+  await check('saved-reading-decision-reports-refresh-failure-without-repeating', async () => {
+    await visit('/?section=summary', { readingImprovement: true, failAfterReadingDecision: true });
+    await click('.recent-document .status.pending'); await review();
+    await textClick('Confirmar el cambio en 2 recibos');
+    await browser.waitFor('document.querySelector("#review-data-panel")?.innerText.includes("La confirmación quedó guardada")');
+    assert.equal(await browser.evaluate('window.__salarivoFixture.readingDecisions.length'), 1);
+    assert.equal(await browser.evaluate('window.__salarivoFixture.confirmedReadings.length'), 2);
+    assert.equal(await browser.evaluate('!!document.querySelector("#reading-improvement-title")'), false);
+  });
   await check('bottom-review-back-forward-refresh', async () => {
     await visit('/?section=summary');
     assert.equal(await browser.evaluate('matchMedia("(display-mode: standalone)").matches'), true);

@@ -24,7 +24,7 @@ const reviewSettlement = { id: id(219), documentId: id(319), employmentId: emplo
 const reviewEstimate = calculateTerminationEstimate({ employment, today, terminationDate: today, settlements: [reviewSettlement] });
 const sourceDescription = 'Premio sintético sin clasificación <texto del recibo>';
 reviewEstimate.salaryBase.trace.forEach(line => { line.sourceDescription = line.lineItemId === id(60) ? sourceDescription : 'Básico sintético'; });
-const reviewData = { estimate: reviewEstimate, settlement: reviewSettlement, issues: reviewTerminationSalary(reviewSettlement) };
+const reviewData = { estimate: reviewEstimate, overrideEstimate: calculateTerminationEstimate({ employment, today, terminationDate: today, settlements: [reviewSettlement], overrides: { monthlyRemuneration: '2000000.00' } }), settlement: reviewSettlement, issues: reviewTerminationSalary(reviewSettlement) };
 assert.equal(reviewEstimate.status, 'UNAVAILABLE');
 assert.ok(!reviewEstimate.salaryBase.missingPeriods.includes(reviewPeriod));
 assert.deepEqual(reviewEstimate.salaryBase.unusablePeriods, [reviewPeriod]);
@@ -55,7 +55,7 @@ function installJurisdictionFixture(employment, estimates, reviewData, options) 
       state.requests.push({ method: init.method, url: url.href, body: JSON.parse(init.body), cache: init.cache, credentials: init.credentials });
       if (options.fail) return Response.json({ error: { code: 'SYNTHETIC_FAILURE', message: 'Fallo sintético. Reintentá.' } }, { status: 503 });
       await new Promise(resolve => setTimeout(resolve, 200));
-      return ok(options.review ? reviewData.estimate : estimates[JSON.parse(init.body).terminationDate]);
+      return ok(options.review ? (JSON.parse(init.body).overrides.monthlyRemuneration === '2000000.00' ? reviewData.overrideEstimate : reviewData.estimate) : estimates[JSON.parse(init.body).terminationDate]);
     }
     if (options.review && path === `/api/v1/documents/${reviewData.settlement.documentId}`) {
       const response = await priorFetch(input, init);
@@ -178,6 +178,13 @@ try {
     await visit(`/?section=termination&employmentId=${employment.id}`, { review: true, private: true });
     await click('Calcular estimación');
     await browser.waitFor('document.querySelector(".termination-trace")');
+    assert.ok(await browser.evaluate('document.querySelector(".termination-next-step").innerText.includes("no hace falta subirlos otra vez")'));
+    assert.equal(await browser.evaluate('document.querySelector(".termination-next-step > details summary").textContent'), 'Recibos con datos para revisar (1)');
+    const nextStepLink = await browser.evaluate('document.querySelector(".termination-next-step .inline-actions a").href');
+    assert.equal(new URL(nextStepLink).searchParams.get('document'), id(319));
+    assert.equal(new URL(nextStepLink).searchParams.get('review'), 'termination');
+    assert.ok(!await browser.evaluate('document.querySelector(".termination-result > .panel-heading").innerText.includes("Completitud")'));
+    await layout('termination-next-step');
     await click('Ingresar remuneración para esta simulación');
     assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").closest("details").open'), true);
     assert.equal(await browser.evaluate('document.activeElement?.getAttribute("name")'), 'monthlyRemuneration');
@@ -214,6 +221,20 @@ try {
     assert.ok(await browser.evaluate(`document.querySelector('#field-${id(70)} input') !== null`));
     assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/corrections") || call.path.endsWith("/original"))'));
   }
+  await visit(`/?section=termination&employmentId=${employment.id}`, { review: true });
+  await click('Calcular estimación');
+  await browser.waitFor('document.querySelector(".termination-next-step")');
+  assert.ok(await browser.evaluate('document.querySelector(".termination-salary-reference").innerText.includes("Puede incluir vacaciones")'));
+  await click('Completar con este importe y revisarlo');
+  assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), reviewSettlement.remunerativeAmount);
+  assert.equal(await browser.evaluate('window.__jurisdictionFixture.requests.length'), 1, 'Copying a reference does not confirm it or calculate automatically');
+  await click('Ingresar remuneración para esta simulación');
+  await input('[name=monthlyRemuneration]', '2.000.000,00');
+  await click('Calcular estimación');
+  await browser.waitFor('document.querySelectorAll(".termination-scenario").length === 2');
+  assert.equal(await browser.evaluate('document.querySelector(".termination-next-step")'), null);
+  assert.ok(await browser.evaluate('document.querySelector(".termination-result").innerText.includes("Dato ingresado para esta simulación")'));
+  assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/corrections"))'));
   }
   await visit(`/?section=history&tab=documents&document=${id(319)}`, { documentIssues: [
     { code: 'COUNTRY_DETECTION_OVERRIDDEN', affectedFieldPath: 'document.countryCode', severity: 'INFO', recoverable: false },

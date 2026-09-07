@@ -135,6 +135,23 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
     assert.ok(fromSalary.json().data.salaryBase.trace[0].lineItemId);
     assert.equal(JSON.stringify(fromSalary.json().data.inputs).includes("Synthetic base"), false);
     assert.equal(JSON.stringify(fromSalary.json().data.inputs).includes("sourceDescription"), false);
+    await client.query(`UPDATE payroll_settlements SET gross_amount=remunerative_amount+200, non_remunerative_amount=200
+      WHERE document_id=$1 AND user_id=$2 AND extraction_run_id=$3`, [eligible.documentId, owner, eligible.runId]);
+    const withoutContributions = randomUUID();
+    await client.query(`INSERT INTO payroll_line_items(id,user_id,settlement_id,item_ordinal,raw_description,
+      normalized_concept_code,amount,currency_code,item_type,is_recurring,source_field)
+      SELECT $1,$2,id,2,'Premio sintético sin aportes','BONUS',200,'ARS','EARNING',false,'settlement.nonRemunerativeAmount'
+      FROM payroll_settlements WHERE document_id=$3 AND user_id=$2 AND extraction_run_id=$4`,
+    [withoutContributions, owner, eligible.documentId, eligible.runId]);
+    const withColumns = await app.inject({ method: "POST", url: estimateUrl, headers, payload: { terminationDate: "2024-12-15" } });
+    assert.equal(withColumns.statusCode, 200, withColumns.body);
+    assert.equal(withColumns.json().data.salaryBase.amount, "900000.00");
+    assert.equal(withColumns.json().data.salaryBase.trace.find((item: {lineItemId:string}) => item.lineItemId === withoutContributions).treatment, "EXCLUDED");
+    assert.equal(withColumns.json().data.inputs.salaryInputs[0].earnings.find((item: {lineItemId:string}) => item.lineItemId === withoutContributions).sourceField, "settlement.nonRemunerativeAmount");
+    const columnReview = await app.inject({ method: "GET", url: `/api/v1/documents/${eligible.documentId}`, headers });
+    assert.equal(columnReview.statusCode, 200, columnReview.body);
+    assert.deepEqual(columnReview.json().data.terminationReview, []);
+    assert.equal((await app.inject({ method: "GET", url: `/api/v1/documents/${eligible.documentId}`, headers: { ...headers, cookie: cookies[1]! } })).statusCode, 404);
     const incorrectCountry = await addSalary("US", "2024-10", "100.00");
     const conflict = await app.inject({ method: "PATCH", url: "/api/v1/documents/employment", headers,
       payload: { employmentId: legacy, documentIds: [incorrectCountry.documentId] } });

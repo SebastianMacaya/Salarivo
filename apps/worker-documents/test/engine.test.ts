@@ -158,6 +158,36 @@ Importe neto de esta liquidación $ 900,00
   );
 });
 
+test('conserva la atribución por columna y clasifica sólo básicos y adicionales explícitos', () => {
+  const row = (description: string, remunerative = '', nonRemunerative = '', deduction = '') =>
+    `${description.padEnd(48)}${remunerative.padStart(20)}${nonRemunerative.padStart(20)}${deduction.padStart(20)}`;
+  const receipt = [
+    'RECIBO DE SUELDO',
+    'Empleador: Empresa Sintética S.A.',
+    'Período: 08/2026',
+    row('Concepto', 'Remunerativo', 'No remunerativo', 'Descuentos'),
+    row('100 CCT Sueldo mínimo conformado', '1.000,00'),
+    row('200 Adicional empresa', '100,00', '20,00'),
+    row('300 Adic voluntario', '50,00'),
+    row('400 Concepto sintético sin clasificar', '30,00'),
+    row('500 Deducción sintética', '', '', '200,00'),
+    row('Totales', '1.180,00', '20,00', '200,00'),
+    'Neto a cobrar $ 1.000,00',
+  ].join('\n');
+  const result = extractArgentinePayroll(receipt, 'PDF_TEXT');
+  assert.equal(result.needsReview, false);
+  assert.deepEqual(result.lineItems.filter(item => item.itemType === 'EARNING').map(item =>
+    [item.amount, item.normalizedConceptCode, item.isRecurring, item.sourceField]), [
+    ['1000.00', 'BASIC_SALARY', true, 'settlement.remunerativeAmount'],
+    ['100.00', 'ADDITIONAL', true, 'settlement.remunerativeAmount'],
+    ['20.00', 'ADDITIONAL', true, 'settlement.nonRemunerativeAmount'],
+    ['50.00', 'ADDITIONAL', true, 'settlement.remunerativeAmount'],
+    ['30.00', null, null, 'settlement.remunerativeAmount'],
+  ]);
+  assert.equal(result.lineItems[1]?.rawDescription, result.lineItems[2]?.rawDescription);
+  assert.equal(result.lineItems.find(item => item.itemType === 'DEDUCTION')?.rawDescription, 'Deducción');
+});
+
 test('extrae las dos grillas sintéticas de haberes y descuentos', () => {
   const combinedRow = (description: string, earning = '', deduction = '') =>
     `${description.padEnd(48)}${earning.padEnd(20)}${deduction}`;
@@ -615,6 +645,7 @@ test('preserva haberes desconocidos y normaliza extraordinarios sin cambiar una 
     itemType: 'EARNING',
     normalizedConceptCode: null,
     rawDescription: '9000 Adicional sintético',
+    sourceField: 'settlement.remunerativeAmount',
   });
   assert.equal(result.lineItems.find(({ rawDescription }) => rawDescription === '9008 Ajuste sintético')?.amount, '-5000.00');
   assert.deepEqual(

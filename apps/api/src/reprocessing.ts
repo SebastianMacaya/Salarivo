@@ -76,7 +76,7 @@ function layoutObservationSql(runAlias: string, issueAlias: string): string {
 
 function earningsRecoverySql(runAlias: string): string {
   return `(CASE WHEN ${runAlias}.parser_version ~ '^[0-9]{1,8}$'
-    THEN ${runAlias}.parser_version::integer < 9 ELSE false END
+    THEN ${runAlias}.parser_version::integer < 10 ELSE false END
     AND EXISTS (
       SELECT 1 FROM payroll_settlements earning_settlement
       JOIN payroll_line_items earning_item
@@ -91,6 +91,13 @@ function earningsRecoverySql(runAlias: string): string {
         AND earning_settlement.gross_amount = earning_settlement.remunerative_amount + earning_settlement.non_remunerative_amount
       GROUP BY earning_settlement.id
       HAVING sum(earning_item.amount) <> earning_settlement.gross_amount
+        OR (earning_settlement.non_remunerative_amount <> 0 AND
+          COALESCE(sum(earning_item.amount) FILTER (
+            WHERE earning_item.source_field = 'settlement.nonRemunerativeAmount'
+              OR earning_item.normalized_concept_code IN ('NON_REMUNERATIVE', 'NO_REMUNERATIVO')
+          ), 0) <> earning_settlement.non_remunerative_amount)
+        OR bool_or((earning_item.normalized_concept_code IS NULL OR earning_item.normalized_concept_code = 'UNKNOWN')
+          AND earning_item.source_field IS DISTINCT FROM 'settlement.nonRemunerativeAmount')
     ))`;
 }
 
@@ -657,7 +664,7 @@ export async function loadProcessingComparisonPreview(
           SELECT count(*)::integer AS item_count,
                  md5(COALESCE(jsonb_agg(jsonb_build_array(
                    item.item_type, item.normalized_concept_code, item.amount::text,
-                   item.currency_code, item.is_recurring
+                   item.currency_code, item.is_recurring, item.source_field
                  ) ORDER BY item.item_ordinal, item.id)::text, '[]')) AS fingerprint,
                  CASE WHEN $4::boolean THEN COALESCE(jsonb_agg(jsonb_build_object(
                    'itemOrdinal', item.item_ordinal,
@@ -666,7 +673,9 @@ export async function loadProcessingComparisonPreview(
                    'amount', item.amount::text,
                    'currencyCode', item.currency_code,
                    'itemType', item.item_type,
-                   'isRecurring', item.is_recurring
+                   'isRecurring', item.is_recurring,
+                   'sourceField', CASE WHEN item.source_field IN ('settlement.remunerativeAmount', 'settlement.nonRemunerativeAmount')
+                     THEN item.source_field ELSE NULL END
                  ) ORDER BY item.item_ordinal, item.id), '[]'::jsonb) END AS line_items
            FROM payroll_line_items item
           WHERE item.user_id = settlement.user_id AND item.settlement_id = settlement.id
@@ -691,6 +700,8 @@ export async function loadProcessingComparisonPreview(
         currencyCode: String(value.currencyCode),
         itemType: String(value.itemType),
         isRecurring: value.isRecurring === true ? true : value.isRecurring === false ? false : null,
+        sourceField: value.sourceField === 'settlement.remunerativeAmount' || value.sourceField === 'settlement.nonRemunerativeAmount'
+          ? value.sourceField : null,
       };
     });
   const beforeItems = new Map(lineItems(base).map((item) => [item.itemOrdinal, item]));
@@ -806,6 +817,7 @@ export async function findCompatibleProcessingRuns(
                     base_item.normalized_concept_code, candidate_item.normalized_concept_code,
                     base_item.currency_code, candidate_item.currency_code,
                     base_item.is_recurring, candidate_item.is_recurring,
+                    base_item.source_field, candidate_item.source_field,
                     base_item.amount IS DISTINCT FROM candidate_item.amount
                    ) ORDER BY transition.item_ordinal), '[]'::jsonb) AS signature,
                    bool_and(base_item.id IS NOT NULL AND candidate_item.id IS NOT NULL
@@ -908,6 +920,7 @@ export async function findCompatibleProcessingRuns(
                     base_item.normalized_concept_code, candidate_item.normalized_concept_code,
                     base_item.currency_code, candidate_item.currency_code,
                     base_item.is_recurring, candidate_item.is_recurring,
+                    base_item.source_field, candidate_item.source_field,
                     base_item.amount IS DISTINCT FROM candidate_item.amount
                    ) ORDER BY transition.item_ordinal), '[]'::jsonb) AS signature,
                    bool_and(base_item.id IS NOT NULL AND candidate_item.id IS NOT NULL

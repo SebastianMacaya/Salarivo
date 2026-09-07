@@ -37,7 +37,7 @@ export type PromotionOutcome = (typeof promotionOutcomes)[number];
 export const processingPipelineVersions = {
   classifier: "7",
   extractor: "7",
-  parser: "9",
+  parser: "10",
   normalizer: "6",
   resultSchema: "1",
 } as const;

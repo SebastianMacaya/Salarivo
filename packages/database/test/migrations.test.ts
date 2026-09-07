@@ -23,11 +23,11 @@ test("production database URLs require full certificate and hostname verificatio
 
 test("migration history detects edits and only returns unapplied files", async () => {
   const migrations = await loadMigrations();
-  assert.equal(migrations.length, 32);
-  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 32 }, (_, index) => index + 1));
+  assert.equal(migrations.length, 33);
+  assert.deepEqual(migrations.map(({ version }) => version), Array.from({ length: 33 }, (_, index) => index + 1));
   assert.deepEqual(
     migrations.at(-1) && { version: migrations.at(-1)!.version, name: migrations.at(-1)!.name },
-    { version: 32, name: "inherit_confirmed_employment_country" },
+    { version: 33, name: "payroll_earning_classification" },
   );
   const migration = migrations[0];
   assert.ok(migration);

@@ -74,6 +74,13 @@ try {
       if (name === 'summary' || name === 'history-evolution') {
         await browser.evaluate('document.querySelector(".chart-panel")?.scrollIntoView({block:"start"})');
         await layout(`${name}-chart`, true);
+        await browser.evaluate('document.querySelector(".bar-group:last-child")?.focus()');
+        const reading = await browser.evaluate(`(() => { const reading = document.querySelector('.chart-reading'); const chart = document.querySelector('.bar-chart'); const last = chart?.querySelector('.bar-group:last-child'); const rect = reading?.getBoundingClientRect(); return { period: reading?.querySelector('strong')?.textContent, last: last?.querySelector('small')?.textContent, left: rect?.left, right: rect?.right, width: innerWidth, tooltipCount: document.querySelectorAll('.chart-tooltip').length, chartOverflow: chart && chart.scrollHeight > chart.clientHeight + 1 }; })()`);
+        assert.equal(reading.period, reading.last, 'Keyboard focus updates the visible monthly amounts');
+        assert.equal(reading.tooltipCount, 0, 'Monthly amounts are outside the clipped scrolling graph');
+        assert.ok(reading.left >= 0 && reading.right <= reading.width + 1, 'Monthly amounts stay inside the viewport');
+        assert.equal(reading.chartOverflow, false);
+        await layout(`${name}-chart-last-month`, true);
       }
       if (name === 'login') { await clickText('Consultar comprobante de eliminación'); await layout('deletion-receipt-lookup', true); }
       if (name === 'history-annual') { await click('.annual-card summary'); await layout(`${name}-expanded`, true); }

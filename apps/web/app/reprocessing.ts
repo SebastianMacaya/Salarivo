@@ -54,7 +54,14 @@ export type ProcessingComparisonLineItem = {
   currencyCode: string;
   itemType: string;
   isRecurring: boolean | null;
+  sourceField?: string | null;
 };
+
+export function remunerationColumnLabel(sourceField?: string | null) {
+  if (sourceField === 'settlement.remunerativeAmount') return 'Columna remunerativa';
+  if (sourceField === 'settlement.nonRemunerativeAmount') return 'Columna no remunerativa';
+  return 'Columna sin determinar';
+}
 
 export type ProcessingRunDetail = ProcessingRun & {
   issues: ProcessingIssue[];
@@ -193,7 +200,7 @@ export function runNeedsDecision(run: Pick<ProcessingRun, 'decisionRequired'>) {
 }
 
 export function compatiblePromotionLabel(count: number) {
-  return count > 1 ? `Aplicar el mismo cambio en ${count} recibos` : null;
+  return count > 1 ? `Confirmar el cambio en ${count} recibos` : null;
 }
 
 export function processingRunDecisionPayload(

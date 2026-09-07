@@ -114,6 +114,7 @@ export async function orchestrateExtraction(
       'remunerativeAmount', 'nonRemunerativeAmount'] as const;
     const conceptKey = (item: PayrollExtraction['lineItems'][number]) => JSON.stringify([
       item.itemType, item.normalizedConceptCode, item.amount, item.isRecurring,
+      item.sourceField ?? null,
       item.normalizedConceptCode ? null : item.rawDescription,
     ]);
     const remainingConcepts = new Map<string, number>();

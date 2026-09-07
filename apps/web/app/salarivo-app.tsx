@@ -1153,7 +1153,7 @@ function AccessScreen({ initialError, initialMode, onAuthenticated, onGoogleRegi
 }
 
 type Section = 'summary' | 'jobs' | 'import' | 'history' | 'settings' | 'termination';
-type AppNavigationOptions = { currencyCode?: string | null; employmentContext?: string | null; employmentId?: string | null; tab?: HistoryTab; period?: string | null; perspective?: EconomicPerspective | null; range?: (typeof evolutionRanges)[number][0] };
+type AppNavigationOptions = { currencyCode?: string | null; documentId?: string; employmentContext?: string | null; employmentId?: string | null; tab?: HistoryTab; period?: string | null; perspective?: EconomicPerspective | null; range?: (typeof evolutionRanges)[number][0]; status?: OwnerLocation['status'] };
 type NavigateApp = (section: Section, options?: AppNavigationOptions) => void;
 const sections: Array<{ id: Section; label: string; icon: string }> = [
   { id: 'summary', label: 'Resumen', icon: '⌂' },
@@ -1253,7 +1253,7 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
 
   const navigate = useCallback<NavigateApp>((nextSection, options = {}) => {
     const withoutDocument = writeDocumentLocation(window.location.search, null);
-    const nextSearch = writeOwnerLocation(withoutDocument, {
+    let nextSearch = writeOwnerLocation(withoutDocument, {
       currencyCode: options.currencyCode ?? null,
       section: nextSection,
       employmentContext: options.employmentContext ?? null,
@@ -1265,8 +1265,9 @@ function PrivateApp({ user, authNotice, onAuthNoticeDismiss, onUserChanged, onLo
       year: null,
       documentType: null,
       settlementType: null,
-      status: null,
+      status: nextSection === 'history' ? options.status ?? null : null,
     });
+    if (nextSection === 'history' && options.documentId) nextSearch = writeDocumentLocation(nextSearch, { documentId: options.documentId });
     window.history.pushState(window.history.state, '', `${window.location.pathname}${nextSearch}${window.location.hash}`);
     setOwnerLocation(readOwnerLocation(nextSearch));
     setSection(nextSection);
@@ -1632,6 +1633,7 @@ function EconomicChangeNote({ change }: { change?: { status: EconomicStatus; rea
 
 function SalaryEvolution({ scope, year = 'all', limit, perspective = 'nominal', recoveryPeriods = new Map(), selectedPeriod, onSelectPeriod }: { scope: SalaryScopeAnalytics; year?: string; limit?: number; perspective?: EconomicPerspective; recoveryPeriods?: Map<string, SalaryRecoveryState>; selectedPeriod?: string; onSelectPeriod?: (period: string) => void }) {
   const { enabled: privacyEnabled } = usePrivacyMode();
+  const [previewPeriod, setPreviewPeriod] = useState<string | null>(null);
   const filtered = year === 'all' ? scope.evolution : scope.evolution.filter((point) => point.period.startsWith(`${year}-`));
   const points = recentPeriodRange(filtered, limit);
   if (!points.length) return <EmptyState title="Sin evolución para mostrar" body="Elegí otro año o importá recibos con datos comparables." />;
@@ -1655,6 +1657,8 @@ function SalaryEvolution({ scope, year = 'all', limit, perspective = 'nominal', 
   const visualHeight = (value: string) => `${Math.max(2, (Number(value) / visualMaximum) * 100)}%`;
   const protectedHeights = privacyChartHeights(chartPoints.flatMap((point) => { const values = valuesFor(point); return [values.comparableSalary, values.amounts?.netAmount ?? null]; }));
   const chartHeight = (value: string, index: number) => privacyEnabled ? protectedHeights[index] ?? '40%' : visualHeight(value);
+  const previewPoint = points.find((point) => point.period === (previewPeriod ?? selectedPeriod)) ?? points[points.length - 1];
+  const previewValues = valuesFor(previewPoint);
   const choosePeriod = (period: string) => onSelectPeriod?.(period);
   const standardExactTable = <div className="table-wrap responsive-data salary-evolution-table" role="region" aria-label={`Tabla de evolución salarial en perspectiva ${perspectiveLabel}`} tabIndex={0}><table role="table"><caption className="sr-only">Valores de la evolución salarial en perspectiva {perspectiveLabel}</caption><thead><tr><th scope="col">Período</th><th scope="col">Básico comparable</th><th scope="col">Bruto total</th><th scope="col">Neto total</th><th scope="col">Descuentos / créditos</th>{economic && <th scope="col">Estado</th>}</tr></thead><tbody>{points.map((point) => {
     const recovery = recoveryPeriods.get(point.period) ?? (point.quality?.reprocessableDocuments ? 'available' : point.quality?.incompleteDocuments ? 'partial' : undefined);
@@ -1700,7 +1704,11 @@ function SalaryEvolution({ scope, year = 'all', limit, perspective = 'nominal', 
     {economicNotice && <p className="message warning" role="status">{economicNotice}</p>}
     {perspective === 'purchasing-power' && <div className="economic-reading" role="note"><strong>¿El neto total cobrado ganó o perdió poder de compra?</strong>{latestRealPoint && latestRealComparison ? <p>Último cambio real del neto total: <EconomicRealChange basisPoints={latestRealComparison.purchasingPower.changeBasisPoints} /> · {periodLabel(latestRealComparison.fromPeriod)} → {periodLabel(latestRealPoint.period)}.</p> : <p>Todavía no hay dos períodos con datos completos para medir el cambio real.</p>}<p>Cada fila reúne tu neto original, su equivalente histórico en USD, la inflación entre recibos y el neto ajustado por IPC. Aguinaldos, bonos u otras liquidaciones también forman parte del neto total, por lo que este resultado no equivale por sí solo a la evolución del sueldo regular.</p></div>}
     <div className="legend"><span className="comparable">Básico comparable</span><span className="net">Neto total</span></div>
-    {visualValues.length > 0 && <div className="bar-chart salary-chart" role="group" aria-label={`Períodos del historial salarial en perspectiva ${perspectiveLabel}`}>{chartPoints.map((point, pointIndex) => { const values = valuesFor(point); return <button type="button" className={`bar-group${selectedPeriod === point.period ? ' selected' : ''}`} aria-label={`Abrir detalle de ${periodLabel(point.period)}`} aria-pressed={selectedPeriod === point.period} disabled={!onSelectPeriod} onClick={() => choosePeriod(point.period)} key={point.period}><span className="chart-tooltip"><span>{periodLabel(point.period)}</span><span>Básico: <MoneyValue value={values.comparableSalary} currency={values.currency} kind="salary" /></span><span>Neto: <MoneyValue value={values.amounts?.netAmount} currency={values.currency} kind="salary" /></span></span><span className="bars" aria-hidden="true">{values.comparableSalary !== null && <i className="bar comparable" style={{ height: chartHeight(values.comparableSalary, pointIndex * 2) }} />}{values.amounts?.netAmount != null && <i className="bar net" style={{ height: chartHeight(values.amounts.netAmount, pointIndex * 2 + 1) }} />}</span><small>{periodLabel(point.period)}</small></button>; })}</div>}
+    {visualValues.length > 0 && <>
+      <div className="chart-reading"><strong>{periodLabel(previewPoint.period)}</strong><span>Básico: <MoneyValue value={previewValues.comparableSalary} currency={previewValues.currency} kind="salary" /></span><span>Neto: <MoneyValue value={previewValues.amounts?.netAmount} currency={previewValues.currency} kind="salary" /></span></div>
+      <div className="bar-chart salary-chart" role="group" aria-label={`Períodos del historial salarial en perspectiva ${perspectiveLabel}`} onMouseLeave={() => setPreviewPeriod(null)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setPreviewPeriod(null); }}>{chartPoints.map((point, pointIndex) => { const values = valuesFor(point); return <button type="button" className={`bar-group${selectedPeriod === point.period ? ' selected' : ''}`} aria-label={`Abrir detalle de ${periodLabel(point.period)}`} aria-pressed={selectedPeriod === point.period} disabled={!onSelectPeriod} onMouseEnter={() => setPreviewPeriod(point.period)} onFocus={() => setPreviewPeriod(point.period)} onClick={() => choosePeriod(point.period)} key={point.period}><span className="bars" aria-hidden="true">{values.comparableSalary !== null && <i className="bar comparable" style={{ height: chartHeight(values.comparableSalary, pointIndex * 2) }} />}{values.amounts?.netAmount != null && <i className="bar net" style={{ height: chartHeight(values.amounts.netAmount, pointIndex * 2 + 1) }} />}</span><small>{periodLabel(point.period)}</small></button>; })}</div>
+      <p className="coverage-note">Elegí un mes para abrir su detalle. Deslizá el gráfico para ver otros períodos.</p>
+    </>}
     {chartPoints.length < points.length && <p className="coverage-note">El gráfico muestra {chartPoints.length} puntos seleccionados; la tabla conserva los {points.length} períodos exactos.</p>}
     <details className="evolution-details"><summary>Ver tabla exacta ({points.length} períodos)</summary>{exactTable}</details>
   </div>;
@@ -1825,11 +1833,12 @@ function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) 
         <section className="panel recent-panel" aria-busy={documentsLoading}>
           <div className="panel-heading"><h2>Documentos recientes</h2><button className="text-button" onClick={() => onNavigate('history', { tab: 'documents', currencyCode: context?.currencyCode, employmentContext: context?.employmentContext, employmentId: context?.employmentId })}>Ver todos</button></div>
           {!documentsLoading && !documentError && <p className="coverage-note">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {pendingReview} acción{pendingReview === 1 ? '' : 'es'} pendiente{pendingReview === 1 ? '' : 's'}</p>}
+          {pendingReview > 0 && <div className="review-summary"><span>Una nueva lectura es una propuesta de cambio. Abrí un recibo para comparar y confirmar juntos los que tengan la misma corrección.</span><button type="button" className="text-button" onClick={() => onNavigate('history', { tab: 'documents', status: 'REVIEW', employmentId: documents.find((item) => item.needsReview || item.decisionRequired)?.employmentId })}>Revisar pendientes</button></div>}
           {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void loadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
           {documentsLoading && !documents.length ? <div className="compact-loading" role="status"><div className="loader" aria-hidden="true" /><span>Cargando documentos…</span></div> : documents.length ? <>
             <ul className="recent-list">{documents.map((document) => {
               const name = documentName(document, privacyEnabled);
-              return <li key={document.id}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{!privacyEnabled && name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{document.payrollPeriod ? `${document.employerName || 'Sin empresa asociada'} · Período: ${periodLabel(document.payrollPeriod)}` : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED' ? 'Documento no soportado' : 'Tipo pendiente de clasificación'}</small><small>Subido {timestampLabel(document.createdAt)}</small></span><DocumentStatusBadges document={document} /></li>;
+              return <li key={document.id}><button type="button" className="document-row recent-document" onClick={() => onNavigate('history', { tab: 'documents', documentId: document.id, employmentId: document.employmentId })}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{!privacyEnabled && name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{document.payrollPeriod ? `${document.employerName || 'Sin empresa asociada'} · Período: ${periodLabel(document.payrollPeriod)}` : document.documentType === 'UNSUPPORTED' || document.processingStatus === 'REJECTED_UNSUPPORTED' ? 'Documento no soportado' : 'Tipo pendiente de clasificación'}</small><small>Subido {timestampLabel(document.createdAt)}</small><small className="document-improvement">{document.decisionRequired ? 'Comparar cambios y confirmar' : 'Abrir recibo y datos'}</small></span><DocumentStatusBadges document={document} /><span aria-hidden="true">›</span></button></li>;
             })}</ul>
             <p className="recent-count">Mostrando últimos {documents.length} de {documentTotal}</p>
           </> : !documentError && <EmptyState title="Sin documentos" body="Todavía no importaste ningún documento." action={<button className="button secondary" onClick={() => onNavigate('import')}>Importar</button>} />}
@@ -1846,7 +1855,7 @@ function Status({ value }: { value: string }) {
 }
 
 function DocumentStatusBadges({ document }: { document: DocumentItem }) {
-  return <span className="document-badges"><Status value={document.processingStatus} />{document.decisionRequired && <span className="status pending">Confirmar lectura</span>}{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
+  return <span className="document-badges"><Status value={document.processingStatus} />{document.decisionRequired && <span className="status pending">Revisar nueva lectura</span>}{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
 }
 
 function Employments({ selectedLocation, onNavigate, runSensitive, primaryCountryCode }: { selectedLocation: OwnerLocation; onNavigate: NavigateApp; runSensitive: RunSensitive; primaryCountryCode?: string | null }) {
@@ -2702,6 +2711,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
       }
       const location = readDocumentLocation(window.location.search);
       const owner = readOwnerLocation(window.location.search);
+      if (!location && owner.section !== 'history') return;
       initialCurrencyCode.current = owner.currencyCode;
       initialEmploymentId.current = owner.employmentId;
       initialEmploymentContext.current = owner.employmentContext;
@@ -2927,7 +2937,9 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
       }
       throw caught;
     }
-    await Promise.all([refreshDetail(), loadProcessingRuns(), loadRecovery(), loadSalary(), reloadDocuments(true)]);
+    setProcessingRuns((current) => current.map((item) => item.id === run.id ? { ...item, decisionRequired: false } : item));
+    const refreshed = await Promise.allSettled([refreshDetail(), loadProcessingRuns(), loadRecovery(), loadSalary(), reloadDocuments(true)]);
+    if (refreshed.some((result) => result.status === 'rejected')) return 'La confirmación quedó guardada, pero faltó actualizar parte de la pantalla. Volvé al listado y recargá para ver los datos vigentes.';
   }
   function dismissReprocessingBatch() {
     if (!reprocessingBatch || batchIsActive(reprocessingBatch)) return;
@@ -3324,6 +3336,8 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
         onNavigate={navigateDocument}
         onReprocess={reprocessDocument}
         onRunDecision={decideProcessingRun}
+        onReviewPending={reviewReprocessingResults}
+        pendingReviewCount={documentPendingReview}
         onSave={saveCorrections}
         onSaveUnsupportedFeedback={saveUnsupportedFeedback}
         processingRuns={processingRuns}
