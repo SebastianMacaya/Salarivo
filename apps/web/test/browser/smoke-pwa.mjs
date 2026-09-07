@@ -99,7 +99,13 @@ try {
   workerSource = workerSource.replace(/salarivo-public-[a-f0-9]+/, 'salarivo-public-synthetic-update');
   await browser.evaluate('(async () => { const registration = await navigator.serviceWorker.getRegistration(); await registration.update(); })()');
   await until('(async () => Boolean((await navigator.serviceWorker.getRegistration()).waiting))()', 'New worker must wait for consent');
-  await until('Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Actualizar")', 'Update control must appear');
+  assert.equal(await browser.evaluate('Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Actualizar")'), false, 'Browser tabs must not expose the installed-app update control');
+  const { identifier: standaloneUpdate } = await browser.command('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
+    const nativeMatchMedia = window.matchMedia.bind(window);
+    window.matchMedia = query => { const result = nativeMatchMedia(query); if (query === '(display-mode: standalone)') Object.defineProperty(result, 'matches', { value: true }); return result; };
+  })();` });
+  await browser.navigate(base);
+  await until('Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Actualizar")', 'Update control must appear in the installed app');
   await browser.evaluate('window.__pwaRetainedDraft = "synthetic-draft"');
   assert.equal(await browser.evaluate('window.__pwaRetainedDraft'), 'synthetic-draft', 'Detecting a version must not reload');
   const clickUpdate = () => browser.command('Runtime.evaluate', { expression: 'Array.from(document.querySelectorAll("button")).find(button => button.textContent === "Actualizar").click()' });
@@ -123,6 +129,7 @@ try {
   await finalClick;
   await until('typeof window.__pwaRetainedDraft === "undefined" && Boolean(navigator.serviceWorker.controller)', 'Only the confirmed window reloads after activation');
   assert.deepEqual(await browser.evaluate('caches.keys()'), ['salarivo-public-synthetic-update']);
+  await browser.command('Page.removeScriptToEvaluateOnNewDocument', { identifier: standaloneUpdate });
 
   // Chromium property emulation covers progressive enhancement branches, not Safari or OS installation.
   for (const scenario of [

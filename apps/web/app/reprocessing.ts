@@ -126,7 +126,7 @@ export function analysisPresentation(analysis: DocumentAnalysis) {
       : { tone: 'ready', title: 'Mejora aplicada', body: 'La comparación confirmó un resultado mejor y quedó activo.' };
   }
   if (analysis.status === 'REVIEW_REQUIRED' || analysis.reprocess.latestOutcome === 'REVIEW_REQUIRED') {
-    return { tone: 'warning', title: 'Hay una mejora para revisar', body: 'El resultado nuevo no reemplazó al activo y necesita una decisión.' };
+    return { tone: 'warning', title: 'Nueva lectura para confirmar', body: 'Compará el cambio y elegí cuál conservar.' };
   }
   if (analysis.reprocess.latestOutcome === 'UNCHANGED') {
     return { tone: 'ready', title: 'Análisis actualizado', body: 'La versión nueva no cambió los datos útiles; conservamos el resultado activo.' };
@@ -193,7 +193,7 @@ export function runNeedsDecision(run: Pick<ProcessingRun, 'decisionRequired'>) {
 }
 
 export function compatiblePromotionLabel(count: number) {
-  return count > 1 ? `Usar en ${count} recibos compatibles` : null;
+  return count > 1 ? `Aplicar el mismo cambio en ${count} recibos` : null;
 }
 
 export function processingRunDecisionPayload(

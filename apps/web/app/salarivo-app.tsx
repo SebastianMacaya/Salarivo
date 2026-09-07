@@ -516,7 +516,7 @@ type HistoryTab = (typeof historyTabs)[number][0];
 const documentStatusGroups = [
   ['ALL', 'Todos'],
   ['READY', 'Listos'],
-  ['REVIEW', 'Para revisar'],
+  ['REVIEW', 'Acción pendiente'],
   ['PROCESSING', 'Procesando'],
   ['ERROR', 'Con error'],
 ] as const;
@@ -1405,39 +1405,40 @@ function EmptyState({ title, body, action }: { title: string; body: string; acti
   return <div className="empty-state"><span className="empty-mark" aria-hidden="true">∿</span><h3>{title}</h3><p>{body}</p>{action}</div>;
 }
 
-function ReprocessingBanner({ availableCandidates, batch, batchLimit = 100, busy, candidates, error, loading, onDismiss, onRetry, onReview, onStart, reviewCandidates }: {
+function ReprocessingBanner({ availableCandidates, batch, batchLimit = 100, busy, candidates, error, hasReadingImprovement, loading, onDismiss, onRetry, onReview, onStart, reviewCandidates }: {
   batch: ReprocessingBatch | null;
   busy: boolean;
   candidates: number;
   availableCandidates: number;
   batchLimit?: number;
   error: string;
+  hasReadingImprovement: boolean;
   loading: boolean;
   reviewCandidates: number;
   onDismiss: () => void;
   onRetry: () => void;
-  onReview: () => void;
+  onReview: (trigger: HTMLButtonElement) => void;
   onStart: () => void;
 }) {
   if (loading) return <aside className="reprocessing-banner quiet" role="status"><span className="loader" aria-hidden="true" /><div><strong>Consultando mejoras…</strong><small>Tu historial sigue disponible.</small></div></aside>;
-  if (error && !batch) return <aside className="reprocessing-banner partial" aria-live="polite"><div><strong>No pudimos actualizar las recomendaciones</strong><small>{error}</small></div><button type="button" className="button secondary" onClick={onRetry}>Reintentar</button></aside>;
+  if (error && !batch && reviewCandidates === 0) return <aside className="reprocessing-banner partial" aria-live="polite"><div><strong>No pudimos actualizar las recomendaciones</strong><small>{error}</small></div><button type="button" className="button secondary" onClick={onRetry}>Reintentar</button></aside>;
   const active = batchIsActive(batch);
   const resolved = batch ? batchResolved(batch) : 0;
-  if (!batch && candidates === 0) return <aside className="reprocessing-banner quiet" aria-live="polite"><span aria-hidden="true">✓</span><div><strong>Análisis al día</strong><small>No hay documentos con una mejora compatible pendiente.</small></div></aside>;
-  if (!batch && availableCandidates === 0) return <aside className="reprocessing-banner" aria-live="polite" aria-busy="true"><span className="loader" aria-hidden="true" /><div><strong>Buscando mejoras</strong><small>Hay {candidates} documento{candidates === 1 ? '' : 's'} en proceso; cada análisis activo sigue disponible.</small></div></aside>;
+  if (!batch && candidates === 0 && reviewCandidates === 0) return <aside className="reprocessing-banner quiet" aria-live="polite"><span aria-hidden="true">✓</span><div><strong>Análisis al día</strong><small>No hay documentos con una acción pendiente.</small></div></aside>;
+  if (!batch && candidates > 0 && availableCandidates === 0 && reviewCandidates === 0) return <aside className="reprocessing-banner" aria-live="polite" aria-busy="true"><span className="loader" aria-hidden="true" /><div><strong>Buscando mejoras</strong><small>Hay {candidates} documento{candidates === 1 ? '' : 's'} en proceso; cada análisis activo sigue disponible.</small></div></aside>;
   const batchSize = Math.min(availableCandidates, batchLimit);
-  const reviewRequired = Boolean(batch && !active && batch.progress.reviewRequired > 0 && reviewCandidates > 0);
+  const reviewRequired = reviewCandidates > 0;
   const outcome = batch && !active
-    ? `${batch.progress.improved} mejorado${batch.progress.improved === 1 ? '' : 's'} · ${batch.progress.unchanged} sin cambios · ${batch.progress.reviewRequired} para revisar · ${batch.progress.failed} con error · ${batch.progress.skipped} conservado${batch.progress.skipped === 1 ? '' : 's'}`
+    ? `${batch.progress.improved} mejorado${batch.progress.improved === 1 ? '' : 's'} · ${batch.progress.unchanged} sin cambios · ${batch.progress.reviewRequired} con decisión pendiente · ${batch.progress.failed} con error · ${batch.progress.skipped} conservado${batch.progress.skipped === 1 ? '' : 's'}`
     : null;
   return <aside className={`reprocessing-banner${batch?.status === 'FAILED' ? ' failed' : batch?.status === 'PARTIAL' ? ' partial' : ''}`} aria-live="polite" aria-busy={active}>
-    <div><strong>{active ? 'Mejorando documentos' : candidates === 1 ? 'Hay una mejora disponible' : candidates > 1 ? `Hay mejoras para ${candidates} documentos` : 'Lote finalizado'}</strong><small>{active ? 'Cada resultado se compara por separado; el análisis activo no se pierde.' : outcome ?? 'Una versión nueva puede recuperar datos que hoy figuran como N/D.'}</small></div>
+    <div><strong>{active ? 'Mejorando documentos' : reviewRequired ? reviewCandidates === 1 ? 'Hay un documento que necesita una decisión' : `Hay ${reviewCandidates} documentos que necesitan una decisión` : candidates === 1 ? 'Hay una mejora disponible' : candidates > 1 ? `Hay mejoras para ${candidates} documentos` : 'Lote finalizado'}</strong><small>{active ? 'Cada resultado se compara por separado; el análisis activo no se pierde.' : reviewRequired ? hasReadingImprovement ? 'Tus recibos actuales siguen listos. Abrí el primero para comparar la lectura nueva y aplicar juntos los cambios que coincidan.' : 'Abrí el primer documento pendiente para ver qué dato necesita tu decisión.' : outcome ?? 'Una versión nueva puede recuperar datos que hoy figuran como N/D.'}</small></div>
     {error && <div><strong>No pudimos actualizar el progreso</strong><small>{error}</small><button type="button" className="text-button" onClick={onRetry}>Reintentar</button></div>}
     {batch && <div className="reprocessing-progress"><progress max={Math.max(1, batch.progress.total)} value={resolved} aria-label="Progreso del reprocesamiento" /><span>{resolved}/{batch.progress.total}</span></div>}
-    {!active && (reviewRequired || availableCandidates > 0 || batch) && <div className="reprocessing-actions">
-      {reviewRequired && <button type="button" className="button primary" onClick={onReview}>Ir a revisar</button>}
-      {availableCandidates > 0 && <button type="button" className={`button ${reviewRequired ? 'secondary' : 'primary'}`} disabled={busy} onClick={onStart}>{busy ? 'Iniciando…' : batchSize === 1 ? 'Buscar mejora' : candidates > batchLimit ? `Mejorar ${batchSize} de los primeros ${batchLimit}` : `Mejorar ${batchSize} documentos`}</button>}
-      {batch && <button type="button" className="button secondary" onClick={onDismiss}>Cerrar</button>}
+    {(reviewRequired || (!active && (availableCandidates > 0 || batch))) && <div className="reprocessing-actions">
+      {reviewRequired && <button type="button" className="button primary" onClick={(event) => onReview(event.currentTarget)}>{hasReadingImprovement ? 'Revisar primera mejora' : 'Ver acciones pendientes'}</button>}
+      {!active && availableCandidates > 0 && <button type="button" className={`button ${reviewRequired ? 'secondary' : 'primary'}`} disabled={busy} onClick={onStart}>{busy ? 'Iniciando…' : batchSize === 1 ? 'Buscar mejora' : candidates > batchLimit ? `Mejorar ${batchSize} de los primeros ${batchLimit}` : `Mejorar ${batchSize} documentos`}</button>}
+      {!active && batch && <button type="button" className="button secondary" onClick={onDismiss}>Cerrar</button>}
     </div>}
   </aside>;
 }
@@ -1823,7 +1824,7 @@ function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) 
         {history && context && scope && <section className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Evolución</p><h2>Comparable y neto reciente</h2></div><button className="text-button" onClick={() => onNavigate('history', { tab: 'summary', currencyCode: context.currencyCode, employmentContext: context.employmentContext, employmentId: context.employmentId })}>Analizar historial</button></div><SalaryEvolution scope={scope} limit={12} onSelectPeriod={(period) => onNavigate('history', { tab: 'evolution', currencyCode: context.currencyCode, employmentContext: context.employmentContext, employmentId: context.employmentId, period })} /></section>}
         <section className="panel recent-panel" aria-busy={documentsLoading}>
           <div className="panel-heading"><h2>Documentos recientes</h2><button className="text-button" onClick={() => onNavigate('history', { tab: 'documents', currencyCode: context?.currencyCode, employmentContext: context?.employmentContext, employmentId: context?.employmentId })}>Ver todos</button></div>
-          {!documentsLoading && !documentError && <p className="coverage-note">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {pendingReview} para revisar</p>}
+          {!documentsLoading && !documentError && <p className="coverage-note">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {pendingReview} acción{pendingReview === 1 ? '' : 'es'} pendiente{pendingReview === 1 ? '' : 's'}</p>}
           {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void loadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
           {documentsLoading && !documents.length ? <div className="compact-loading" role="status"><div className="loader" aria-hidden="true" /><span>Cargando documentos…</span></div> : documents.length ? <>
             <ul className="recent-list">{documents.map((document) => {
@@ -1845,7 +1846,7 @@ function Status({ value }: { value: string }) {
 }
 
 function DocumentStatusBadges({ document }: { document: DocumentItem }) {
-  return <span className="document-badges"><Status value={document.processingStatus} />{document.decisionRequired && <span className="status pending">Para revisar</span>}{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
+  return <span className="document-badges"><Status value={document.processingStatus} />{document.decisionRequired && <span className="status pending">Confirmar lectura</span>}{document.errorCode === 'DOCUMENT_DUPLICATE' && document.processingStatus !== 'DUPLICATE' && <span className="status duplicate">Duplicado</span>}</span>;
 }
 
 function Employments({ selectedLocation, onNavigate, runSensitive, primaryCountryCode }: { selectedLocation: OwnerLocation; onNavigate: NavigateApp; runSensitive: RunSensitive; primaryCountryCode?: string | null }) {
@@ -2934,11 +2935,16 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     try { window.localStorage.setItem(dismissedReprocessingBatchKey, reprocessingBatch.id); }
     catch { /* El estado local alcanza hasta recargar si storage está bloqueado. */ }
   }
-  function reviewReprocessingResults() {
+  function reviewReprocessingResults(trigger: HTMLButtonElement) {
+    const firstDecision = documents.find((document) => document.decisionRequired);
     setTab('documents'); setDocumentKind('ALL'); setDocumentSearch('');
     setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all');
     setDocumentEmploymentId(context?.employmentId ?? 'all'); setDocumentStatusGroup('REVIEW'); setCheckedDocumentIds([]); setSelected(null);
     onLocationChange({ tab: 'documents', employmentId: context?.employmentId ?? null, documentType: 'ALL', year: null, period: null, settlementType: null, status: 'REVIEW' }, false);
+    if (firstDecision) {
+      openDocument(firstDecision, trigger);
+      return;
+    }
     window.setTimeout(() => {
       const panel = document.getElementById('history-panel-documents');
       panel?.focus();
@@ -3235,17 +3241,17 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
         ? 'Documento no soportado'
         : 'Tipo pendiente de clasificación';
     const candidate = candidateByDocument.get(document.id);
-    return <div className={`document-entry${showCheckbox ? '' : ' no-check'}`} key={document.id}>{showCheckbox && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${name}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{!privacyEnabled && name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{metadata}</small><small>Subido {timestampLabel(document.createdAt)}</small>{candidate && <small className="document-improvement">{candidate.inProgress ? 'Buscando una mejora…' : 'Mejora disponible para datos faltantes'}</small>}{document.errorCode && document.errorCode !== 'DOCUMENT_DUPLICATE' && <small className="document-reason">{importErrorLabels[document.errorCode] ?? 'El documento no pudo procesarse.'}</small>}</span><span className="document-badges"><DocumentStatusBadges document={document} />{candidate && <span className={`status ${candidate.inProgress ? 'pending' : 'ready'}`}>{candidate.inProgress ? 'Procesando' : 'Mejora disponible'}</span>}</span><span aria-hidden="true">›</span></button></div>;
+    return <div className={`document-entry${showCheckbox ? '' : ' no-check'}`} key={document.id}>{showCheckbox && <label className="document-check" title={assignable ? 'Seleccionar documento' : 'Disponible cuando termine el procesamiento'}><input type="checkbox" aria-label={`Seleccionar ${name}`} disabled={!assignable} checked={checkedDocumentIds.includes(document.id)} onChange={(event) => setCheckedDocumentIds((current) => event.target.checked ? [...current, document.id] : current.filter((id) => id !== document.id))} /></label>}<button type="button" className="document-row" onClick={(event) => openDocument(document, event.currentTarget)}><span className="file-icon">PDF</span><span className="document-copy"><strong title={name}>{name}</strong>{!privacyEnabled && name !== document.originalFilename && <small className="document-original" title={document.originalFilename}>Archivo original: {document.originalFilename}</small>}<small>{metadata}</small><small>Subido {timestampLabel(document.createdAt)}</small>{document.decisionRequired && <small className="document-improvement">Hay una lectura nueva para confirmar. Abrí para comparar y elegir.</small>}{candidate && <small className="document-improvement">{candidate.inProgress ? 'Buscando una mejora…' : 'Mejora disponible para datos faltantes'}</small>}{document.errorCode && document.errorCode !== 'DOCUMENT_DUPLICATE' && <small className="document-reason">{importErrorLabels[document.errorCode] ?? 'El documento no pudo procesarse.'}</small>}</span><span className="document-badges"><DocumentStatusBadges document={document} />{candidate && <span className={`status ${candidate.inProgress ? 'pending' : 'ready'}`}>{candidate.inProgress ? 'Procesando' : 'Mejora disponible'}</span>}</span><span aria-hidden="true">›</span></button></div>;
   }
   const selectedDocumentIndex = documents.findIndex(({ id }) => id === selected?.id);
   const reprocessingBatchDismissed = batchWasDismissed(reprocessingBatch, dismissedReprocessingBatchId);
   const visibleReprocessingBatch = reprocessingBatchDismissed ? null : reprocessingBatch;
-  const showReprocessingBanner = !reprocessingBatchDismissed || reprocessingCandidateTotal > 0;
+  const showReprocessingBanner = !reprocessingBatchDismissed || reprocessingCandidateTotal > 0 || documentPendingReview > 0;
 
   return (
     <div className="page" aria-busy={loading || documentsLoading || comparisonLoading || conceptLoading || conceptLoadingMore}>
       <PageHeader eyebrow="Datos estructurados" title={tab === 'documents' ? 'Documentos' : 'Historial salarial'} action={tab === 'documents' ? <button className="button primary" onClick={() => onNavigate('import')}>Subir recibos</button> : undefined} />
-      {showReprocessingBanner && <ReprocessingBanner availableCandidates={reprocessingCandidates.filter((candidate) => candidate.available).length} batch={visibleReprocessingBatch} batchLimit={reprocessingBatchLimit} busy={reprocessingBusy} candidates={reprocessingCandidateTotal} error={reprocessingError} loading={reprocessingLoading} onDismiss={dismissReprocessingBatch} onRetry={() => void loadRecovery()} onReview={reviewReprocessingResults} onStart={() => void startReprocessingBatch()} reviewCandidates={documentPendingReview} />}
+      {showReprocessingBanner && <ReprocessingBanner availableCandidates={reprocessingCandidates.filter((candidate) => candidate.available).length} batch={visibleReprocessingBatch} batchLimit={reprocessingBatchLimit} busy={reprocessingBusy} candidates={reprocessingCandidateTotal} error={reprocessingError} hasReadingImprovement={documents.some((document) => document.decisionRequired)} loading={reprocessingLoading} onDismiss={dismissReprocessingBatch} onRetry={() => void loadRecovery()} onReview={reviewReprocessingResults} onStart={() => void startReprocessingBatch()} reviewCandidates={documentPendingReview} />}
       <div className="tabs history-tabs" role="tablist" aria-label="Secciones del historial">{historyTabs.map(([value, label], index) => <a id={`history-tab-${value}`} role="tab" href={historyTabHref(value)} aria-controls={`history-panel-${value}`} aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} className={tab === value ? 'active' : ''} onKeyDown={(event) => moveHistoryTab(event, index)} onClick={(event) => { if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) { event.preventDefault(); selectHistoryTab(value); } }} key={value}>{label}</a>)}</div>
       {error && <p className="message error" role="alert">{error} <button type="button" className="text-button" disabled={loading} onClick={() => void load()}>{loading ? 'Reintentando…' : 'Reintentar'}</button></p>}
       {loading && !history && <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando el historial salarial…</p></div>}
@@ -3283,7 +3289,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
           onLocationChange({ year: filters.year, period: filters.period || null, settlementType: filters.settlementType === 'all' ? null : filters.settlementType, status: filters.status }, true);
         }} />
         {documentError && <p className="message error" role="alert">{documentError} <button type="button" className="text-button" disabled={documentsLoading} onClick={() => void reloadDocuments()}>{documentsLoading ? 'Reintentando…' : 'Reintentar'}</button></p>}
-        {!documentsLoading && !documentError && <p className="document-count">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {documentPendingReview} para revisar · mostrando {documents.length}</p>}
+        {!documentsLoading && !documentError && <p className="document-count">{documentTotal} documento{documentTotal === 1 ? '' : 's'} · {documentPendingReview} acción{documentPendingReview === 1 ? '' : 'es'} pendiente{documentPendingReview === 1 ? '' : 's'} · mostrando {documents.length}</p>}
         {documentPeriod && <p className="coverage-note">Documentos de {periodLabel(documentPeriod)}. Abrí uno para revisar sus conceptos y, si decidís mostrarlo, el PDF fuente.</p>}
         {documentKind === 'PAYROLL' && documents.length > 0 && <div className="bulk-association"><label><input type="checkbox" checked={allAssignableSelected} onChange={(event) => setCheckedDocumentIds(event.target.checked ? assignableDocuments.map(({ id }) => id) : [])} />Seleccionar todos</label><span>{checkedDocumentIds.length} seleccionado{checkedDocumentIds.length === 1 ? '' : 's'}</span><select aria-label="Empleo para asociar" value={employmentChoice} onChange={(event) => setEmploymentChoice(event.target.value)}><option value="">Elegí un empleo</option>{employments.map((employment) => <option key={employment.id} value={employment.id}>{employmentOptionLabel(employment)}</option>)}<option value="none">Quitar asociación</option></select><button type="button" className="button primary compact" disabled={!checkedDocumentIds.length || !employmentChoice || associating} onClick={() => void associateDocuments()}>{associating ? 'Guardando…' : 'Aplicar'}</button></div>}
         <div id="document-results">{documentError ? null : documentsLoading ? <div className="empty-state" role="status"><div className="loader" aria-hidden="true" /><p>Cargando documentos…</p></div> : documents.length ? <><div className="document-groups">{[...documentGroups.entries()].map(([year, items]) => <details className="document-year" open key={year}><summary><strong>{year}</strong><span>{items.length} documento{items.length === 1 ? '' : 's'}</span></summary><div className="document-list">{items.map(documentRow)}</div></details>)}</div>{documentCursor && <div className="load-more"><button type="button" className="button secondary" disabled={loadingMoreDocuments} onClick={() => void loadMoreDocuments()}>{loadingMoreDocuments ? 'Cargando…' : 'Cargar más'}</button></div>}</> : <EmptyState title="No encontramos documentos con estos filtros" body="Probá limpiar los filtros o importá un PDF nuevo." action={<button type="button" className="button secondary" onClick={() => { setDocumentSearch(''); setDocumentYear('all'); setDocumentPeriod(''); setDocumentSettlementType('all'); setDocumentStatusGroup('ALL'); onLocationChange({ year: null, period: null, settlementType: null, status: 'ALL' }, true); }}>Limpiar filtros</button>} />}</div>

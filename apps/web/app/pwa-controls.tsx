@@ -89,10 +89,12 @@ export function PwaControls({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (process.env.NODE_ENV !== 'production' || !('serviceWorker' in navigator) || !window.isSecureContext) return;
+    const standalone = window.matchMedia('(display-mode: standalone)').matches
+      || Boolean((navigator as Navigator & { standalone?: boolean }).standalone);
     let disposed = false;
     let installing: ServiceWorker | null = null;
     const checkWaiting = () => {
-      if (!disposed) setUpdateReady(Boolean(registration.current?.waiting && navigator.serviceWorker.controller));
+      if (!disposed) setUpdateReady(Boolean(standalone && registration.current?.waiting && navigator.serviceWorker.controller));
     };
     const updateFound = () => {
       installing?.removeEventListener('statechange', checkWaiting);

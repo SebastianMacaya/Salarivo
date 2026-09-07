@@ -38,7 +38,7 @@ test('prioriza una mejora disponible sobre el PROMOTED histórico del backfill',
 
 test('distingue procesamiento, revisión, fallo, sin cambios y análisis parcial', () => {
   assert.equal(analysisPresentation(analysis({ reprocess: { available: false, inProgress: true, latestOutcome: null } })).title, 'Buscando una mejora');
-  assert.equal(analysisPresentation(analysis({ status: 'REVIEW_REQUIRED' })).title, 'Hay una mejora para revisar');
+  assert.equal(analysisPresentation(analysis({ status: 'REVIEW_REQUIRED' })).title, 'Nueva lectura para confirmar');
   assert.equal(analysisPresentation(analysis({ status: 'FAILED' })).title, 'La mejora no pudo completarse');
   assert.equal(analysisPresentation(analysis({ reprocess: { available: false, inProgress: false, latestOutcome: 'UNCHANGED' } })).title, 'Análisis actualizado');
   assert.equal(analysisPresentation(analysis({ status: 'REVIEW_REQUIRED', reprocess: { available: false, inProgress: false, latestOutcome: 'REJECTED_REGRESSION' } })).title, 'Se conservó el mejor resultado');
@@ -67,7 +67,7 @@ test('recupera el lote activo sólo ante el conflicto esperado', () => {
 
 test('ofrece alcance compatible sólo cuando hay más de un recibo', () => {
   assert.equal(compatiblePromotionLabel(1), null);
-  assert.equal(compatiblePromotionLabel(4), 'Usar en 4 recibos compatibles');
+  assert.equal(compatiblePromotionLabel(4), 'Aplicar el mismo cambio en 4 recibos');
   assert.deepEqual(processingRunDecisionPayload('PROMOTE', 'COMPATIBLE', 'active-run', 4), {
     decision: 'PROMOTE', scope: 'COMPATIBLE', expectedActiveRunId: 'active-run', expectedCompatiblePromotionCount: 4,
   });
