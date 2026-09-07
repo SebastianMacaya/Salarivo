@@ -5,6 +5,8 @@ import {
   batchIsActive,
   batchResolved,
   batchWasDismissed,
+  compatiblePromotionLabel,
+  processingRunDecisionPayload,
   issueLabel,
   processingHealthPage,
   processingHealthPagination,
@@ -61,6 +63,17 @@ test('resume el lote incluyendo resultados conservados', () => {
 test('recupera el lote activo sólo ante el conflicto esperado', () => {
   assert.equal(shouldHydrateActiveBatch('REPROCESSING_BATCH_ALREADY_ACTIVE'), true);
   assert.equal(shouldHydrateActiveBatch('NO_REPROCESSING_CANDIDATES'), false);
+});
+
+test('ofrece alcance compatible sólo cuando hay más de un recibo', () => {
+  assert.equal(compatiblePromotionLabel(1), null);
+  assert.equal(compatiblePromotionLabel(4), 'Usar en 4 recibos compatibles');
+  assert.deepEqual(processingRunDecisionPayload('PROMOTE', 'COMPATIBLE', 'active-run', 4), {
+    decision: 'PROMOTE', scope: 'COMPATIBLE', expectedActiveRunId: 'active-run', expectedCompatiblePromotionCount: 4,
+  });
+  assert.deepEqual(processingRunDecisionPayload('PROMOTE', 'DOCUMENT', 'active-run', 4), {
+    decision: 'PROMOTE', expectedActiveRunId: 'active-run',
+  });
 });
 
 test('pagina juntas las versiones e issues de health hasta cubrir la lista más larga', () => {

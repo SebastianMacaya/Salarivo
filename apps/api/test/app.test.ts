@@ -54,6 +54,32 @@ test("Fastify registers every local route and rejects untrusted mutations", asyn
   assert.equal(anonymousAdminMutation.statusCode, 401);
   assert.equal(anonymousAdminMutation.json().error.code, "AUTHENTICATION_REQUIRED");
 
+  const decisionPath = "/api/v1/documents/00000000-0000-4000-8000-000000000001/processing-runs/00000000-0000-4000-8000-000000000002/decision";
+  const compatibleWithoutExpectedCount = await app.inject({
+    method: "POST",
+    url: decisionPath,
+    headers: { origin: "http://localhost:3000" },
+    payload: {
+      decision: "PROMOTE",
+      expectedActiveRunId: "00000000-0000-4000-8000-000000000003",
+      scope: "COMPATIBLE",
+    },
+  });
+  assert.equal(compatibleWithoutExpectedCount.statusCode, 400);
+  assert.equal(compatibleWithoutExpectedCount.json().error.code, "VALIDATION_ERROR");
+  const individualWithoutExpectedCount = await app.inject({
+    method: "POST",
+    url: decisionPath,
+    headers: { origin: "http://localhost:3000" },
+    payload: {
+      decision: "PROMOTE",
+      expectedActiveRunId: "00000000-0000-4000-8000-000000000003",
+      scope: "DOCUMENT",
+    },
+  });
+  assert.equal(individualWithoutExpectedCount.statusCode, 401);
+  assert.equal(individualWithoutExpectedCount.json().error.code, "AUTHENTICATION_REQUIRED");
+
   const googleUnavailable = await app.inject({
     method: "POST",
     url: "/api/v1/auth/google/start",

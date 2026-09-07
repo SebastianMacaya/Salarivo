@@ -10,11 +10,13 @@ import { MoneyValue, PercentageValue, PrivacyToggle, SensitiveValue, usePrivacyM
 import { MONEY_MASK, PERCENTAGE_MASK, isMonetaryField, isSalaryPercentageField } from './privacy-mode-state';
 import {
   analysisPresentation,
+  compatiblePromotionLabel,
   issueLabel,
   runNeedsDecision,
   runOutcomeLabel,
   triggerLabel,
   type DocumentAnalysis,
+  type ProcessingComparisonLineItem,
   type ProcessingComparisonPreview,
   type ProcessingRun,
 } from './reprocessing';
@@ -168,6 +170,15 @@ function comparisonValue(preview: ProcessingComparisonPreview, fieldPath: string
   return value;
 }
 
+function comparisonLineItem(item: ProcessingComparisonLineItem | null) {
+  if (!item) return 'No estaba';
+  const classification = item.itemType === 'EARNING'
+    ? earningLabels[item.normalizedConceptCode ?? 'UNKNOWN'] ?? 'Otro concepto'
+    : item.itemType === 'DEDUCTION' ? 'Descuento' : 'Otro concepto';
+  const recurrence = item.isRecurring === true ? 'Recurrente' : item.isRecurring === false ? 'No recurrente' : 'Periodicidad sin determinar';
+  return <><SensitiveValue value={item.rawDescription} mask="Concepto salarial" /> · {classification} · {recurrence} · <MoneyValue value={item.amount} currency={item.currencyCode} creditAware /></>;
+}
+
 function handleReviewKey(event: KeyboardEvent<HTMLElement>, close: () => void) {
   if (event.key === 'Escape') {
     if (document.fullscreenElement) return;
@@ -221,6 +232,7 @@ export function DocumentReview({
   onSave,
   onSaveUnsupportedFeedback,
   processingRuns = [],
+  runCompatiblePromotionCounts = {},
   runPreviewErrors = {},
   runPreviews = {},
   runsError = '',
@@ -251,10 +263,11 @@ export function DocumentReview({
   onLocationChange: (page: number, evidenceId?: string, lineItemId?: string) => void;
   onNavigate: (direction: -1 | 1) => void;
   onReprocess: (retry?: boolean) => Promise<void>;
-  onRunDecision: (run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE') => Promise<void>;
+  onRunDecision: (run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE', scope: 'DOCUMENT' | 'COMPATIBLE') => Promise<void>;
   onSave: (changes: Array<{ field: ExtractedFieldDetail; value: string }>, extractionRunId: string) => Promise<void>;
   onSaveUnsupportedFeedback: (comment: string) => Promise<string | null>;
   processingRuns?: ProcessingRun[];
+  runCompatiblePromotionCounts?: Record<string, number>;
   runPreviewErrors?: Record<string, string>;
   runPreviews?: Record<string, ProcessingComparisonPreview | null | undefined>;
   runsError?: string;
@@ -556,7 +569,9 @@ export function DocumentReview({
               {runsError ? <p className={styles.error} role="alert">{runsError}</p> : runsLoading ? <p role="status">Cargando versiones y comparación…</p> : runTimeline.length ? <ol>{runTimeline.map((version) => {
                 const reviewCandidate = runNeedsDecision(version);
                 const preview = runPreviews[version.id];
+                const compatibleActionLabel = compatiblePromotionLabel(runCompatiblePromotionCounts[version.id] ?? 1);
                 const changedFields = preview?.fields.filter((field) => field.change !== 'UNCHANGED') ?? [];
+                const changedLineItems = preview?.lineItems.changes ?? [];
                 const previewMatchesActive = preview?.baseRunId === analysis.activeRunId && preview.candidateRunId === version.id;
                 return <li key={version.id}>
                   <div><strong>Versión {version.processingVersion}</strong>{version.active && <span>Activa</span>}</div>
@@ -569,8 +584,13 @@ export function DocumentReview({
                     {preview && <>
                       {changedFields.length ? <div className={styles.comparisonTable} role="region" aria-label={`Comparación de la versión ${version.processingVersion}`} tabIndex={0}><table><thead><tr><th scope="col">Dato</th><th scope="col">Activo</th><th scope="col">Nuevo</th></tr></thead><tbody>{changedFields.map((field) => <tr key={field.fieldPath}><th scope="row">{comparisonLabels[field.fieldPath] ?? field.fieldPath}</th><td data-label="Activo">{comparisonValue(preview, field.fieldPath, field.before, 'before')}</td><td data-label="Nuevo">{comparisonValue(preview, field.fieldPath, field.after, 'after')}</td></tr>)}</tbody></table></div> : <p>Los campos principales no cambian.</p>}
                       {preview.lineItems.changed && <p>Conceptos detectados: {preview.lineItems.beforeCount} activos → {preview.lineItems.afterCount} nuevos.</p>}
+                      {changedLineItems.length > 0 && <><h5>Cambios que se activarán</h5><ul className={styles.lineItems}>{changedLineItems.map((change) => <li key={change.itemOrdinal}><small>Activo: {comparisonLineItem(change.before)}</small><small>Nuevo: {comparisonLineItem(change.after)}</small></li>)}</ul></>}
                     </>}
-                    <div className={styles.runActions}>{previewMatchesActive && <button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'PROMOTE'))}>Usar esta mejora</button>}<button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'KEEP_ACTIVE'))}>Conservar versión activa</button></div>
+                    <div className={styles.runActions}>{previewMatchesActive && <><button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'PROMOTE', 'DOCUMENT'))}>{compatibleActionLabel ? 'Usar sólo en este recibo' : 'Usar esta mejora'}</button>{compatibleActionLabel && <button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => {
+                      const count = runCompatiblePromotionCounts[version.id] ?? 1;
+                      if (!confirm(`¿Usar esta mejora en ${count} recibos compatibles? Esto sólo activa mejoras técnicas ya procesadas. Las observaciones para la estimación indemnizatoria pueden seguir apareciendo en cada recibo.`)) return;
+                      void run(() => onRunDecision(version, 'PROMOTE', 'COMPATIBLE'));
+                    }}>{compatibleActionLabel}</button>}</>}<button type="button" disabled={busy || analysis.reprocess.inProgress} onClick={() => void run(() => onRunDecision(version, 'KEEP_ACTIVE', 'DOCUMENT'))}>Conservar versión activa</button></div>
                   </div>}
                 </li>;
               })}</ol> : <p>No hay versiones registradas.</p>}

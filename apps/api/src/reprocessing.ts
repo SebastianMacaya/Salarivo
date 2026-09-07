@@ -597,6 +597,7 @@ export async function loadProcessingComparisonPreview(
   userId: string,
   documentId: string,
   runId: string,
+  includeLineItemChanges = false,
 ) {
   const selected = await client.query(
     `WITH target AS (
@@ -621,8 +622,9 @@ export async function loadProcessingComparisonPreview(
               detected_employer.name,
               employer_field.interpreted_value #>> '{}'
             ) AS employer_name,
-            COALESCE(items.item_count, 0)::integer AS item_count,
-            items.fingerprint AS line_items_fingerprint
+             COALESCE(items.item_count, 0)::integer AS item_count,
+             items.fingerprint AS line_items_fingerprint,
+             items.line_items
        FROM target
        JOIN extraction_runs run
          ON run.user_id = $2 AND run.document_id = $3
@@ -642,15 +644,24 @@ export async function loadProcessingComparisonPreview(
          ON employer_field.user_id = run.user_id AND employer_field.document_id = run.document_id
         AND employer_field.extraction_run_id = run.id AND employer_field.field_path = 'employer.name'
        LEFT JOIN LATERAL (
-         SELECT count(*)::integer AS item_count,
-                md5(COALESCE(jsonb_agg(jsonb_build_array(
-                  item.item_type, item.normalized_concept_code, item.amount::text,
-                  item.currency_code, item.is_recurring
-                ) ORDER BY item.item_ordinal, item.id)::text, '[]')) AS fingerprint
+          SELECT count(*)::integer AS item_count,
+                 md5(COALESCE(jsonb_agg(jsonb_build_array(
+                   item.item_type, item.normalized_concept_code, item.amount::text,
+                   item.currency_code, item.is_recurring
+                 ) ORDER BY item.item_ordinal, item.id)::text, '[]')) AS fingerprint,
+                 CASE WHEN $4::boolean THEN COALESCE(jsonb_agg(jsonb_build_object(
+                   'itemOrdinal', item.item_ordinal,
+                   'rawDescription', item.raw_description,
+                   'normalizedConceptCode', item.normalized_concept_code,
+                   'amount', item.amount::text,
+                   'currencyCode', item.currency_code,
+                   'itemType', item.item_type,
+                   'isRecurring', item.is_recurring
+                 ) ORDER BY item.item_ordinal, item.id), '[]'::jsonb) END AS line_items
            FROM payroll_line_items item
           WHERE item.user_id = settlement.user_id AND item.settlement_id = settlement.id
        ) items ON true`,
-    [runId, userId, documentId],
+    [runId, userId, documentId, includeLineItemChanges],
   );
   const candidate = selected.rows.find((row) => String(row.id) === runId);
   const baseRunId = candidate?.base_extraction_run_id === null || candidate?.base_extraction_run_id === undefined
@@ -659,6 +670,28 @@ export async function loadProcessingComparisonPreview(
   if (!candidate || !baseRunId || candidate.settlement_id === null) return null;
   const base = selected.rows.find((row) => String(row.id) === baseRunId);
   if (!base) return null;
+  const lineItems = (row: Record<string, unknown>) => (Array.isArray(row.line_items) ? row.line_items : [])
+    .map((item) => {
+      const value = item as Record<string, unknown>;
+      return {
+        itemOrdinal: Number(value.itemOrdinal),
+        rawDescription: String(value.rawDescription ?? ''),
+        normalizedConceptCode: value.normalizedConceptCode === null ? null : String(value.normalizedConceptCode),
+        amount: String(value.amount),
+        currencyCode: String(value.currencyCode),
+        itemType: String(value.itemType),
+        isRecurring: value.isRecurring === true ? true : value.isRecurring === false ? false : null,
+      };
+    });
+  const beforeItems = new Map(lineItems(base).map((item) => [item.itemOrdinal, item]));
+  const afterItems = new Map(lineItems(candidate).map((item) => [item.itemOrdinal, item]));
+  const changedLineItems = [...new Set([...beforeItems.keys(), ...afterItems.keys()])]
+    .sort((left, right) => left - right)
+    .flatMap((itemOrdinal) => {
+      const before = beforeItems.get(itemOrdinal) ?? null;
+      const after = afterItems.get(itemOrdinal) ?? null;
+      return JSON.stringify(before) === JSON.stringify(after) ? [] : [{ itemOrdinal, before, after }];
+    });
   const fields = [
     ["employer.name", "employer_name"],
     ["settlement.payrollPeriod", "payroll_period"],
@@ -688,8 +721,314 @@ export async function loadProcessingComparisonPreview(
       beforeCount: Number(base.item_count ?? 0),
       afterCount: Number(candidate.item_count ?? 0),
       changed: base.line_items_fingerprint !== candidate.line_items_fingerprint,
+      changes: changedLineItems,
     },
   };
+}
+
+export type CompatibleProcessingRun = {
+  documentId: string;
+  runId: string;
+  expectedActiveRunId: string;
+};
+
+function processingComparisonShape(
+  preview: NonNullable<Awaited<ReturnType<typeof loadProcessingComparisonPreview>>>,
+) {
+  return JSON.stringify({
+    fields: preview.fields
+      .filter(({ change }) => change !== "UNCHANGED")
+      .map(({ fieldPath, change }) => `${fieldPath}:${change}`)
+      .sort(),
+    lineItems: preview.lineItems,
+  });
+}
+
+export async function findCompatibleProcessingRuns(
+  client: Queryable,
+  input: { userId: string; documentId: string; runId: string },
+): Promise<CompatibleProcessingRun[]> {
+  const result = await client.query(
+    `WITH source AS (
+       SELECT source_run.*, source_document.employment_id,
+              source_job.reprocessing_batch_id,
+              source_settlement.currency_code, source_settlement.settlement_type,
+               source_transition.signature AS line_item_transition_signature,
+              source_base.pipeline_fingerprint AS base_pipeline_fingerprint,
+              source_base.classifier_name AS base_classifier_name,
+              source_base.classifier_version AS base_classifier_version,
+              source_base.extractor_name AS base_extractor_name,
+              source_base.extractor_version AS base_extractor_version,
+              source_base.parser_version AS base_parser_version,
+              source_base.normalizer_version AS base_normalizer_version,
+              source_base.result_schema_version AS base_result_schema_version,
+              source_base.ocr_provider AS base_ocr_provider,
+              source_base.ocr_version AS base_ocr_version,
+              source_base.ocr_language AS base_ocr_language,
+              COALESCE((SELECT jsonb_agg(jsonb_build_array(issue.code, issue.severity, issue.affected_field_path)
+                ORDER BY issue.code, issue.severity, issue.affected_field_path)
+                FROM extraction_run_issues issue WHERE issue.user_id = source_run.user_id
+                  AND issue.document_id = source_run.document_id AND issue.extraction_run_id = source_run.id), '[]'::jsonb) AS issue_signature,
+              COALESCE((SELECT jsonb_agg(jsonb_build_array(issue.code, issue.severity, issue.affected_field_path)
+                ORDER BY issue.code, issue.severity, issue.affected_field_path)
+                FROM extraction_run_issues issue WHERE issue.user_id = source_base.user_id
+                  AND issue.document_id = source_base.document_id AND issue.extraction_run_id = source_base.id), '[]'::jsonb) AS base_issue_signature
+         FROM extraction_runs source_run
+         JOIN documents source_document ON source_document.id = source_run.document_id AND source_document.user_id = source_run.user_id
+         JOIN employments source_employment ON source_employment.id = source_document.employment_id
+           AND source_employment.user_id = source_document.user_id
+         JOIN extraction_runs source_base ON source_base.id = source_document.active_extraction_run_id
+           AND source_base.user_id = source_document.user_id AND source_base.document_id = source_document.id
+         JOIN processing_jobs source_job ON source_job.user_id = source_run.user_id
+           AND source_job.document_id = source_run.document_id AND source_job.processing_version = source_run.processing_version
+         JOIN payroll_settlements source_settlement ON source_settlement.user_id = source_run.user_id
+           AND source_settlement.document_id = source_run.document_id AND source_settlement.extraction_run_id = source_run.id
+           AND source_settlement.settlement_ordinal = 1
+         JOIN payroll_settlements source_base_settlement ON source_base_settlement.user_id = source_base.user_id
+           AND source_base_settlement.document_id = source_base.document_id
+           AND source_base_settlement.extraction_run_id = source_base.id
+           AND source_base_settlement.settlement_ordinal = 1
+         CROSS JOIN LATERAL (
+            SELECT COALESCE(jsonb_agg(jsonb_build_array(
+                     transition.item_ordinal,
+                     lower(btrim(COALESCE(base_item.raw_description, ''))),
+                     base_item.item_type, candidate_item.item_type,
+                    base_item.normalized_concept_code, candidate_item.normalized_concept_code,
+                    base_item.currency_code, candidate_item.currency_code,
+                    base_item.is_recurring, candidate_item.is_recurring,
+                    base_item.amount IS DISTINCT FROM candidate_item.amount
+                   ) ORDER BY transition.item_ordinal), '[]'::jsonb) AS signature,
+                   bool_and(base_item.id IS NOT NULL AND candidate_item.id IS NOT NULL
+                     AND lower(btrim(base_item.raw_description)) = lower(btrim(candidate_item.raw_description))) AS descriptions_unchanged
+             FROM (
+               SELECT item.item_ordinal FROM payroll_line_items item
+                WHERE item.user_id = source_base.user_id AND item.settlement_id = source_base_settlement.id
+               UNION
+               SELECT item.item_ordinal FROM payroll_line_items item
+                WHERE item.user_id = source_run.user_id AND item.settlement_id = source_settlement.id
+             ) transition
+             LEFT JOIN payroll_line_items base_item ON base_item.user_id = source_base.user_id
+              AND base_item.settlement_id = source_base_settlement.id
+              AND base_item.item_ordinal = transition.item_ordinal
+             LEFT JOIN payroll_line_items candidate_item ON candidate_item.user_id = source_run.user_id
+              AND candidate_item.settlement_id = source_settlement.id
+              AND candidate_item.item_ordinal = transition.item_ordinal
+         ) source_transition
+        WHERE source_run.id = $1 AND source_run.document_id = $2 AND source_run.user_id = $3
+          AND source_run.status IN ('COMPLETED', 'COMPLETED_WITH_WARNINGS')
+          AND source_run.promotion_outcome = 'REVIEW_REQUIRED'
+          AND source_run.comparison_summary ->> 'comparison' = 'REVIEW_REQUIRED'
+           AND source_run.pipeline_fingerprint = $4
+           AND source_run.parser_version = $5
+           AND source_base.parser_version ~ '^[0-9]{1,8}$'
+           AND source_base.parser_version::integer < $5::integer
+          AND source_run.base_extraction_run_id = source_document.active_extraction_run_id
+          AND source_document.deleted_at IS NULL AND source_document.original_deleted_at IS NULL
+          AND source_document.security_status = 'CLEAN' AND source_document.document_type = 'PAYROLL'
+          AND source_document.employment_id IS NOT NULL
+          AND source_run.detected_employer_id = source_employment.employer_id
+          AND (source_run.country_code IS NULL OR source_document.country_code IS NULL
+            OR source_run.country_code = source_document.country_code)
+          AND (source_run.country_code IS NULL OR source_employment.country_confirmed_at IS NULL
+            OR source_run.country_code = source_employment.country_code)
+          AND NOT EXISTS (SELECT 1 FROM extraction_run_issues country_issue
+            WHERE country_issue.user_id = source_run.user_id
+              AND country_issue.document_id = source_run.document_id
+              AND country_issue.extraction_run_id = source_run.id
+              AND country_issue.code IN ('COUNTRY_UNCONFIRMED', 'COUNTRY_EMPLOYMENT_CONFLICT',
+                'COUNTRY_SNAPSHOT_CONFLICT', 'COUNTRY_NOT_SUPPORTED'))
+          AND source_employment.currency_code = source_settlement.currency_code
+          AND source_settlement.is_recurring IS NOT DISTINCT FROM source_base_settlement.is_recurring
+          AND source_settlement.payment_date IS NOT DISTINCT FROM source_base_settlement.payment_date
+          AND source_settlement.issue_date IS NOT DISTINCT FROM source_base_settlement.issue_date
+          AND source_settlement.employment_id = source_document.employment_id
+           AND source_base_settlement.employment_id = source_document.employment_id
+           AND source_transition.descriptions_unchanged
+           AND source_base_settlement.gross_amount = source_base_settlement.remunerative_amount
+             + source_base_settlement.non_remunerative_amount
+           AND (SELECT COALESCE(sum(item.amount), 0) FROM payroll_line_items item
+             WHERE item.user_id = source_base.user_id AND item.settlement_id = source_base_settlement.id
+               AND item.item_type = 'EARNING') IS DISTINCT FROM source_base_settlement.gross_amount
+           AND (SELECT COALESCE(sum(item.amount), 0) FROM payroll_line_items item
+             WHERE item.user_id = source_run.user_id AND item.settlement_id = source_settlement.id
+               AND item.item_type = 'EARNING') IS NOT DISTINCT FROM source_settlement.gross_amount
+          AND (SELECT count(*) FROM payroll_settlements settlement_count
+            WHERE settlement_count.user_id = source_run.user_id
+              AND settlement_count.document_id = source_run.document_id
+              AND settlement_count.extraction_run_id = source_run.id) = 1
+          AND (SELECT count(*) FROM payroll_settlements settlement_count
+            WHERE settlement_count.user_id = source_base.user_id
+              AND settlement_count.document_id = source_base.document_id
+              AND settlement_count.extraction_run_id = source_base.id) = 1
+          AND date_trunc('month', source_employment.start_date)::date <= source_settlement.payroll_period
+          AND (source_employment.end_date IS NULL
+            OR date_trunc('month', source_employment.end_date)::date >= source_settlement.payroll_period)
+          AND source_run.layout_fingerprint IS NOT NULL
+          AND source_job.reprocessing_batch_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM processing_jobs active_job
+            WHERE active_job.user_id = source_document.user_id AND active_job.document_id = source_document.id
+              AND (active_job.state IN ('PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE') OR active_job.execution_owner IS NOT NULL))
+     ), candidates AS (
+       SELECT source.document_id, source.id AS run_id, source.base_extraction_run_id AS expected_active_run_id
+         FROM source
+       UNION ALL
+       SELECT candidate.document_id, candidate.id, candidate.base_extraction_run_id
+         FROM source
+         JOIN processing_jobs peer_job ON peer_job.user_id = source.user_id
+          AND peer_job.reprocessing_batch_id = source.reprocessing_batch_id
+          AND peer_job.document_id <> source.document_id
+         JOIN extraction_runs candidate ON candidate.user_id = peer_job.user_id
+          AND candidate.document_id = peer_job.document_id AND candidate.processing_version = peer_job.processing_version
+         JOIN documents document ON document.id = candidate.document_id AND document.user_id = candidate.user_id
+         JOIN employments employment ON employment.id = document.employment_id
+           AND employment.user_id = document.user_id
+         JOIN extraction_runs base ON base.id = document.active_extraction_run_id
+          AND base.user_id = document.user_id AND base.document_id = document.id
+         JOIN payroll_settlements settlement ON settlement.user_id = candidate.user_id
+          AND settlement.document_id = candidate.document_id AND settlement.extraction_run_id = candidate.id
+          AND settlement.settlement_ordinal = 1
+         JOIN payroll_settlements base_settlement ON base_settlement.user_id = base.user_id
+          AND base_settlement.document_id = base.document_id AND base_settlement.extraction_run_id = base.id
+          AND base_settlement.settlement_ordinal = 1
+         CROSS JOIN LATERAL (
+            SELECT COALESCE(jsonb_agg(jsonb_build_array(
+                     transition.item_ordinal,
+                     lower(btrim(COALESCE(base_item.raw_description, ''))),
+                     base_item.item_type, candidate_item.item_type,
+                    base_item.normalized_concept_code, candidate_item.normalized_concept_code,
+                    base_item.currency_code, candidate_item.currency_code,
+                    base_item.is_recurring, candidate_item.is_recurring,
+                    base_item.amount IS DISTINCT FROM candidate_item.amount
+                   ) ORDER BY transition.item_ordinal), '[]'::jsonb) AS signature,
+                   bool_and(base_item.id IS NOT NULL AND candidate_item.id IS NOT NULL
+                     AND lower(btrim(base_item.raw_description)) = lower(btrim(candidate_item.raw_description))) AS descriptions_unchanged
+             FROM (
+               SELECT item.item_ordinal FROM payroll_line_items item
+                WHERE item.user_id = base.user_id AND item.settlement_id = base_settlement.id
+               UNION
+               SELECT item.item_ordinal FROM payroll_line_items item
+                WHERE item.user_id = candidate.user_id AND item.settlement_id = settlement.id
+             ) transition
+             LEFT JOIN payroll_line_items base_item ON base_item.user_id = base.user_id
+              AND base_item.settlement_id = base_settlement.id
+              AND base_item.item_ordinal = transition.item_ordinal
+             LEFT JOIN payroll_line_items candidate_item ON candidate_item.user_id = candidate.user_id
+              AND candidate_item.settlement_id = settlement.id
+              AND candidate_item.item_ordinal = transition.item_ordinal
+         ) peer_transition
+        WHERE candidate.status = source.status
+          AND candidate.promotion_outcome = 'REVIEW_REQUIRED'
+          AND candidate.comparison_summary ->> 'comparison' = 'REVIEW_REQUIRED'
+          AND candidate.pipeline_fingerprint = source.pipeline_fingerprint
+          AND candidate.base_extraction_run_id = document.active_extraction_run_id
+          AND document.deleted_at IS NULL AND document.original_deleted_at IS NULL
+          AND document.security_status = 'CLEAN' AND document.document_type = 'PAYROLL'
+          AND document.employment_id = source.employment_id
+          AND candidate.detected_employer_id = employment.employer_id
+          AND candidate.detected_employer_id = source.detected_employer_id
+          AND candidate.country_code IS NOT DISTINCT FROM source.country_code
+          AND (candidate.country_code IS NULL OR document.country_code IS NULL
+            OR candidate.country_code = document.country_code)
+          AND (candidate.country_code IS NULL OR employment.country_confirmed_at IS NULL
+            OR candidate.country_code = employment.country_code)
+          AND NOT EXISTS (SELECT 1 FROM extraction_run_issues country_issue
+            WHERE country_issue.user_id = candidate.user_id
+              AND country_issue.document_id = candidate.document_id
+              AND country_issue.extraction_run_id = candidate.id
+              AND country_issue.code IN ('COUNTRY_UNCONFIRMED', 'COUNTRY_EMPLOYMENT_CONFLICT',
+                'COUNTRY_SNAPSHOT_CONFLICT', 'COUNTRY_NOT_SUPPORTED'))
+          AND candidate.layout_fingerprint = source.layout_fingerprint
+          AND candidate.layout_fingerprint_version = source.layout_fingerprint_version
+          AND candidate.document_layout_version_id IS NOT DISTINCT FROM source.document_layout_version_id
+          AND candidate.classifier_name IS NOT DISTINCT FROM source.classifier_name
+          AND candidate.classifier_version IS NOT DISTINCT FROM source.classifier_version
+          AND candidate.extractor_name = source.extractor_name
+          AND candidate.extractor_version IS NOT DISTINCT FROM source.extractor_version
+          AND candidate.parser_version IS NOT DISTINCT FROM source.parser_version
+          AND candidate.normalizer_version IS NOT DISTINCT FROM source.normalizer_version
+          AND candidate.result_schema_version IS NOT DISTINCT FROM source.result_schema_version
+          AND candidate.ocr_provider IS NOT DISTINCT FROM source.ocr_provider
+          AND candidate.ocr_version IS NOT DISTINCT FROM source.ocr_version
+          AND candidate.ocr_language IS NOT DISTINCT FROM source.ocr_language
+          AND settlement.currency_code = source.currency_code
+          AND settlement.settlement_type = source.settlement_type
+          AND settlement.is_recurring IS NOT DISTINCT FROM base_settlement.is_recurring
+          AND settlement.payment_date IS NOT DISTINCT FROM base_settlement.payment_date
+          AND settlement.issue_date IS NOT DISTINCT FROM base_settlement.issue_date
+          AND settlement.employment_id = document.employment_id
+           AND base_settlement.employment_id = document.employment_id
+           AND peer_transition.descriptions_unchanged
+           AND base_settlement.gross_amount = base_settlement.remunerative_amount
+             + base_settlement.non_remunerative_amount
+           AND (SELECT COALESCE(sum(item.amount), 0) FROM payroll_line_items item
+             WHERE item.user_id = base.user_id AND item.settlement_id = base_settlement.id
+               AND item.item_type = 'EARNING') IS DISTINCT FROM base_settlement.gross_amount
+           AND (SELECT COALESCE(sum(item.amount), 0) FROM payroll_line_items item
+             WHERE item.user_id = candidate.user_id AND item.settlement_id = settlement.id
+               AND item.item_type = 'EARNING') IS NOT DISTINCT FROM settlement.gross_amount
+          AND peer_transition.signature = source.line_item_transition_signature
+          AND employment.currency_code = settlement.currency_code
+          AND (SELECT count(*) FROM payroll_settlements settlement_count
+            WHERE settlement_count.user_id = candidate.user_id
+              AND settlement_count.document_id = candidate.document_id
+              AND settlement_count.extraction_run_id = candidate.id) = 1
+          AND (SELECT count(*) FROM payroll_settlements settlement_count
+            WHERE settlement_count.user_id = base.user_id
+              AND settlement_count.document_id = base.document_id
+              AND settlement_count.extraction_run_id = base.id) = 1
+          AND date_trunc('month', employment.start_date)::date <= settlement.payroll_period
+          AND (employment.end_date IS NULL
+            OR date_trunc('month', employment.end_date)::date >= settlement.payroll_period)
+          AND base.pipeline_fingerprint IS NOT DISTINCT FROM source.base_pipeline_fingerprint
+          AND base.classifier_name IS NOT DISTINCT FROM source.base_classifier_name
+          AND base.classifier_version IS NOT DISTINCT FROM source.base_classifier_version
+          AND base.extractor_name = source.base_extractor_name
+          AND base.extractor_version IS NOT DISTINCT FROM source.base_extractor_version
+          AND base.parser_version IS NOT DISTINCT FROM source.base_parser_version
+          AND base.normalizer_version IS NOT DISTINCT FROM source.base_normalizer_version
+          AND base.result_schema_version IS NOT DISTINCT FROM source.base_result_schema_version
+          AND base.ocr_provider IS NOT DISTINCT FROM source.base_ocr_provider
+          AND base.ocr_version IS NOT DISTINCT FROM source.base_ocr_version
+          AND base.ocr_language IS NOT DISTINCT FROM source.base_ocr_language
+          AND COALESCE((SELECT jsonb_agg(jsonb_build_array(issue.code, issue.severity, issue.affected_field_path)
+                ORDER BY issue.code, issue.severity, issue.affected_field_path)
+                FROM extraction_run_issues issue WHERE issue.user_id = candidate.user_id
+                  AND issue.document_id = candidate.document_id AND issue.extraction_run_id = candidate.id), '[]'::jsonb) = source.issue_signature
+          AND COALESCE((SELECT jsonb_agg(jsonb_build_array(issue.code, issue.severity, issue.affected_field_path)
+                ORDER BY issue.code, issue.severity, issue.affected_field_path)
+                FROM extraction_run_issues issue WHERE issue.user_id = base.user_id
+                  AND issue.document_id = base.document_id AND issue.extraction_run_id = base.id), '[]'::jsonb) = source.base_issue_signature
+          AND NOT EXISTS (SELECT 1 FROM processing_jobs active_job
+            WHERE active_job.user_id = document.user_id AND active_job.document_id = document.id
+              AND (active_job.state IN ('PENDING', 'PUBLISHED', 'RUNNING', 'RETRYABLE') OR active_job.execution_owner IS NOT NULL))
+     )
+     SELECT document_id, run_id, expected_active_run_id
+       FROM candidates ORDER BY (run_id = $1) DESC, document_id LIMIT 100`,
+    [input.runId, input.documentId, input.userId, currentPipelineFingerprint, processingPipelineVersions.parser],
+  );
+  const candidates = result.rows.map((row) => ({
+    documentId: String(row.document_id),
+    runId: String(row.run_id),
+    expectedActiveRunId: String(row.expected_active_run_id),
+  }));
+  // ponytail: bounded to 100 candidates; fold previews into the CTE if review latency becomes material.
+  const previews: Array<Awaited<ReturnType<typeof loadProcessingComparisonPreview>>> = [];
+  for (const candidate of candidates) {
+    previews.push(await loadProcessingComparisonPreview(
+      client, input.userId, candidate.documentId, candidate.runId,
+    ));
+  }
+  const sourceIndex = candidates.findIndex(({ runId }) => runId === input.runId);
+  const sourcePreview = previews[sourceIndex];
+  if (!sourcePreview) return [];
+  if (sourcePreview.fields.some(({ change }) => change !== "UNCHANGED")
+    || !sourcePreview.lineItems.changed
+    || sourcePreview.lineItems.beforeCount !== sourcePreview.lineItems.afterCount) return [];
+  const sourceShape = processingComparisonShape(sourcePreview);
+  return candidates.filter((_candidate, index) => {
+    const preview = previews[index];
+    return preview !== null && preview !== undefined && processingComparisonShape(preview) === sourceShape;
+  });
 }
 
 export async function promoteProcessingRun(

@@ -37,6 +37,7 @@ import {
   enqueueReprocessing,
   enqueueReprocessingBatch,
   countReprocessingCandidates,
+  findCompatibleProcessingRuns,
   findReprocessingCandidates,
   loadProcessingAnalysis,
   loadProcessingComparisonPreview,
@@ -115,6 +116,8 @@ type ProcessingRunParams = { id: string; runId: string };
 type ProcessingRunDecisionBody = {
   decision: "PROMOTE" | "KEEP_ACTIVE";
   expectedActiveRunId: string | null;
+  expectedCompatiblePromotionCount?: number;
+  scope?: "DOCUMENT" | "COMPATIBLE";
 };
 
 const UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
@@ -2255,16 +2258,21 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
         ),
       ]);
       if (!run.rowCount) throw new ApiError(404, "NOT_FOUND", "Recurso no encontrado.");
-      const comparisonPreview = await loadProcessingComparisonPreview(
-        pool,
-        request.authUser!.id,
-        request.params.id,
-        request.params.runId,
-      );
+      const [comparisonPreview, compatibleRuns] = await Promise.all([
+        loadProcessingComparisonPreview(pool, request.authUser!.id, request.params.id, request.params.runId, true),
+        run.rows[0].decision_required === true
+          ? findCompatibleProcessingRuns(pool, {
+              userId: request.authUser!.id,
+              documentId: request.params.id,
+              runId: request.params.runId,
+            })
+          : Promise.resolve([]),
+      ]);
       return {
         data: {
           ...processingRunView(run.rows[0]),
           comparisonPreview,
+          compatiblePromotionCount: run.rows[0].decision_required === true ? Math.max(1, compatibleRuns.length) : 0,
           issues: issues.rows.map((issue) => ({
             id: String(issue.id),
             code: String(issue.code),
@@ -2296,8 +2304,17 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
           type: "object",
           additionalProperties: false,
           required: ["decision", "expectedActiveRunId"],
+          allOf: [{
+            if: {
+              properties: { scope: { const: "COMPATIBLE" } },
+              required: ["scope"],
+            },
+            then: { required: ["expectedCompatiblePromotionCount"] },
+          }],
           properties: {
             decision: { type: "string", enum: ["PROMOTE", "KEEP_ACTIVE"] },
+            expectedCompatiblePromotionCount: { type: "integer", minimum: 1, maximum: 100 },
+            scope: { type: "string", enum: ["DOCUMENT", "COMPATIBLE"] },
             expectedActiveRunId: {
               anyOf: [{ type: "string", pattern: UUID_PATTERN }, { type: "null" }],
             },
@@ -2307,21 +2324,60 @@ export async function registerDataRoutes(app: FastifyInstance, options: Register
     },
     async (request) => {
       const result = await withTransaction(async (client) => {
-        const decision = await promoteProcessingRun(client, {
-          userId: request.authUser!.id,
+        const scope = request.body.scope ?? "DOCUMENT";
+        if (scope === "COMPATIBLE" && request.body.decision !== "PROMOTE") {
+          throw new ApiError(400, "COMPATIBLE_SCOPE_REQUIRES_PROMOTION", "La aplicación conjunta sólo está disponible al usar una mejora.");
+        }
+        if (scope === "COMPATIBLE") {
+          await lockEmployerMutation(client);
+          await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [request.authUser!.id]);
+        }
+        const compatible = scope === "COMPATIBLE"
+          ? await findCompatibleProcessingRuns(client, {
+              userId: request.authUser!.id,
+              documentId: request.params.id,
+              runId: request.params.runId,
+            })
+          : [];
+        if (scope === "COMPATIBLE"
+          && compatible.length !== request.body.expectedCompatiblePromotionCount) {
+          throw new ApiError(409, "COMPATIBLE_PROMOTION_COUNT_CHANGED", "La cantidad de recibos compatibles cambió; recargá antes de continuar.");
+        }
+        const sourceCompatible = compatible.find(({ runId }) => runId === request.params.runId);
+        if (scope === "COMPATIBLE" && !sourceCompatible) {
+          throw new ApiError(409, "RUN_NOT_COMPATIBLE", "La mejora ya no es compatible con una aplicación conjunta; recargá antes de continuar.");
+        }
+        if (sourceCompatible
+          && sourceCompatible.expectedActiveRunId !== request.body.expectedActiveRunId) {
+          throw new ApiError(409, "ACTIVE_RUN_CHANGED", "El análisis activo cambió; recargá antes de continuar.");
+        }
+        const targets = scope === "COMPATIBLE" ? compatible : [{
           documentId: request.params.id,
           runId: request.params.runId,
           expectedActiveRunId: request.body.expectedActiveRunId,
-          decision: request.body.decision,
-          requireReviewCandidate: true,
-        }, ApiError);
-        await audit(client, request.authUser!.id, "PROCESSING_RUN_DECIDED", "EXTRACTION_RUN", request.params.runId, {
-          decision: request.body.decision,
-          documentId: request.params.id,
-          employmentAssociationRemoved: decision.employmentAssociationRemoved ?? false,
-          previousActiveRunId: request.body.expectedActiveRunId ?? "NONE",
-        });
-        return decision;
+        }];
+        let sourceDecision: Awaited<ReturnType<typeof promoteProcessingRun>> | null = null;
+        for (const target of targets) {
+          const decision = await promoteProcessingRun(client, {
+            userId: request.authUser!.id,
+            documentId: target.documentId,
+            runId: target.runId,
+            expectedActiveRunId: target.expectedActiveRunId,
+            decision: request.body.decision,
+            requireReviewCandidate: true,
+          }, ApiError);
+          if (target.runId === request.params.runId) sourceDecision = decision;
+          await audit(client, request.authUser!.id, "PROCESSING_RUN_DECIDED", "EXTRACTION_RUN", target.runId, {
+            decision: request.body.decision,
+            decisionScope: scope,
+            documentId: target.documentId,
+            employmentAssociationRemoved: decision.employmentAssociationRemoved ?? false,
+            previousActiveRunId: target.expectedActiveRunId ?? "NONE",
+            sourceRunId: request.params.runId,
+          });
+        }
+        if (!sourceDecision) throw new ApiError(409, "RUN_NOT_REVIEW_CANDIDATE", "Ese análisis ya no está disponible para decidir.");
+        return { ...sourceDecision, compatiblePromotionCount: targets.length };
       });
       return { data: result };
     },

@@ -13,6 +13,7 @@ import {
   batchIsActive,
   batchResolved,
   batchWasDismissed,
+  processingRunDecisionPayload,
   type ProcessingComparisonPreview,
   type ProcessingRun,
   type ProcessingRunDetail,
@@ -2275,6 +2276,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
   const [detail, setDetail] = useState<DocumentDetail | null>(null);
   const [processingRuns, setProcessingRuns] = useState<ProcessingRun[]>([]);
   const [runPreviews, setRunPreviews] = useState<Record<string, ProcessingComparisonPreview | null | undefined>>({});
+  const [runCompatiblePromotionCounts, setRunCompatiblePromotionCounts] = useState<Record<string, number>>({});
   const [runPreviewErrors, setRunPreviewErrors] = useState<Record<string, string>>({});
   const [runsLoading, setRunsLoading] = useState(false);
   const [runsError, setRunsError] = useState('');
@@ -2596,7 +2598,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     return () => window.clearTimeout(timer);
   }, [documents, applyDocuments, documentPendingReview, documentTotal, fetchDocumentPage, loadSalary, loadingMoreDocuments, selectedId]);
   const loadProcessingRuns = useCallback(async () => {
-    if (!selectedId) { setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); return; }
+    if (!selectedId) { setProcessingRuns([]); setRunPreviews({}); setRunCompatiblePromotionCounts({}); setRunPreviewErrors({}); return; }
     const documentId = selectedId;
     setRunsLoading(true); setRunsError('');
     try {
@@ -2605,14 +2607,19 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
       const details = await Promise.allSettled(reviewRuns.map((run) => api<ProcessingRunDetail>(`/documents/${documentId}/processing-runs/${run.id}`)));
       if (activeDocumentId.current === documentId) {
         const previews: Record<string, ProcessingComparisonPreview | null | undefined> = {};
+        const compatiblePromotionCounts: Record<string, number> = {};
         const errors: Record<string, string> = {};
         reviewRuns.forEach((run, index) => {
           const result = details[index];
-          if (result?.status === 'fulfilled') previews[run.id] = result.value.comparisonPreview;
+          if (result?.status === 'fulfilled') {
+            previews[run.id] = result.value.comparisonPreview;
+            compatiblePromotionCounts[run.id] = result.value.compatiblePromotionCount;
+          }
           else if (result?.status === 'rejected') errors[run.id] = result.reason instanceof Error ? result.reason.message : 'No pudimos cargar la comparación.';
         });
         setProcessingRuns(next.items);
         setRunPreviews(previews);
+        setRunCompatiblePromotionCounts(compatiblePromotionCounts);
         setRunPreviewErrors(errors);
       }
     } catch (caught) {
@@ -2728,6 +2735,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
         setDetailError('');
         setProcessingRuns([]);
         setRunPreviews({});
+        setRunCompatiblePromotionCounts({});
         setRunPreviewErrors({});
         setRunsError('');
       }
@@ -2752,7 +2760,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     setPrivacyPreviewDocumentId(null);
     opener.current = trigger;
     activeDocumentId.current = document.id;
-    setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); setRunsError('');
+    setProcessingRuns([]); setRunPreviews({}); setRunCompatiblePromotionCounts({}); setRunPreviewErrors({}); setRunsError('');
     setSelected(document); setDetail(null); setDetailError(''); setLocationSeed({}); setOpenedFromList(true); setError('');
     reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: document.id })}${window.location.hash}`;
     window.history.pushState(window.history.state, '', reviewUrl.current);
@@ -2880,7 +2888,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     invalidatePreview();
     setPrivacyPreviewDocumentId(null);
     activeDocumentId.current = next.id;
-    setProcessingRuns([]); setRunPreviews({}); setRunPreviewErrors({}); setRunsError('');
+    setProcessingRuns([]); setRunPreviews({}); setRunCompatiblePromotionCounts({}); setRunPreviewErrors({}); setRunsError('');
     setSelected(next); setDetail(null); setDetailError(''); setLocationSeed({});
     reviewUrl.current = `${window.location.pathname}${writeDocumentLocation(window.location.search, { documentId: next.id })}${window.location.hash}`;
     window.history.replaceState(window.history.state, '', reviewUrl.current);
@@ -2895,17 +2903,26 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
     });
     await Promise.all([reloadDocuments(true), refreshDetail(), loadProcessingRuns(), loadReprocessingCandidates()]);
   }
-  async function decideProcessingRun(run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE') {
+  async function decideProcessingRun(run: ProcessingRun, decision: 'PROMOTE' | 'KEEP_ACTIVE', scope: 'DOCUMENT' | 'COMPATIBLE') {
     if (!selected || !detail?.analysis) return;
     try {
       await api(`/documents/${selected.id}/processing-runs/${run.id}/decision`, {
         method: 'POST',
-        body: JSON.stringify({ decision, expectedActiveRunId: detail.analysis.activeRunId }),
+        body: JSON.stringify(processingRunDecisionPayload(
+          decision,
+          scope,
+          detail.analysis.activeRunId,
+          runCompatiblePromotionCounts[run.id] ?? 1,
+        )),
       });
     } catch (caught) {
       if (caught instanceof ApiError && caught.code === 'ACTIVE_RUN_CHANGED') {
         await Promise.all([refreshDetail(), loadProcessingRuns()]);
         throw new Error('El análisis activo fue actualizado en otra sesión. Recargamos el historial para que decidas sobre la versión vigente.');
+      }
+      if (caught instanceof ApiError && ['COMPATIBLE_PROMOTION_COUNT_CHANGED', 'RUN_NOT_COMPATIBLE'].includes(caught.code)) {
+        await Promise.all([refreshDetail(), loadProcessingRuns()]);
+        throw new Error('Cambió el grupo de recibos compatibles. Actualizamos la cantidad para que confirmes el alcance vigente.');
       }
       throw caught;
     }
@@ -3304,6 +3321,7 @@ function History({ initialLocation, onLocationChange, onNavigate, runSensitive }
         onSave={saveCorrections}
         onSaveUnsupportedFeedback={saveUnsupportedFeedback}
         processingRuns={processingRuns}
+        runCompatiblePromotionCounts={runCompatiblePromotionCounts}
         runPreviewErrors={runPreviewErrors}
         runPreviews={runPreviews}
         runsError={runsError}

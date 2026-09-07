@@ -192,6 +192,10 @@ Contadores derivados:
 
 La implementación actual completa el lote automáticamente cuando todos sus items son terminales, admite un solo lote activo por usuario y permite cancelar items que aún no terminaron el upload. El reproceso agrupado usa `ReprocessingBatch`: sólo correlaciona jobs existentes del mismo titular y deriva progreso y resumen sin crear otra cola. Pause y resume manuales siguen fuera del MVP.
 
+Si varias corridas del mismo `ReprocessingBatch` requieren la misma decisión de promoción, la web puede ofrecer una única acción explícita para los resultados compatibles e informar antes su cantidad. No reutiliza implícitamente una decisión tomada sobre un recibo. La selección permanece owner-scoped y se limita al parser vigente cuando corrige una suma de haberes que antes no conciliaba y ahora coincide exactamente con el bruto. También exige baseline activo sin cambios, documento limpio y sin job, metadata de pipeline y OCR equivalente, mismo país, `PAYROLL`, empleador, empleo, moneda y huella estructural, y la misma versión de layout aprobado cuando corresponda. Cada candidata debe conservar los campos principales, fechas y descripciones de su liquidación, tener una sola liquidación y presentar la misma transición estructural de conceptos y los mismos issues que el recibo confirmado. Antes de mover los punteros, el servidor vuelve a calcular el conjunto y exige que su cantidad coincida con la confirmada.
+
+Esta operación es una publicación en lote de corridas ya calculadas, no entrenamiento ni aprobación global de un formato. No crea aliases ni copia una corrección humana a otros documentos. Promover la mejora elimina la decisión pendiente de esa corrida, pero no borra diagnósticos particulares del recibo; conceptos desconocidos, periodicidad ambigua, importes negativos o separación remunerativa insuficiente siguen en revisión cuando corresponda.
+
 ## Idempotencia
 
 Claves mínimas:

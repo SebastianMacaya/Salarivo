@@ -34,12 +34,32 @@ export type ProcessingComparisonPreview = {
     after: string | null;
     change: 'UNCHANGED' | 'ADDED' | 'REMOVED' | 'CHANGED';
   }>;
-  lineItems: { beforeCount: number; afterCount: number; changed: boolean };
+  lineItems: {
+    beforeCount: number;
+    afterCount: number;
+    changed: boolean;
+    changes?: Array<{
+      itemOrdinal: number;
+      before: ProcessingComparisonLineItem | null;
+      after: ProcessingComparisonLineItem | null;
+    }>;
+  };
+};
+
+export type ProcessingComparisonLineItem = {
+  itemOrdinal: number;
+  rawDescription: string;
+  normalizedConceptCode: string | null;
+  amount: string;
+  currencyCode: string;
+  itemType: string;
+  isRecurring: boolean | null;
 };
 
 export type ProcessingRunDetail = ProcessingRun & {
   issues: ProcessingIssue[];
   comparisonPreview: ProcessingComparisonPreview | null;
+  compatiblePromotionCount: number;
 };
 
 export type DocumentAnalysis = {
@@ -170,6 +190,21 @@ export function processingHealthPagination(
 
 export function runNeedsDecision(run: Pick<ProcessingRun, 'decisionRequired'>) {
   return run.decisionRequired;
+}
+
+export function compatiblePromotionLabel(count: number) {
+  return count > 1 ? `Usar en ${count} recibos compatibles` : null;
+}
+
+export function processingRunDecisionPayload(
+  decision: 'PROMOTE' | 'KEEP_ACTIVE',
+  scope: 'DOCUMENT' | 'COMPATIBLE',
+  expectedActiveRunId: string | null,
+  compatiblePromotionCount: number,
+) {
+  return scope === 'COMPATIBLE'
+    ? { decision, scope, expectedActiveRunId, expectedCompatiblePromotionCount: compatiblePromotionCount }
+    : { decision, expectedActiveRunId };
 }
 
 export function runOutcomeLabel(outcome: string) {
