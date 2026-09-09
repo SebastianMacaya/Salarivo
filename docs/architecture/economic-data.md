@@ -8,7 +8,7 @@ Economic Data incorpora contexto histórico sin cambiar la fuente salarial:
 
 ~~~text
 liquidación nominal privada ─┐
-                            ├─ economic-analytics-v1 ─> nominal / USD histórico / poder adquisitivo
+                            ├─ economic-analytics-v2 ─> nominal / USD histórico / poder adquisitivo
 observación económica global ┘
 ~~~
 
@@ -87,7 +87,11 @@ Los inputs decimales se validan y se calculan como coeficientes y escalas `BigIn
 
 API solicita todas las observaciones necesarias como un snapshot batched y evita N+1 por liquidación. Cada referencia conserva serie interna y externa, observation ID, revisión, fecha pedida/usada, método, proveedor, fuente, metodología, enlace de licencia y fecha de fetch.
 
-Cada punto de la evolución salarial incluye además una comparación resumida contra el período salarial anterior disponible, calculada en memoria con las mismas funciones exactas que el comparador explícito: cambio del neto en USD histórico, variación del IPC y cambio del neto ajustado a poder adquisitivo. El primer punto no tiene comparación. Si hay un salto entre recibos, `fromPeriod` conserva la base real y la UI dice “desde ese período”; no lo presenta como una inflación mensual ni inventa observaciones intermedias.
+`salary-analytics-v2` conserva `totals` y agrega `sac`, `other` y `regularMixed` a cada mes; `regular` contiene sólo el sueldo habitual separable. `economic-analytics-v2` conserva `amounts` como total y agrega `regularAmounts`, `sacAmounts` y `otherAmounts`, transformados con las fechas/observaciones propias de cada recibo. No hay nuevas consultas por categoría. La falta de una cotización del SAC no bloquea la comparación de un sueldo habitual que sí pudo convertirse.
+
+Cada punto incluye una comparación contra el período salarial anterior disponible, calculada con las mismas funciones exactas que el comparador explícito: cambio del neto habitual en USD, variación del IPC y cambio del neto habitual ajustado. El primer punto no tiene comparación. Un período sólo con SAC no se trata como sueldo cero ni produce una caída del 100%. `fromPeriod` conserva la base real si faltan meses; no se presenta el intervalo como inflación mensual ni se inventan índices intermedios. El comparador nominal agrega `netBreakdown` habitual/SAC/otros, preservando los cambios y explicaciones del total cobrado.
+
+La separación usa tipos y conceptos conocidos del recibo, nunca una regla por mes. El [SAC argentino se paga habitualmente en junio y diciembre](https://www.argentina.gob.ar/node/60753), pero también puede aparecer en una liquidación proporcional o fuera de esos meses. Cuando un recibo normal contiene SAC u otro extraordinario conocido integrado, se preserva esa señal aunque otros conceptos sean desconocidos: `regularMixed` inhibe los importes habituales comparables y el recibo completo queda en otros/sin discriminar. No se resta un SAC bruto del neto ni se reparte su descuento por un porcentaje inventado. El básico comparable, el total, los documentos y la cobertura conservan su comportamiento. La ausencia de una categoría SAC/otros vale cero; un importe faltante de una categoría presente sigue siendo nulo. Sin sueldo normal separable, el neto habitual es nulo.
 
 Las perspectivas económicas declaran:
 

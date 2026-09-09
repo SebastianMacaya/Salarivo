@@ -3372,20 +3372,38 @@ test("upload privado crea un único documento y un único intent durable", async
   ]);
   const salaryHistory = await app.inject({ method: "GET", url: "/api/v1/salary-history", headers: { cookie: cookieA } });
   assert.equal(salaryHistory.statusCode, 200, salaryHistory.body);
-  assert.equal(salaryHistory.json().data.calculationVersion, "salary-analytics-v1");
-  assert.equal(salaryHistory.json().data.economicCalculationVersion, "economic-analytics-v1");
+  assert.equal(salaryHistory.json().data.calculationVersion, "salary-analytics-v2");
+  assert.equal(salaryHistory.json().data.economicCalculationVersion, "economic-analytics-v2");
   assert.equal(salaryHistory.json().data.contexts[0].state, "DETECTED");
   assert.equal(salaryHistory.json().data.contexts[0].countryCode, "AR");
   assert.equal(salaryHistory.json().data.analytics.scopes[0].currencyCode, "ARS");
   assert.equal(salaryHistory.json().data.analytics.scopes[0].current.comparableSalary, "1000.00");
+  const mixedSalaryPeriod = salaryHistory.json().data.analytics.scopes[0].evolution[0];
+  // The known BONUS remains detectable even though another earning is unclassified.
+  assert.equal(mixedSalaryPeriod.regularMixed, true);
+  assert.equal(mixedSalaryPeriod.regular.netAmount, null);
+  assert.deepEqual(mixedSalaryPeriod.other, mixedSalaryPeriod.totals);
+  const pendingBreakdown = {
+    regularAmounts: null,
+    sacAmounts: {
+      basicAmount: "0.00", grossAmount: "0.00", netAmount: "0.00", deductionsAmount: "0.00",
+      remunerativeAmount: "0.00", nonRemunerativeAmount: "0.00",
+    },
+    otherAmounts: {
+      basicAmount: null, grossAmount: null, netAmount: null, deductionsAmount: null,
+      remunerativeAmount: null, nonRemunerativeAmount: null,
+    },
+  };
   assert.deepEqual(
     salaryHistory.json().data.analytics.scopes[0].evolution[0].economic,
     {
       historicalUsd: {
+        ...pendingBreakdown,
         status: "PENDING", reason: "SYNC_PENDING", currencyCode: "USD", referencePeriod: null,
         amounts: null, comparableSalary: null, observations: [],
       },
       purchasingPower: {
+        ...pendingBreakdown,
         status: "PENDING", reason: "SYNC_PENDING", currencyCode: "ARS", referencePeriod: null,
         amounts: null, comparableSalary: null, observations: [],
       },

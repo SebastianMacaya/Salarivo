@@ -346,3 +346,92 @@ test("keeps economic amounts available when a zero net makes percentage change u
   assert.equal(comparison?.historicalUsd.earlierComparableNetCents, "0");
   assert.equal(comparison?.historicalUsd.changeBasisPoints, null);
 });
+
+test("compares regular purchasing power across SAC months and keeps separately dated extras in the totals", async () => {
+  let calls = 0;
+  const queryable: EconomicDataQueryable = {
+    async query(_text, values) {
+      calls += 1;
+      const requests = JSON.parse(String(values?.[0])) as Record<string, unknown>[];
+      return { rows: requests.map((request) => ({
+        ...economicRow(request),
+        observation_value: String(request.series_code).startsWith("FX.")
+          ? request.target_date === "2024-06-15" ? "2000.00" : "1000.00"
+          : "100.00",
+      })) };
+    },
+  };
+  const receipts = ["2024-06", "2024-07", "2024-09", "2024-12", "2025-01"].flatMap((period) => [
+    settlement({ id: `normal-${period}`, documentId: `normal-doc-${period}`, payrollPeriod: period }),
+    ...(["2024-06", "2024-12", "2025-01"].includes(period) ? [settlement({
+      id: `sac-${period}`, documentId: `sac-doc-${period}`, payrollPeriod: period,
+      settlementType: "SAC", isRecurring: false, grossAmount: "50000.00", netAmount: "40000.00",
+      paymentDate: "2024-06-15",
+    })] : []),
+  ]);
+  receipts.push(settlement({
+    id: "only-sac", documentId: "only-sac-doc", payrollPeriod: "2024-08", settlementType: "SAC", isRecurring: false,
+  }));
+  const result = await buildEconomicAnalytics(queryable, receipts);
+  assert.equal(calls, 1);
+  const june = result.byScopePeriod.get(scopePeriodKey("employment-1", "ARS", "2024-06"))!.public;
+  assert.equal(june.historicalUsd.regularAmounts?.netAmount, "80.00");
+  assert.equal(june.historicalUsd.sacAmounts?.netAmount, "20.00");
+  assert.equal(june.historicalUsd.amounts?.netAmount, "100.00");
+  assert.equal(june.purchasingPower.regularAmounts?.netAmount, "80000.00");
+  assert.equal(june.purchasingPower.sacAmounts?.netAmount, "40000.00");
+  assert.equal(june.purchasingPower.amounts?.netAmount, "120000.00");
+  for (const [fromPeriod, toPeriod] of [["2024-06", "2024-07"], ["2024-12", "2025-01"]]) {
+    const comparison = compareEconomicPeriods(result, {
+      employmentContext: "employment-1", currencyCode: "ARS", fromPeriod: fromPeriod!, toPeriod: toPeriod!,
+    });
+    assert.equal(comparison?.purchasingPower.changeBasisPoints, "0");
+    assert.equal(comparison?.historicalUsd.changeBasisPoints, "0");
+  }
+  const august = result.byScopePeriod.get(scopePeriodKey("employment-1", "ARS", "2024-08"))!.public;
+  assert.equal(august.purchasingPower.regularAmounts, null);
+  const evolution = addEconomicProjections(analyzeSalaryHistory(receipts).scopes, result)[0]!.evolution;
+  assert.equal(evolution[1]!.economic.comparisonToPrevious?.purchasingPower.changeBasisPoints, "0");
+  assert.equal(evolution[2]!.economic.comparisonToPrevious?.purchasingPower.changeBasisPoints, null);
+  assert.equal(evolution[3]!.economic.comparisonToPrevious?.fromPeriod, "2024-08");
+  assert.equal(evolution[3]!.economic.comparisonToPrevious?.purchasingPower.changeBasisPoints, null);
+});
+
+test("an unavailable SAC rate does not block regular net comparisons and mixed receipts never fall back to totals", async () => {
+  const queryable: EconomicDataQueryable = {
+    async query(_text, values) {
+      const requests = JSON.parse(String(values?.[0])) as Record<string, unknown>[];
+      return { rows: requests.map((request) => ({
+        ...economicRow(request),
+        ...(request.target_date === "2024-06-15" ? {
+          observation_id: null, observation_value: null, job_state: "FAILED", job_error_code: "ECONOMIC_PROVIDER_HTTP_ERROR",
+        } : {}),
+      })) };
+    },
+  };
+  const receipts = [
+    settlement({ payrollPeriod: "2024-06" }),
+    settlement({ id: "sac", documentId: "sac-doc", payrollPeriod: "2024-06", settlementType: "SAC", isRecurring: false, paymentDate: "2024-06-15" }),
+    settlement({ id: "july", documentId: "july-doc", payrollPeriod: "2024-07" }),
+    settlement({ id: "mixed", documentId: "mixed-doc", payrollPeriod: "2024-08", hasEmbeddedExtraordinary: true }),
+  ];
+  const result = await buildEconomicAnalytics(queryable, receipts);
+  const june = result.byScopePeriod.get(scopePeriodKey("employment-1", "ARS", "2024-06"))!.public.historicalUsd;
+  assert.equal(june.status, "PARTIAL");
+  assert.equal(june.amounts?.netAmount, null);
+  assert.equal(june.sacAmounts?.netAmount, null);
+  assert.equal(june.regularAmounts?.netAmount, "80.00");
+  const comparison = compareEconomicPeriods(result, {
+    employmentContext: "employment-1", currencyCode: "ARS", fromPeriod: "2024-06", toPeriod: "2024-07",
+  });
+  assert.equal(comparison?.historicalUsd.status, "AVAILABLE");
+  assert.equal(comparison?.historicalUsd.reason, null);
+  assert.equal(comparison?.historicalUsd.changeBasisPoints, "0");
+  const mixed = result.byScopePeriod.get(scopePeriodKey("employment-1", "ARS", "2024-08"))!.public.historicalUsd;
+  assert.equal(mixed.amounts?.netAmount, "80.00");
+  assert.equal(mixed.otherAmounts?.netAmount, "80.00");
+  assert.equal(mixed.regularAmounts, null);
+  assert.equal(compareEconomicPeriods(result, {
+    employmentContext: "employment-1", currencyCode: "ARS", fromPeriod: "2024-07", toPeriod: "2024-08",
+  })?.historicalUsd.changeBasisPoints, null);
+});

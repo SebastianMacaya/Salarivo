@@ -29,6 +29,7 @@ export interface SalarySettlement {
   remunerativeAmount?: MoneyAmount | null;
   nonRemunerativeAmount?: MoneyAmount | null;
   earnings?: readonly NormalizedEarning[];
+  hasEmbeddedExtraordinary?: boolean;
 }
 
 export const SALARY_CATEGORIES = [
@@ -84,6 +85,9 @@ export interface MonthlyEvolution {
   period: string;
   totals: SalaryAmounts;
   regular: SalaryAmounts;
+  sac: SalaryAmounts;
+  other: SalaryAmounts;
+  regularMixed: boolean;
   comparableSalary: MoneyAmount | null;
   settlements: SettlementView[];
 }
@@ -235,6 +239,11 @@ export interface PeriodComparison {
     remunerativeAmount: MoneyChange | null;
     nonRemunerativeAmount: MoneyChange | null;
   };
+  netBreakdown: {
+    regular: MoneyChange | null;
+    sac: MoneyChange | null;
+    other: MoneyChange | null;
+  };
   earnings: EarningChange[] | null;
   drivers: PeriodComparisonDriver[];
   driversComplete: boolean;
@@ -261,6 +270,7 @@ interface InternalSettlement {
   settlementType: string;
   category: SalaryCategory;
   isRecurring: boolean;
+  hasEmbeddedExtraordinary: boolean;
   basicAmount: bigint | null;
   grossAmount: bigint | null;
   netAmount: bigint | null;
@@ -376,6 +386,16 @@ export function salaryCategoryForEarning(code: string, isRecurring?: boolean | n
   return semanticCategory === "OTRO" && isRecurring === true ? "NORMAL" : semanticCategory;
 }
 
+export function hasEmbeddedExtraordinary(settlement: Pick<
+  SalarySettlement, "settlementType" | "isRecurring" | "earnings" | "hasEmbeddedExtraordinary"
+>): boolean {
+  if (!isRegular(settlement)) return false;
+  return settlement.hasEmbeddedExtraordinary === true || (settlement.earnings ?? []).some((earning) => {
+    const category = salaryCategoryForEarning(earning.code, earning.isRecurring);
+    return category !== "NORMAL" && category !== "OTRO" && parseAmount(earning.amount, "earning.amount") !== 0n;
+  });
+}
+
 function categoryOfEarning(earning: InternalEarning): SalaryCategory {
   return salaryCategoryForEarning(earning.code, earning.isRecurring);
 }
@@ -416,6 +436,7 @@ function normalizeSettlement(settlement: SalarySettlement): InternalSettlement {
     settlementType,
     category: categoryOf(settlementType),
     isRecurring: settlement.isRecurring,
+    hasEmbeddedExtraordinary: hasEmbeddedExtraordinary(settlement),
     basicAmount: parseAmount(settlement.basicAmount, "basicAmount"),
     grossAmount: parseAmount(settlement.grossAmount, "grossAmount"),
     netAmount: parseAmount(settlement.netAmount, "netAmount"),
@@ -426,8 +447,8 @@ function normalizeSettlement(settlement: SalarySettlement): InternalSettlement {
   };
 }
 
-function isRegular(settlement: InternalSettlement): boolean {
-  return settlement.category === "NORMAL" && settlement.isRecurring;
+export function isRegular(settlement: Pick<SalarySettlement, "settlementType" | "isRecurring">): boolean {
+  return settlement.settlementType.trim().toUpperCase() === "NORMAL" && settlement.isRecurring;
 }
 
 function sumField(settlements: readonly InternalSettlement[], key: AmountKey): bigint | null {
@@ -441,8 +462,13 @@ function sumField(settlements: readonly InternalSettlement[], key: AmountKey): b
   return total;
 }
 
-function internalAmounts(settlements: readonly InternalSettlement[]): Record<AmountKey, bigint | null> {
-  return Object.fromEntries(AMOUNT_KEYS.map((key) => [key, sumField(settlements, key)])) as Record<
+function internalAmounts(
+  settlements: readonly InternalSettlement[],
+  emptyAsMissing = false,
+): Record<AmountKey, bigint | null> {
+  return Object.fromEntries(AMOUNT_KEYS.map((key) => [
+    key, emptyAsMissing && settlements.length === 0 ? null : sumField(settlements, key),
+  ])) as Record<
     AmountKey,
     bigint | null
   >;
@@ -516,14 +542,20 @@ function makeEvolution(settlements: readonly InternalSettlement[]): MonthlyEvolu
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([period, entries]) => {
       const regular = entries.filter(isRegular);
+      const regularMixed = regular.some((entry) => entry.hasEmbeddedExtraordinary);
       const comparable = comparableSalary(entries);
       return {
         period,
         totals: publicAmounts(internalAmounts(entries)),
         regular: {
-          ...publicAmounts(internalAmounts(regular)),
+          ...publicAmounts(internalAmounts(regularMixed ? [] : regular, true)),
           basicAmount: comparable === null ? null : formatAmount(comparable),
         },
+        sac: publicAmounts(internalAmounts(entries.filter((entry) => entry.category === "SAC"))),
+        other: publicAmounts(internalAmounts(entries.filter((entry) => (
+          (!isRegular(entry) || entry.hasEmbeddedExtraordinary) && entry.category !== "SAC"
+        )))),
+        regularMixed,
         comparableSalary: comparable === null ? null : formatAmount(comparable),
         settlements: entries.map(toSettlementView),
       };
@@ -749,7 +781,7 @@ function makeScope(settlements: readonly InternalSettlement[]): SalaryScopeAnaly
   let current: CurrentSalary | null = null;
 
   if (currentPoint !== null) {
-    const regular = currentPoint.settlements.filter((entry) => entry.category === "NORMAL" && entry.isRecurring);
+    const regular = settlements.filter((entry) => entry.payrollPeriod === currentPoint.period && isRegular(entry));
     const currentComparable = comparablePoints.find((point) => point.period === currentPoint.period) ?? null;
     const previous = currentComparable === null
       ? null
@@ -772,7 +804,7 @@ function makeScope(settlements: readonly InternalSettlement[]): SalaryScopeAnaly
     );
     current = {
       period: currentPoint.period,
-      amounts: currentPoint.regular,
+      amounts: { ...publicAmounts(internalAmounts(regular)), basicAmount: currentPoint.comparableSalary },
       comparableSalary: currentPoint.comparableSalary,
       settlementCount: regular.length,
       documentCount: new Set(regular.map((entry) => entry.documentId)).size,
@@ -1017,6 +1049,20 @@ export function compareSalaryPeriods(
       deductionsAmount: makeMoneyChange(fromAmounts.deductionsAmount, toAmounts.deductionsAmount),
       remunerativeAmount: makeMoneyChange(fromAmounts.remunerativeAmount, toAmounts.remunerativeAmount),
       nonRemunerativeAmount: makeMoneyChange(fromAmounts.nonRemunerativeAmount, toAmounts.nonRemunerativeAmount),
+    },
+    netBreakdown: {
+      regular: makeMoneyChange(
+        from.some((entry) => entry.hasEmbeddedExtraordinary) ? null : internalAmounts(from.filter(isRegular), true).netAmount,
+        to.some((entry) => entry.hasEmbeddedExtraordinary) ? null : internalAmounts(to.filter(isRegular), true).netAmount,
+      ),
+      sac: makeMoneyChange(
+        sumField(from.filter((entry) => entry.category === "SAC"), "netAmount"),
+        sumField(to.filter((entry) => entry.category === "SAC"), "netAmount"),
+      ),
+      other: makeMoneyChange(
+        sumField(from.filter((entry) => (!isRegular(entry) || entry.hasEmbeddedExtraordinary) && entry.category !== "SAC"), "netAmount"),
+        sumField(to.filter((entry) => (!isRegular(entry) || entry.hasEmbeddedExtraordinary) && entry.category !== "SAC"), "netAmount"),
+      ),
     },
     earnings,
     drivers,

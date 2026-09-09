@@ -304,6 +304,9 @@ input:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rg
 .compact-loading .loader { width: 24px; height: 24px; }
 .summary-documents-grid > .recent-panel:only-child { grid-column: 1 / -1; }
 
+.salary-payment-breakdown { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; }
+.salary-payment-breakdown h3 { margin: 0 0 6px; font-size: 16px; }
+.salary-payment-breakdown tbody tr:last-child { background: var(--green-soft); font-weight: 750; }
 .employment-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .employment-card { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: var(--space-3); border: 1px solid var(--line); border-radius: 15px; background: white; padding: var(--panel-padding); }
 .employment-card.interactive { position: relative; transition: border-color .15s, box-shadow .15s; }
@@ -697,7 +700,7 @@ body:has(input:focus, select:focus, textarea:focus) .mobile-navigation { display
 /* One DOM/data source: labeled rows on mobile, conventional tables on larger screens. */
 .responsive-data { overflow: visible; border: 0; background: transparent; }
 .responsive-data thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-.responsive-data :is(table, tbody, tr, td, tbody th) { display: block; width: 100%; }
+.responsive-data :where(table, tbody, tr, td, tbody th) { display: block; width: 100%; }
 .responsive-data tbody { display: grid; gap: var(--space-3); }
 .responsive-data tbody tr { border: 1px solid var(--line); border-radius: 12px; background: white; padding: var(--space-3); }
 .responsive-data :is(td, tbody th) { min-width: 0; border-top: 1px solid var(--line); padding: 10px 0; white-space: normal; text-align: left; }
@@ -794,7 +797,7 @@ body:has(input:focus, select:focus, textarea:focus) .mobile-navigation { display
   .responsive-data table { display: table; }
   .responsive-data thead { position: static; width: auto; height: auto; overflow: visible; clip-path: none; display: table-header-group; }
   .responsive-data tbody { display: table-row-group; }
-  .responsive-data tbody tr { display: table-row; }
+  .responsive-data tr { display: table-row; }
   .responsive-data :is(td, tbody th) { display: table-cell; width: auto; padding: 14px 12px; }
   .responsive-data td::before { display: none; }
   .annual-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }

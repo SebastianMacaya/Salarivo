@@ -20,6 +20,7 @@ import type { ApiConfig } from "./config.ts";
 import {
   analyzeSalaryHistory,
   compareSalaryPeriods,
+  hasEmbeddedExtraordinary,
   salaryCategoryForEarning,
   SALARY_CATEGORIES,
   type SalaryCategory,
@@ -974,6 +975,7 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
     if (row.has_incomplete_analysis === true) quality.incomplete.add(documentId);
     if (row.reprocess_available === true) quality.reprocessable.add(documentId);
     qualityByScopePeriod.set(qualityKey, quality);
+    const knownEarnings = earningViews(row.earnings);
     return {
       id: String(row.id),
       documentId,
@@ -988,6 +990,11 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
       issueDate: value(row, "issue_date"),
       settlementType: String(row.settlement_type),
       isRecurring: row.is_recurring === true,
+      hasEmbeddedExtraordinary: hasEmbeddedExtraordinary({
+        settlementType: String(row.settlement_type),
+        isRecurring: row.is_recurring === true,
+        earnings: knownEarnings,
+      }),
       basicAmount: value(row, "basic_amount"),
       grossAmount: value(row, "gross_amount"),
       netAmount: value(row, "net_amount"),
@@ -995,7 +1002,7 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
       remunerativeAmount: value(row, "remunerative_amount"),
       nonRemunerativeAmount: value(row, "non_remunerative_amount"),
       ...(Number(row.earning_count) > 0 && Number(row.unknown_earning_count) === 0
-        ? { earnings: earningViews(row.earnings) }
+        ? { earnings: knownEarnings }
         : {}),
     };
   });
@@ -1010,6 +1017,9 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
         period: point.period,
         totals: point.totals,
         regular: point.regular,
+        sac: point.sac,
+        other: point.other,
+        regularMixed: point.regularMixed,
         comparableSalary: point.comparableSalary,
         ...(projectedScopes ? {
           economic: projectedScopes[scopeIndex]?.evolution[pointIndex]?.economic,
@@ -1041,8 +1051,8 @@ async function loadSalaryHistory(userId: string, includeEconomic = true) {
   const rankedIndexes = rankedSalaryContextIndexes(contexts);
   return {
     response: {
-      calculationVersion: "salary-analytics-v1",
-      economicCalculationVersion: "economic-analytics-v1",
+      calculationVersion: "salary-analytics-v2",
+      economicCalculationVersion: "economic-analytics-v2",
       contexts: rankedIndexes.map((index) => contexts[index]!),
       coverage: {
         documents: Number(coverage.documents ?? 0),

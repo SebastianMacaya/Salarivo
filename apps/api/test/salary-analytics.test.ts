@@ -136,6 +136,63 @@ test("preserves multiple settlements from the same month", () => {
   assert.equal(month.comparableSalary, "5000000.00");
 });
 
+test("separates monthly regular pay, SAC and other receipts without treating missing regular pay as zero", () => {
+  const receipts = [
+    settlement({ payrollPeriod: "2026-06", grossAmount: "100.00", netAmount: "80.00" }),
+    settlement({ payrollPeriod: "2026-06", settlementType: "SAC", isRecurring: false, grossAmount: "50.00", netAmount: "40.00" }),
+    settlement({ payrollPeriod: "2026-06", settlementType: "BONUS", isRecurring: false, grossAmount: "10.00", netAmount: "8.00" }),
+    settlement({ payrollPeriod: "2026-07", grossAmount: "100.00", netAmount: "80.00" }),
+    settlement({ payrollPeriod: "2026-08", settlementType: "SAC", isRecurring: false, grossAmount: "30.00", netAmount: null }),
+  ];
+  const months = analyzeSalaryHistory(receipts).scopes[0]!.evolution;
+  assert.equal(months[0]!.totals.netAmount, "128.00");
+  assert.equal(months[0]!.regular.netAmount, "80.00");
+  assert.equal(months[0]!.sac.grossAmount, "50.00");
+  assert.equal(months[0]!.sac.netAmount, "40.00");
+  assert.equal(months[0]!.other.netAmount, "8.00");
+  assert.equal(months[1]!.sac.netAmount, "0.00");
+  assert.equal(months[1]!.other.netAmount, "0.00");
+  assert.equal(months[2]!.regular.netAmount, null);
+  assert.equal(months[2]!.sac.grossAmount, "30.00");
+  assert.equal(months[2]!.sac.netAmount, null);
+  const comparison = compareSalaryPeriods(receipts, {
+    employmentContext: "employment-a", currencyCode: "ARS", fromPeriod: "2026-06", toPeriod: "2026-07",
+  })!;
+  assert.equal(comparison.changes.netAmount?.percentage, "-37.50");
+  assert.equal(comparison.netBreakdown.regular?.percentage, "0.00");
+  assert.equal(comparison.netBreakdown.sac?.deltaAmount, "-40.00");
+  assert.equal(comparison.netBreakdown.other?.deltaAmount, "-8.00");
+  assert.equal(compareSalaryPeriods(receipts, {
+    employmentContext: "employment-a", currencyCode: "ARS", fromPeriod: "2026-07", toPeriod: "2026-08",
+  })?.netBreakdown.regular, null);
+});
+
+test("keeps mixed receipts visible without inventing a regular net or changing current pay and coverage", () => {
+  for (const extra of [
+    { earnings: [{ code: "SAC", amount: "50.00", isRecurring: false }] },
+    { earnings: [{ code: "BONUS", amount: "50.00", isRecurring: true }] },
+    { hasEmbeddedExtraordinary: true },
+  ]) {
+    const receipts = [
+      settlement({ payrollPeriod: "2026-05", grossAmount: "100.00", netAmount: "80.00" }),
+      settlement({ payrollPeriod: "2026-06", grossAmount: "150.00", netAmount: "120.00", ...extra }),
+    ];
+    const scope = analyzeSalaryHistory(receipts).scopes[0]!;
+    const mixed = scope.evolution[1]!;
+    assert.equal(mixed.regularMixed, true);
+    assert.equal(mixed.regular.netAmount, null);
+    assert.equal(mixed.regular.grossAmount, null);
+    assert.equal(mixed.comparableSalary, "5000000.00");
+    assert.equal(mixed.totals.netAmount, "120.00");
+    assert.equal(mixed.other.netAmount, "120.00");
+    assert.equal(scope.current?.amounts.netAmount, "120.00");
+    assert.deepEqual(scope.coverage.availablePeriods, ["2026-05", "2026-06"]);
+    assert.equal(compareSalaryPeriods(receipts, {
+      employmentContext: "employment-a", currencyCode: "ARS", fromPeriod: "2026-05", toPeriod: "2026-06",
+    })?.netBreakdown.regular, null);
+  }
+});
+
 test("separates annual regular and extraordinary settlement totals", () => {
   const inputs = [
     ["NORMAL", "100.00", true],

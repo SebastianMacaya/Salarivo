@@ -16,6 +16,7 @@ import type {
   SalaryScopeAnalytics,
   SalarySettlement,
 } from "./salary-analytics.ts";
+import { hasEmbeddedExtraordinary, isRegular } from "./salary-analytics.ts";
 
 const AMOUNT_KEYS = [
   "basicAmount",
@@ -64,6 +65,9 @@ export interface EconomicProjection {
   currencyCode: string;
   referencePeriod: string | null;
   amounts: SalaryAmounts | null;
+  regularAmounts: SalaryAmounts | null;
+  sacAmounts: SalaryAmounts | null;
+  otherAmounts: SalaryAmounts | null;
   comparableSalary: string | null;
   observations: EconomicObservationReference[];
 }
@@ -336,6 +340,9 @@ function unavailableProjection(
     currencyCode,
     referencePeriod: null,
     amounts: null,
+    regularAmounts: null,
+    sacAmounts: null,
+    otherAmounts: null,
     comparableSalary: null,
     observations: [],
   };
@@ -457,13 +464,26 @@ function transformedAmounts(
   ])) as unknown as SalaryAmounts;
 }
 
+function transformedBreakdown(
+  settlements: readonly EconomicSalarySettlement[],
+  transform: (settlement: EconomicSalarySettlement, amount: string) => string | null,
+): Pick<EconomicProjection, "regularAmounts" | "sacAmounts" | "otherAmounts"> {
+  const regular = settlements.filter(isRegular);
+  return {
+    regularAmounts: regular.length > 0 && !regular.some(hasEmbeddedExtraordinary)
+      ? transformedAmounts(regular, transform) : null,
+    sacAmounts: transformedAmounts(settlements.filter((entry) => entry.settlementType.trim().toUpperCase() === "SAC"), transform),
+    otherAmounts: transformedAmounts(settlements.filter((entry) => (
+      (!isRegular(entry) || hasEmbeddedExtraordinary(entry)) && entry.settlementType.trim().toUpperCase() !== "SAC"
+    )), transform),
+  };
+}
+
 function comparableSalary(
   settlements: readonly EconomicSalarySettlement[],
   transform: (settlement: EconomicSalarySettlement, amount: string) => string | null,
 ): string | null {
-  const regular = settlements.filter((settlement) => (
-    settlement.settlementType.toUpperCase() === "NORMAL" && settlement.isRecurring
-  ));
+  const regular = settlements.filter(isRegular);
   if (regular.length === 0 || regular.some((settlement) => settlement.basicAmount === null
     || settlement.basicAmount === undefined)) return null;
   if (new Set(regular.map((settlement) => settlement.basicAmount)).size !== 1) return null;
@@ -576,6 +596,7 @@ function makePeriodResult(
   };
   const historicalUsd: EconomicProjection = {
     ...fxAvailability,
+    ...transformedBreakdown(settlements, fxFor),
     currencyCode: profile.referenceCurrencyCode,
     referencePeriod: null,
     amounts: fxRequired.some((required) => required.snapshot.observation !== null)
@@ -597,6 +618,7 @@ function makePeriodResult(
   });
   const purchasingPower: EconomicProjection = {
     ...priceAvailability,
+    ...transformedBreakdown(settlements, priceFor),
     currencyCode: profile.currencyCode,
     referencePeriod: targetRequired.snapshot.observation?.date.slice(0, 7) ?? null,
     amounts: priceRequired.some((required) => required.snapshot.observation !== null)
@@ -746,12 +768,12 @@ export function compareEconomicPeriods(
   const comparison = (key: keyof EconomicPeriodProjection): EconomicComparisonProjection => {
     const earlier = from.public[key];
     const later = to.public[key];
-    const earlierNet = earlier.amounts?.netAmount ?? null;
-    const laterNet = later.amounts?.netAmount ?? null;
+    const earlierNet = earlier.regularAmounts?.netAmount ?? null;
+    const laterNet = later.regularAmounts?.netAmount ?? null;
     return {
       ...combineProjection(
-        { ...earlier, comparableSalary: earlierNet },
-        { ...later, comparableSalary: laterNet },
+        { ...earlier, comparableSalary: earlierNet, ...(earlierNet !== null ? { status: "AVAILABLE" as const, reason: null } : {}) },
+        { ...later, comparableSalary: laterNet, ...(laterNet !== null ? { status: "AVAILABLE" as const, reason: null } : {}) },
       ),
       currencyCode: later.currencyCode,
       earlierComparableNetCents: moneyAsCents(earlierNet),

@@ -3,12 +3,13 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openBrowser } from './cdp.mjs';
-import { fixtureSource, id, manyEmployments, syntheticPdf } from './fixtures.mjs';
+import { fixtureSource, id, manyEmployments, mixedSacHistory, sacComparison, sacHistory, syntheticPdf } from './fixtures.mjs';
 
 const base = process.env.SALARIVO_TEST_URL || 'http://localhost:3000';
 const output = process.env.SALARIVO_TEST_OUTPUT || join(tmpdir(), 'salarivo-responsive-qa');
 await mkdir(output, { recursive: true });
 const browser = await openBrowser();
+await browser.command('Page.bringToFront');
 const measurements = [];
 const exceptions = [];
 browser.on('Runtime.exceptionThrown', ({ exceptionDetails }) => exceptions.push(exceptionDetails.exception?.description || exceptionDetails.text));
@@ -71,6 +72,69 @@ async function filterJobs(value, status = 'ALL') {
 const employmentIds = '[...document.querySelectorAll(".employment-row .employment-card-link")].map(el => new URL(el.href).searchParams.get("employmentId"))';
 
 try {
+  for (const width of [320, 1440]) {
+    await browser.viewport(width, 900);
+    for (const tab of ['evolution', 'purchasing-power']) {
+      await visit(`/?section=history&tab=${tab}`, 'owner', { history: sacHistory, comparison: sacComparison });
+      assert.deepEqual(await browser.evaluate('[...document.querySelectorAll(".legend > span")].map(el => el.textContent)'), ['Básico comparable', 'Bruto habitual', 'Neto habitual']);
+      const bars = await browser.evaluate('[...document.querySelectorAll(".bar-group")].map(el => ({ period: el.querySelector("small").textContent, net: el.querySelector(".net")?.style.height, gross: el.querySelector(".gross")?.style.height }))');
+      assert.ok(bars.length === 10 && bars.slice(0, 9).every(point => point.net && point.gross), 'Every covered month has habitual salary bars');
+      await browser.evaluate('document.querySelector(\'.bar-group[aria-label="Abrir detalle de Diciembre 2025"]\').focus()');
+      await browser.waitFor('document.querySelector(".salary-payment-breakdown h3").textContent.includes("Diciembre 2025")');
+      for (const [before, after] of [['Diciembre 2025', 'Enero 2026'], ['Marzo 2026', 'Abril 2026'], ['Junio 2026', 'Julio 2026']]) {
+        assert.equal(bars.find(point => point.period === before)?.net, bars.find(point => point.period === after)?.net, 'SAC and bonuses do not create a false net salary drop');
+        assert.equal(bars.find(point => point.period === before)?.gross, bars.find(point => point.period === after)?.gross, 'Gross salary also excludes separate extraordinary payments');
+      }
+      if (tab === 'purchasing-power') {
+        const result = await browser.evaluate('document.querySelector(".economic-reading").textContent');
+        assert.match(result, /Último cambio real del sueldo habitual:.*0,00%.*Junio 2026 → Julio 2026/);
+        assert.doesNotMatch(result, /Empeoró|Mejoró/, 'Stable salary and synthetic CPI remain stable after SAC');
+        assert.match(await browser.evaluate('document.querySelector(".economic-context").textContent'), /AR · moneda original ARS/);
+        assert.match(await browser.evaluate('document.querySelector(".economic-context").textContent'), /precios de Julio 2026/);
+        const august = await browser.evaluate('[...document.querySelectorAll(".salary-evolution-table tbody tr")].find(el => el.textContent.includes("Agosto 2026"))?.textContent');
+        assert.match(august, /ARS 80\.000,00.*USD 80,00.*N\/D/, 'Missing August IPC does not erase the original salary or invent purchasing power');
+      }
+      for (const [period, sac, other, total] of [['Diciembre 2025', '40.000,00', '0,00', '120.000,00'], ['Marzo 2026', '0,00', '16.000,00', '96.000,00'], ['Julio 2026', '0,00', '0,00', '80.000,00'], ['Junio 2026', '40.000,00', '0,00', '120.000,00']]) {
+        await browser.evaluate(`(() => { const button = document.querySelector('.bar-group[aria-label="Abrir detalle de ${period}"]'); button.focus(); button.click(); })()`);
+        await browser.waitFor(`document.querySelector('.salary-payment-breakdown').textContent.includes(${JSON.stringify(period)})`);
+        const rows = await browser.evaluate('[...document.querySelectorAll(".salary-payment-breakdown tbody tr")].map(row => [...row.querySelectorAll("th,td")].map(cell => cell.textContent))');
+        assert.deepEqual(rows, [['Sueldo habitual', 'ARS 100.000,00', 'ARS 80.000,00'], ['Aguinaldo / SAC', `ARS ${sac === '0,00' ? '0,00' : '50.000,00'}`, `ARS ${sac}`], ['Otros pagos', `ARS ${other === '0,00' ? '0,00' : '20.000,00'}`, `ARS ${other}`], ['Total del mes', `ARS ${total === '120.000,00' ? '150.000,00' : total === '96.000,00' ? '120.000,00' : '100.000,00'}`, `ARS ${total}`]], 'The focused month keeps SAC, other payments and total separately');
+      }
+      if (width >= 1024) {
+        const columns = await browser.evaluate('[...document.querySelectorAll(".salary-payment-breakdown tr")].map(row => [...row.children].map(cell => cell.getBoundingClientRect().left))');
+        assert.ok(columns.slice(1).every(row => row.every((left, index) => Math.abs(left - columns[0][index]) <= 1)), 'Desktop payment rows align with their column headings');
+      }
+      await browser.evaluate('document.querySelector(".salary-payment-breakdown").scrollIntoView({block:"center"})');
+      await layout(`sac-${tab}`, true);
+      await clickText('Ocultar importes');
+      const hiddenBreakdown = await browser.evaluate('[...document.querySelectorAll(".salary-payment-breakdown td[data-label=Bruto],.salary-payment-breakdown td[data-label=Neto]")].map(el => el.textContent)');
+      assert.ok(hiddenBreakdown.length === 8 && hiddenBreakdown.every(text => text.includes('••••••••') && !/[0-9]/.test(text)), 'Privacy hides every payment component and monthly total');
+      if (tab === 'purchasing-power') assert.doesNotMatch(await browser.evaluate('document.querySelector(".economic-reading .economic-real-change").textContent'), /0,00|Se mantuvo|Empeoró|Mejoró/);
+      await layout(`sac-${tab}-private`, true);
+    }
+    await visit('/?section=history&tab=purchasing-power&period=2026-07', 'owner', { history: mixedSacHistory });
+    const mixedRows = await browser.evaluate('[...document.querySelectorAll(".salary-payment-breakdown tbody tr")].map(row => row.textContent)');
+    assert.match(mixedRows[0], /Sueldo habitualN\/DN\/D/, 'A mixed receipt never invents gross or net regular salary');
+    assert.match(mixedRows[2], /Otros pagos \/ sin discriminarARS 150\.000,00ARS 120\.000,00/);
+    assert.match(mixedRows[3], /Total del mesARS 150\.000,00ARS 120\.000,00/);
+    assert.match(await browser.evaluate('document.querySelector(".salary-payment-breakdown .warning").textContent'), /no se pueden repartir sus descuentos con certeza/);
+    assert.equal(await browser.evaluate('!!document.querySelector(\'.bar-group[aria-label="Abrir detalle de Julio 2026"] .net\')'), false);
+    assert.match(await browser.evaluate('[...document.querySelectorAll(".salary-evolution-table tbody tr")].find(row => row.textContent.includes("Julio 2026"))?.textContent'), /Sueldo y extras sin discriminar/);
+    await browser.evaluate('document.querySelector(".salary-payment-breakdown").scrollIntoView({block:"start"})');
+    await layout('sac-mixed-receipt', true);
+    await visit('/?section=history&tab=summary', 'owner', { history: sacHistory, comparison: sacComparison });
+    await browser.evaluate(`(() => { const fields = [...document.querySelectorAll('.comparison-controls select')]; ['2026-06', '2026-07'].forEach((period, index) => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(fields[index], period); fields[index].dispatchEvent(new Event('change', {bubbles:true})); }); })()`);
+    await clickText('Comparar');
+    await browser.waitFor('document.querySelector(".comparison-result")');
+    const comparison = await browser.evaluate('[...document.querySelectorAll(".comparison-result tbody tr")].filter(row => ["Neto habitual", "Aguinaldo / SAC (neto)", "Otros pagos (neto)"].includes(row.querySelector("th")?.textContent)).map(row => row.textContent)');
+    assert.equal(comparison.length, 3, 'Explicit period comparison separates each net component');
+    assert.match(comparison[0], /ARS 80\.000,00.*ARS 80\.000,00.*0,00%/);
+    assert.match(comparison[1], /ARS 40\.000,00.*ARS 0,00/);
+    await browser.evaluate('document.querySelector(".comparison-result").scrollIntoView({block:"start"})');
+    await layout('sac-comparison', true);
+  }
+  process.stdout.write('SAC and bonuses separated from habitual salary, purchasing power, comparison and privacy at 320/1440px passed.\n');
+
   const scenarios = [
     ['login', '/', 'guest'], ['registration', '/?auth=google-registration', 'guest'], ['oauth-error', '/?auth=google-failed', 'guest'], ['oauth-return', '/?auth=google-success'], ['mfa', '/', 'mfa'], ['onboarding', '/', 'onboarding'], ['acceptance', '/', 'acceptance'],
     ['summary', '/?section=summary'], ['jobs', '/?section=jobs'], ['import', '/?section=import'],
@@ -100,9 +164,9 @@ try {
             heights: [...chart.querySelectorAll('.bar')].map(el => parseFloat(el.style.height)),
             maximum: chart.querySelector('.bar-group:last-child .gross')?.style.height,
             reading: grossReading?.textContent.replace(/^Bruto:\\s*/, ''),
-            table: chart.querySelector('tbody tr:last-child [data-label="Bruto total"]')?.textContent };
+            table: chart.querySelector('tbody tr:last-child [data-label="Bruto habitual"]')?.textContent };
         })()`);
-        assert.deepEqual(grossChart.legend, ['Básico comparable', 'Bruto total', 'Neto total']);
+        assert.deepEqual(grossChart.legend, ['Básico comparable', 'Bruto habitual', 'Neto habitual']);
         assert.ok(grossChart.series.length > 0 && grossChart.series.every(series => JSON.stringify(series) === JSON.stringify(['bar comparable', 'bar gross', 'bar net'])), 'Each month shows comparable, gross and net in order');
         assert.equal(grossChart.maximum, '100%', 'The largest synthetic gross sets the chart scale');
         assert.ok(grossChart.heights.every(height => height <= 100), 'Gross bars fit within the shared scale');
@@ -189,7 +253,7 @@ try {
     await browser.waitFor('document.body.innerText.includes("••••••••")');
     const protectedChart = await browser.evaluate(`(() => {
       const chart = document.querySelector('.salary-evolution');
-      return { gross: [...chart.querySelectorAll('.chart-reading > span,[data-label="Bruto total"]')].filter(el => el.matches('[data-label]') || el.textContent.startsWith('Bruto:')).map(el => el.textContent),
+      return { gross: [...chart.querySelectorAll('.chart-reading > span,[data-label="Bruto habitual"]')].filter(el => el.matches('[data-label]') || el.textContent.startsWith('Bruto:')).map(el => el.textContent),
         heights: [...chart.querySelectorAll('.bar')].map(el => el.style.height),
         maximum: chart.querySelector('.bar-group:last-child .gross')?.style.height };
     })()`);
@@ -299,6 +363,6 @@ try {
     await layout('logout', true);
   }
   assert.deepEqual(exceptions, [], 'Browser runtime errors');
-  await writeFile(join(output, 'results.json'), JSON.stringify({ measurements, checks: ['all-owner-routes', 'mobile-widths', 'landscape', 'long-names-money', 'many-employments-filters-actions', 'employment-milestones-salaries', 'forms', 'privacy', 'pdf-fit-zoom', 'upload-synthetic', 'empty-error', 'logout'], exceptions }, null, 2));
+  await writeFile(join(output, 'results.json'), JSON.stringify({ measurements, checks: ['sac-regular-purchasing-power', 'all-owner-routes', 'mobile-widths', 'landscape', 'long-names-money', 'many-employments-filters-actions', 'employment-milestones-salaries', 'forms', 'privacy', 'pdf-fit-zoom', 'upload-synthetic', 'empty-error', 'logout'], exceptions }, null, 2));
   process.stdout.write(`${measurements.length} responsive checks passed. Screenshots: ${output}\n`);
 } finally { await browser.close(); }

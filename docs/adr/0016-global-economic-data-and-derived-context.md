@@ -70,6 +70,10 @@ El request externo contiene sólo el identificador de serie, el rango y opciones
 
 No se materializa una cache ni una tabla de valuaciones salariales. Cada respuesta deriva desde la liquidación vigente y las observaciones revisionadas; así una nueva revisión o corrección salarial entra en el siguiente cálculo sin invalidación paralela.
 
+### Separación del sueldo habitual en V2
+
+`salary-analytics-v2` y `economic-analytics-v2` distinguen sueldo habitual, SAC y otros pagos sin alterar los totales nominales. Comparar el neto total de junio con julio confundía la salida del aguinaldo con una pérdida salarial; la comparación económica ahora usa el neto habitual y mantiene el resto en un desglose visible. Se reutilizan categorías, decimal exacto y el mismo snapshot de observaciones. La fecha del mes no clasifica un recibo. Un sueldo con extras integrados conocidos queda sin neto habitual comparable si no se pueden atribuir los descuentos; el total y el básico conservan su evidencia. No se agregan reglas de nómina, IA, persistencia ni dependencias. Casos sintéticos de SAC, bonos, recibos mixtos y cobertura incompleta verifican esta distinción.
+
 ## Alternativas consideradas
 
 - **Llamar al proveedor por salario o desde el navegador:** rechazado por privacidad, N+1, falta de auditoría y dependencia del proveedor en cada lectura.
