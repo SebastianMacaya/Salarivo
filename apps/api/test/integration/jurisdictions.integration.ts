@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { Pool } from "pg";
+import type { LightMyRequestResponse } from "fastify";
 
 test("jurisdictions preserve legacy evidence, isolate owners and derive reproducible estimates", { timeout: 60_000 }, async () => {
   const databaseUrl = process.env.DATABASE_URL!;
@@ -130,6 +131,8 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
     assert.equal(fromSalary.statusCode, 200, fromSalary.body);
     assert.equal(fromSalary.json().data.salaryBase.amount, "900000.00");
     assert.deepEqual(fromSalary.json().data.salaryBase.analyzedDocumentIds, [eligible.documentId]);
+    assert.equal(fromSalary.json().data.salaryReference.documentId, eligible.documentId);
+    assert.equal(fromSalary.json().data.salaryReference.amount, "900000.00");
     assert.equal(JSON.stringify(fromSalary.json()).includes('"netAmount"'), false);
     assert.equal(fromSalary.json().data.salaryBase.trace[0].sourceDescription, "Synthetic base");
     assert.ok(fromSalary.json().data.salaryBase.trace[0].lineItemId);
@@ -152,6 +155,44 @@ test("jurisdictions preserve legacy evidence, isolate owners and derive reproduc
     assert.equal(columnReview.statusCode, 200, columnReview.body);
     assert.deepEqual(columnReview.json().data.terminationReview, []);
     assert.equal((await app.inject({ method: "GET", url: `/api/v1/documents/${eligible.documentId}`, headers: { ...headers, cookie: cookies[1]! } })).statusCode, 404);
+    await client.query(`UPDATE payroll_line_items SET normalized_concept_code='UNKNOWN',is_recurring=false
+      WHERE user_id=$1 AND normalized_concept_code='BASIC_SALARY' AND settlement_id IN
+        (SELECT id FROM payroll_settlements WHERE document_id=$2 AND user_id=$1)`, [owner, eligible.documentId]);
+    const strictReview = await app.inject({ method: "POST", url: estimateUrl, headers, payload: { terminationDate: "2024-12-15" } });
+    assert.equal(strictReview.json().data.status, "UNAVAILABLE");
+    assert.equal(strictReview.json().data.salaryReference.amount, "900000.00", "suggestion is available despite unresolved concepts");
+    const simpleBody = { ...base, salaryMode: "SIMPLE", overrides: { ...base.overrides, pendingVacationDays: "10.50",
+      deductionRatePercent: "20.00", additionalWithholdings: "10000.00" } };
+    const simple = await app.inject({ method: "POST", url: estimateUrl, headers, payload: simpleBody });
+    assert.equal(simple.statusCode, 200, simple.body);
+    assert.equal(simple.json().data.status, "AVAILABLE");
+    assert.equal(simple.json().data.inputs.salaryMode, "SIMPLE");
+    assert.equal(simple.json().data.inputs.vacationDays, "10.50");
+    assert.equal(simple.json().data.salaryBase.source, "SIMULATION_OVERRIDE");
+    assert.ok(simple.json().data.salaryBase.trace.some((line: { treatment: string }) => line.treatment === "REVIEW_REQUIRED"));
+    for (const scenario of simple.json().data.scenarios) {
+      assert.equal(scenario.breakdown.find((line: { code: string }) => line.code === "UNUSED_VACATION").amount, "420000.00");
+      assert.equal(scenario.netEstimate.contributionPercent, "20.00");
+      assert.equal(scenario.netEstimate.additionalWithholdingsAmount, "10000.00");
+    }
+    assert.equal(simple.headers["cache-control"], "no-store");
+    assert.equal(JSON.stringify(simple.json()).includes('"netAmount"'), false);
+    assert.deepEqual((await app.inject({ method: "POST", url: estimateUrl, headers, payload: simpleBody })).json(), simple.json());
+    assert.equal((await app.inject({ method: "POST", url: estimateUrl, headers: { ...headers, cookie: cookies[1]! }, payload: simpleBody })).statusCode, 404);
+    for (const [payload, message] of [
+      [{ ...base, salaryMode: "OTHER" }, null], [{ terminationDate: base.terminationDate, salaryMode: "SIMPLE" }, null],
+      [{ ...base, overrides: { ...base.overrides, pendingVacationDays: "367" } }, "Los días de vacaciones deben estar entre 0 y 366."],
+      [{ ...base, overrides: { ...base.overrides, pendingVacationDays: "10", priorVacationDays: "0" } }, "Ingresá el total de vacaciones pendientes o los días gozados y saldos anteriores, sin combinar ambas opciones."],
+      [{ ...base, overrides: { ...base.overrides, deductionRatePercent: "100.01" } }, "El porcentaje de aportes debe estar entre 0 y 100."],
+      [{ ...base, overrides: { ...base.overrides, additionalWithholdings: "999999999999.99" } }, "Las otras retenciones no pueden superar el total neto de ninguno de los escenarios."],
+    ] as const) {
+      const invalid: LightMyRequestResponse = await app.inject({ method: "POST", url: estimateUrl, headers, payload });
+      assert.equal(invalid.statusCode, 400);
+      if (message) { assert.equal(invalid.json().error.code, "VALIDATION_ERROR"); assert.equal(invalid.json().error.message, message); }
+    }
+    await client.query(`UPDATE payroll_line_items SET normalized_concept_code='BASIC_SALARY',is_recurring=true
+      WHERE user_id=$1 AND normalized_concept_code='UNKNOWN' AND settlement_id IN
+        (SELECT id FROM payroll_settlements WHERE document_id=$2 AND user_id=$1)`, [owner, eligible.documentId]);
     const incorrectCountry = await addSalary("US", "2024-10", "100.00");
     const conflict = await app.inject({ method: "PATCH", url: "/api/v1/documents/employment", headers,
       payload: { employmentId: legacy, documentIds: [incorrectCountry.documentId] } });

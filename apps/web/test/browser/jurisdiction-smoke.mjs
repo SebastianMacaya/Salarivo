@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { openBrowser } from './cdp.mjs';
 import { fixtureSource, id } from './fixtures.mjs';
 import { calculateTerminationEstimate, reviewTerminationSalary } from '../../../api/src/termination-calculator.ts';
-import { periodLabel } from '../../app/format.ts';
+import { money, periodLabel } from '../../app/format.ts';
 
 const base = process.env.SALARIVO_TEST_URL || 'http://127.0.0.1:3042';
 const output = process.env.SALARIVO_TEST_OUTPUT || join(tmpdir(), 'salarivo-jurisdiction-qa');
@@ -14,25 +14,26 @@ const current = new Date();
 const today = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}-${String(current.getDate()).padStart(2, '0')}`;
 const future = `${current.getFullYear() + 1}-01-15`;
 const employment = { id: id(10), employerName: 'Empresa Sintética Internacional de Prueba', countryCode: 'AR', currencyCode: 'ARS', countryConfirmedAt: '2026-01-01', startDate: '2019-07-01', startDateConfirmedAt: '2026-01-01', startDateSource: 'CONFIRMED', legalRegimeCode: 'AR_LCT_GENERAL', status: 'ACTIVE', statusConfirmedAt: '2026-01-01', employmentType: 'DEPENDENT' };
-const estimates = Object.fromEntries([today, '2024-12-15', future].map(terminationDate => [terminationDate, calculateTerminationEstimate({ employment, today, terminationDate, settlements: [], overrides: { monthlyRemuneration: '2000000.00' } })]));
-assert.ok(Object.values(estimates).every(result => result.status === 'AVAILABLE' && result.scenarios.length === 2));
 const reviewPeriod = new Date(Date.UTC(current.getFullYear(), current.getMonth() - 1, 1)).toISOString().slice(0, 7);
-const reviewSettlement = { id: id(219), documentId: id(319), employmentId: employment.id, currencyCode: 'ARS', payrollPeriod: reviewPeriod, settlementType: 'NORMAL', grossAmount: '1000000.00', remunerativeAmount: '1000000.00', nonRemunerativeAmount: '0.00', netAmount: '700000.00', deductionsAmount: '300000.00', basicAmount: '900000.00', earnings: [
+const reviewSettlement = { id: id(219), documentId: id(319), employmentId: employment.id, currencyCode: 'ARS', payrollPeriod: reviewPeriod, settlementType: 'NORMAL', grossAmount: '3000000.00', remunerativeAmount: '3000000.00', nonRemunerativeAmount: '0.00', netAmount: '2100000.00', deductionsAmount: '900000.00', basicAmount: '900000.00', earnings: [
   { code: 'UNKNOWN', lineItemId: id(60), amount: '300000.00', isRecurring: false },
   { code: 'BASIC_SALARY', lineItemId: id(61), amount: '900000.00', isRecurring: true },
 ] };
-const reviewEstimate = calculateTerminationEstimate({ employment, today, terminationDate: today, settlements: [reviewSettlement] });
+const normalSettlement = { ...reviewSettlement, grossAmount: '2000000.00', remunerativeAmount: '2000000.00', netAmount: '1660000.00', deductionsAmount: '340000.00', basicAmount: '2000000.00', earnings: [{ code: 'BASIC_SALARY', lineItemId: id(61), amount: '2000000.00', isRecurring: true }] };
+const reviewEstimate = calculateTerminationEstimate({ employment, today, terminationDate: today, salaryMode: 'DOCUMENTS', settlements: [reviewSettlement] });
 const sourceDescription = 'Premio sintético sin clasificación <texto del recibo>';
 reviewEstimate.salaryBase.trace.forEach(line => { line.sourceDescription = line.lineItemId === id(60) ? sourceDescription : 'Básico sintético'; });
-const reviewData = { estimate: reviewEstimate, overrideEstimate: calculateTerminationEstimate({ employment, today, terminationDate: today, settlements: [reviewSettlement], overrides: { monthlyRemuneration: '2000000.00' } }), settlement: reviewSettlement, issues: reviewTerminationSalary(reviewSettlement) };
+const reviewData = { estimate: reviewEstimate, settlement: reviewSettlement, issues: reviewTerminationSalary(reviewSettlement) };
 assert.equal(reviewEstimate.status, 'UNAVAILABLE');
 assert.ok(!reviewEstimate.salaryBase.missingPeriods.includes(reviewPeriod));
 assert.deepEqual(reviewEstimate.salaryBase.unusablePeriods, [reviewPeriod]);
 
-function installJurisdictionFixture(employment, estimates, reviewData, options) {
+function installJurisdictionFixture(employment, reviewData, options) {
   const priorFetch = window.fetch;
   const state = window.__jurisdictionFixture = { requests: [], employmentPatch: null, employment: { ...employment, ...(options.unknown ? { status: 'UNKNOWN', statusConfirmedAt: null, employmentType: 'UNKNOWN', countryConfirmedAt: null, startDateConfirmedAt: null, legalRegimeCode: null } : {}), ...(options.legacyActive ? { statusConfirmedAt: null } : {}) }, primaryCountryCode: options.unconfirmed ? null : 'AR', primaryCountryConfirmedAt: options.unconfirmed ? null : '2026-01-01' };
   const ok = data => Response.json({ data }, { headers: { 'Cache-Control': 'no-store' } });
+  const pending = new Map();
+  state.resolveEstimate = (sequence, result) => { pending.get(sequence)?.(result); pending.delete(sequence); };
   window.fetch = async (input, init = {}) => {
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
     const path = url.pathname;
@@ -52,10 +53,17 @@ function installJurisdictionFixture(employment, estimates, reviewData, options) 
       return ok(state.employment);
     }
     if (path === `/api/v1/employments/${employment.id}/termination-estimate`) {
-      state.requests.push({ method: init.method, url: url.href, body: JSON.parse(init.body), cache: init.cache, credentials: init.credentials });
+      const body = JSON.parse(init.body);
+      state.requests.push({ method: init.method, url: url.href, body, cache: init.cache, credentials: init.credentials });
+      const sequence = state.requests.length;
       if (options.fail) return Response.json({ error: { code: 'SYNTHETIC_FAILURE', message: 'Fallo sintético. Reintentá.' } }, { status: 503 });
       await new Promise(resolve => setTimeout(resolve, 200));
-      return ok(options.review ? (JSON.parse(init.body).overrides.monthlyRemuneration === '2000000.00' ? reviewData.overrideEstimate : reviewData.estimate) : estimates[JSON.parse(init.body).terminationDate]);
+      const result = await new Promise(resolve => {
+        pending.set(sequence, resolve);
+        window.__calculateTerminationFixture(JSON.stringify({ sequence, body, employment: state.employment, review: options.review, noSalary: options.noSalary, grossOnly: options.grossOnly, priorUsable: options.priorUsable }));
+      });
+      if (body.terminationType) state.lastEstimate = result;
+      return ok(result);
     }
     if (options.review && path === `/api/v1/documents/${reviewData.settlement.documentId}`) {
       const response = await priorFetch(input, init);
@@ -73,13 +81,28 @@ function installJurisdictionFixture(employment, estimates, reviewData, options) 
 const browser = await openBrowser();
 const exceptions = [];
 browser.on('Runtime.exceptionThrown', ({ exceptionDetails }) => exceptions.push(exceptionDetails.exception?.description || exceptionDetails.text));
+await browser.command('Runtime.addBinding', { name: '__calculateTerminationFixture' });
+browser.on('Runtime.bindingCalled', ({ name, payload, executionContextId }) => {
+  if (name !== '__calculateTerminationFixture') return;
+  const request = JSON.parse(payload);
+  const settlement = request.review ? reviewSettlement : normalSettlement;
+  const settlements = request.noSalary ? [] : [{ ...settlement, ...(request.grossOnly ? { remunerativeAmount: null } : {}) }];
+  if (request.priorUsable) settlements.push({ ...normalSettlement, id: id(218), documentId: id(318), payrollPeriod: new Date(Date.UTC(current.getFullYear(), current.getMonth() - 2, 1)).toISOString().slice(0, 7) });
+  // Every synthetic POST runs the real Node motor, including submitted dates and overrides.
+  const result = calculateTerminationEstimate({ ...request.body, employment: request.employment, today, settlements });
+  if (request.review) result.salaryBase.trace.forEach(line => { line.sourceDescription = line.lineItemId === id(60) ? sourceDescription : 'Básico sintético'; });
+  browser.command('Runtime.evaluate', { contextId: executionContextId, expression: `window.__jurisdictionFixture.resolveEstimate(${request.sequence}, ${JSON.stringify(result)})` }).catch(error => exceptions.push(error.message));
+});
 let injection;
 async function visit(path, options = {}) {
   if (injection) await browser.command('Page.removeScriptToEvaluateOnNewDocument', { identifier: injection });
-  const source = `${fixtureSource({ ...options, private: options.private ?? false })}\n(${installJurisdictionFixture})(${JSON.stringify(employment)}, ${JSON.stringify(estimates)}, ${JSON.stringify(reviewData)}, ${JSON.stringify(options)});`;
+  const source = `${fixtureSource({ ...options, private: options.private ?? false })}\n(${installJurisdictionFixture})(${JSON.stringify(employment)}, ${JSON.stringify(reviewData)}, ${JSON.stringify(options)});`;
   injection = (await browser.command('Page.addScriptToEvaluateOnNewDocument', { source })).identifier;
   await browser.navigate(new URL(path, base).href);
   await browser.waitFor('window.__jurisdictionFixture && document.querySelector("h1") && !document.querySelector("main .loader")');
+  if (new URL(path, base).searchParams.get('section') === 'termination' && !options.empty && !options.legacyActive) {
+    await browser.waitFor('document.querySelector(".termination-form") && !document.querySelector(".termination-suggestion")?.textContent.includes("Buscando")');
+  }
 }
 async function click(label) {
   const found = await browser.evaluate(`(() => { const button = [...document.querySelectorAll('button')].find(el => el.getClientRects().length && !el.disabled && (el.getAttribute('aria-label') || el.textContent.trim()) === ${JSON.stringify(label)}); button?.click(); return !!button; })()`);
@@ -94,31 +117,49 @@ async function layout(name) {
   assert.equal(size.tiny, 0);
   await browser.screenshot(join(output, `${size.width}-${name}.png`));
 }
+async function expectTotals() {
+  await browser.waitFor('document.querySelectorAll(".termination-scenario").length === 2');
+  const estimate = await browser.evaluate('window.__jurisdictionFixture.lastEstimate');
+  const displayed = await browser.evaluate('[...document.querySelectorAll(".termination-scenario")].map(el => [...el.querySelectorAll(".termination-totals dd")].map(total => total.textContent))');
+  assert.deepEqual(displayed, estimate.scenarios.map(scenario => [money(scenario.total), money(scenario.netEstimate.total)]));
+  return estimate;
+}
 try {
   if (!process.argv.includes('--document-country-only')) {
   for (const width of [320, 390, 1440]) {
     await browser.viewport(width, 900);
     await visit('/?section=termination');
     assert.equal(await browser.evaluate('document.querySelector("select[aria-label]").value'), employment.id);
+    assert.equal(await browser.evaluate('document.querySelector("[name=salaryMode]").value'), 'SIMPLE');
+    assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), normalSettlement.remunerativeAmount);
+    assert.equal(await browser.evaluate('document.querySelectorAll(".termination-result").length'), 0, 'Reference loading must not calculate a visible result');
+    assert.equal(await browser.evaluate('window.__jurisdictionFixture.requests.length'), 1);
+    assert.equal(await browser.evaluate('window.__jurisdictionFixture.requests[0].body.salaryMode'), 'DOCUMENTS');
+    assert.ok(await browser.evaluate('["startDate", "terminationDate", "monthlyRemuneration", "pendingVacationDays"].every(name => document.querySelector(`.termination-form [name=${name}]`).getClientRects().length > 0)'));
+    await browser.evaluate('document.querySelector(".termination-form").scrollIntoView({block:"start"})');
+    await layout('simple-form');
     await click('Calcular estimación');
-    await browser.waitFor('document.querySelectorAll(".termination-scenario").length === 2');
-    if (width < 768) {
-      assert.equal(await browser.evaluate('document.querySelectorAll(".termination-mobile-totals dd").length'), 2);
-      await browser.evaluate('document.querySelector(".termination-mobile-totals").scrollIntoView({block:"start"})');
-      assert.ok(await browser.evaluate('document.querySelector(".termination-mobile-totals").getBoundingClientRect().bottom < innerHeight - 80'));
-      await layout('mobile-totals');
-    }
+    const initial = await expectTotals();
+    assert.equal(initial.inputs.salaryMode, 'SIMPLE');
+    assert.ok(initial.scenarios.every(scenario => scenario.netEstimate.total !== scenario.total));
     await browser.evaluate('document.querySelector(".termination-scenarios").scrollIntoView({block:"start"})');
     await layout('comparison');
     await click('Ocultar importes');
     const hidden = await browser.evaluate('({text:document.querySelector(".termination-result").innerText, accessible:document.querySelector(".termination-result").innerHTML})');
-    for (const scenario of estimates[today].scenarios) {
-      assert.ok(!hidden.accessible.includes(scenario.total));
+    for (const scenario of initial.scenarios) {
+      for (const amount of [scenario.total, scenario.netEstimate.total, scenario.netEstimate.contributionsAmount]) {
+        assert.ok(!hidden.accessible.includes(amount));
+        assert.ok(!hidden.accessible.includes(money(amount)));
+      }
     }
     assert.ok(hidden.text.includes('••••••••'));
     await browser.evaluate('document.querySelector(".termination-page form details").open=true');
     assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").type'), 'password');
-    await input('[name=monthlyRemuneration]', '2.000.000,00');
+    assert.equal(await browser.evaluate('document.querySelector("[name=additionalWithholdings]").type'), 'password');
+    assert.equal(await browser.evaluate('document.querySelector("[name=deductionRatePercent]").type'), 'password');
+    assert.ok(!hidden.accessible.includes('17.00%'));
+    await input('[name=monthlyRemuneration]', '2.400.000,00');
+    await input('[name=pendingVacationDays]', '0');
     await input('[name=terminationDate]', future);
     assert.ok(await browser.evaluate('document.body.innerText.includes("Es una proyección")'));
     assert.equal(await browser.evaluate('document.querySelectorAll(".termination-result").length'), 0, 'Input change removes stale result');
@@ -126,12 +167,18 @@ try {
     await browser.waitFor('document.querySelectorAll(".termination-scenario").length === 2');
     const request = await browser.evaluate('window.__jurisdictionFixture.requests.at(-1)');
     assert.equal(request.method, 'POST'); assert.equal(request.cache, 'no-store'); assert.equal(request.credentials, 'include');
-    assert.equal(request.body.overrides.monthlyRemuneration, '2000000.00');
-    assert.ok(!request.url.includes('2000000')); assert.ok(!request.url.includes('?'));
+    assert.equal(request.body.salaryMode, 'SIMPLE');
+    assert.equal(request.body.overrides.monthlyRemuneration, '2400000.00');
+    assert.equal(request.body.overrides.pendingVacationDays, '0.00');
+    assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), '2.400.000,00', 'Reference refresh preserves the edited salary');
+    assert.ok(!request.url.includes('2400000')); assert.ok(!request.url.includes('?'));
+    const zeroVacation = await browser.evaluate('window.__jurisdictionFixture.lastEstimate');
+    assert.equal(zeroVacation.inputs.vacationDays, '0.00');
+    assert.ok(zeroVacation.scenarios.every(scenario => scenario.breakdown.find(line => line.code === 'UNUSED_VACATION').amount === '0.00'));
     await input('[name=terminationDate]', '2024-12-15');
     await click('Calcular estimación');
     await browser.waitFor('document.querySelectorAll(".termination-scenario").length === 2');
-    assert.ok(await browser.evaluate(`document.body.innerText.includes(${JSON.stringify(estimates['2024-12-15'].legalRuleVersion.version)})`));
+    assert.equal(await browser.evaluate('window.__jurisdictionFixture.lastEstimate.legalRuleVersion.version'), '2024-07-09');
     await layout('historical-private');
   }
   await browser.viewport(390, 844);
@@ -160,6 +207,7 @@ try {
   await visit('/?section=termination', { empty: true });
   assert.ok(await browser.evaluate('document.body.innerText.includes("Primero, registrá tu empleo")'));
   await visit('/?section=termination', { fail: true });
+  await input('[name=monthlyRemuneration]', '2000000');
   await click('Calcular estimación');
   await browser.waitFor('document.querySelector("[role=alert]")');
   assert.equal(await browser.evaluate('document.querySelectorAll(".termination-scenario").length'), 0);
@@ -176,26 +224,24 @@ try {
   for (const width of [320, 1440]) {
     await browser.viewport(width, 900);
     await visit(`/?section=termination&employmentId=${employment.id}`, { review: true, private: true });
+    assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), reviewSettlement.remunerativeAmount);
+    await browser.evaluate('document.querySelector(".termination-form details").open = true');
+    await input('[name=salaryMode]', 'DOCUMENTS');
     await click('Calcular estimación');
     await browser.waitFor('document.querySelector(".termination-trace")');
-    assert.ok(await browser.evaluate('document.querySelector(".termination-next-step").innerText.includes("no hace falta subirlos otra vez")'));
-    assert.equal(await browser.evaluate('document.querySelector(".termination-next-step > details summary").textContent'), 'Recibos con datos para revisar (1)');
-    const nextStepLink = await browser.evaluate('document.querySelector(".termination-next-step .inline-actions a").href');
-    assert.equal(new URL(nextStepLink).searchParams.get('document'), id(319));
-    assert.equal(new URL(nextStepLink).searchParams.get('review'), 'termination');
+    assert.equal(await browser.evaluate('window.__jurisdictionFixture.lastEstimate.status'), 'UNAVAILABLE');
+    assert.ok(await browser.evaluate('document.querySelector(".termination-next-step").innerText.includes("sin revisar todos los recibos")'));
+    assert.equal(await browser.evaluate('window.__jurisdictionFixture.requests.at(-1).body.overrides.monthlyRemuneration'), undefined, 'Document analysis must not silently use the suggested salary');
     assert.ok(!await browser.evaluate('document.querySelector(".termination-result > .panel-heading").innerText.includes("Completitud")'));
     await layout('termination-next-step');
-    await click('Ingresar remuneración para esta simulación');
-    assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").closest("details").open'), true);
-    assert.equal(await browser.evaluate('document.activeElement?.getAttribute("name")'), 'monthlyRemuneration');
     await browser.evaluate('document.querySelector(".termination-trace").closest("details").open = true');
     await click('Mostrar importes');
     const trace = await browser.evaluate('document.querySelector(".termination-trace").innerText');
     assert.ok(trace.includes('Concepto sin clasificar') && trace.includes('Sueldo básico'));
     assert.ok(trace.includes(sourceDescription));
     assert.ok(!trace.includes('UNKNOWN') && !trace.includes('BASIC_SALARY'));
-    const coverage = await browser.evaluate('[...document.querySelectorAll(".termination-result p")].map(el => el.innerText)');
-    assert.ok(coverage.some(text => text.startsWith('Períodos con recibos que no permiten calcular la base:') && text.includes(periodLabel(reviewPeriod))));
+    const coverage = await browser.evaluate('[...document.querySelectorAll(".termination-result p")].map(el => el.textContent)');
+    assert.ok(coverage.some(text => text.startsWith('Recibos sin detalle suficiente') && text.includes(periodLabel(reviewPeriod))));
     assert.ok(!coverage.find(text => text.startsWith('Períodos sin recibos analizados:')).includes(periodLabel(reviewPeriod)));
     await browser.evaluate('document.querySelector(".termination-trace").scrollIntoView({block:"start"})');
     await layout('termination-review-trace');
@@ -221,20 +267,51 @@ try {
     assert.ok(await browser.evaluate(`document.querySelector('#field-${id(70)} input') !== null`));
     assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/corrections") || call.path.endsWith("/original"))'));
   }
+  await visit(`/?section=termination&employmentId=${employment.id}`, { review: true, priorUsable: true });
+  assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), reviewSettlement.remunerativeAmount, 'Suggest the latest receipt even when an earlier usable month has a different salary');
+  assert.equal(await browser.evaluate('document.querySelectorAll(".termination-result").length'), 0);
+  await click('Calcular estimación');
+  const fromAmbiguous = await expectTotals();
+  assert.equal(fromAmbiguous.salaryBase.amount, reviewSettlement.remunerativeAmount);
+  assert.equal(await browser.evaluate('document.querySelector(".termination-next-step")'), null);
+  await input('[name=pendingVacationDays]', '10,5');
+  await input('[name=monthlyRemuneration]', '2.000.000,00');
+  await input('.termination-form [name=startDate]', '2018-07-01');
+  await click('Calcular estimación');
+  const vacation = await expectTotals();
+  assert.equal(vacation.inputs.startDate, '2018-07-01');
+  assert.equal(vacation.inputs.vacationDays, '10.50');
+  assert.ok(vacation.scenarios.every(scenario => scenario.breakdown.find(line => line.code === 'UNUSED_VACATION').amount === '840000.00'));
+  await browser.evaluate('document.querySelector(".termination-form details").open = true');
+  assert.ok(await browser.evaluate('document.querySelector("[name=vacationDaysTaken]").disabled && document.querySelector("[name=priorVacationDays]").disabled'));
+  await input('[name=deductionRatePercent]', '10');
+  await input('[name=additionalWithholdings]', '10.000,00');
+  await click('Calcular estimación');
+  const adjustedNet = await expectTotals();
+  assert.deepEqual(adjustedNet.scenarios.map(scenario => scenario.total), vacation.scenarios.map(scenario => scenario.total), 'Deductions must not change gross estimates');
+  assert.notDeepEqual(adjustedNet.scenarios.map(scenario => scenario.netEstimate.total), vacation.scenarios.map(scenario => scenario.netEstimate.total));
+  assert.ok(adjustedNet.scenarios.every(scenario => scenario.netEstimate.contributionPercent === '10.00' && scenario.netEstimate.additionalWithholdingsAmount === '10000.00'));
+  assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/corrections"))'));
   await visit(`/?section=termination&employmentId=${employment.id}`, { review: true });
+  await browser.evaluate('document.querySelector(".termination-form details").open = true');
+  await input('[name=salaryMode]', 'DOCUMENTS');
   await click('Calcular estimación');
   await browser.waitFor('document.querySelector(".termination-next-step")');
-  assert.ok(await browser.evaluate('document.querySelector(".termination-salary-reference").innerText.includes("Puede incluir vacaciones")'));
-  await click('Completar con este importe y revisarlo');
-  assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), reviewSettlement.remunerativeAmount);
-  assert.equal(await browser.evaluate('window.__jurisdictionFixture.requests.length'), 1, 'Copying a reference does not confirm it or calculate automatically');
-  await click('Ingresar remuneración para esta simulación');
-  await input('[name=monthlyRemuneration]', '2.000.000,00');
+  await click('Usar estimación simple');
+  await browser.waitFor('document.activeElement?.getAttribute("name") === "monthlyRemuneration"');
+  assert.equal(await browser.evaluate('document.querySelector("[name=salaryMode]").value'), 'SIMPLE');
   await click('Calcular estimación');
-  await browser.waitFor('document.querySelectorAll(".termination-scenario").length === 2');
-  assert.equal(await browser.evaluate('document.querySelector(".termination-next-step")'), null);
-  assert.ok(await browser.evaluate('document.querySelector(".termination-result").innerText.includes("Dato ingresado para esta simulación")'));
-  assert.ok(!await browser.evaluate('window.__salarivoFixture.calls.some(call => call.path.endsWith("/corrections"))'));
+  await expectTotals();
+  await visit('/?section=termination', { review: true, grossOnly: true });
+  assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), reviewSettlement.grossAmount);
+  await click('Calcular estimación');
+  await expectTotals();
+  await visit('/?section=termination', { noSalary: true });
+  assert.equal(await browser.evaluate('document.querySelector("[name=monthlyRemuneration]").value'), '');
+  assert.equal(await browser.evaluate('document.querySelector(".termination-form").checkValidity()'), false);
+  await input('[name=monthlyRemuneration]', '2000000');
+  await click('Calcular estimación');
+  await expectTotals();
   }
   await visit(`/?section=history&tab=documents&document=${id(319)}`, { documentIssues: [
     { code: 'COUNTRY_DETECTION_OVERRIDDEN', affectedFieldPath: 'document.countryCode', severity: 'INFO', recoverable: false },

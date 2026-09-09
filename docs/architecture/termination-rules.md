@@ -4,11 +4,17 @@ Estado: implementado en `apps/api/src/termination-calculator.ts`, verificado con
 
 ## Contrato y alcance efectivo
 
-`calculateTerminationEstimate` recibe exclusivamente un empleo, fecha civil de egreso, fecha de referencia explícita, liquidaciones normalizadas y overrides. Devuelve dos escenarios completos, ocho conceptos con importes decimales, supuestos, cobertura, trazabilidad por concepto, versión legal y snapshot de entradas. La versión de cálculo `termination-estimate-v2` permite conciliar conceptos con separación remunerativa explícita, sin modificar las versiones legales. Reutiliza los helpers exactos de analytics: centavos `BigInt`, redondeo half-up al centavo por línea y suma exacta de las líneas mostradas. No importa ORM, consulta PDFs ni utiliza IA, red, reloj implícito o storage.
+`calculateTerminationEstimate` recibe exclusivamente un empleo, fecha civil de egreso, fecha de referencia explícita, liquidaciones normalizadas, modo de cálculo y overrides. Devuelve dos escenarios completos, ocho conceptos con importes decimales, supuestos, cobertura, trazabilidad por concepto, versión legal y snapshot de entradas. La versión `termination-estimate-v3` agrega estimación simple con sueldo constante, saldo total de vacaciones y neto orientativo; conserva la conciliación documental de v2 y las versiones legales. Reutiliza los helpers exactos de analytics: centavos `BigInt`, redondeo half-up al centavo por línea y suma exacta de las líneas mostradas. No importa ORM, consulta PDFs ni utiliza IA, red, reloj implícito o storage.
 
 El resolver exige país, régimen explícito, moneda y fecha compatibles. Sólo `AR` / `ARS` / `AR_LCT_GENERAL`, mensualizado por tiempo indeterminado, despido sin causa, desde 2023-01-01. Una subdivisión argentina conserva su identidad como contexto; estas reglas nacionales no modelan divergencias judiciales provinciales. Otro país, régimen, moneda, causa o fecha anterior devuelve `UNSUPPORTED`, sin totales. La falta de ingreso, base o información necesaria devuelve `UNAVAILABLE`. Un recibo no confirma continuidad laboral ni convierte automáticamente un empleo en régimen LCT.
 
 El modelo mantiene requerimiento y cumplimiento de preaviso separados. Esta UI compara cumplimiento completo con omisión total, ambos para la misma fecha efectiva de egreso. El contrato permite agregar modalidades futuras sin introducir fórmulas nacionales en endpoints o React. La implementación actual no calcula preaviso parcialmente cumplido.
+
+## Estimación simple y análisis documental
+
+La web abre en modo `SIMPLE`: muestra fechas, sueldo bruto habitual y vacaciones pendientes. Precarga el importe positivo del último recibo `NORMAL` único y elegible, priorizando total remunerativo y luego bruto; conserva período, campo e IDs de origen en `salaryReference`. La referencia usa los mismos límites de empleo, moneda y fecha que el cálculo. No usa neto ni completa datos ausentes; si el último mes es ambiguo, no elige silenciosamente un sueldo anterior. Un total OCR permite orientar la simulación aunque los conceptos no concilien; no se convierte por eso en base legal verificada.
+
+El usuario puede ajustar el importe visible y calcular sin revisar los recibos. `SIMPLE` exige `monthlyRemuneration` explícito y lo considera constante para antigüedad, sueldo, preaviso, integración, vacaciones y todo el semestre del SAC. Ese supuesto evita mezclar el sueldo ingresado con meses históricos en la estimación simple. El modo queda en `inputs.salaryMode`; los cambios sólo viven en la simulación. `DOCUMENTS`, predeterminado en el contrato API y opcional en la web, conserva la reconstrucción estricta y el comportamiento previo del override mensual. Ningún modo altera las extracciones ni sus diagnósticos.
 
 ## Fuentes y versiones
 
@@ -49,7 +55,17 @@ Salario e integración prorratean días calendario reales del mes; es una conven
 
 Vacaciones usa derecho anual 14/21/28/35 según antigüedad civil al 31/12, proporción de días de servicio del año, divisor 25, menos días gozados y más saldo anterior indicado. Los promedios variables siguen art. 155. No hay datos de ausencias, calendario real de días trabajados, licencias o saldos previos: la respuesta explicita ese límite y permite override de días.
 
+`pendingVacationDays` acepta un saldo total de 0 a 366 días con hasta dos decimales y reemplaza el cálculo proporcional completo. No se combina con días gozados o saldo anterior: la API rechaza esa mezcla y la web deshabilita esos campos para evitar duplicar vacaciones. Vacío mantiene el cálculo automático; `0` indica que no quedan días. `inputs.vacationDays` expone los días aplicados, redondeados a dos decimales para presentación; la fórmula proporcional automática conserva su precisión interna.
+
 Se muestra incidencia de SAC sobre preaviso e integración como criterio indemnizatorio de remuneración frustrada. Un ejemplo judicial primario que lo aplica es [CNAT, sentencia publicada por CIJ](https://www.cij.gov.ar/blog/d/sentencia-SGU-cd1502d6-2b4e-448f-a349-34c22a9a97b5.pdf). Su alcance no es universal para todas las jurisdicciones. No se suma SAC a vacaciones indemnizadas; la respuesta informa que su procedencia puede depender del criterio judicial. Los resultados son brutos, suponen pendiente el sueldo del mes y excluyen agravantes, tutela especial, multas, intereses y deudas anteriores. No sustituyen un balance final de pagos ya realizados.
+
+### Neto orientativo (fuentes revisadas el 2026-09-09)
+
+Cada escenario conserva su `total` bruto y agrega `netEstimate`: total neto orientativo, aportes estimados, otras retenciones ingresadas y porcentaje aplicado. El porcentaje editable `deductionRatePercent` (0–100) se aplica por línea sólo a sueldo devengado y SAC proporcional. Antigüedad, preaviso sustitutivo, integración, sus incidencias indemnizatorias y vacaciones no gozadas no reciben ese descuento previsional. Se sigue la separación de remuneración e indemnizaciones de la [Ley 24.241, arts. 6–7](https://www.argentina.gob.ar/normativa/nacional/ley-24241-639/actualizacion).
+
+El valor inicial de 17% representa 11% jubilación, 3% obra social y 3% INSSJP, según la [guía salarial oficial](https://www.argentina.gob.ar/node/12243). Es un supuesto editable, sin topes de aportes ni deducciones particulares; no se infiere del cociente neto/bruto del recibo, que puede incluir Ganancias, préstamos u otros descuentos. `additionalWithholdings` permite ingresar un importe adicional, igual para ambos escenarios; se rechaza si supera el saldo después de aportes de cualquiera de ellos.
+
+No se calcula Ganancias automáticamente. Ausencia de aportes no equivale a exención tributaria: preaviso, vacaciones no gozadas y SAC pueden estar alcanzados, conforme [Circular 4/2021](https://servicios.infoleg.gob.ar/infolegInternet/anexos/355000-359999/355411/norma.htm) y [ARCA, rentas del trabajo](https://www.arca.gob.ar/gananciasYBienes/ganancias/personas-humanas-sucesiones-indivisas/rentas/trabajo.asp). La interfaz identifica el neto como orientativo y explica ese límite junto a los resultados.
 
 ## Convenios, calidad y reproducción
 

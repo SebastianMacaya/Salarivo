@@ -347,7 +347,7 @@ test("explicit non-remunerative columns can form a base only when both component
   data.settlements = [mixed];
   const result = calculateTerminationEstimate(data);
   assert.equal(result.status, "AVAILABLE");
-  assert.equal(result.calculationVersion, "termination-estimate-v2");
+  assert.equal(result.calculationVersion, "termination-estimate-v3");
   assert.equal(result.salaryBase.amount, "1000.00");
   assert.equal(result.salaryBase.currentMonthlyRemuneration, "1000.00");
   assert.deepEqual(result.salaryBase.unusablePeriods, []);
@@ -440,4 +440,95 @@ test("the verified 2026 injunction interval yields no figures and discloses its 
   for (const date of ["2026-03-29", "2026-04-23", "2026-09-05"]) {
     assert.equal(calculateTerminationEstimate(input("2024-01-01", date)).status, "AVAILABLE");
   }
+});
+
+test("simple salary bypasses receipt reconciliation explicitly and uses a constant salary for SAC", () => {
+  const data = input(); delete data.overrides;
+  data.settlements = twelveMonths().map(row => ({ ...row, earnings: [{ code: "UNKNOWN", amount: "300000.00" }] }));
+  const strict = calculateTerminationEstimate(data);
+  assert.equal(strict.status, "UNAVAILABLE");
+  assert.equal(strict.inputs.salaryMode, "DOCUMENTS");
+  assert.deepEqual(strict.salaryReference, { amount: "300000.00", sourceField: "remunerativeAmount", period: "2026-05",
+    documentId: "document-2026-05", settlementId: "settlement-2026-05" });
+  data.salaryMode = "SIMPLE";
+  assert.throws(() => calculateTerminationEstimate(data), /INVALID_TERMINATION_AMOUNT/);
+  data.overrides = { monthlyRemuneration: "300000.00" };
+  const simple = calculateTerminationEstimate(data);
+  assertComplete(simple, middle, "1751405.48", "1263905.48");
+  assert.equal(simple.inputs.salaryMode, "SIMPLE");
+  assert.equal(simple.salaryBase.source, "SIMULATION_OVERRIDE");
+  assert.equal(simple.salaryBase.trace.filter(entry => entry.treatment === "REVIEW_REQUIRED").length, 12);
+  data.settlements = twelveMonths().map(row => settlement(row.payrollPeriod, "600000.00"));
+  assert.deepEqual(amounts(calculateTerminationEstimate(data)), middle, "simple SAC does not mix in usable historical salaries");
+  data.salaryMode = "DOCUMENTS";
+  assert.equal(amounts(calculateTerminationEstimate(data)).PROPORTIONAL_SAC, "262500.00", "document override keeps its existing historical SAC behavior");
+  assert.throws(() => calculateTerminationEstimate({ ...data, salaryMode: "NET" as "SIMPLE" }), /INVALID_SALARY_MODE/);
+});
+
+test("salary suggestion uses the latest unique eligible normal receipt without treating it as a verified base", () => {
+  const data = input(); delete data.overrides;
+  data.settlements = [settlement("2026-04"), settlement("2026-05", "400000.00", { remunerativeAmount: null,
+    nonRemunerativeAmount: null, earnings: [{ code: "UNKNOWN", amount: "400000.00" }] }),
+    settlement("2026-06", "900000.00"), settlement("2026-05", "800000.00", { id: "other-owner", employmentId: "other-owner" }),
+    settlement("2026-05", "700000.00", { id: "other-currency", currencyCode: "USD" }),
+    settlement("2026-05", "600000.00", { id: "later-issued", knownOn: "2026-06-16" }),
+    settlement("2026-05", "500000.00", { id: "bonus", settlementType: "BONO" })];
+  const reference = calculateTerminationEstimate(data).salaryReference;
+  assert.deepEqual(reference, { amount: "400000.00", sourceField: "grossAmount", period: "2026-05",
+    documentId: "document-2026-05", settlementId: "settlement-2026-05" });
+  data.settlements = [...data.settlements, data.settlements[1]!];
+  assert.deepEqual(calculateTerminationEstimate(data).salaryReference, reference, "duplicate row IDs remain idempotent");
+  data.settlements = [...data.settlements, settlement("2026-05", "500000.00", { id: "another-normal" })];
+  assert.equal(calculateTerminationEstimate(data).salaryReference, null, "an ambiguous latest month does not silently fall back to an older one");
+  data.settlements = [settlement("2026-04"), settlement("2026-05", "0.00", { grossAmount: null, remunerativeAmount: null, earnings: [] })];
+  assert.equal(calculateTerminationEstimate(data).salaryReference, null, "a net-only latest receipt does not provide a gross salary reference");
+});
+
+test("pending vacation days replace the total balance, preserve zero and reject conflicting inputs", () => {
+  const data = input(); data.overrides!.pendingVacationDays = "10.50";
+  const result = calculateTerminationEstimate(data);
+  assert.equal(result.inputs.vacationDays, "10.50");
+  assert.equal(amounts(result).UNUSED_VACATION, "126000.00");
+  data.overrides!.pendingVacationDays = "0.00";
+  assert.equal(amounts(calculateTerminationEstimate(data)).UNUSED_VACATION, "0.00");
+  for (const value of ["-1", "366.01", "1.001"]) {
+    data.overrides!.pendingVacationDays = value;
+    assert.throws(() => calculateTerminationEstimate(data), /INVALID_/);
+  }
+  data.overrides!.pendingVacationDays = "10";
+  for (const key of ["vacationDaysTaken", "priorVacationDays"] as const) {
+    data.overrides![key] = "0";
+    assert.throws(() => calculateTerminationEstimate(data), /INVALID_VACATION_DAYS_COMBINATION/);
+    delete data.overrides![key];
+  }
+});
+
+test("estimated net applies exact contributions to salary and SAC only, with explicit optional withholdings", () => {
+  const data = input();
+  const result = calculateTerminationEstimate(data);
+  assert.deepEqual(result.scenarios.map(scenario => scenario.netEstimate), [
+    { total: "1215030.48", contributionsAmount: "48875.00", additionalWithholdingsAmount: "0.00", contributionPercent: "17.00" },
+    { total: "1702530.48", contributionsAmount: "48875.00", additionalWithholdingsAmount: "0.00", contributionPercent: "17.00" },
+  ]);
+  data.overrides!.deductionRatePercent = "20"; data.overrides!.additionalWithholdings = "10000";
+  const adjusted = calculateTerminationEstimate(data);
+  assert.deepEqual(adjusted.scenarios[1]!.netEstimate,
+    { total: "1683905.48", contributionsAmount: "57500.00", additionalWithholdingsAmount: "10000.00", contributionPercent: "20.00" });
+  assert.deepEqual(amounts(adjusted), middle, "net inputs never change gross legal components");
+  data.overrides = { monthlyRemuneration: "0.07" };
+  assert.equal(calculateTerminationEstimate(data).scenarios[0]!.netEstimate.contributionsAmount, "0.02", "each taxable line is rounded separately");
+  data.overrides = { monthlyRemuneration: "300000.00", deductionRatePercent: "0" };
+  assert.equal(calculateTerminationEstimate(data).scenarios[0]!.netEstimate.total, result.scenarios[0]!.total);
+  data.overrides.deductionRatePercent = "100";
+  assert.equal(calculateTerminationEstimate(data).scenarios[0]!.netEstimate.contributionsAmount, "287500.00");
+  for (const value of ["-1", "100.01", "17.001", "NaN"]) {
+    data.overrides.deductionRatePercent = value;
+    assert.throws(() => calculateTerminationEstimate(data), /INVALID_/);
+  }
+  data.overrides = { monthlyRemuneration: "300000.00", additionalWithholdings: result.scenarios[0]!.netEstimate.total };
+  assert.equal(calculateTerminationEstimate(data).scenarios[0]!.netEstimate.total, "0.00");
+  data.overrides.additionalWithholdings = "1215030.49";
+  assert.throws(() => calculateTerminationEstimate(data), /INVALID_ADDITIONAL_WITHHOLDINGS/, "reject if either scenario would have a negative net");
+  data.overrides.additionalWithholdings = "-0.01";
+  assert.throws(() => calculateTerminationEstimate(data), /INVALID_TERMINATION_AMOUNT/);
 });

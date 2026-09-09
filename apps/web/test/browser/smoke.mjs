@@ -80,6 +80,22 @@ try {
         assert.equal(reading.tooltipCount, 0, 'Monthly amounts are outside the clipped scrolling graph');
         assert.ok(reading.left >= 0 && reading.right <= reading.width + 1, 'Monthly amounts stay inside the viewport');
         assert.equal(reading.chartOverflow, false);
+        const grossChart = await browser.evaluate(`(() => {
+          const chart = document.querySelector('.salary-evolution');
+          const grossReading = [...chart.querySelectorAll('.chart-reading > span')].find(el => el.textContent.startsWith('Bruto:'));
+          return { legend: [...chart.querySelectorAll('.legend > span')].map(el => el.textContent),
+            series: [...chart.querySelectorAll('.bars')].map(el => [...el.children].map(bar => bar.className)),
+            heights: [...chart.querySelectorAll('.bar')].map(el => parseFloat(el.style.height)),
+            maximum: chart.querySelector('.bar-group:last-child .gross')?.style.height,
+            reading: grossReading?.textContent.replace(/^Bruto:\\s*/, ''),
+            table: chart.querySelector('tbody tr:last-child [data-label="Bruto total"]')?.textContent };
+        })()`);
+        assert.deepEqual(grossChart.legend, ['Básico comparable', 'Bruto total', 'Neto total']);
+        assert.ok(grossChart.series.length > 0 && grossChart.series.every(series => JSON.stringify(series) === JSON.stringify(['bar comparable', 'bar gross', 'bar net'])), 'Each month shows comparable, gross and net in order');
+        assert.equal(grossChart.maximum, '100%', 'The largest synthetic gross sets the chart scale');
+        assert.ok(grossChart.heights.every(height => height <= 100), 'Gross bars fit within the shared scale');
+        assert.ok(grossChart.reading && /[0-9]/.test(grossChart.reading), 'Monthly reading includes the exact gross amount');
+        assert.equal(grossChart.reading, grossChart.table, 'Gross reading matches the exact table for the focused month');
         await layout(`${name}-chart-last-month`, true);
       }
       if (name === 'login') { await clickText('Consultar comprobante de eliminación'); await layout('deletion-receipt-lookup', true); }
@@ -115,6 +131,15 @@ try {
     await browser.waitFor('!document.body.innerText.includes("••••••••")');
     await clickText('Ocultar importes');
     await browser.waitFor('document.body.innerText.includes("••••••••")');
+    const protectedChart = await browser.evaluate(`(() => {
+      const chart = document.querySelector('.salary-evolution');
+      return { gross: [...chart.querySelectorAll('.chart-reading > span,[data-label="Bruto total"]')].filter(el => el.matches('[data-label]') || el.textContent.startsWith('Bruto:')).map(el => el.textContent),
+        heights: [...chart.querySelectorAll('.bar')].map(el => el.style.height),
+        maximum: chart.querySelector('.bar-group:last-child .gross')?.style.height };
+    })()`);
+    assert.ok(protectedChart.gross.length > 1 && protectedChart.gross.every(text => text.includes('••••••••') && !/[0-9]/.test(text)), 'Privacy masks gross in the monthly reading and exact table');
+    assert.ok(protectedChart.heights.every(height => ['30%', '52%', '74%', '96%'].includes(height)), 'Every series uses protected chart heights');
+    assert.equal(protectedChart.maximum, '96%', 'The largest gross uses its protected rank instead of a proportional height');
 
     await visit('/?section=jobs');
     await clickText('Agregar empleo');

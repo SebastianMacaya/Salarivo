@@ -36,7 +36,10 @@ export interface TerminationOverrides {
   employerEmployeeCount?: number;
   vacationDaysTaken?: string;
   priorVacationDays?: string;
+  pendingVacationDays?: string;
   sacAlreadyPaid?: string;
+  deductionRatePercent?: string;
+  additionalWithholdings?: string;
 }
 
 export interface TerminationEmployment {
@@ -64,6 +67,7 @@ export interface TerminationInput {
   terminationDate: string;
   today: string;
   terminationType?: string;
+  salaryMode?: "SIMPLE" | "DOCUMENTS";
   settlements: readonly TerminationSalarySettlement[];
   overrides?: TerminationOverrides;
 }
@@ -109,6 +113,7 @@ export interface TerminationScenario {
   total: string;
   breakdown: TerminationBreakdownLine[];
   notice: { unit: "MONTHS" | "DAYS"; value: number; fulfilled: "FULL" | "NONE" };
+  netEstimate: { total: string; contributionsAmount: string; additionalWithholdingsAmount: string; contributionPercent: string };
 }
 
 export interface TerminationEstimate {
@@ -121,6 +126,7 @@ export interface TerminationEstimate {
   assumptions: string[];
   disclaimer: string;
   salaryBase: TerminationSalaryBase;
+  salaryReference: { amount: string; sourceField: "remunerativeAmount" | "grossAmount"; period: string; documentId: string; settlementId: string } | null;
   scenarios: TerminationScenario[];
   inputs: {
     employment: TerminationEmployment;
@@ -129,11 +135,13 @@ export interface TerminationEstimate {
     terminationDate: string;
     today: string;
     terminationType: string;
+    salaryMode: "SIMPLE" | "DOCUMENTS";
     isProjection: boolean;
     seniority: { years: number; months: number; days: number; indemnityYears: number } | null;
     probation: { months: number; applies: boolean } | null;
     cappedSalaryBase: string | null;
     capFloorApplied: boolean;
+    vacationDays: string | null;
     collectiveAgreement: (CollectiveAgreementVersion & { source: "CATALOG" | "SIMULATION_OVERRIDE" }) | null;
     overrides: TerminationOverrides;
     salaryInputs: readonly Omit<TerminationSalarySettlement, "netAmount" | "deductionsAmount">[];
@@ -233,7 +241,10 @@ function validateOverrides(overrides: TerminationOverrides): void {
   if (overrides.startDate !== undefined) date(overrides.startDate);
   if (overrides.monthlyRemuneration !== undefined) positiveMoney(overrides.monthlyRemuneration);
   if (overrides.sacAlreadyPaid !== undefined) positiveMoney(overrides.sacAlreadyPaid, true);
-  for (const value of [overrides.vacationDaysTaken, overrides.priorVacationDays]) {
+  if (overrides.additionalWithholdings !== undefined) positiveMoney(overrides.additionalWithholdings, true);
+  if (overrides.deductionRatePercent !== undefined && positiveMoney(overrides.deductionRatePercent, true) > 10000n) throw new TypeError("INVALID_DEDUCTION_RATE");
+  if (overrides.pendingVacationDays !== undefined && (overrides.vacationDaysTaken !== undefined || overrides.priorVacationDays !== undefined)) throw new TypeError("INVALID_VACATION_DAYS_COMBINATION");
+  for (const value of [overrides.vacationDaysTaken, overrides.priorVacationDays, overrides.pendingVacationDays]) {
     if (value !== undefined && positiveMoney(value, true) > 36600n) throw new TypeError("INVALID_VACATION_DAYS");
   }
   if (overrides.probationWaived !== undefined && typeof overrides.probationWaived !== "boolean") throw new TypeError("INVALID_PROBATION");
@@ -457,6 +468,14 @@ function salaryMonths(input: TerminationInput, result: TerminationEstimate): Sal
     }
   }
   result.inputs.salaryInputs = snapshot;
+  const normal = snapshot.filter(settlement => settlement.settlementType === "NORMAL");
+  const latestNormal = normal.at(-1);
+  if (latestNormal && normal.filter(settlement => settlement.payrollPeriod.slice(0, 7) === latestNormal.payrollPeriod.slice(0, 7)).length === 1) {
+    const sourceField = (money(latestNormal.remunerativeAmount) ?? 0n) > 0n ? "remunerativeAmount" : "grossAmount";
+    const amount = money(latestNormal[sourceField]);
+    if (amount !== null && amount > 0n) result.salaryReference = { amount: formatAmount(amount), sourceField,
+      period: latestNormal.payrollPeriod.slice(0, 7), documentId: latestNormal.documentId, settlementId: latestNormal.id };
+  }
   result.salaryBase.analyzedDocumentIds = [...new Set(result.salaryBase.analyzedDocumentIds)];
   result.salaryBase.analyzedPeriods = [...new Set(snapshot.map(settlement => settlement.payrollPeriod.slice(0, 7)))].sort();
   return [...byPeriod.values()].sort((a, b) => a.period.localeCompare(b.period));
@@ -552,6 +571,9 @@ export function calculateTerminationEstimate(input: TerminationInput,
   date(input.terminationDate); date(input.today);
   const overrides = input.overrides ?? {};
   validateOverrides(overrides);
+  const salaryMode = input.salaryMode ?? "DOCUMENTS";
+  if (!["SIMPLE", "DOCUMENTS"].includes(salaryMode)) throw new TypeError("INVALID_SALARY_MODE");
+  if (salaryMode === "SIMPLE" && overrides.monthlyRemuneration === undefined) throw new TypeError("INVALID_TERMINATION_AMOUNT");
   const startDate = overrides.startDate ?? input.employment.startDate;
   if (startDate !== null) { date(startDate); if (startDate > input.terminationDate) throw new TypeError("TERMINATION_BEFORE_START"); }
   if (!/^[A-Z]{3}$/.test(input.employment.currencyCode)) throw new TypeError("INVALID_TERMINATION_CURRENCY");
@@ -559,16 +581,16 @@ export function calculateTerminationEstimate(input: TerminationInput,
     input.terminationDate, input.employment.subdivisionCode);
   const result: TerminationEstimate = {
     status: "UNAVAILABLE", currencyCode: input.employment.currencyCode, legalRuleVersion: rule,
-    calculationVersion: "termination-estimate-v2", confidence: "LOW", warnings: [], assumptions: [],
+    calculationVersion: "termination-estimate-v3", confidence: "LOW", warnings: [], assumptions: [],
     disclaimer: "Estimación informativa basada en los datos disponibles y la normativa configurada en Salarivo. El monto real puede variar según convenio, régimen, conceptos salariales, circunstancias de la desvinculación y cambios normativos.",
     salaryBase: { amount: null, currentMonthlyRemuneration: null, vacationMonthlyRemuneration: null, selectedPeriod: null,
       source: "UNAVAILABLE", analyzedDocumentIds: [], analyzedSettlementIds: [], analyzedPeriods: [], missingPeriods: [], unusablePeriods: [],
-      variableAverage: { sixMonths: null, twelveMonths: null, selected: "0.00" }, trace: [] }, scenarios: [],
+      variableAverage: { sixMonths: null, twelveMonths: null, selected: "0.00" }, trace: [] }, salaryReference: null, scenarios: [],
     inputs: { employment: structuredClone(input.employment), startDate,
       startDateSource: overrides.startDate ? "SIMULATION_OVERRIDE" : input.employment.startDateSource ?? "UNKNOWN",
       terminationDate: input.terminationDate, today: input.today,
-      terminationType: input.terminationType ?? "DISMISSAL_WITHOUT_CAUSE", isProjection: input.terminationDate > input.today,
-      seniority: null, probation: null, cappedSalaryBase: null, capFloorApplied: false, collectiveAgreement: null,
+      terminationType: input.terminationType ?? "DISMISSAL_WITHOUT_CAUSE", salaryMode, isProjection: input.terminationDate > input.today,
+      seniority: null, probation: null, cappedSalaryBase: null, capFloorApplied: false, vacationDays: null, collectiveAgreement: null,
       overrides: structuredClone(overrides), salaryInputs: [] },
   };
   if (!rule || result.currencyCode !== "ARS" || result.inputs.terminationType !== "DISMISSAL_WITHOUT_CAUSE") {
@@ -645,15 +667,16 @@ export function calculateTerminationEstimate(input: TerminationInput,
   let inferredSac = false;
   for (const accrualPeriod of periods(accrualStart, input.terminationDate)) {
     if (accrualPeriod === period) { semesterRemuneration += earned; continue; }
-    const observed = months.find(month => month.period === accrualPeriod && month.usable);
+    const observed = salaryMode === "DOCUMENTS" ? months.find(month => month.period === accrualPeriod && month.usable) : undefined;
     if (observed) semesterRemuneration += observed.remuneration;
     else {
       const firstDay = startDate.slice(0, 7) === accrualPeriod ? Number(startDate.slice(8, 10)) : 1;
       semesterRemuneration += roundDivide(current * BigInt(monthLength(accrualPeriod) - firstDay + 1), BigInt(monthLength(accrualPeriod)));
-      inferredSac = true;
+      if (salaryMode === "DOCUMENTS") inferredSac = true;
     }
   }
   if (inferredSac) result.warnings.push("Faltan remuneraciones del semestre: el SAC usa la remuneración mensual de la simulación en esos meses. Completá los recibos para reemplazar ese supuesto.");
+  if (salaryMode === "SIMPLE") result.assumptions.push("La estimación simple usa el sueldo bruto ingresado como remuneración constante, también para todos los meses del SAC proporcional. No requiere conciliar los conceptos de cada recibo.");
   const proportionalSac = max(0n, roundDivide(semesterRemuneration, 12n) - (money(overrides.sacAlreadyPaid) ?? 0n));
   const vacationReference = `${year}-12-31`;
   const statutoryVacation = vacationReference <= addMonths(startDate, 60) ? 14 : vacationReference <= addMonths(startDate, 120) ? 21
@@ -664,14 +687,22 @@ export function calculateTerminationEstimate(input: TerminationInput,
   const yearDays = monthLength(`${year}-02`) === 29 ? 366 : 365;
   const takenHundredths = money(overrides.vacationDaysTaken) ?? 0n;
   const priorHundredths = money(overrides.priorVacationDays) ?? 0n;
-  const vacationDayNumerator = max(0n, BigInt(annualVacation * workedDays * 100) - takenHundredths * BigInt(yearDays)) + priorHundredths * BigInt(yearDays);
+  const pendingHundredths = money(overrides.pendingVacationDays);
+  const vacationDayNumerator = pendingHundredths === null
+    ? max(0n, BigInt(annualVacation * workedDays * 100) - takenHundredths * BigInt(yearDays)) + priorHundredths * BigInt(yearDays)
+    : pendingHundredths * BigInt(yearDays);
+  result.inputs.vacationDays = formatAmount(roundDivide(vacationDayNumerator, BigInt(yearDays)));
   const vacationBase = money(result.salaryBase.vacationMonthlyRemuneration) ?? current;
   const vacation = roundDivide(vacationBase * vacationDayNumerator, BigInt(25 * yearDays * 100));
   result.assumptions.push("Importes brutos antes de retenciones; salario del mes pendiente de pago. Los días de sueldo e integración se prorratean por días calendario reales del mes.",
-    "Vacaciones proporcionales por días calendario de servicio del año, sin ausencias que reduzcan el derecho; divisor 25. Revisá días ya gozados y saldos anteriores.",
+    pendingHundredths === null ? "Vacaciones proporcionales por días calendario de servicio del año, sin ausencias que reduzcan el derecho; divisor 25. Revisá días ya gozados y saldos anteriores."
+      : "Los días de vacaciones pendientes ingresados reemplazan el saldo proporcional y los saldos anteriores; no se suman nuevamente. Remuneración mensual / 25 por los días indicados.",
     "SAC proporcional: doceava parte de la remuneración devengada en el semestre, menos el SAC ya pagado que indiques (art. 123).",
     "Se incluye incidencia SAC sobre preaviso e integración como criterio indemnizatorio (arts. 232–233); no SAC sobre vacaciones indemnizadas, cuya procedencia puede depender del criterio judicial.",
-    "No se cuantifican agravantes por tutela especial, discriminación, multas, intereses, deudas previas ni períodos anteriores reingresados no reflejados en la fecha de antigüedad.");
+    "No se cuantifican agravantes por tutela especial, discriminación, multas, intereses, deudas previas ni períodos anteriores reingresados no reflejados en la fecha de antigüedad.",
+    "El neto es orientativo: aplica el porcentaje de aportes indicado sólo al sueldo devengado y SAC proporcional, sin topes de aportes ni cálculo automático de Ganancias. Los conceptos indemnizatorios conservan su importe bruto; se restan además las otras retenciones ingresadas. El 17% inicial representa 11% jubilación, 3% obra social y 3% INSSJP y puede ajustarse según tu caso.");
+  const contributionPercent = money(overrides.deductionRatePercent) ?? 1700n;
+  const additionalWithholdings = money(overrides.additionalWithholdings) ?? 0n;
   result.scenarios = (["WITH_NOTICE", "WITHOUT_NOTICE"] as const).map(code => {
     const omitted = code === "WITHOUT_NOTICE";
     const noticeAmount = !omitted ? 0n : notice.unit === "MONTHS" ? current * BigInt(notice.value) : roundDivide(current * BigInt(notice.value), 30n);
@@ -685,11 +716,19 @@ export function calculateTerminationEstimate(input: TerminationInput,
       line("MONTH_INTEGRATION", "Integración del mes", monthIntegration, inProbation ? "No corresponde en período de prueba." : omitted ? `${monthDays - elapsedDays} días hasta fin de mes, sin tope salarial.` : "No corresponde cuando el preaviso fue cumplido.", "LCT art. 233"),
       line("EARNED_SALARY", "Salario devengado", earned, `${elapsedDays - employmentDay + 1} días de servicio del mes; se supone pendiente de pago.`, "LCT arts. 103 y 126"),
       line("PROPORTIONAL_SAC", "SAC proporcional", proportionalSac, "Remuneraciones devengadas del semestre / 12, descontando el SAC informado como ya pagado.", "LCT art. 123"),
-      line("UNUSED_VACATION", "Vacaciones no gozadas/proporcionales", vacation, `${annualVacation} días anuales según antigüedad al 31/12, proporcionales al servicio, menos días gozados y más saldo anterior informado; remuneración / 25.`, "LCT arts. 150, 155 y 156"),
+      line("UNUSED_VACATION", "Vacaciones no gozadas/proporcionales", vacation, pendingHundredths === null
+        ? `${annualVacation} días anuales según antigüedad al 31/12, proporcionales al servicio, menos días gozados y más saldo anterior informado; remuneración / 25.`
+        : `${formatAmount(pendingHundredths)} días pendientes ingresados en total; remuneración / 25, sin sumar vacaciones proporcionales otra vez.`, "LCT arts. 150, 155 y 156"),
       line("SAC_ON_NOTICE", "Incidencia SAC sobre preaviso", roundDivide(noticeAmount, 12n), "Doceava parte del preaviso sustitutivo; criterio de reparación de remuneración frustrada.", "LCT art. 232; criterio judicial indicado"),
       line("SAC_ON_INTEGRATION", "Incidencia SAC sobre integración", roundDivide(monthIntegration, 12n), "Doceava parte de la integración; criterio de reparación de remuneración frustrada.", "LCT art. 233; criterio judicial indicado"),
     ];
-    return { code, total: formatAmount(breakdown.reduce((sum, item) => sum + parseAmount(item.amount, "calculatedAmount")!, 0n)), breakdown,
+    const total = breakdown.reduce((sum, item) => sum + parseAmount(item.amount, "calculatedAmount")!, 0n);
+    const contributions = breakdown.filter(item => item.code === "EARNED_SALARY" || item.code === "PROPORTIONAL_SAC")
+      .reduce((sum, item) => sum + roundDivide(parseAmount(item.amount, "calculatedAmount")! * contributionPercent, 10000n), 0n);
+    if (additionalWithholdings > total - contributions) throw new TypeError("INVALID_ADDITIONAL_WITHHOLDINGS");
+    return { code, total: formatAmount(total), breakdown,
+      netEstimate: { total: formatAmount(total - contributions - additionalWithholdings), contributionsAmount: formatAmount(contributions),
+        additionalWithholdingsAmount: formatAmount(additionalWithholdings), contributionPercent: formatAmount(contributionPercent) },
       notice: { ...notice, fulfilled: omitted ? "NONE" as const : "FULL" as const } };
   });
   result.status = "AVAILABLE";

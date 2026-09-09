@@ -28,7 +28,8 @@ const overridesSchema = { type: "object", additionalProperties: false, propertie
   cctCode: { type: "string", minLength: 1, maxLength: 80 },
   cctCategory: { type: "string", minLength: 1, maxLength: 120 },
   probationWaived: { type: "boolean" }, employerEmployeeCount: { type: "integer", minimum: 1, maximum: 10_000_000 },
-  vacationDaysTaken: money, priorVacationDays: money, sacAlreadyPaid: money,
+  vacationDaysTaken: money, priorVacationDays: money, pendingVacationDays: money, sacAlreadyPaid: money,
+  deductionRatePercent: money, additionalWithholdings: money,
   cctCapVersion: { type: "object", additionalProperties: false,
     required: ["version", "cctCode", "effectiveFrom", "effectiveTo", "sourceUrl", "capAmount"], properties: {
       version: { type: "string", minLength: 1, maxLength: 80 },
@@ -124,14 +125,15 @@ export async function registerJurisdictionRoutes(app: FastifyInstance, { require
       suggestion: suggestCountry({ confirmedCountryCode: code }) } };
   });
 
-  app.post<{ Params: { id: string }; Body: { terminationDate?: string; terminationType?: string; overrides?: TerminationOverrides } }>(
+  app.post<{ Params: { id: string }; Body: { terminationDate?: string; terminationType?: string; salaryMode?: "SIMPLE" | "DOCUMENTS"; overrides?: TerminationOverrides } }>(
     "/api/v1/employments/:id/termination-estimate", {
       preHandler: requireAuth,
       config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
       schema: { params: { type: "object", required: ["id"], additionalProperties: false,
         properties: { id: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" } } },
       body: { type: "object", additionalProperties: false, properties: { terminationDate: date,
-        terminationType: { type: "string", enum: ["DISMISSAL_WITHOUT_CAUSE"] }, overrides: overridesSchema } } },
+        terminationType: { type: "string", enum: ["DISMISSAL_WITHOUT_CAUSE"] },
+        salaryMode: { type: "string", enum: ["SIMPLE", "DOCUMENTS"] }, overrides: overridesSchema } } },
     }, async (request) => {
       const today = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Argentina/Buenos_Aires", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
       const terminationDate = request.body.terminationDate ?? today;
@@ -193,10 +195,17 @@ export async function registerJurisdictionRoutes(app: FastifyInstance, { require
             startDateSource: row.start_date_confirmed_at ? "CONFIRMED" : "UNKNOWN" },
           today, terminationDate, settlements,
           ...(request.body.terminationType ? { terminationType: request.body.terminationType } : {}),
+          ...(request.body.salaryMode ? { salaryMode: request.body.salaryMode } : {}),
           ...(request.body.overrides ? { overrides: request.body.overrides } : {}),
         }); } catch (error) {
           if (error instanceof TypeError && /^(INVALID_|TERMINATION_BEFORE_START)/.test(error.message)) {
-            throw new ApiError(400, "VALIDATION_ERROR", "Revisá fechas, importes y vigencia del convenio de la simulación.");
+            const messages: Record<string, string> = {
+              INVALID_DEDUCTION_RATE: "El porcentaje de aportes debe estar entre 0 y 100.",
+              INVALID_VACATION_DAYS: "Los días de vacaciones deben estar entre 0 y 366.",
+              INVALID_VACATION_DAYS_COMBINATION: "Ingresá el total de vacaciones pendientes o los días gozados y saldos anteriores, sin combinar ambas opciones.",
+              INVALID_ADDITIONAL_WITHHOLDINGS: "Las otras retenciones no pueden superar el total neto de ninguno de los escenarios.",
+            };
+            throw new ApiError(400, "VALIDATION_ERROR", messages[error.message] ?? "Revisá fechas, importes y vigencia del convenio de la simulación.");
           }
           throw error;
         }
