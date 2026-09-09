@@ -8,6 +8,7 @@ import { ResponsiveDialog } from './responsive-dialog';
 import { countryName, getCountry } from '@salarivo/jurisdictions';
 import { CountrySettings, EmploymentJurisdictionFields } from './country-select';
 import { TerminationSimulator } from './termination-simulator';
+import { SalaryRaisePlanner } from './salary-raise-planner';
 import { fetchDocumentPrefix, readDocumentLocation, readOwnerLocation, writeDocumentLocation, writeOwnerLocation, type CursorDocumentPage, type DocumentLocation, type OwnerLocation, type OwnerLocationPatch } from './document-evidence';
 import {
   batchIsActive,
@@ -1802,8 +1803,62 @@ function SummaryLoading() {
   return <div className="salary-loading">
     <span className="sr-only" role="status">Cargando tu historial salarial…</span>
     <div className="scope-control" aria-hidden="true"><div className="scope-picker"><span className="loading-skeleton loading-caption">&nbsp;</span><strong className="loading-skeleton loading-context">&nbsp;</strong></div><div className="scope-meta"><span className="status loading-skeleton">&nbsp;</span><span className="loading-skeleton loading-range">&nbsp;</span></div></div>
+    <div className="panel monthly-review monthly-review-comparable" aria-hidden="true"><div className="panel-heading"><div><p className="eyebrow">Tu último período registrado</p><h2>Qué cambió en tu sueldo</h2></div></div><p className="loading-skeleton loading-range">&nbsp;</p><div className="annual-kpis monthly-review-metrics">{Array.from({ length: 3 }, (_, index) => <div key={index}><p className="loading-skeleton">&nbsp;</p><p className="loading-skeleton">&nbsp;</p></div>)}</div></div>
+    <div className="panel salary-raise-loading" aria-hidden="true"><span className="loading-skeleton">Preparar un aumento</span></div>
+    <div className="inline-actions" aria-hidden="true"><span className="button secondary loading-skeleton">Indemnización estimada</span></div>
     <div className="metric-grid salary-metrics" aria-hidden="true">{Array.from({ length: 6 }, (_, index) => <div className="metric" key={index}><small className="loading-skeleton">&nbsp;</small><strong className="loading-skeleton">&nbsp;</strong><span className="loading-skeleton">&nbsp;</span></div>)}</div>
   </div>;
+}
+
+function MonthlySalaryReview({ context, fromPeriod, toPeriod, onViewPeriod, onImport }: {
+  context: SalaryContext;
+  fromPeriod?: string;
+  toPeriod?: string;
+  onViewPeriod: (period: string) => void;
+  onImport: () => void;
+}) {
+  const [result, setResult] = useState<{ comparison: PeriodComparison | null; error: boolean } | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const { employmentContext, currencyCode } = context;
+  useEffect(() => {
+    if (!fromPeriod || !toPeriod) return;
+    const controller = new AbortController();
+    const query = new URLSearchParams({ employmentContext, currencyCode, fromPeriod, toPeriod });
+    void api<PeriodComparison | null>(`/salary-history/comparison?${query}`, { signal: controller.signal }).then((comparison) => {
+      if (!controller.signal.aborted) setResult({ comparison, error: false });
+    }).catch(() => {
+      if (!controller.signal.aborted) setResult({ comparison: null, error: true });
+    });
+    return () => controller.abort();
+  }, [employmentContext, currencyCode, fromPeriod, toPeriod, attempt]);
+  const comparison = result?.comparison;
+  const regular = comparison?.netBreakdown?.regular;
+  const purchasingPower = comparison?.economic?.purchasingPower;
+  const nominalTrend = regular ? regular.deltaAmount === '0.00' ? 'no cambió' : regular.deltaAmount.startsWith('-') ? 'bajó' : 'subió' : null;
+  const realTrend = economicTrendLabel(purchasingPower?.changeBasisPoints);
+  const headline = nominalTrend
+    ? `Tu neto habitual ${nominalTrend}. ${realTrend === 'Mejoró' ? 'Su poder de compra mejoró.' : realTrend === 'Empeoró' ? 'Su poder de compra bajó.' : realTrend === 'Sin cambio' ? 'Su poder de compra se mantuvo.' : 'Todavía no podemos medir su poder de compra.'}`
+    : 'Revisá el detalle de tus últimos períodos: falta un neto habitual separable para compararlos.';
+  return <section className={`panel monthly-review${fromPeriod && toPeriod ? ' monthly-review-comparable' : ''}`} aria-labelledby="monthly-review-title" aria-busy={Boolean(fromPeriod && toPeriod && !result)}>
+    <div className="panel-heading"><div><p className="eyebrow">Tu último período registrado</p><h2 id="monthly-review-title">Qué cambió en tu sueldo</h2></div></div>
+    {fromPeriod && toPeriod ? <>
+      <p className="coverage-note">{periodLabel(fromPeriod)} → {periodLabel(toPeriod)} · {currencyCode}. Comparación con el período anterior disponible.</p>
+      {!result ? <p role="status">Preparando tu resumen mensual…</p> : result.error ? <p className="message error" role="alert">No pudimos cargar el resumen mensual. <button type="button" className="text-button" onClick={() => { setResult(null); setAttempt((value) => value + 1); }}>Reintentar resumen mensual</button></p> : comparison ? <>
+        <p className="comparison-conclusion"><SensitiveValue value={headline} mask="Conclusión oculta" /></p>
+        <dl className="annual-kpis monthly-review-metrics">
+          <div><dt>Cambio en el neto habitual</dt><dd><MoneyValue value={regular?.deltaAmount} currency={currencyCode} kind="salary" /> · <PercentageValue value={regular?.percentage} /></dd></div>
+          <div><dt>Cambio en el básico</dt><dd><PercentageValue value={comparison.changes.comparableSalary?.percentage} /></dd></div>
+          <div><dt>Poder adquisitivo del neto habitual</dt><dd><EconomicRealChange basisPoints={purchasingPower?.changeBasisPoints} /></dd></div>
+        </dl>
+        {!regular && <p className="coverage-note">No hay dos netos habituales separables para comparar. Un aguinaldo, bono o recibo mixto no se interpreta como un aumento o una caída del sueldo habitual.</p>}
+        {(!purchasingPower || purchasingPower.changeBasisPoints === null) && <p className="coverage-note">{purchasingPower?.reason ? economicStatusMessage(purchasingPower.status, purchasingPower.reason) : 'Falta un neto habitual o un índice de alguno de los períodos para medir el poder adquisitivo.'}</p>}
+        <p className="coverage-note">Sólo comparamos el neto habitual cuando puede separarse de los pagos extraordinarios. {comparison.driversComplete === false && 'La explicación es parcial: faltan conceptos normalizados.'}</p>
+        <details><summary>Qué explica el total cobrado</summary><p><SensitiveValue value={comparisonConclusionLabels[comparison.conclusionCode]} mask="Explicación oculta" /></p>{comparison.drivers.length > 0 && <ul>{comparison.drivers.map((driver) => <li key={`${driver.type}-${driver.code}`}><SensitiveValue value={driver.type === 'DEDUCTIONS' ? 'Descuentos / créditos' : categoryLabels[driver.category as SalaryCategory] ?? earningLabels[driver.code] ?? 'Ingreso extraordinario'} />: <MoneyValue value={driver.change.deltaAmount} currency={currencyCode} kind="salary" /></li>)}</ul>}</details>
+        {purchasingPower && <EconomicEvidence observations={purchasingPower.observations} referencePeriod={purchasingPower.referencePeriod} />}
+      </> : <p className="coverage-note">No hay datos suficientes para comparar estos períodos. Revisá sus recibos.</p>}
+      <div className="modal-actions"><button type="button" className="button secondary" onClick={() => onViewPeriod(toPeriod)}>Ver detalle del período</button></div>
+    </> : <><p>Importá otro recibo de un período distinto del mismo empleo para descubrir qué cambió. Sólo se comparan datos disponibles del mismo empleo y moneda.</p><button type="button" className="button secondary" onClick={onImport}>Importar recibos</button></>}
+  </section>;
 }
 
 function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) {
@@ -1842,6 +1897,10 @@ function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) 
 
   const context = history?.contexts.find((item) => salaryScopeKey(item) === selectedScopeKey) ?? history?.contexts[0];
   const scope = history && salaryScopeForContext(history, context);
+  const recentPeriods = scope?.evolution.slice(-2).map((point) => point.period) ?? [];
+  const toPeriod = recentPeriods.at(-1);
+  const fromPeriod = recentPeriods.length === 2 ? recentPeriods[0] : undefined;
+  const viewPeriod = (period: string) => onNavigate('history', { tab: 'evolution', currencyCode: context?.currencyCode, employmentContext: context?.employmentContext, employmentId: context?.employmentId, period });
 
   return (
     <div className="page" aria-busy={historyLoading || documentsLoading}>
@@ -1851,6 +1910,8 @@ function Summary({ user, onNavigate }: { user: User; onNavigate: NavigateApp }) 
       {history && context && scope ? <>
         <SalaryScopeControl history={history} selectedKey={selectedScopeKey} onChange={setSelectedScopeKey} id="summary-salary-scope" />
         <SalaryContextNotice context={context} />
+        <MonthlySalaryReview key={`${selectedScopeKey}:${fromPeriod}:${toPeriod}`} context={context} fromPeriod={fromPeriod} toPeriod={toPeriod} onViewPeriod={viewPeriod} onImport={() => onNavigate('import')} />
+        <SalaryRaisePlanner key={selectedScopeKey} currencyCode={context.currencyCode} countryCode={context.countryCode} points={scope.evolution} onViewPeriod={viewPeriod} />
         {context.employmentId && <div className="inline-actions"><button type="button" className="button secondary" onClick={() => onNavigate('termination', { employmentId: context.employmentId })}>Indemnización estimada</button></div>}
         <SalaryMetricGrid scope={scope} context={context} />
       </> : history && !historyLoading && <EmptyState title="Todavía no hay datos salariales" body="Importá un recibo soportado y completá su revisión para construir el historial." action={<button className="button primary" onClick={() => onNavigate('import')}>Importar recibos</button>} />}

@@ -7,6 +7,7 @@ import {
   ECONOMIC_PROFILES,
   MAX_DAILY_OBSERVATION_LOOKBACK_DAYS,
   adjustForPriceIndex,
+  calculateSalaryRaise,
   convertMoney,
   economicProfileFor,
   percentageChange,
@@ -308,4 +309,31 @@ test("percentage change is exact for large values and missing indexes remain mis
   assert.equal(adjustForPriceIndex({ nominalAmount: "100.00", sourceIndex: "100", targetIndex: null }), null);
   assert.throws(() => adjustForPriceIndex({ nominalAmount: "100.00", sourceIndex: "0", targetIndex: "150" }), /positive/);
   assert.throws(() => percentageChange({ fromValue: "0", toValue: "1" }), /positive/);
+});
+
+test("plans a net raise against the existing CPI projection with exact money and bounded percentages", () => {
+  const target = adjustForPriceIndex({ nominalAmount: "1000.00", sourceIndex: "100", targetIndex: "150" });
+  assert.ok(target);
+  const input = { currencyCode: "ARS", latestNetAmount: "1200.00", targetNetAmount: target, increasePercent: "25" };
+  assert.deepEqual(calculateSalaryRaise(input), {
+    currencyCode: "ARS", differenceToTarget: "300.00", requiredIncreasePercent: "25.00",
+    simulatedNetAmount: "1500.00", simulatedDifferenceToTarget: "0.00",
+  });
+  assert.equal(calculateSalaryRaise({ ...input, increasePercent: "10.00" }).simulatedDifferenceToTarget, "-180.00");
+  assert.equal(calculateSalaryRaise({ ...input, latestNetAmount: "1600" }).requiredIncreasePercent, "0.00");
+  assert.equal(calculateSalaryRaise({ ...input, latestNetAmount: target }).requiredIncreasePercent, "0.00");
+  const third = { ...input, latestNetAmount: "300.00", targetNetAmount: "400.00", increasePercent: "33.34" };
+  assert.equal(calculateSalaryRaise(third).requiredIncreasePercent, "33.34");
+  assert.equal(calculateSalaryRaise(third).simulatedNetAmount, "400.02");
+  assert.equal(calculateSalaryRaise({ ...input, latestNetAmount: "0.01", increasePercent: "50" }).simulatedNetAmount, "0.02");
+  assert.equal(calculateSalaryRaise({ ...input, latestNetAmount: "9007199254740993.99", increasePercent: "100" }).simulatedNetAmount, "18014398509481987.98");
+  assert.equal(calculateSalaryRaise({ ...input, increasePercent: "1000.00" }).simulatedNetAmount, "13200.00");
+  for (const increasePercent of ["-1", "1.001", "1e2", "25,5", "+25", "1000.01", "1001", " 25", ""]) {
+    assert.throws(() => calculateSalaryRaise({ ...input, increasePercent }));
+  }
+  for (const latestNetAmount of ["0", "-1", "1.001", "1000000000000000000"]) {
+    assert.throws(() => calculateSalaryRaise({ ...input, latestNetAmount }));
+  }
+  assert.throws(() => calculateSalaryRaise({ ...input, targetNetAmount: "0" }), /positive/);
+  assert.throws(() => calculateSalaryRaise({ ...input, currencyCode: "ars" }), /ISO 4217/);
 });

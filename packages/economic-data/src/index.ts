@@ -456,3 +456,37 @@ export function percentageChange(input: {
   if (toCoefficient < 0n) throw new RangeError("toValue must not be negative");
   return formatFixed(roundDivide((toCoefficient - fromCoefficient) * 10_000n, fromCoefficient), 2);
 }
+
+export const MAX_SIMULATED_RAISE_PERCENT = 1000;
+
+export function calculateSalaryRaise(input: {
+  readonly currencyCode: string;
+  readonly latestNetAmount: string;
+  readonly targetNetAmount: string;
+  readonly increasePercent: string;
+}) {
+  const currencyCode = requireCurrencyCode(input.currencyCode, "currencyCode");
+  const latest = parseMoney(input.latestNetAmount, "latestNetAmount");
+  const target = parseMoney(input.targetNetAmount, "targetNetAmount");
+  if (latest <= 0n || target <= 0n) throw new RangeError("net amounts must be positive");
+  if (!/^\d{1,4}(?:\.\d{1,2})?$/.test(input.increasePercent)) {
+    throw new TypeError("increasePercent must have at most two decimal places");
+  }
+  const increase = parseDecimal(input.increasePercent, "increasePercent", 2, 4);
+  const increaseBasisPoints = increase.coefficient * powerOfTen(2 - increase.scale);
+  if (increaseBasisPoints > BigInt(MAX_SIMULATED_RAISE_PERCENT) * 100n) {
+    throw new RangeError(`increasePercent must be between 0 and ${MAX_SIMULATED_RAISE_PERCENT}`);
+  }
+  const difference = target - latest;
+  const requiredDifference = difference > 0n ? difference : 0n;
+  // Round the required percentage up: a displayed proposal must reach the target.
+  const requiredBasisPoints = (requiredDifference * 10_000n + latest - 1n) / latest;
+  const simulated = roundDivide(latest * (10_000n + increaseBasisPoints), 10_000n);
+  return {
+    currencyCode,
+    differenceToTarget: formatFixed(difference, 2),
+    requiredIncreasePercent: formatFixed(requiredBasisPoints, 2),
+    simulatedNetAmount: formatFixed(simulated, 2),
+    simulatedDifferenceToTarget: formatFixed(simulated - target, 2),
+  };
+}

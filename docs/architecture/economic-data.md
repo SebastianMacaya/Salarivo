@@ -85,6 +85,10 @@ Los inputs decimales se validan y se calculan como coeficientes y escalas `BigIn
 
 ## API, estados y privacidad
 
+La preparación de un aumento reutiliza la proyección de neto habitual a precios del último IPC disponible. El usuario elige el período salarial de origen; la referencia económica sigue siendo la última publicada, no un índice futuro ni una serie elegida libremente. El navegador compara ese objetivo con el último neto habitual registrado y permite ensayar un aumento porcentual sobre ese neto. El helper compartido usa `BigInt`, dinero con dos decimales y un porcentaje mínimo redondeado hacia arriba a dos decimales para no sugerir un aumento inferior al objetivo. El escenario no modela cómo un cambio del bruto modifica aportes o retenciones.
+
+La simulación sólo vive en memoria del navegador y no modifica fuentes ni resultados de extracción. Los períodos, moneda, disponibilidad y referencias de IPC se validan antes de ofrecer un resultado. Los recibos mixtos y los importes ausentes no se completan con totales ni con un sueldo anterior. Sin cobertura utilizable, la interfaz explica el impedimento. Este flujo no agrega consultas al proveedor, cachés privadas ni un nuevo endpoint de API.
+
 API solicita todas las observaciones necesarias como un snapshot batched y evita N+1 por liquidación. Cada referencia conserva serie interna y externa, observation ID, revisión, fecha pedida/usada, método, proveedor, fuente, metodología, enlace de licencia y fecha de fetch.
 
 `salary-analytics-v2` conserva `totals` y agrega `sac`, `other` y `regularMixed` a cada mes; `regular` contiene sólo el sueldo habitual separable. `economic-analytics-v2` conserva `amounts` como total y agrega `regularAmounts`, `sacAmounts` y `otherAmounts`, transformados con las fechas/observaciones propias de cada recibo. No hay nuevas consultas por categoría. La falta de una cotización del SAC no bloquea la comparación de un sueldo habitual que sí pudo convertirse.

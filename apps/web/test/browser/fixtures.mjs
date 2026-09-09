@@ -79,7 +79,10 @@ export function syntheticPdf() {
   return text;
 }
 
-const fixtures = { user, permissions, employment, history, documents, detail, run, adminUser, adminDocument, adminEmployer, legalDocuments, overview, job, now, pdf: syntheticPdf(), comparisons: { latest: compareSalaryPeriods(settlements, { employmentContext: id(10), currencyCode: 'ARS', fromPeriod: '2025-01', toPeriod: '2026-08' }) } };
+const fixtures = { user, permissions, employment, history, documents, detail, run, adminUser, adminDocument, adminEmployer, legalDocuments, overview, job, now, pdf: syntheticPdf(), comparisons: [
+  compareSalaryPeriods(settlements, { employmentContext: id(10), currencyCode: 'ARS', fromPeriod: '2025-01', toPeriod: '2026-08' }),
+  ...settlements.slice(1).map((settlement, index) => compareSalaryPeriods(settlements, { employmentContext: id(10), currencyCode: 'ARS', fromPeriod: settlements[index].payrollPeriod, toPeriod: settlement.payrollPeriod })),
+] };
 
 function installFixture(data, options) {
   if (!['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)) throw new Error('Synthetic fixtures require localhost.');
@@ -133,7 +136,10 @@ function installFixture(data, options) {
     if (path === '/employment-detections') return ok(state.detections || []);
     if (path === '/salary-history') return ok(state.empty ? { ...data.history, contexts: [], analytics: { ...data.history.analytics, scopes: [] } } : state.history || data.history);
     if (path === '/salary-history/concepts') return ok({ items: state.empty ? [] : [{ period: '2026-08', settlementId: 'synthetic-settlement', settlementType: 'NORMAL', earningIndex: 0, category: 'NORMAL', code: 'BASIC_SALARY', isRecurring: true, amount: data.detail.settlement.basicAmount }], nextCursor: null });
-    if (path === '/salary-history/comparison') return ok(state.comparison || data.comparisons.latest);
+    if (path === '/salary-history/comparison') {
+      const candidates = state.comparisons || (state.comparison ? [state.comparison] : state.history ? [] : data.comparisons);
+      return ok(candidates.find((comparison) => comparison && ['employmentContext', 'currencyCode', 'fromPeriod', 'toPeriod'].every((key) => comparison[key] === url.searchParams.get(key))) ?? null);
+    }
     if (path === '/documents') {
       const items = state.empty ? [] : data.documents.map((document) => ({ ...document, needsReview: Boolean(readingPending(document.id)), decisionRequired: Boolean(readingPending(document.id)) })).filter((document) => !state.readingImprovement || url.searchParams.get('statusGroup') !== 'REVIEW' || document.needsReview);
       return ok({ items: items.slice(0, Number(url.searchParams.get('limit')) || 20), nextCursor: null, pendingReview: state.empty ? 0 : readingIds.filter(readingPending).length, total: items.length });

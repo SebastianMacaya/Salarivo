@@ -35,6 +35,8 @@ No se optimiza por cantidad de OCR ejecutados. Se optimiza por información labo
 - historial `salary-analytics-v2` derivado por contexto laboral y moneda, con situación actual, evolución mensual sin perder liquidaciones del mismo período, aumentos compuestos, resumen anual por tipo/concepto normalizado, comparación determinística y posibles duplicados;
 - selección inicial del historial por empresa favorita y luego por el último `payrollPeriod` elegible; upload, pago, emisión y alta del empleo no determinan esa recencia;
 - contexto `economic-analytics-v2` derivado para `AR` + `ARS`, con nominal intacto, equivalente USD histórico, poder adquisitivo a precios del último IPC disponible, inflación del período y procedencia inspeccionable;
+- tarjeta en Resumen con comparación automática de los dos últimos períodos disponibles del mismo empleo y moneda, explicación del total cobrado, cambios del sueldo habitual y acceso al período fuente;
+- preparación de un aumento para `AR` + `ARS`: mes salarial base elegido, neto habitual necesario a precios del último IPC disponible y simulación porcentual sobre el último neto habitual registrado, sin persistir escenarios ni predecir descuentos;
 - navegación contextual y recuperable desde la URL entre un empleo, su historial salarial, períodos, conceptos y documentos asociados;
 - modo privacidad visual global en la interfaz autenticada para enmascarar importes, porcentajes y gráficos financieros durante la navegación, sin modificar datos ni crear copias censuradas, y con advertencia antes de abrir un PDF original;
 - visor privado del PDF por página con evidencia espacial cuando es inequívoca, datos extraídos y procedencia lado a lado;

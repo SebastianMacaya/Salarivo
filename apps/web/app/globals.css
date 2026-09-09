@@ -506,6 +506,12 @@ dialog.modal-layer::backdrop { background: transparent; }
 .evolution-details > summary, .comparison-result > details > summary, .settlement-detail > details > summary { cursor: pointer; color: var(--green); font-size: 12px; font-weight: 750; }
 .evolution-details .salary-evolution-table, .comparison-result > details .table-wrap { margin-top: 10px; }
 .comparison-panel { margin-top: 18px; }
+.monthly-review { margin: 18px 0; }
+.monthly-review-comparable { min-height: 660px; }
+.salary-raise-loading > span { display: block; min-height: 44px; padding: 10px 0; font-size: 18px; }
+@media (min-width: 1024px) { .monthly-review-comparable { min-height: 460px; } }
+.monthly-review .monthly-review-metrics { margin: 16px 0 0; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
+.monthly-review > details:not(.economic-evidence) > summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; color: var(--green); font-weight: 750; }
 .comparison-result { display: grid; gap: 15px; margin-top: 20px; }
 .comparison-conclusion { margin: 0; border-radius: 10px; background: var(--green-soft); padding: 12px; color: var(--green-dark); font-size: 12px; line-height: 1.5; }
 .comparison-drivers h4 { margin: 0 0 6px; font-size: 13px; }
