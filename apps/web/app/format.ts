@@ -55,6 +55,9 @@ export function economicTrendLabel(value?: string | null) {
 
 const periodFormatter = new Intl.DateTimeFormat('es-AR', { month: 'long', timeZone: 'UTC' });
 const dateFormatter = new Intl.DateTimeFormat('es-AR', { dateStyle: 'medium', timeZone: 'UTC' });
+const todayFormatter = new Intl.DateTimeFormat('en-CA', {
+  year: 'numeric', month: '2-digit', day: '2-digit', timeZone: 'America/Argentina/Buenos_Aires',
+});
 const timestampFormatter = new Intl.DateTimeFormat('es-AR', {
   dateStyle: 'medium',
   timeStyle: 'short',
@@ -72,13 +75,62 @@ export function periodLabel(value?: string | null) {
   return `${month.charAt(0).toLocaleUpperCase('es-AR')}${month.slice(1)} ${match[1]}`;
 }
 
-export function dateLabel(value?: string | null) {
+function calendarDate(value?: string | null) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value ?? '');
-  if (!match) return '—';
+  if (!match) return null;
   const date = new Date(`${value}T00:00:00Z`);
   return Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value
-    ? '—'
-    : dateFormatter.format(date);
+    ? null
+    : date;
+}
+
+export function dateLabel(value?: string | null) {
+  const date = calendarDate(value);
+  return date ? dateFormatter.format(date) : '—';
+}
+
+export function employmentMilestones(employment: {
+  startDate: string;
+  endDate?: string | null;
+  status: string;
+}, today = todayFormatter.format(new Date())) {
+  const start = calendarDate(employment.startDate);
+  const current = calendarDate(today);
+  const hasEnd = employment.endDate != null;
+  const end = hasEnd ? calendarDate(employment.endDate) : current;
+  if (!start || !current || !end || start > end || end > current
+    || (!hasEnd && employment.status !== 'ACTIVE')) return null;
+
+  // Calendar milestones keep the original day, clamped to the target month's last day.
+  const afterMonths = (months: number) => {
+    const date = new Date(start);
+    date.setUTCDate(1);
+    date.setUTCMonth(date.getUTCMonth() + months + 1, 0);
+    date.setUTCDate(Math.min(start.getUTCDate(), date.getUTCDate()));
+    return date;
+  };
+  let months = (end.getUTCFullYear() - start.getUTCFullYear()) * 12 + end.getUTCMonth() - start.getUTCMonth();
+  if (afterMonths(months) > end) months -= 1;
+  const years = Math.floor(months / 12);
+  const remainingMonths = months % 12;
+  const days = (end.getTime() - start.getTime()) / 86_400_000;
+  const tenureLabel = [
+    years ? `${years} ${years === 1 ? 'año' : 'años'}` : null,
+    remainingMonths ? `${remainingMonths} ${remainingMonths === 1 ? 'mes' : 'meses'}` : null,
+  ].filter(Boolean).join(' y ') || `${days} ${days === 1 ? 'día' : 'días'}`;
+  if (hasEnd) return { tenureLabel, anniversary: null };
+
+  let anniversaryYears = Math.max(1, current.getUTCFullYear() - start.getUTCFullYear());
+  let anniversaryDate = afterMonths(anniversaryYears * 12);
+  if (anniversaryDate < current) anniversaryDate = afterMonths(++anniversaryYears * 12);
+  return {
+    tenureLabel,
+    anniversary: {
+      date: anniversaryDate.toISOString().slice(0, 10),
+      years: anniversaryYears,
+      daysUntil: (anniversaryDate.getTime() - current.getTime()) / 86_400_000,
+    },
+  };
 }
 
 export function employmentOptionLabel(employment: {

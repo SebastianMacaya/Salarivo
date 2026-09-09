@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openBrowser } from './cdp.mjs';
-import { fixtureSource, id, syntheticPdf } from './fixtures.mjs';
+import { fixtureSource, id, manyEmployments, syntheticPdf } from './fixtures.mjs';
 
 const base = process.env.SALARIVO_TEST_URL || 'http://localhost:3000';
 const output = process.env.SALARIVO_TEST_OUTPUT || join(tmpdir(), 'salarivo-responsive-qa');
@@ -57,6 +57,18 @@ async function clickText(text, selector = 'button') {
 async function click(selector) {
   assert.ok(await browser.evaluate(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.click(); return true; })()`), `Missing selector: ${selector}`);
 }
+async function filterJobs(value, status = 'ALL') {
+  await browser.evaluate(`(() => {
+    const input = document.querySelector('input[placeholder="Empresa, puesto o año"]');
+    const select = [...document.querySelectorAll('select')].find(el => [...el.labels].some(label => label.textContent.startsWith('Estado')));
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(value)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(select, ${JSON.stringify(status)});
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await browser.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+}
+const employmentIds = '[...document.querySelectorAll(".employment-row .employment-card-link")].map(el => new URL(el.href).searchParams.get("employmentId"))';
 
 try {
   const scenarios = [
@@ -123,6 +135,50 @@ try {
   process.stdout.write('Viewport sweep 320–2560 and landscape passed.\n');
   }
 
+  for (const width of [320, 390, 768, 1440]) {
+    await browser.viewport(width, 900);
+    await visit('/?section=jobs', 'owner', { employments: manyEmployments });
+    assert.deepEqual(await browser.evaluate(employmentIds), [601, 10, 602, 603, 604, 605, 606, 607, 608, 600, 609, 610].map(id), 'Every employment episode is visible, current jobs first and each group newest first');
+    assert.deepEqual(await browser.evaluate(String.raw`[...document.querySelectorAll('.employment-group h2')].map(el => el.textContent.replace(/\s*\d+\s*$/, ''))`), ['Actuales', 'Anteriores', 'Por confirmar']);
+    assert.equal(await browser.evaluate(`[...document.querySelector('input[placeholder="Empresa, puesto o año"]').labels].some(label => label.textContent.includes('Buscar empleos'))`), true);
+    assert.equal(await browser.evaluate('[...document.querySelectorAll(".employment-row")].filter(el => el.textContent.includes("Sin sueldo mensual registrado")).length'), 11, 'Missing salary history is explicit for every other employment');
+    assert.equal(await browser.evaluate('[...document.querySelectorAll(".employment-row h3")].filter(el => el.textContent.includes("Empresa Sintética")).length'), 2, 'Re-entry into one employer remains two separate episodes');
+    await layout('many-employments', true);
+    await filterJobs('', 'ACTIVE');
+    assert.deepEqual(await browser.evaluate(employmentIds), [601, 10].map(id));
+    await layout('many-employments-active', true);
+    await filterJobs('', 'ENDED');
+    assert.equal((await browser.evaluate(employmentIds)).length, 9);
+    assert.deepEqual(await browser.evaluate('[...document.querySelectorAll(".employment-milestones dt")].map(el => el.textContent)'), Array(9).fill('Duración del empleo'), 'Ended employment rows show duration without a future anniversary');
+    await filterJobs('', 'UNKNOWN');
+    assert.deepEqual(await browser.evaluate(employmentIds), [id(610)]);
+    assert.equal(await browser.evaluate('document.querySelectorAll(".employment-milestones").length'), 0, 'Unknown continuity does not invent tenure or an anniversary');
+    for (const [query, expected] of [['nandu', 601], ['coordinacion', 603], ['2026', 601]]) {
+      await filterJobs(query);
+      assert.deepEqual(await browser.evaluate(employmentIds), [id(expected)], 'Search matches employer, role or year without requiring accents');
+    }
+    await filterJobs('nandu', 'ENDED');
+    assert.deepEqual(await browser.evaluate(employmentIds), [], 'Search and status filters combine');
+    await layout('many-employments-no-match', true);
+    await clickText('Limpiar filtros');
+    await browser.waitFor('document.querySelectorAll(".employment-row").length === 12');
+    const menu = '.employment-row .employment-menu summary';
+    await browser.evaluate(`document.querySelector(${JSON.stringify(menu)}).scrollIntoView({block:'center'})`);
+    const menuHit = await browser.evaluate(`(() => { const el = document.querySelector(${JSON.stringify(menu)}); const box = el.getBoundingClientRect(); return { width: box.width, height: box.height, menu: !!document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)?.closest('.employment-menu') }; })()`);
+    assert.ok(menuHit.menu && menuHit.width >= 44 && menuHit.height >= 44, 'The actions menu has its own accessible hit target');
+    await click(menu);
+    assert.equal(await browser.evaluate('!!document.querySelector(".employment-detail-actions")'), false, 'Opening actions does not open the employment');
+    await clickText('Editar');
+    await browser.waitFor('document.querySelector("dialog:modal")');
+    await layout('many-employments-edit', true);
+    await clickText('Cancelar');
+    await click('.employment-row .employment-card-link');
+    await browser.waitFor('document.querySelector(".employment-detail-actions")');
+    assert.equal(await browser.evaluate('new URLSearchParams(location.search).get("employmentId")'), id(601), 'The row opens its own episode, including jobs without salary history');
+    await layout('many-employments-detail', true);
+  }
+  process.stdout.write('Twelve employment episodes, search, filters and independent actions at 320–1440px passed.\n');
+
   for (const width of [320, 1440]) {
     await browser.viewport(width, 850);
     await visit('/?section=summary', 'owner', { private: true });
@@ -142,10 +198,36 @@ try {
     assert.equal(protectedChart.maximum, '96%', 'The largest gross uses its protected rank instead of a proportional height');
 
     await visit('/?section=jobs');
+    const employmentCard = await browser.evaluate(`(() => {
+      const card = document.querySelector('.employment-row');
+      return { milestones: card.querySelector('.employment-milestones')?.textContent,
+        milestoneLabels: [...card.querySelectorAll('.employment-milestones dt')].map(el => el.textContent),
+        salaryLabels: [...card.querySelectorAll('.employment-salary dt')].map(el => el.textContent),
+        salaries: [...card.querySelectorAll('.employment-salary dd')].map(el => el.textContent),
+        summary: card.querySelector('.employment-card-summary')?.textContent };
+    })()`);
+    assert.equal(employmentCard.milestoneLabels[0], 'Antigüedad');
+    assert.ok(['Próximo aniversario', 'Aniversario hoy'].includes(employmentCard.milestoneLabels[1]));
+    assert.match(employmentCard.milestones, /\d+ (año|mes|día)/, 'Employment tenure is visible');
+    assert.match(employmentCard.milestones, /Cumplís \d+ año/, 'The next employment anniversary is visible');
+    assert.deepEqual(employmentCard.salaryLabels, ['Bruto', 'Neto']);
+    assert.deepEqual(employmentCard.salaries, ['ARS 1.937.507,98', 'ARS 1.637.507,98'], 'Both amounts come from the latest synthetic settlement');
+    assert.match(employmentCard.summary, /Último sueldo mensual · Agosto 2026/);
+    assert.match(employmentCard.summary, /20 períodos con recibos · 20 documentos/);
+    await layout('employment-milestones', true);
+    await clickText('Ocultar importes');
+    const hiddenSalaries = await browser.evaluate('[...document.querySelectorAll(".employment-salary dd")].map(el => el.textContent)');
+    assert.ok(hiddenSalaries.length === 2 && hiddenSalaries.every(text => text.includes('••••••••') && !/[0-9]/.test(text)), 'Privacy hides gross and net in employment cards');
+    assert.equal(await browser.evaluate('document.querySelector(".employment-milestones").textContent'), employmentCard.milestones, 'Tenure and anniversary remain visible with private salaries');
+    await clickText('Mostrar importes');
     await clickText('Agregar empleo');
     await browser.waitFor('document.querySelector("dialog:modal,[role=dialog]")');
     await layout('employment-form', true);
     await clickText('Cancelar');
+    await click('.employment-card-link');
+    await browser.waitFor('document.querySelector(".employment-detail-actions")');
+    assert.equal(await browser.evaluate('document.querySelector(".employment-milestones")?.textContent'), employmentCard.milestones, 'The employment detail shows the same tenure and anniversary as its card');
+    await layout('employment-detail-milestones', true);
 
     await visit(`/?section=history&tab=documents&document=${id(319)}`);
     await browser.waitFor('document.querySelector("#review-title")');
@@ -217,6 +299,6 @@ try {
     await layout('logout', true);
   }
   assert.deepEqual(exceptions, [], 'Browser runtime errors');
-  await writeFile(join(output, 'results.json'), JSON.stringify({ measurements, checks: ['all-owner-routes', 'mobile-widths', 'landscape', 'long-names-money', 'forms', 'privacy', 'pdf-fit-zoom', 'upload-synthetic', 'empty-error', 'logout'], exceptions }, null, 2));
+  await writeFile(join(output, 'results.json'), JSON.stringify({ measurements, checks: ['all-owner-routes', 'mobile-widths', 'landscape', 'long-names-money', 'many-employments-filters-actions', 'employment-milestones-salaries', 'forms', 'privacy', 'pdf-fit-zoom', 'upload-synthetic', 'empty-error', 'logout'], exceptions }, null, 2));
   process.stdout.write(`${measurements.length} responsive checks passed. Screenshots: ${output}\n`);
 } finally { await browser.close(); }

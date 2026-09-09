@@ -17,6 +17,19 @@ const analytics = analyzeSalaryHistory(settlements);
 const last = settlements.at(-1);
 const permissions = ['dashboard.read', 'users.read_metadata', 'users.read_contact', 'users.status.update', 'sessions.revoke', 'documents.read_metadata', 'documents.quarantine', 'employers.read_metadata', 'processing.read', 'processing.retry', 'processing.cancel', 'processing.reprocess', 'processing.rollback', 'storage.read', 'privacy.read', 'security.read', 'audit.read', 'legal.manage', 'settings.read', 'system.health.read', 'roles.manage'];
 const employment = { id: id(10), employerId: id(20), employerName, role: 'Especialista en sistemas y operaciones de prueba', startDate: '2025-01-01', endDate: null, status: 'ACTIVE', countryCode: 'AR', countryConfirmedAt: now, statusConfirmedAt: now, legalRegimeCode: 'AR_LCT_GENERAL', employmentType: 'DEPENDENT', currencyCode: 'ARS', isFavorite: true, employerStatus: 'VERIFIED' };
+export const manyEmployments = [
+  ['Estudio Delta', 'Asistente', '2013-01-01', '2014-12-31'],
+  ['Cooperativa Ñandú', 'Analista de datos', '2026-02-01', null],
+  [employerName, 'Analista de sistemas', '2022-04-01', '2024-12-31'],
+  ['Servicios del Sur', 'Coordinación técnica', '2021-01-01', '2022-03-31'],
+  ['Taller Horizonte', 'Soporte', '2019-01-01', '2020-12-31'],
+  ['Laboratorio Álamo', 'Investigación', '2018-01-01', '2018-12-31'],
+  ['Fundación Río', 'Administración', '2017-01-01', '2017-12-31'],
+  ['Consultora del Centro', 'Operaciones', '2016-01-01', '2016-12-31'],
+  ['Comercio Aurora', 'Atención al cliente', '2015-01-01', '2015-12-31'],
+  ['Proyecto Inicial', null, '2012-01-01', '2012-12-31'],
+  ['Archivo Pendiente', null, '2011-01-01', null, 'UNKNOWN'],
+].map(([name, role, startDate, endDate, status], index) => ({ ...employment, id: id(600 + index), employerId: name === employerName ? employment.employerId : id(700 + index), employerName: name, role, startDate, endDate, status: status || (endDate ? 'ENDED' : 'ACTIVE'), isFavorite: index === 0 })).concat(employment);
 const user = { id: id(1), email: 'persona.sintetica@example.test', displayName: 'Persona Sintética', role: 'USER', adminRole: null, permissions: [], authState: 'AUTHENTICATED', mfaEnabled: true, onboardingCompleted: true, legalAcceptanceRequired: false, authMethods: ['GOOGLE'], primaryCountryCode: 'AR', primaryCountryConfirmedAt: now };
 const history = { calculationVersion: 'salary-analytics-v1', economicCalculationVersion: 'economic-analytics-v1', analytics, contexts: [{ employmentContext: id(10), employmentId: id(10), employerName, state: 'CONFIRMED', countryCode: 'AR', currencyCode: 'ARS', isFavorite: true, employmentStatus: 'ACTIVE', startDate: '2025-01-01', endDate: null, firstPeriod: '2025-01', lastPeriod: '2026-08' }], coverage: { documents: 20, activeEmployments: 1, completedDocuments: 20, needsReviewDocuments: 0, pendingReviewDocuments: 0, unassociatedDocuments: 0, analyzedSettlements: 20, reprocessing: { candidateDocuments: 0, processingDocuments: 0, reviewRequiredDocuments: 0 } } };
 const documents = [...settlements].reverse().map((settlement) => ({ id: settlement.documentId, employmentId: id(10), employerName, payrollPeriod: settlement.payrollPeriod, settlementType: 'NORMAL', originalFilename: `recibo-sintetico-${settlement.payrollPeriod}-nombre-largo-para-verificar-responsive.pdf`, displayFilename: `Recibo mensual ${settlement.payrollPeriod} · ${employerName}`, createdAt: now, processingStatus: 'COMPLETED', documentType: 'PAYROLL', confidence: '0.99', originalAvailable: true, needsReview: false }));
@@ -91,7 +104,7 @@ function installFixture(data, options) {
       return ok({ primaryCountryCode: data.user.primaryCountryCode, primaryCountryConfirmedAt: data.user.primaryCountryConfirmedAt, suggestion: { countryCode: 'AR', confidence: 'MEDIUM', source: 'BROWSER_LOCALE' } });
     }
     if (path === `/employments/${data.employment.id}` && method === 'PATCH') { Object.assign(data.employment, JSON.parse(init.body)); return ok(data.employment); }
-    if (path === '/employments') return ok(state.empty ? [] : [data.employment]);
+    if (path === '/employments') return ok(state.empty ? [] : state.employments || [data.employment]);
     if (path === '/employment-detections') return ok(state.detections || []);
     if (path === '/salary-history') return ok(state.empty ? { ...data.history, contexts: [], analytics: { ...data.history.analytics, scopes: [] } } : data.history);
     if (path === '/salary-history/concepts') return ok({ items: state.empty ? [] : [{ period: '2026-08', settlementId: 'synthetic-settlement', settlementType: 'NORMAL', earningIndex: 0, category: 'NORMAL', code: 'BASIC_SALARY', isRecurring: true, amount: data.detail.settlement.basicAmount }], nextCursor: null });

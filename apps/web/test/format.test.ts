@@ -8,6 +8,7 @@ import {
   economicStatusMessage,
   economicTrendLabel,
   earningLabels,
+  employmentMilestones,
   employmentOptionLabel,
   extractionSourceLabel,
   money,
@@ -37,6 +38,59 @@ test('no presenta un empleo sin estado confirmado como actualmente vigente', () 
   const label = employmentOptionLabel({ employerName: 'Empresa sintética', startDate: '2025-01-01', status: 'UNKNOWN' });
   assert.match(label, /Continuidad sin confirmar/);
   assert.doesNotMatch(label, /actualidad/);
+});
+
+test('muestra antigüedad calendario y próximo aniversario sólo con continuidad conocida', () => {
+  const employment = { startDate: '2024-11-01', status: 'ACTIVE' };
+  assert.deepEqual(employmentMilestones(employment, '2026-09-09'), {
+    tenureLabel: '1 año y 10 meses', anniversary: { date: '2026-11-01', years: 2, daysUntil: 53 },
+  });
+  assert.deepEqual(employmentMilestones({ ...employment, status: 'ENDED', endDate: '2025-12-01' }, '2026-09-09'), {
+    tenureLabel: '1 año y 1 mes', anniversary: null,
+  });
+  assert.equal(employmentMilestones({ ...employment, status: 'UNKNOWN' }, '2026-09-09'), null);
+  assert.equal(employmentMilestones({ ...employment, status: 'ENDED' }, '2026-09-09'), null);
+  assert.deepEqual(employmentMilestones({ ...employment, endDate: '2025-12-01' }, '2026-09-09'), {
+    tenureLabel: '1 año y 1 mes', anniversary: null,
+  });
+  for (const dates of [
+    { startDate: '2026-09-10' }, { startDate: '2026-02-30' }, { startDate: 'invalid' },
+    { endDate: '2026-09-10' }, { endDate: '2024-10-31' }, { endDate: '' },
+  ]) assert.equal(employmentMilestones({ ...employment, ...dates }, '2026-09-09'), null);
+  assert.equal(employmentMilestones(employment, '2026-02-30'), null);
+});
+
+test('respeta días, fin de mes, bisiestos y aniversarios de hoy o del año siguiente', () => {
+  const active = (startDate: string, today: string) => employmentMilestones({ startDate, status: 'ACTIVE' }, today);
+  assert.deepEqual(active('2026-09-09', '2026-09-09'), {
+    tenureLabel: '0 días', anniversary: { date: '2027-09-09', years: 1, daysUntil: 365 },
+  });
+  assert.equal(active('2026-09-08', '2026-09-09')?.tenureLabel, '1 día');
+  assert.equal(active('2026-09-01', '2026-09-09')?.tenureLabel, '8 días');
+  assert.equal(active('2026-01-31', '2026-02-27')?.tenureLabel, '27 días');
+  assert.equal(active('2026-01-31', '2026-02-28')?.tenureLabel, '1 mes');
+  assert.equal(active('2026-01-31', '2026-03-30')?.tenureLabel, '1 mes');
+  assert.equal(active('2026-01-31', '2026-03-31')?.tenureLabel, '2 meses');
+  assert.deepEqual(active('2024-02-29', '2025-02-28'), {
+    tenureLabel: '1 año', anniversary: { date: '2025-02-28', years: 1, daysUntil: 0 },
+  });
+  assert.deepEqual(active('2024-02-29', '2028-02-28'), {
+    tenureLabel: '3 años y 11 meses', anniversary: { date: '2028-02-29', years: 4, daysUntil: 1 },
+  });
+  assert.deepEqual(active('2024-01-01', '2026-12-31'), {
+    tenureLabel: '2 años y 11 meses', anniversary: { date: '2027-01-01', years: 3, daysUntil: 1 },
+  });
+  assert.deepEqual(active('2024-11-01', '2026-11-01'), {
+    tenureLabel: '2 años', anniversary: { date: '2026-11-01', years: 2, daysUntil: 0 },
+  });
+});
+
+test('la antigüedad por defecto cambia de día en Buenos Aires', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-11-01T02:30:00Z') });
+  const employment = { startDate: '2024-11-01', status: 'ACTIVE' };
+  assert.equal(employmentMilestones(employment)?.anniversary?.daysUntil, 1);
+  context.mock.timers.tick(60 * 60 * 1000);
+  assert.equal(employmentMilestones(employment)?.anniversary?.daysUntil, 0);
 });
 
 test('convierte centavos y puntos básicos sin pasar por punto flotante', () => {
